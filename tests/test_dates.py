@@ -174,6 +174,7 @@ from datetime import date as _date  # noqa: E402
 from krepis.dates import (  # noqa: E402
     expected_last_close,
     is_fresh_in_trading_days,
+    resolve_trading_day,
     trading_days_stale,
 )
 
@@ -274,3 +275,41 @@ class TestIsFreshInTradingDays:
         assert is_fresh_in_trading_days(
             _date(2026, 5, 22), _date(2026, 5, 26), max_stale=1,
         )
+
+
+class TestResolveTradingDay:
+    """``resolve_trading_day(date_str)`` normalizes a calendar date to the most
+    recent NYSE trading day on or before it — the canonical artifact-keying
+    helper lifted from the backtester + evaluator duplicates."""
+
+    def test_saturday_walks_back_to_friday(self):
+        assert resolve_trading_day("2026-05-30") == "2026-05-29"
+
+    def test_sunday_walks_back_to_friday(self):
+        assert resolve_trading_day("2026-05-31") == "2026-05-29"
+
+    def test_trading_day_is_idempotent(self):
+        # A trading-day input returns unchanged (re-normalizing is a no-op).
+        assert resolve_trading_day("2026-05-29") == "2026-05-29"
+
+    def test_good_friday_holiday_walks_back(self):
+        # Fri 2026-04-03 is Good Friday (NYSE closed) → Thu 2026-04-02.
+        assert resolve_trading_day("2026-04-03") == "2026-04-02"
+
+    def test_holiday_monday_walks_back_over_weekend(self):
+        # Mon 2026-01-19 is MLK Day → Fri 2026-01-16.
+        assert resolve_trading_day("2026-01-19") == "2026-01-16"
+
+    def test_iso_datetime_string_tolerated(self):
+        # Only the leading yyyy-mm-dd is parsed.
+        assert resolve_trading_day("2026-05-30T12:00:00Z") == "2026-05-29"
+
+    def test_none_defaults_to_today_normalized(self):
+        # Default (None) == normalizing today's calendar date. NOTE this is
+        # today-itself when today is a trading day (it normalizes a calendar
+        # KEY), distinct from now_dual().trading_day's last-*closed*-session.
+        assert resolve_trading_day() == resolve_trading_day(_date.today().isoformat())
+
+    def test_parse_failure_returns_input_unchanged(self):
+        # Defensive: a normalization miss must not raise — return raw + WARN.
+        assert resolve_trading_day("not-a-date") == "not-a-date"
