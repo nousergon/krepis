@@ -55,10 +55,18 @@ single canonical entry point so every consumer sees the same semantics.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 
-from .trading_calendar import count_trading_days, last_closed_trading_day
+from .trading_calendar import (
+    count_trading_days,
+    is_trading_day,
+    last_closed_trading_day,
+    previous_trading_day,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -126,6 +134,66 @@ def now_dual(*, now: datetime | None = None) -> DualDate:
         calendar_date=cal_utc.isoformat(),
         trading_day=td.isoformat(),
     )
+
+
+def resolve_trading_day(date_str: str | None = None) -> str:
+    """Normalize a date string to the most recent NYSE trading day on or before it.
+
+    Canonical artifact-keying helper. Per ``DATE_CONVENTIONS``: every trade
+    artifact keys by the TRADING DAY, not the calendar date. The Saturday SF
+    threads a CALENDAR run_date (``date(Execution.StartTime)`` — e.g. Sat
+    2026-05-30) while Research + ``signals.json`` + the backtester key by the
+    trading day (Fri 2026-05-29). Normalizing the calendar run_date here keeps
+    every consumer reading the same ``{module}/{trading_day}`` keys the
+    producers wrote — the research↔backtester pit-parity drift and the
+    evaluator's 0/18-graded report card both traced to a consumer that trusted
+    the calendar run_date verbatim.
+
+    Single source of truth for the normalizer previously duplicated as
+    ``pipeline_common.resolve_trading_day`` (backtester) and
+    ``grading.handler._to_trading_day`` (evaluator) — both thin wrappers over
+    ``trading_calendar``. Lifted to the shared chokepoint on the second
+    adoption.
+
+    Behavior:
+        * Idempotent — a trading-day input returns unchanged, so re-normalizing
+          an already-normalized value (e.g. ``now_dual().trading_day`` or a
+          bash-normalized ``RUN_DATE``) is a no-op.
+        * Default (``date_str is None``) = today UTC, then normalized.
+        * Tolerant of an ISO datetime / longer string — only the leading
+          ``yyyy-mm-dd`` is parsed.
+        * Defensive: on any parse failure, returns the input unchanged with a
+          WARNING rather than raising. A date-normalization miss must not abort
+          the caller (the backtester run or the non-fatal grading path).
+
+    Args:
+        date_str: ISO ``yyyy-mm-dd`` (or longer ISO) string, or ``None`` for
+            today UTC.
+
+    Returns:
+        ISO ``yyyy-mm-dd`` string of the most recent NYSE trading day on or
+        before the input (the input itself if it is already a trading day),
+        or the raw input unchanged on a parse failure.
+
+    Example::
+
+        >>> resolve_trading_day("2026-05-30")  # Saturday
+        '2026-05-29'
+        >>> resolve_trading_day("2026-05-29")  # Friday (already a trading day)
+        '2026-05-29'
+        >>> resolve_trading_day("2026-05-30T12:00:00Z")  # ISO datetime tolerated
+        '2026-05-29'
+    """
+    raw = date_str if date_str is not None else date.today().isoformat()
+    try:
+        d = date.fromisoformat(raw[:10])
+        td = d if is_trading_day(d) else previous_trading_day(d)
+        return td.isoformat()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "resolve_trading_day(%r) failed (%s) — using input unchanged", raw, exc
+        )
+        return raw
 
 
 # ── Freshness checks (trading-day-aware) ─────────────────────────────────────
