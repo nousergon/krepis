@@ -1,0 +1,46 @@
+name: Tests
+
+# pytest matrix across declared Python versions. Required check on PRs to
+# main so a change can't ship before being validated against the floor of
+# declared support (3.9 — the EC2 always-on micro instance).
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run pytest
+        run: python -m pytest -q
+
+  # Alert (Telegram) ONLY on genuine post-merge breakage of the default
+  # branch. PR-branch reds stay silent. Reusable workflow + transport
+  # live in nousergon-lib. See alpha-engine-config#1128.
+  notify-main-failure:
+    needs: [test]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@main
+    secrets: inherit

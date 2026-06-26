@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "krepis"
+version = "0.1.0"
+description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, trading-calendar/date helpers, and EC2-spot/SSM resilience."
+readme = "README.md"
+# EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
+# union syntax (``str | None``) is deferred via ``from __future__ import
+# annotations`` and eval_type_backport on 3.9.
+requires-python = ">=3.9"
+authors = [{ name = "Brian McMahon" }]
+license = { text = "MIT" }
+keywords = ["aws", "ssm", "telemetry", "pipeline", "alerts", "trading-calendar"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Operating System :: OS Independent",
+    "Typing :: Typed",
+]
+dependencies = [
+    "boto3>=1.34",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "requests>=2.31",
+    # Pydantic V2 evaluates field annotations at class-construction time;
+    # on Python 3.9 it cannot eval PEP 604 union syntax even under
+    # ``from __future__ import annotations``. eval_type_backport is the
+    # backport Pydantic's own error message points to. 3.10+ is native.
+    "eval_type_backport>=0.2.0; python_version < '3.10'",
+]
+
+[project.urls]
+Homepage = "https://github.com/nousergon/krepis"
+Repository = "https://github.com/nousergon/krepis"
+Issues = "https://github.com/nousergon/krepis/issues"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "moto>=5.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"krepis" = ["model_pricing.yaml", "py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
