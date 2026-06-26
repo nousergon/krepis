@@ -7,4 +7,4 @@ bounded-backoff HTTP retry, S3 conditional-PUT writer locks, the Anthropic
 payload chokepoint, LLM cost telemetry, and trading-calendar/date helpers.
 """
 
-__version__ = "0.1.2"
+__version__ = "0.2.0"
