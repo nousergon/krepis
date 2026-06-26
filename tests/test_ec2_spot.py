@@ -540,3 +540,138 @@ class TestClassifyTermination:
         assert fields[1] == "shutting-down"
         assert fields[2] == "Server.SpotInstanceTermination"
         assert fields[4] == "instance-terminated-no-capacity"  # sir_code appended
+
+
+class TestRelaunchDecision:
+    """Pins the bounded mid-run relaunch DECISION lifted from the divergent
+    inline copies in spot_data_weekly.sh (#349) and spot_backtest.sh
+    (#283/#289), and supplied to the missing predictor adopter (#883)."""
+
+    def test_reclaim_with_budget_relaunches(self):
+        d = ec2_spot.relaunch_decision(classification="reclaim", attempt=1, max_attempts=2)
+        assert d["relaunch"] is True
+        assert d["reason"] == "reclaim"
+        assert d["attempts_remaining"] == 1
+        assert d["next_attempt"] == 2
+
+    def test_non_reclaim_never_relaunches(self):
+        # A genuine crash/OOM/timeout must fail loud — no blind retry.
+        d = ec2_spot.relaunch_decision(classification="other", attempt=1, max_attempts=2)
+        assert d["relaunch"] is False
+        assert d["reason"].startswith("not-reclaim:other")
+
+    def test_unknown_never_relaunches(self):
+        d = ec2_spot.relaunch_decision(classification="unknown", attempt=1, max_attempts=2)
+        assert d["relaunch"] is False
+        assert d["reason"].startswith("not-reclaim:unknown")
+
+    def test_budget_exhausted_holds(self):
+        # Last allowed attempt just finished — no relaunch even though reclaim.
+        d = ec2_spot.relaunch_decision(classification="reclaim", attempt=2, max_attempts=2)
+        assert d["relaunch"] is False
+        assert d["reason"].startswith("budget-exhausted:2/2")
+        assert d["attempts_remaining"] == 0
+
+    def test_default_max_attempts_is_two(self):
+        # Default budget = 2 (one relaunch), matching #349.
+        assert ec2_spot.DEFAULT_MAX_SPOT_ATTEMPTS == 2
+        d = ec2_spot.relaunch_decision(classification="reclaim", attempt=1)
+        assert d["relaunch"] is True
+
+    def test_higher_budget_allows_second_relaunch(self):
+        d = ec2_spot.relaunch_decision(classification="reclaim", attempt=2, max_attempts=3)
+        assert d["relaunch"] is True
+        assert d["attempts_remaining"] == 1
+
+    def test_sf_budget_guard_blocks_when_next_attempt_overflows(self):
+        # next_attempt=2, per_attempt=3000s -> projected 6000s > 5400s budget.
+        d = ec2_spot.relaunch_decision(
+            classification="reclaim", attempt=1, max_attempts=2,
+            sf_execution_timeout=5400, per_attempt_seconds=3000,
+        )
+        assert d["relaunch"] is False
+        assert d["reason"].startswith("sf-budget-exceeded:6000s>5400s")
+
+    def test_sf_budget_guard_allows_when_it_fits(self):
+        # next_attempt=2, per_attempt=2500s -> projected 5000s <= 5400s budget.
+        d = ec2_spot.relaunch_decision(
+            classification="reclaim", attempt=1, max_attempts=2,
+            sf_execution_timeout=5400, per_attempt_seconds=2500,
+        )
+        assert d["relaunch"] is True
+
+    def test_sf_guard_inert_without_both_values(self):
+        # Only one of the pair given -> coupling guard does not fire.
+        d = ec2_spot.relaunch_decision(
+            classification="reclaim", attempt=1, max_attempts=2,
+            sf_execution_timeout=5400, per_attempt_seconds=None,
+        )
+        assert d["relaunch"] is True
+
+    def test_known_fleet_sf_timeouts_present(self):
+        # The issue names DataPhase1/MorningEnrich=5400s, RAGIngestion=3600s.
+        assert ec2_spot.SF_EXECUTION_TIMEOUTS["DataPhase1"] == 5400
+        assert ec2_spot.SF_EXECUTION_TIMEOUTS["MorningEnrich"] == 5400
+        assert ec2_spot.SF_EXECUTION_TIMEOUTS["RAGIngestion"] == 3600
+
+
+class TestRelaunchDecisionCLI:
+    """The bash-facing chokepoint: classify + decide in one call, decision in
+    the exit code (0=relaunch, 75=hold) so launchers branch on $?."""
+
+    def _classified_reclaim(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.describe_spot_instance_requests.return_value = {
+            "SpotInstanceRequests": [{"Status": {"Code": "instance-terminated-no-capacity"}}]
+        }
+        ec2.describe_instances.return_value = _describe_resp(
+            "shutting-down", reason_code="Server.SpotInstanceTermination",
+            transition_reason="Service initiated (ts)",
+        )
+        return fake
+
+    def test_cli_relaunch_exits_zero_and_prints_relaunch(self, fake_boto3, capsys):
+        fake = self._classified_reclaim(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1", "--max-attempts", "2",
+            ])
+        assert rc == 0
+        fields = capsys.readouterr().out.strip().split("\t")
+        assert fields[0] == "relaunch"
+        assert fields[2] == "reclaim"
+        assert fields[3] == "1"  # attempts_remaining
+
+    def test_cli_hold_on_other_exits_75(self, fake_boto3, capsys):
+        fake, ec2 = fake_boto3
+        ec2.describe_spot_instance_requests.return_value = {"SpotInstanceRequests": []}
+        ec2.describe_instances.return_value = _describe_resp("running", transition_reason="")
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1",
+            ])
+        assert rc == ec2_spot.NO_RELAUNCH_EXIT_CODE == 75
+        assert capsys.readouterr().out.strip().split("\t")[0] == "hold"
+
+    def test_cli_hold_on_budget_exhausted_exits_75(self, fake_boto3, capsys):
+        fake = self._classified_reclaim(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "2", "--max-attempts", "2",
+            ])
+        assert rc == 75
+        assert capsys.readouterr().out.strip().split("\t")[0] == "hold"
+
+    def test_cli_sf_budget_guard_holds(self, fake_boto3, capsys):
+        fake = self._classified_reclaim(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1", "--max-attempts", "2",
+                "--sf-execution-timeout", "5400", "--per-attempt-seconds", "3000",
+            ])
+        assert rc == 75
+        assert "sf-budget-exceeded" in capsys.readouterr().out

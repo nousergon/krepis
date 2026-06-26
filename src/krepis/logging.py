@@ -235,14 +235,22 @@ def _seed_flow_doctor_secrets(yaml_path: str) -> None:
     ``${VAR}`` set, and a yaml-added secret must not silently re-open
     the gap.
 
-    Invariants (mirroring the retired shim):
+    Invariants:
 
-    - A var already present in ``os.environ`` wins — never overwritten.
-    - A genuinely unresolvable secret is left **unset**, so
-      flow-doctor's own ``ConfigError`` fires loudly rather than being
-      masked with ``""`` (see ``feedback_no_silent_fails``).
+    - **Local dev** (not deployed): a var already present in ``os.environ``
+      wins — never overwritten, and the secrets backend is never touched
+      for it. An explicitly-set shell var is the developer's intent.
+    - **Deployed** (``_is_deployed()``): SSM is authoritative. A value
+      already in ``os.environ`` is *overwritten* with the live SSM value
+      when one resolves — a legacy ``~/.alpha-engine.env`` sourced before
+      the entrypoint can otherwise pin a STALE secret (e.g. a rotated PAT)
+      that wins over SSM. If SSM resolves nothing the existing value is
+      left untouched (graceful SSM-miss fallback).
+    - A genuinely unresolvable secret with no prior value is left
+      **unset**, so flow-doctor's own ``ConfigError`` fires loudly rather
+      than being masked with ``""`` (see ``feedback_no_silent_fails``).
     - A secrets-backend hiccup never blocks logging setup; it is logged
-      at WARNING and the var is left unset (same loud-failure path).
+      at WARNING and any existing value is preserved.
     """
     try:
         with open(yaml_path, "r", encoding="utf-8") as fh:
@@ -254,19 +262,28 @@ def _seed_flow_doctor_secrets(yaml_path: str) -> None:
 
     from krepis.secrets import get_secret
 
+    deployed = _is_deployed()
     for var in sorted(set(_FD_VAR_RE.findall(yaml_text))):
-        if os.environ.get(var):
+        existing = os.environ.get(var)
+        # Local dev: an explicitly-set env var wins; never hit the backend.
+        # Deployed: fall through so SSM can overwrite a stale sourced value.
+        if existing and not deployed:
             continue
         try:
             value = get_secret(var, required=False)
         except Exception as exc:  # noqa: BLE001 - backend hiccup is non-fatal
             logging.getLogger(__name__).warning(
-                "flow-doctor secret seed: get_secret(%s) raised %r; "
-                "leaving unset so flow-doctor fails loudly", var, exc,
+                "flow-doctor secret seed: get_secret(%s) raised %r; leaving %s",
+                var, exc,
+                "prior value in place" if existing
+                else "unset so flow-doctor fails loudly",
             )
             continue
         if value:
             os.environ[var] = value
+        # value is None: leave any existing value untouched (graceful
+        # SSM-miss fallback when deployed); if there was none it stays
+        # unset so flow-doctor's ConfigError fires loudly.
 
 
 def _is_deployed() -> bool:

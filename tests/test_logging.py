@@ -292,8 +292,11 @@ def test_seed_derives_var_set_from_yaml_and_seeds_unset(
         assert os.environ[var] == f"resolved-{var}"
 
 
-def test_seed_preset_env_var_wins(_patch_get_secret, tmp_path, _clean_fd_env):
-    """An already-set env var is never overwritten (shim semantics)."""
+def test_seed_preset_env_var_wins(_patch_get_secret, tmp_path, _clean_fd_env, monkeypatch):
+    """Local dev (not deployed): an already-set env var wins and the
+    backend is never touched for it."""
+    monkeypatch.delenv("ALPHA_ENGINE_DEPLOYED", raising=False)
+    monkeypatch.delenv("AWS_LAMBDA_FUNCTION_NAME", raising=False)
     yaml_path = tmp_path / "flow-doctor.yaml"
     yaml_path.write_text(_FD_YAML)
     os.environ["EMAIL_SENDER"] = "preset@example.com"
@@ -305,6 +308,42 @@ def test_seed_preset_env_var_wins(_patch_get_secret, tmp_path, _clean_fd_env):
     _seed_flow_doctor_secrets(str(yaml_path))
 
     assert os.environ["EMAIL_SENDER"] == "preset@example.com"
+
+
+def test_seed_deployed_ssm_overwrites_stale_env(
+    _patch_get_secret, tmp_path, _clean_fd_env, monkeypatch
+):
+    """Deployed: SSM is authoritative — a stale sourced value (e.g. a
+    rotated PAT from a legacy ~/.alpha-engine.env) is overwritten with
+    the live SSM value."""
+    monkeypatch.setenv("ALPHA_ENGINE_DEPLOYED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text(_FD_YAML)
+    os.environ["FLOW_DOCTOR_GITHUB_TOKEN"] = "stale-from-dotenv"
+
+    _patch_get_secret(
+        lambda name, **kw: "fresh-from-ssm"
+        if name == "FLOW_DOCTOR_GITHUB_TOKEN" else "resolved"
+    )
+    _seed_flow_doctor_secrets(str(yaml_path))
+
+    assert os.environ["FLOW_DOCTOR_GITHUB_TOKEN"] == "fresh-from-ssm"
+
+
+def test_seed_deployed_ssm_miss_keeps_existing(
+    _patch_get_secret, tmp_path, _clean_fd_env, monkeypatch
+):
+    """Deployed but SSM resolves nothing: the existing sourced value is
+    left untouched (graceful SSM-miss fallback, not blanked)."""
+    monkeypatch.setenv("ALPHA_ENGINE_DEPLOYED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text(_FD_YAML)
+    os.environ["FLOW_DOCTOR_GITHUB_TOKEN"] = "sourced-value"
+
+    _patch_get_secret(lambda name, **kw: None)
+    _seed_flow_doctor_secrets(str(yaml_path))
+
+    assert os.environ["FLOW_DOCTOR_GITHUB_TOKEN"] == "sourced-value"
 
 
 def test_seed_unresolvable_secret_left_unset(_patch_get_secret, tmp_path, _clean_fd_env):

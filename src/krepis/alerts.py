@@ -17,7 +17,7 @@ Per the ``~/Development/CLAUDE.md`` SOTA / institutional-approach rule
 (sub-sub-rule: lift to lib when ≥2 consumers exist), this module is the
 canonical Python primitive backing all consumers. Bash callers reach it
 via the CLI entry (``python -m krepis.alerts publish ...``) —
-mirrors the :mod:`krepis.transparency` ``--cadence daily/weekly``
+mirrors the the transparency CLI ``--cadence daily/weekly``
 CLI convention.
 
 **Public API:**
@@ -472,7 +472,7 @@ def publish(
 # ─── CLI entry ──────────────────────────────────────────────────────────────
 # Designed for Bash callers that need failure surveillance from a script
 # (spot dispatcher `cleanup` traps, deploy.sh rollback branches, etc.).
-# Mirrors the :mod:`krepis.transparency` ``python -m`` pattern so
+# Mirrors the the transparency CLI ``python -m`` pattern so
 # Bash callers reach this primitive without bootstrapping a full Python
 # project. Exit code is 0 if *any* channel succeeded, 1 if both failed.
 

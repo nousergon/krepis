@@ -64,6 +64,13 @@ shape we use in the fleet:
   transition_reason``. The fleet-wide chokepoint for the spot-reclaim
   classification that previously lived (buggy) in ``spot_backtest.sh`` and was
   absent from ``spot_train.sh`` / the data spot launchers.
+- :func:`relaunch_decision` / ``relaunch-decision`` CLI — the bounded mid-run
+  relaunch DECISION wrapped around classification: given the attempt number, a
+  ``MAX_SPOT_ATTEMPTS`` budget, and (optionally) the outer SF
+  ``executionTimeout`` coupling guard, decide whether the launcher should exec a
+  fresh spot. Lifts the divergent inline copies in ``spot_data_weekly.sh`` (#349)
+  and ``spot_backtest.sh`` (#283/#289) and supplies the missing predictor
+  adopter. CLI exits 0 = relaunch, 75 = hold (fail loud).
 """
 
 from __future__ import annotations
@@ -91,6 +98,12 @@ CAPACITY_ERROR_CODES: Final[frozenset[str]] = frozenset(
 )
 
 CAPACITY_EXIT_CODE: Final[int] = 64
+
+# relaunch-decision CLI: exit 0 = RELAUNCH, this = HOLD (do not relaunch, fail
+# loud). Distinct from 64 (capacity) and 1 (generic) so a bash caller can branch
+# on it unambiguously: `python -m ... relaunch-decision ...; case $? in 0) exec
+# ...;; 75) exit "$orig";; esac`.
+NO_RELAUNCH_EXIT_CODE: Final[int] = 75
 
 # ── Spot-reclaim classification ──────────────────────────────────────────────
 # A mid-run AWS spot reclaim surfaces to a dispatcher as a generic command
@@ -370,6 +383,109 @@ def classify_termination(instance_id: str, *, region: str = "us-east-1") -> dict
     return result
 
 
+# ── Bounded mid-run relaunch decision ────────────────────────────────────────
+# classify_termination answers "was this a reclaim?". The relaunch *decision*
+# that wraps it — "given the verdict and how many attempts we've already burned,
+# should the launcher exec a fresh spot, and does the attempt budget still fit
+# the outer Step-Functions executionTimeout?" — was duplicated, with divergent
+# conventions, in every adopter:
+#   * alpha-engine-data/spot_data_weekly.sh (#349): forward SPOT_ATTEMPT counter
+#     vs MAX_SPOT_ATTEMPTS, relaunch iff reason non-empty AND attempts remain.
+#   * alpha-engine-backtester/spot_backtest.sh (#283/#289): decrementing
+#     RECLAIM_RELAUNCH_MAX budget, relaunch iff reclaim AND budget > 0.
+#   * predictor spot_train.sh: NO relaunch at all (the open gap, issue #883).
+# Two divergent in-repo copies + one missing adopter is exactly the ≥2-consumer
+# lift-to-lib trigger. This chokepoint owns the decision so all three launchers
+# collapse to: classify → ask the lib → exec-relaunch (the exec itself stays in
+# bash; it must replace the launcher's own PID and cannot be lifted).
+DEFAULT_MAX_SPOT_ATTEMPTS: Final[int] = 2  # one relaunch; matches #349 default
+
+# Outer Step-Functions executionTimeout (seconds) per orchestrated state, used
+# to guard the MAX_SPOT_ATTEMPTS ↔ SF-budget coupling the issue calls out: each
+# relaunch costs a fresh boot (~7 min) plus a worst-case full re-run, so attempts
+# beyond what the SF budget can absorb are dead budget that silently expire the
+# state. A launcher passes ``--sf-execution-timeout`` (the SF budget it runs
+# under) and a per-attempt wall-time estimate; we refuse to advise a relaunch the
+# budget cannot fit. Known fleet budgets (from the Saturday SF definitions):
+SF_EXECUTION_TIMEOUTS: Final[dict[str, int]] = {
+    "DataPhase1": 5400,
+    "MorningEnrich": 5400,
+    "RAGIngestion": 3600,
+}
+
+
+def relaunch_decision(
+    *,
+    classification: str,
+    attempt: int,
+    max_attempts: int = DEFAULT_MAX_SPOT_ATTEMPTS,
+    sf_execution_timeout: int | None = None,
+    per_attempt_seconds: int | None = None,
+) -> dict[str, object]:
+    """Decide whether a launcher should relaunch on a fresh spot.
+
+    Pure decision logic (no AWS calls) so it is trivially testable and the
+    caller stays in control of the AWS describe (via :func:`classify_termination`)
+    and the ``exec`` re-launch. Inputs:
+
+    * ``classification`` — the verdict from :func:`classify_termination`
+      (``"reclaim"`` | ``"other"`` | ``"unknown"``). Only ``"reclaim"`` is
+      retryable; ``"other"`` (real crash/OOM/timeout) and ``"unknown"`` must
+      fail loud so a blind retry never masks a genuine bug.
+    * ``attempt`` — 1-based count of the attempt that just finished (the first
+      run is attempt 1).
+    * ``max_attempts`` — total attempts allowed including the first
+      (default :data:`DEFAULT_MAX_SPOT_ATTEMPTS` = 2, i.e. one relaunch).
+    * ``sf_execution_timeout`` / ``per_attempt_seconds`` — optional coupling
+      guard. When BOTH are given, the next attempt is only advised if
+      ``(attempt + 1) * per_attempt_seconds <= sf_execution_timeout`` — so
+      raising ``max_attempts`` past what the outer SF budget can absorb can
+      never silently produce dead attempts (the issue's explicit requirement).
+
+    Returns a dict with:
+
+    * ``relaunch`` (bool) — True iff the launcher should exec a fresh spot.
+    * ``reason`` (str) — short machine-readable cause for logging/metrics.
+    * ``attempts_remaining`` (int) — attempts left AFTER this one.
+    * ``next_attempt`` (int) — the attempt number the relaunch would be.
+    """
+    attempts_remaining = max(0, max_attempts - attempt)
+    next_attempt = attempt + 1
+
+    if classification != "reclaim":
+        return {
+            "relaunch": False,
+            "reason": f"not-reclaim:{classification or 'empty'}",
+            "attempts_remaining": attempts_remaining,
+            "next_attempt": next_attempt,
+        }
+    if attempts_remaining <= 0:
+        return {
+            "relaunch": False,
+            "reason": f"budget-exhausted:{attempt}/{max_attempts}",
+            "attempts_remaining": 0,
+            "next_attempt": next_attempt,
+        }
+    if sf_execution_timeout is not None and per_attempt_seconds is not None:
+        projected = next_attempt * per_attempt_seconds
+        if projected > sf_execution_timeout:
+            return {
+                "relaunch": False,
+                "reason": (
+                    f"sf-budget-exceeded:{projected}s>{sf_execution_timeout}s "
+                    f"(per_attempt={per_attempt_seconds}s next_attempt={next_attempt})"
+                ),
+                "attempts_remaining": attempts_remaining,
+                "next_attempt": next_attempt,
+            }
+    return {
+        "relaunch": True,
+        "reason": "reclaim",
+        "attempts_remaining": attempts_remaining,
+        "next_attempt": next_attempt,
+    }
+
+
 def _split_csv(s: str) -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
@@ -470,9 +586,79 @@ def main(argv: list[str] | None = None) -> int:
         help="AWS region (default: $AWS_REGION or us-east-1).",
     )
 
+    decide_p = subparsers.add_parser(
+        "relaunch-decision",
+        help=(
+            "Classify a terminated spot AND decide whether the launcher should "
+            "relaunch a fresh spot (bounded by --max-attempts, optionally gated "
+            "on the outer SF executionTimeout). Exits 0 = RELAUNCH, "
+            f"{NO_RELAUNCH_EXIT_CODE} = DO NOT relaunch (fail loud). Prints "
+            "'relaunch|hold<TAB>reason<TAB>classification<TAB>attempts_remaining' "
+            "on stdout for bash callers."
+        ),
+    )
+    decide_p.add_argument("--instance-id", required=True, help="EC2 instance ID.")
+    decide_p.add_argument(
+        "--region",
+        default=os.environ.get("AWS_REGION", "us-east-1"),
+        help="AWS region (default: $AWS_REGION or us-east-1).",
+    )
+    decide_p.add_argument(
+        "--attempt",
+        type=int,
+        required=True,
+        help="1-based number of the attempt that just finished (first run = 1).",
+    )
+    decide_p.add_argument(
+        "--max-attempts",
+        type=int,
+        default=int(os.environ.get("MAX_SPOT_ATTEMPTS", DEFAULT_MAX_SPOT_ATTEMPTS)),
+        help=(
+            "Total attempts allowed incl. the first "
+            f"(default $MAX_SPOT_ATTEMPTS or {DEFAULT_MAX_SPOT_ATTEMPTS})."
+        ),
+    )
+    decide_p.add_argument(
+        "--sf-execution-timeout",
+        type=int,
+        default=None,
+        help=(
+            "Outer Step-Functions executionTimeout (s) this launcher runs under. "
+            "When given with --per-attempt-seconds, refuses a relaunch the SF "
+            "budget cannot absorb (MAX_SPOT_ATTEMPTS ↔ SF-timeout coupling guard)."
+        ),
+    )
+    decide_p.add_argument(
+        "--per-attempt-seconds",
+        type=int,
+        default=None,
+        help="Worst-case wall time (s) of one attempt incl. boot; pairs with --sf-execution-timeout.",
+    )
+
     args = parser.parse_args(argv)
 
     logging.basicConfig(level=logging.WARNING)
+
+    if args.cmd == "relaunch-decision":
+        classified = classify_termination(args.instance_id, region=args.region)
+        decision = relaunch_decision(
+            classification=classified["classification"],
+            attempt=args.attempt,
+            max_attempts=args.max_attempts,
+            sf_execution_timeout=args.sf_execution_timeout,
+            per_attempt_seconds=args.per_attempt_seconds,
+        )
+        print(
+            "\t".join(
+                (
+                    "relaunch" if decision["relaunch"] else "hold",
+                    str(decision["reason"]),
+                    classified["classification"],
+                    str(decision["attempts_remaining"]),
+                )
+            )
+        )
+        return 0 if decision["relaunch"] else NO_RELAUNCH_EXIT_CODE
 
     if args.cmd == "classify-termination":
         result = classify_termination(args.instance_id, region=args.region)

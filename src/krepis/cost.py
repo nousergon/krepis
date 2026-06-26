@@ -3,7 +3,7 @@ LLM cost-pricing primitive for the Alpha Engine cost-telemetry stream.
 
 This module is the price-table side of the P1 "Per-run LLM cost telemetry as
 code artifact" workstream. The capture wrapper in
-:mod:`krepis.cost` translates the token counts recorded on every LLM
+the decision-capture wrapper records token counts on every LLM
 call; this module translates token counts × model × wall-clock time into a
 USD cost figure.
 
