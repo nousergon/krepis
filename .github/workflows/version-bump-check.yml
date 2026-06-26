@@ -1,0 +1,150 @@
+name: Version-bump check
+
+# On PRs that touch the package source under ``src/**``, require a
+# ``pyproject.toml::version`` bump AND that the bumped version is not
+# already tagged. Without this, a public-surface src change can merge
+# with the version unchanged, ``auto-tag.yml`` idempotently skips, and
+# the next downstream consumer that pins to the expected
+# ``@vX.Y.Z`` fails ``pip install`` until someone notices.
+#
+# Origin: alpha-engine-lib #76 (AggregateCosts registry entry) merged
+# 2026-05-25 with a public-surface src change but no version bump.
+# auto-tag saw the same ``0.36.0`` it had already tagged and skipped.
+# Downstream alpha-engine-dashboard #129's ``@v0.36.1`` pin failed in
+# CI for ~10 min until a follow-up #77 bumped pyproject. Recoverable
+# but operator-visible — and a recurrence class (any future
+# src-touching PR could repeat this). ROADMAP L347.
+#
+# What this workflow does NOT do:
+#   - It does not enforce a SemVer-style bump (patch vs minor vs
+#     major). That call belongs with the PR author.
+#   - It does not fire on PRs that only touch docs / tests / CI /
+#     README / pyproject metadata. Those are real refactors that
+#     legitimately don't bump the version.
+#   - It does not deduplicate against the PR-time pre-bump state.
+#     If two PRs race the same bump, the second to merge will fail
+#     this check on the "tag already exists" branch and need a
+#     follow-up to pick the next version.
+#
+# Composes with:
+#   - ``auto-tag.yml``: this workflow is the PR-time guard that
+#     ensures the post-merge auto-tag has something new to tag.
+#   - ``tests/test_version_pin.py``: pyproject.toml and
+#     ``__init__.__version__`` must already match (lockstep
+#     invariant) — this workflow extends the chokepoint from
+#     internal-consistency to external-monotonicity.
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  version-bump-check:
+    name: pyproject version bumped for src/ changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # Need the base branch + tags so we can diff vs main and check
+          # ``git tag --list`` for the proposed new version.
+          fetch-depth: 0
+
+      - name: Detect whether PR touches src/**
+        id: detect
+        run: |
+          set -euo pipefail
+          # GITHUB_BASE_REF is the PR's target branch (main); fetch its
+          # tip explicitly so the diff base is correct even on shallow
+          # checkouts (fetch-depth: 0 above guards this, but be explicit).
+          git fetch --no-tags origin "${GITHUB_BASE_REF}"
+          base="origin/${GITHUB_BASE_REF}"
+          changed=$(git diff --name-only "${base}...HEAD")
+          echo "Changed files vs ${base}:"
+          echo "${changed}" | sed 's/^/  /'
+          if echo "${changed}" | grep -qE '^src/'; then
+            echo "src_touched=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "src_touched=false" >> "${GITHUB_OUTPUT}"
+            echo "PR does not touch src/** — version-bump check skipped."
+          fi
+
+      - name: Read pyproject.toml versions (base vs PR)
+        id: versions
+        if: steps.detect.outputs.src_touched == 'true'
+        run: |
+          set -euo pipefail
+          base="origin/${GITHUB_BASE_REF}"
+          # Use a tiny Python snippet for tomllib-correct parsing rather
+          # than a fragile grep — pyproject's [project] section may evolve
+          # (e.g., a future [tool.uv] block that also carries a version
+          # field would break a naive ``grep '^version = '``).
+          pr_version=$(python -c "import tomllib,sys; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          # git show emits the file content at the base ref so we can
+          # parse THAT pyproject too (the PR may have moved it).
+          git show "${base}:pyproject.toml" > /tmp/pyproject-base.toml
+          base_version=$(python -c "import tomllib,sys; print(tomllib.load(open('/tmp/pyproject-base.toml','rb'))['project']['version'])")
+          echo "Base version (origin/${GITHUB_BASE_REF}): ${base_version}"
+          echo "PR version (HEAD): ${pr_version}"
+          echo "base_version=${base_version}" >> "${GITHUB_OUTPUT}"
+          echo "pr_version=${pr_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Require version bump for src/** changes
+        if: steps.detect.outputs.src_touched == 'true'
+        env:
+          BASE_VERSION: ${{ steps.versions.outputs.base_version }}
+          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
+        run: |
+          set -euo pipefail
+          if [ "${BASE_VERSION}" = "${PR_VERSION}" ]; then
+            cat >&2 <<EOF
+          ERROR: PR touches src/** but pyproject.toml::version is unchanged.
+
+            base (origin/${GITHUB_BASE_REF}): ${BASE_VERSION}
+            PR (HEAD):                       ${PR_VERSION}
+
+          Origin: alpha-engine-lib #76 merged a public-surface src change
+          without bumping pyproject. auto-tag.yml idempotently skipped, and
+          the next downstream consumer's pin failed pip install for ~10 min
+          until follow-up #77 bumped the version. This guard catches the
+          same class at PR time.
+
+          Fix: bump pyproject.toml::version (and src/alpha_engine_lib/
+          __init__.py::__version__ — test_version_pin enforces lockstep)
+          to a new tag that is NOT in ``git tag --list``.
+
+          Or: if the src change is genuinely no-op for consumers (whitespace,
+          comment, deferred import inside an existing function — a NO-public-
+          surface-change), prefer to split the diff so the src touch lives
+          in a separate doc/internal PR that this guard correctly skips.
+          EOF
+            exit 1
+          fi
+          echo "OK: pyproject.toml::version bumped ${BASE_VERSION} → ${PR_VERSION}"
+
+      - name: Require new version is not already tagged
+        if: steps.detect.outputs.src_touched == 'true'
+        env:
+          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
+        run: |
+          set -euo pipefail
+          tag="v${PR_VERSION}"
+          # Local clone is fetch-depth:0 + actions/checkout pulls tags by
+          # default; an explicit fetch is belt-and-suspenders.
+          git fetch --tags origin
+          if git tag --list | grep -Fxq "${tag}"; then
+            cat >&2 <<EOF
+          ERROR: pyproject.toml::version v${PR_VERSION} already exists as a tag.
+
+          auto-tag.yml will NOT re-tag an existing version — your PR's
+          version bump will appear to succeed but the auto-tag run on
+          merge will idempotently skip, and the consumer pin to
+          ``@v${PR_VERSION}`` will resolve to the OLD commit instead of
+          your PR's HEAD.
+
+          Fix: bump pyproject.toml::version to the next unused version
+          (check ``git tag --list | sort -V | tail`` for the highest
+          existing tag).
+          EOF
+            exit 1
+          fi
+          echo "OK: v${PR_VERSION} not yet tagged — auto-tag.yml will create it on merge."

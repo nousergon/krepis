@@ -1,0 +1,71 @@
+name: Auto-tag from pyproject.toml version
+
+# Reads the version field from pyproject.toml on every push-to-main and
+# creates + pushes a matching ``vX.Y.Z`` tag if one doesn't exist yet.
+# This closes a recurring consumer-CI failure mode: a lib PR merges,
+# downstream repos bump their pin to ``@vX.Y.Z`` in the same wave, and
+# ``pip install ... @ git+...@vX.Y.Z`` fails until someone remembers to
+# manually tag the merge commit.
+#
+# Single source of truth is pyproject.toml — the existing
+# tests/test_version_pin.py enforces ``pyproject == __init__.__version__``,
+# so the auto-tag stays consistent with both.
+#
+# Idempotent: skips when the tag already exists, so no-version-bump
+# PRs (docs, CI, internal refactors) don't fail this workflow.
+# Doc-only PRs are expected to no-op here — version stays static, no
+# tag fires.
+#
+# GitHub-Actions-pushed tags don't trigger other workflows by default
+# (loop-prevention). That's fine for this workflow's purpose — consumer
+# ``pip install`` just needs ``git ls-remote`` to see the tag, not a
+# workflow trigger downstream.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Serialize tag pushes so two rapid merges can't race on the same
+# ``git ls-remote`` check and both try to push the same tag.
+concurrency:
+  group: auto-tag-main
+  cancel-in-progress: false
+
+permissions:
+  contents: write  # required to push the tag back to origin
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so ``git tag -a`` can resolve HEAD and so
+          # ``git ls-remote --tags`` works against the local clone.
+          fetch-depth: 0
+
+      - name: Read version from pyproject.toml
+        id: ver
+        run: |
+          # tomllib is stdlib on Python 3.11+. ubuntu-latest ships
+          # Python 3.12 by default since 2024-09; no setup-python step
+          # needed.
+          VERSION=$(python -c "import tomllib; print(tomllib.loads(open('pyproject.toml','rb').read().decode())['project']['version'])")
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version tag: v${VERSION}"
+
+      - name: Tag if missing
+        env:
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          if git ls-remote --tags --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag ${TAG} already exists on origin — no-op (likely a doc-only or CI-only PR without a version bump)."
+            exit 0
+          fi
+          # Standard commit-author identity for GitHub-Actions commits/tags.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${TAG}" -m "auto-tag from pyproject.toml on push-to-main"
+          git push origin "${TAG}"
+          echo "Pushed ${TAG} → $(git rev-parse HEAD)"

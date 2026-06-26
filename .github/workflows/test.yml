@@ -34,7 +34,7 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run pytest
-        run: python -m pytest -q
+        run: python -m pytest -q --cov=krepis --cov-report=term-missing --cov-fail-under=90
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds stay silent. Reusable workflow + transport
