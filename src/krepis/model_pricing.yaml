@@ -13,11 +13,13 @@
 #   input_per_1m:         USD per 1,000,000 input tokens.
 #   output_per_1m:        USD per 1,000,000 output tokens.
 #   cache_read_per_1m:    USD per 1,000,000 cached-prompt-read tokens (0.10× input).
-#   cache_create_per_1m:  USD per 1,000,000 5-MIN cache-write tokens (1.25× input).
-#                         (1-hour cache writes are 2.0× input; not modeled here —
-#                         the SDK reports cache-write tokens uniformly so we
-#                         price them at the standard 5-min rate. Add a separate
-#                         field if 1-hour writes become a material spend share.)
+#   cache_create_per_1m:  USD per 1,000,000 5-MIN-TTL cache-write tokens (1.25× input).
+#   cache_create_1h_per_1m: USD per 1,000,000 1-HOUR-TTL cache-write tokens (2.0× input).
+#                         Optional — when omitted, 1-hour cache writes fall back to
+#                         ``cache_create_per_1m`` (the 5-min rate). The Anthropic SDK
+#                         splits cache-write tokens by TTL on
+#                         ``usage.cache_creation`` (ephemeral_5m / ephemeral_1h), and
+#                         the cost pipeline prices each slice at its own rate.
 #
 # **Cards for the same model MUST be sorted ascending by effective_from.**
 # When pricing changes, append a new card with the new effective_from rather
@@ -35,18 +37,21 @@ cards:
     output_per_1m: 5.00
     cache_read_per_1m: 0.10
     cache_create_per_1m: 1.25
+    cache_create_1h_per_1m: 2.00
   - model_name: claude-sonnet-4-6
     effective_from: 2026-01-01
     input_per_1m: 3.00
     output_per_1m: 15.00
     cache_read_per_1m: 0.30
     cache_create_per_1m: 3.75
+    cache_create_1h_per_1m: 6.00
   - model_name: claude-opus-4-7
     effective_from: 2026-01-01
     input_per_1m: 5.00
     output_per_1m: 25.00
     cache_read_per_1m: 0.50
     cache_create_per_1m: 6.25
+    cache_create_1h_per_1m: 10.00
 
 # Server-side tool fees (Anthropic ``Message.usage.server_tool_use``).
 # Billed as flat per-request fees, independent of which model invoked

@@ -412,6 +412,19 @@ class _FakeServerToolUsage:
         self.web_fetch_requests = web_fetch_requests
 
 
+class _FakeCacheCreation:
+    """Duck-typed stand-in for ``anthropic.types.CacheCreation``."""
+
+    def __init__(
+        self,
+        *,
+        ephemeral_5m_input_tokens: int = 0,
+        ephemeral_1h_input_tokens: int = 0,
+    ):
+        self.ephemeral_5m_input_tokens = ephemeral_5m_input_tokens
+        self.ephemeral_1h_input_tokens = ephemeral_1h_input_tokens
+
+
 class _FakeUsage:
     """Duck-typed stand-in for ``anthropic.types.Usage``."""
 
@@ -422,12 +435,14 @@ class _FakeUsage:
         output_tokens: int,
         cache_read_input_tokens: int | None = None,
         cache_creation_input_tokens: int | None = None,
+        cache_creation: _FakeCacheCreation | None = None,
         server_tool_use: _FakeServerToolUsage | None = None,
     ):
         self.input_tokens = input_tokens
         self.output_tokens = output_tokens
         self.cache_read_input_tokens = cache_read_input_tokens
         self.cache_creation_input_tokens = cache_creation_input_tokens
+        self.cache_creation = cache_creation
         self.server_tool_use = server_tool_use
 
 
@@ -898,3 +913,216 @@ class TestRecordAnthropicCall:
         # effective 2026-01-01.
         assert record["cost_usd"] > 0
 
+
+
+# ── 1-hour cache-write rate (config#766) ──────────────────────────────────
+
+
+class TestPriceCardOneHourCacheWrite:
+    def test_one_hour_rate_optional_defaults_none(self):
+        c = PriceCard(
+            model_name="claude-haiku-4-5",
+            effective_from=date(2026, 1, 1),
+            input_per_1m=1.0,
+            output_per_1m=5.0,
+            cache_read_per_1m=0.1,
+            cache_create_per_1m=1.25,
+        )
+        assert c.cache_create_1h_per_1m is None
+
+    def test_one_hour_rate_accepted(self):
+        c = PriceCard(
+            model_name="claude-haiku-4-5",
+            effective_from=date(2026, 1, 1),
+            input_per_1m=1.0,
+            output_per_1m=5.0,
+            cache_read_per_1m=0.1,
+            cache_create_per_1m=1.25,
+            cache_create_1h_per_1m=2.0,
+        )
+        assert c.cache_create_1h_per_1m == 2.0
+
+    def test_negative_one_hour_rate_rejected(self):
+        with pytest.raises(ValueError):
+            PriceCard(
+                model_name="x",
+                effective_from=date(2026, 1, 1),
+                input_per_1m=1.0,
+                output_per_1m=1.0,
+                cache_read_per_1m=0.0,
+                cache_create_per_1m=0.0,
+                cache_create_1h_per_1m=-1.0,
+            )
+
+
+class TestComputeCostOneHourCacheWrite:
+    def _card_with_1h(self) -> PriceCard:
+        return PriceCard(
+            model_name="claude-haiku-4-5",
+            effective_from=date(2026, 1, 1),
+            input_per_1m=1.0,
+            output_per_1m=5.0,
+            cache_read_per_1m=0.1,
+            cache_create_per_1m=1.25,
+            cache_create_1h_per_1m=2.0,
+        )
+
+    def test_one_hour_slice_priced_at_one_hour_rate(self):
+        # 1M 1h-cache-write tokens × $2.0/M = $2.00 (vs $1.25 at the 5-min
+        # rate) — proves the slice is priced distinctly.
+        cost = compute_cost(
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cache_create_1h_tokens=1_000_000,
+            card=self._card_with_1h(),
+        )
+        assert cost == pytest.approx(2.0)
+
+    def test_both_slices_summed_independently(self):
+        # 5m: 1M × 1.25 = 1.25 ; 1h: 1M × 2.0 = 2.0 → 3.25
+        cost = compute_cost(
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_create_tokens=1_000_000,
+            cache_create_1h_tokens=1_000_000,
+            card=self._card_with_1h(),
+        )
+        assert cost == pytest.approx(3.25)
+
+    def test_one_hour_falls_back_to_five_min_rate_when_unset(self):
+        # Card authored before the 1h rate existed: 1h tokens priced at the
+        # 5-min rate (1.25), preserving the pre-existing behavior.
+        card = PriceCard(
+            model_name="claude-haiku-4-5",
+            effective_from=date(2026, 1, 1),
+            input_per_1m=1.0,
+            output_per_1m=5.0,
+            cache_read_per_1m=0.1,
+            cache_create_per_1m=1.25,
+        )
+        cost = compute_cost(
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            cache_create_1h_tokens=1_000_000,
+            card=card,
+        )
+        assert cost == pytest.approx(1.25)
+
+    def test_default_one_hour_tokens_zero_no_change(self):
+        # Omitting cache_create_1h_tokens is identical to the old signature.
+        card = self._card_with_1h()
+        cost = compute_cost(
+            input_tokens=1_000_000,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_create_tokens=0,
+            card=card,
+        )
+        assert cost == pytest.approx(1.0)
+
+
+class TestMetadataFromAnthropicMessageTTLSplit:
+    def test_splits_cache_creation_by_ttl(self):
+        # Total cache-write = 1000; 1h slice = 300; 5m slice = 700.
+        msg = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(
+                input_tokens=10,
+                output_tokens=20,
+                cache_creation_input_tokens=1000,
+                cache_creation=_FakeCacheCreation(
+                    ephemeral_5m_input_tokens=700,
+                    ephemeral_1h_input_tokens=300,
+                ),
+            ),
+        )
+        m = metadata_from_anthropic_message(msg)
+        assert m.cache_create_tokens == 700
+        assert m.cache_create_1h_tokens == 300
+
+    def test_no_cache_creation_object_all_in_five_min(self):
+        # Older SDK / no 1h caching: scalar total only, no breakdown object.
+        msg = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(
+                input_tokens=10,
+                output_tokens=20,
+                cache_creation_input_tokens=2000,
+            ),
+        )
+        m = metadata_from_anthropic_message(msg)
+        assert m.cache_create_tokens == 2000
+        assert m.cache_create_1h_tokens == 0
+
+    def test_only_one_hour_writes(self):
+        msg = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(
+                input_tokens=10,
+                output_tokens=20,
+                cache_creation_input_tokens=500,
+                cache_creation=_FakeCacheCreation(
+                    ephemeral_5m_input_tokens=0,
+                    ephemeral_1h_input_tokens=500,
+                ),
+            ),
+        )
+        m = metadata_from_anthropic_message(msg)
+        assert m.cache_create_tokens == 0
+        assert m.cache_create_1h_tokens == 500
+
+    def test_end_to_end_ttl_split_priced_against_packaged_default(self):
+        # SDK message with mixed-TTL cache writes → ModelMetadata →
+        # recompute against the packaged default card (haiku: 5m=1.25,
+        # 1h=2.0). 1M 5m + 1M 1h = 1.25 + 2.0 = 3.25.
+        msg = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(
+                input_tokens=0,
+                output_tokens=0,
+                cache_creation_input_tokens=2_000_000,
+                cache_creation=_FakeCacheCreation(
+                    ephemeral_5m_input_tokens=1_000_000,
+                    ephemeral_1h_input_tokens=1_000_000,
+                ),
+            ),
+        )
+        m = metadata_from_anthropic_message(msg)
+        cost = recompute_cost(m, load_default_pricing(), at=date(2026, 5, 25))
+        assert cost == pytest.approx(3.25)
+
+
+class TestLoadDefaultPricingOneHourRate:
+    def test_packaged_cards_carry_one_hour_rate(self):
+        table = load_default_pricing()
+        for name in ("claude-haiku-4-5", "claude-sonnet-4-6", "claude-opus-4-7"):
+            card = table.get(name, date(2026, 5, 25))
+            assert card.cache_create_1h_per_1m is not None
+            # 1-hour rate is 2.0× input per Anthropic prompt-caching pricing.
+            assert card.cache_create_1h_per_1m == pytest.approx(
+                card.input_per_1m * 2.0
+            )
+
+
+class TestRecordAnthropicCallOneHourField:
+    def test_record_includes_one_hour_token_count(self):
+        msg = _FakeMessage(
+            model="claude-haiku-4-5",
+            usage=_FakeUsage(
+                input_tokens=10,
+                output_tokens=5,
+                cache_creation_input_tokens=400,
+                cache_creation=_FakeCacheCreation(
+                    ephemeral_5m_input_tokens=100,
+                    ephemeral_1h_input_tokens=300,
+                ),
+            ),
+        )
+        record = record_anthropic_call(msg)
+        assert record["cache_create_tokens"] == 100
+        assert record["cache_create_1h_tokens"] == 300
