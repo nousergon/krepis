@@ -95,12 +95,22 @@ if TYPE_CHECKING:
 class PriceCard(BaseModel):
     """One row of the price table — per-model, per-effective-date rate.
 
-    All four prices are USD per 1,000,000 tokens. Cache-write and cache-
-    read prices follow Anthropic's prompt-caching semantics: cache-write
-    tokens are billed at ~1.25× the input price, cache-read tokens at
-    ~0.10× the input price. The fields are stored explicitly rather than
-    derived from a multiplier so that future provider changes (or the
-    addition of non-Anthropic providers) don't require a math change.
+    All prices are USD per 1,000,000 tokens. Cache-write and cache-read
+    prices follow Anthropic's prompt-caching semantics: tokens cached with
+    the default 5-minute TTL are billed at ~1.25× the input price, tokens
+    cached with the 1-hour TTL at ~2.0× the input price, and cache-read
+    tokens at ~0.10× the input price. The fields are stored explicitly
+    rather than derived from a multiplier so that future provider changes
+    (or the addition of non-Anthropic providers) don't require a math
+    change.
+
+    ``cache_create_per_1m`` is the 5-minute (default) cache-write rate.
+    ``cache_create_1h_per_1m`` is the 1-hour-TTL cache-write rate and is
+    OPTIONAL for backward compatibility: cards authored before the 1-hour
+    rate was modeled omit it, and 1-hour cache-write tokens then fall back
+    to the 5-minute rate (the pre-existing behavior). Populate it once a
+    model's 1-hour cache writes become a material spend share — see
+    :func:`compute_cost`.
 
     A card applies to its model from ``effective_from`` until the next
     card for the same model, exclusive on the new card's ``effective_from``
@@ -115,6 +125,11 @@ class PriceCard(BaseModel):
     output_per_1m: float = Field(ge=0.0)
     cache_read_per_1m: float = Field(ge=0.0)
     cache_create_per_1m: float = Field(ge=0.0)
+    # 1-hour-TTL cache-write rate (~2.0× input). Optional: when ``None`` a
+    # card prices 1-hour cache writes at ``cache_create_per_1m`` (the 5-min
+    # rate), preserving behavior for cards authored before this field
+    # existed. See ``compute_cost``'s ``cache_create_1h_tokens`` handling.
+    cache_create_1h_per_1m: float | None = Field(default=None, ge=0.0)
 
 
 # ── Errors ────────────────────────────────────────────────────────────────
@@ -460,6 +475,7 @@ def compute_cost(
     cache_read_tokens: int,
     cache_create_tokens: int,
     card: PriceCard,
+    cache_create_1h_tokens: int = 0,
     tool_requests: dict[str, int] | None = None,
     tool_fees: dict[str, ToolFee] | None = None,
 ) -> float:
@@ -477,12 +493,27 @@ def compute_cost(
     has a non-zero request count but no matching fee, :exc:`PriceCardLookupError`
     is raised (per ``feedback_no_silent_fails`` — a silent zero would
     bury a real cost slice).
+
+    Cache-write tokens split by TTL: ``cache_create_tokens`` is the
+    5-minute (default-TTL) slice, billed at ``card.cache_create_per_1m``;
+    ``cache_create_1h_tokens`` is the 1-hour-TTL slice (Anthropic
+    ``usage.cache_creation.ephemeral_1h_input_tokens``), billed at
+    ``card.cache_create_1h_per_1m``. When the card omits the 1-hour rate
+    (``cache_create_1h_per_1m is None``) the 1-hour slice falls back to the
+    5-minute rate — preserving the pre-existing single-rate behavior for
+    cards authored before the 1-hour rate was modeled.
     """
+    cache_create_1h_rate = (
+        card.cache_create_1h_per_1m
+        if card.cache_create_1h_per_1m is not None
+        else card.cache_create_per_1m
+    )
     cost = (
         input_tokens * card.input_per_1m
         + output_tokens * card.output_per_1m
         + cache_read_tokens * card.cache_read_per_1m
         + cache_create_tokens * card.cache_create_per_1m
+        + cache_create_1h_tokens * cache_create_1h_rate
     ) / _TOKENS_PER_PRICE_UNIT
 
     if tool_requests:
@@ -589,6 +620,7 @@ def recompute_cost(
         output_tokens=metadata.output_tokens,
         cache_read_tokens=metadata.cache_read_tokens,
         cache_create_tokens=metadata.cache_create_tokens,
+        cache_create_1h_tokens=metadata.cache_create_1h_tokens,
         card=card,
         tool_requests=tool_requests or None,
         tool_fees=tool_fees,
@@ -608,6 +640,18 @@ class _AnthropicServerToolUsageLike(Protocol):
     web_fetch_requests: int
 
 
+class _AnthropicCacheCreationLike(Protocol):
+    """Structural type for ``anthropic.types.CacheCreation``.
+
+    The per-TTL breakdown of cache-write tokens that the Anthropic SDK
+    exposes on ``Usage.cache_creation``. The scalar
+    ``Usage.cache_creation_input_tokens`` is the sum of these.
+    """
+
+    ephemeral_5m_input_tokens: int
+    ephemeral_1h_input_tokens: int
+
+
 class _AnthropicUsageLike(Protocol):
     """Structural type for an Anthropic SDK ``Usage`` object.
 
@@ -622,6 +666,7 @@ class _AnthropicUsageLike(Protocol):
     output_tokens: int
     cache_read_input_tokens: int | None
     cache_creation_input_tokens: int | None
+    cache_creation: _AnthropicCacheCreationLike | None
     server_tool_use: _AnthropicServerToolUsageLike | None
 
 
@@ -674,15 +719,39 @@ def metadata_from_anthropic_message(
     They are flat per-request fees, billed via :class:`ToolFee` rather
     than the per-1M-token rates on :class:`PriceCard`. Pass a
     :class:`ToolFeeTable` to :func:`recompute_cost` to price them.
+
+    Cache-write tokens are split by TTL. The Anthropic SDK reports the
+    total on the scalar ``usage.cache_creation_input_tokens`` and the
+    per-TTL breakdown on ``usage.cache_creation`` (a ``CacheCreation`` with
+    ``ephemeral_5m_input_tokens`` + ``ephemeral_1h_input_tokens``). We map
+    the 1-hour slice onto ``ModelMetadata.cache_create_1h_tokens`` and the
+    remainder (total − 1-hour) onto ``cache_create_tokens`` (the 5-minute
+    slice). When the SDK omits the breakdown (older versions with no
+    ``cache_creation`` object, or no 1-hour caching), the 1-hour slice is
+    zero and all cache-write tokens land in ``cache_create_tokens`` — the
+    pre-existing behavior.
     """
     u = msg.usage
     stu = getattr(u, "server_tool_use", None)
+
+    cache_create_total = getattr(u, "cache_creation_input_tokens", None) or 0
+    cache_creation = getattr(u, "cache_creation", None)
+    cache_create_1h = (
+        getattr(cache_creation, "ephemeral_1h_input_tokens", 0) or 0
+    ) if cache_creation is not None else 0
+    # The scalar total is the sum of the per-TTL slices; derive the 5-min
+    # slice by subtracting the 1-hour slice. ``max(..., 0)`` guards against
+    # an inconsistent payload where the total is absent but the breakdown
+    # is present (so the 5-min slice never goes negative).
+    cache_create_5m = max(cache_create_total - cache_create_1h, 0)
+
     return ModelMetadata(
         model_name=model_name if model_name is not None else msg.model,
         input_tokens=u.input_tokens,
         output_tokens=u.output_tokens,
         cache_read_tokens=getattr(u, "cache_read_input_tokens", None) or 0,
-        cache_create_tokens=getattr(u, "cache_creation_input_tokens", None) or 0,
+        cache_create_tokens=cache_create_5m,
+        cache_create_1h_tokens=cache_create_1h,
         web_search_requests=(getattr(stu, "web_search_requests", 0) or 0)
             if stu is not None else 0,
         web_fetch_requests=(getattr(stu, "web_fetch_requests", 0) or 0)
@@ -747,9 +816,10 @@ def record_anthropic_call(
     dict
         Flat dict with: ``ts`` (ISO-8601 UTC capture time), ``model``,
         ``input_tokens``, ``output_tokens``, ``cache_read_tokens``,
-        ``cache_create_tokens``, ``web_search_requests``,
-        ``web_fetch_requests``, ``cost_usd`` (priced via
-        ``recompute_cost``), plus any ``extra_fields`` merged in.
+        ``cache_create_tokens`` (5-min slice), ``cache_create_1h_tokens``
+        (1-hour slice), ``web_search_requests``, ``web_fetch_requests``,
+        ``cost_usd`` (priced via ``recompute_cost``), plus any
+        ``extra_fields`` merged in.
         Caller-owned field names take precedence over the standard set
         when keys collide.
 
@@ -774,6 +844,7 @@ def record_anthropic_call(
         "output_tokens": metadata.output_tokens,
         "cache_read_tokens": metadata.cache_read_tokens,
         "cache_create_tokens": metadata.cache_create_tokens,
+        "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,

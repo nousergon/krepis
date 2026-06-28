@@ -40,7 +40,15 @@ class ModelMetadata(BaseModel):
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cache_read_tokens: int = Field(default=0, ge=0)
+    # Cache-write tokens split by TTL. ``cache_create_tokens`` is the
+    # 5-minute (default-TTL) slice; ``cache_create_1h_tokens`` is the
+    # 1-hour-TTL slice (Anthropic ``usage.cache_creation.
+    # ephemeral_1h_input_tokens``). Zero-defaulted so callers that don't
+    # use the 1-hour TTL — the common case — omit it harmlessly. Priced
+    # separately by :func:`krepis.cost.recompute_cost` at the 1-hour rate
+    # when the active price card carries one. Additive within the schema.
     cache_create_tokens: int = Field(default=0, ge=0)
+    cache_create_1h_tokens: int = Field(default=0, ge=0)
     # Server-tool request counts (Anthropic ``Message.usage.server_tool_use``).
     # Distinct from token classes — these are flat per-request fees billed
     # via :class:`krepis.cost.ToolFee`, not the per-1M-token rate on the
