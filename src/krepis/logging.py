@@ -386,23 +386,19 @@ def _attach_flow_doctor(
         return
 
     _seed_flow_doctor_secrets(yaml_path)
-    # flow-doctor 0.6.0 removed the deprecated ``flow_doctor.init()`` free
-    # function in favour of ``FlowDoctor.from_config()`` (identical
-    # config_path contract). Prefer from_config when present; fall back to
-    # init() on flow-doctor < 0.6 so this works across the soak window
-    # regardless of which flow-doctor the consumer has pinned. Drop the
-    # fallback once the fleet floor is flow-doctor>=0.6.0.
+    # flow-doctor >=0.6.0 (the pinned floor, see pyproject ``flow_doctor``
+    # extra) constructs via ``FlowDoctor.from_config()``; the deprecated
+    # ``flow_doctor.init()`` free function was removed in 0.6.0. The fleet
+    # floor is now flow-doctor>=0.6.0, so the transitional <0.6 init()
+    # fallback has been dropped (config#647).
     #
     # ``strict`` flows into from_config: in prod a missing token raises a
     # ConfigError (fail loud); in dev FlowDoctor degrades to a no-op (_healthy
     # = False) with a stderr WARN instead of crashing the developer's run.
     try:
-        if hasattr(flow_doctor.FlowDoctor, "from_config"):
-            _fd_instance = flow_doctor.FlowDoctor.from_config(
-                config_path=yaml_path, strict=strict
-            )
-        else:
-            _fd_instance = flow_doctor.init(config_path=yaml_path)
+        _fd_instance = flow_doctor.FlowDoctor.from_config(
+            config_path=yaml_path, strict=strict
+        )
     except Exception as exc:  # noqa: BLE001 - strict re-raise below
         if strict:
             raise
