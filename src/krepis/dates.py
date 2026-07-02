@@ -21,6 +21,28 @@ Use this at every artifact-write site::
         ...
     }
 
+``trading_day`` is the system's PRIMARY axis — "what closed data am I
+working with?" — and is correct for everything computed FROM data
+(predictions, signals, features, eval joins). A small set of artifacts are
+instead *records of physical events* (fills, NAV marks, account
+snapshots); those are keyed by the **session axis** — "when did this event
+happen?" — via :func:`session_date`, because brokers, benchmarks, and the
+EOD snapshot/reconcile join all speak trade dates. During a live session
+the two axes differ by exactly one session; see DATE_CONVENTIONS.md and
+config#1610 for the doctrine::
+
+    from krepis.dates import session_date
+
+    run_date = session_date(strict=True)  # daemon startup: the session
+                                          # being traded, fail-loud on
+                                          # weekend/holiday/post-close
+
+Writers of session-keyed artifacts self-check content-vs-key::
+
+    from krepis.dates import assert_within_session
+
+    assert_within_session(fill_time, run_date)  # raises on mis-key
+
 For backfilling historical rows that only have a wall-clock timestamp::
 
     from krepis.dates import session_for_timestamp
@@ -60,10 +82,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 
 from .trading_calendar import (
+    assert_within_session,
     count_trading_days,
     is_trading_day,
     last_closed_trading_day,
     previous_trading_day,
+    session_date,
 )
 
 logger = logging.getLogger(__name__)
