@@ -180,6 +180,84 @@ _NYSE_CLOSE_ET = time(16, 0)
 _NYSE_TZ = ZoneInfo("America/New_York")
 
 
+def session_date(
+    now: datetime | None = None, *, strict: bool = False
+) -> date:
+    """Return the NYSE session a moment belongs to (event-time axis).
+
+    Partitions time by session closes: session S owns the interval
+    ``(close(S-1), close(S)]`` in ET. This is the *trade-date* axis — the
+    session a fill, NAV mark, or account snapshot physically belongs to —
+    and is deliberately distinct from ``last_closed_trading_day`` (the
+    *knowledge/as-of* axis: the newest fully-closed session whose data a
+    computation may use). During a live session the two differ by exactly
+    one session; conflating them is the off-by-one that mis-joined the EOD
+    reconcile (config#1610, 2026-07-02).
+
+      - Monday 9 AM ET     → Mon (pre-open: the upcoming session)
+      - Monday 1 PM ET     → Mon (intraday)
+      - Monday 4:00 PM ET  → Mon (at the close, inclusive)
+      - Monday 4:05 PM ET  → Tue (post-close events print next session)
+      - Saturday           → Mon (next session)
+      - Fri 2026-07-03 (holiday) → Mon 2026-07-06
+
+    Session-scoped processes (the intraday daemon) should resolve this
+    ONCE at startup and freeze it — the frozen value stays correct through
+    the close, and freezing prevents a post-close shutdown path from
+    drifting onto the next session.
+
+    Args:
+        now: naive (assumed NYSE-local) or tz-aware datetime; defaults to
+            the current moment in NYSE time.
+        strict: when True, raise ``ValueError`` unless ``now`` falls on the
+            returned session's own calendar day at-or-before the close —
+            i.e. fail loud instead of silently attributing a weekend,
+            holiday, or post-close start to the next session. Session-
+            scoped processes that must never start outside their own
+            session (the daemon) pass ``strict=True``.
+    """
+    if now is None:
+        now = datetime.now(_NYSE_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_NYSE_TZ)
+    else:
+        now = now.astimezone(_NYSE_TZ)
+
+    today = now.date()
+    if is_trading_day(today) and now.time() <= _NYSE_CLOSE_ET:
+        return today
+    nxt = next_trading_day(today)
+    if strict:
+        raise ValueError(
+            f"session_date(strict=True): {now.isoformat()} does not fall "
+            f"within a live NYSE session (next session: {nxt.isoformat()}). "
+            f"Refusing to attribute a weekend/holiday/post-close start to a "
+            f"future session."
+        )
+    return nxt
+
+
+def assert_within_session(ts: datetime, session: date | str) -> None:
+    """Fail-loud content-vs-key check: ``ts`` must belong to ``session``.
+
+    Writers of session-keyed event artifacts (trade log, nav_series,
+    snapshots) call this before persisting, so an event timestamped in a
+    different session than its label raises at write time instead of
+    silently mis-keying — the write-time guard that would have caught the
+    daemon's D-1 mislabeling (config#1610) on day one.
+    """
+    if isinstance(session, str):
+        session = date.fromisoformat(session)
+    actual = session_date(ts)
+    if actual != session:
+        raise ValueError(
+            f"Event timestamp {ts.isoformat()} belongs to session "
+            f"{actual.isoformat()}, not the labeled session "
+            f"{session.isoformat()} — refusing to write a mis-keyed "
+            f"session artifact."
+        )
+
+
 def last_closed_trading_day(now: datetime | None = None) -> date:
     """Return the most recent NYSE trading day whose session has actually closed.
 
