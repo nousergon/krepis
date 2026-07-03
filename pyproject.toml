@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.9.0"
+version = "0.9.1"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -45,6 +45,14 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # `krepis[flow_doctor]` + `from krepis.logging import setup_logging`, no AGPL
 # nousergon-lib required.
 flow_doctor = ["flow-doctor[diagnosis,s3]>=0.6.0,<0.7"]
+# krepis.llm transports. Both SDKs are lazy-imported at call time, so a
+# consumer installs only the transport(s) its ModelSpec can resolve to:
+# `krepis[anthropic]` for the native Anthropic transport, `krepis[openai]`
+# for OpenAI / OpenRouter / any OpenAI-compatible endpoint. (These were
+# intended to ship in 0.9.0 with krepis.llm; a silently-no-op'd edit
+# dropped them from the merged pyproject — restored in 0.9.1.)
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.40"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
