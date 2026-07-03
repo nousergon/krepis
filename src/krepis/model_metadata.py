@@ -37,6 +37,19 @@ class ModelMetadata(BaseModel):
 
     model_name: str
     model_version: str | None = None
+    # Which provider served the call ("anthropic" default preserves the
+    # pre-multi-provider record shape). Drives provider-scoped tool-fee
+    # naming in :func:`krepis.cost.recompute_cost` (e.g. an OpenRouter
+    # web search bills at the "openrouter:web_search" fee, not
+    # Anthropic's "web_search" rate). Additive within the schema.
+    provider: str = "anthropic"
+    # USD cost the provider itself reported for the call (OpenRouter
+    # returns it in ``usage.cost`` when the request opts in). Preferred
+    # over card-derived recompute by :func:`krepis.cost.record_llm_call`
+    # — with :floor routing the actually-routed backend's price varies
+    # below our card ceilings, so the aggregator's number is canonical.
+    # ``None`` = not reported; fall back to the price card.
+    provider_reported_cost_usd: float | None = None
     input_tokens: int = Field(default=0, ge=0)
     output_tokens: int = Field(default=0, ge=0)
     cache_read_tokens: int = Field(default=0, ge=0)

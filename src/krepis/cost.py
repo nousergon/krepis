@@ -76,9 +76,20 @@ from krepis.model_metadata import ModelMetadata
 # keyed on the alias so a new snapshot date doesn't require a card refresh.
 _DATED_SNAPSHOT_SUFFIX_RE = re.compile(r"-\d{8}$")
 
+# OpenRouter model slugs carry an optional routing-variant suffix after a
+# colon (``deepseek/deepseek-v4-flash:floor``, ``...:online``, ``...:nitro``,
+# ``...:free``). The variant changes ROUTING, not the model, so pricing
+# cards are keyed on the bare slug and lookups strip the variant on miss —
+# the same shape as the Anthropic dated-snapshot strip above.
+_VARIANT_SUFFIX_RE = re.compile(r":[A-Za-z0-9_-]+$")
+
 
 def _strip_dated_snapshot_suffix(model_name: str) -> str:
     return _DATED_SNAPSHOT_SUFFIX_RE.sub("", model_name)
+
+
+def _strip_variant_suffix(model_name: str) -> str:
+    return _VARIANT_SUFFIX_RE.sub("", model_name)
 
 if TYPE_CHECKING:
     # Structural Protocol below describes the only attributes we touch on
@@ -200,12 +211,15 @@ class PriceTable(BaseModel):
         the one whose ``effective_from`` is the latest among cards ≤ ``at``.
 
         Lookup tries the model name as-given first; on miss, retries with
-        any trailing ``-YYYYMMDD`` snapshot suffix stripped. This lets the
-        YAML stay keyed on family aliases (``claude-haiku-4-5``) while
-        accepting the dated form (``claude-haiku-4-5-20251001``) that the
-        Anthropic SDK returns in ``Message.model``.
+        any trailing ``-YYYYMMDD`` snapshot suffix stripped (the Anthropic
+        SDK returns the dated form in ``Message.model`` even when the
+        caller requested the family alias), then with any trailing
+        ``:variant`` routing suffix stripped (OpenRouter slugs like
+        ``deepseek/deepseek-v4-flash:floor`` — the variant changes routing,
+        not the model). The YAML stays keyed on the bare alias/slug either
+        way.
 
-        Raises :exc:`PriceCardLookupError` if neither form matches.
+        Raises :exc:`PriceCardLookupError` if no form matches.
         """
         query_date = at.date() if isinstance(at, datetime) else at
 
@@ -220,6 +234,10 @@ class PriceTable(BaseModel):
             alias = _strip_dated_snapshot_suffix(model_name)
             if alias != model_name:
                 candidates = _candidates_for(alias)
+        if not candidates:
+            bare = _strip_variant_suffix(model_name)
+            if bare != model_name:
+                candidates = _candidates_for(bare)
         if not candidates:
             raise PriceCardLookupError(
                 f"No price card for model {model_name!r} active on {query_date}"
@@ -536,14 +554,19 @@ def _tool_request_counts(metadata: ModelMetadata) -> dict[str, int]:
     """Pull non-zero server-tool request counts off a ``ModelMetadata``.
 
     Centralizes the mapping between ``ModelMetadata`` field names and
-    Anthropic tool names. Add new server tools here when the SDK adds
-    them to ``Usage.server_tool_use`` (and to ``ModelMetadata``).
+    tool-fee names. Fee names are provider-scoped for non-Anthropic
+    providers (``openrouter:web_search``) because the same logical tool
+    bills at different rates per provider — Anthropic web_search is
+    $10/1k requests, OpenRouter's server tool ~$5/1k. The bare names
+    (``web_search`` / ``web_fetch``) stay reserved for Anthropic so every
+    pre-multi-provider record and fee row keeps pricing identically.
     """
+    prefix = "" if metadata.provider == "anthropic" else f"{metadata.provider}:"
     return {
         name: count
         for name, count in (
-            ("web_search", metadata.web_search_requests),
-            ("web_fetch", metadata.web_fetch_requests),
+            (f"{prefix}web_search", metadata.web_search_requests),
+            (f"{prefix}web_fetch", metadata.web_fetch_requests),
         )
         if count > 0
     }
@@ -848,6 +871,178 @@ def record_anthropic_call(
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
+    }
+    if extra_fields:
+        record.update(extra_fields)
+    return record
+
+
+# ── OpenAI-compatible SDK adapter ─────────────────────────────────────────
+
+
+class _OpenAIPromptTokensDetailsLike(Protocol):
+    """Structural type for ``openai.types.PromptTokensDetails``."""
+
+    cached_tokens: int | None
+
+
+class _OpenAIUsageLike(Protocol):
+    """Structural type for an OpenAI SDK ``CompletionUsage`` object.
+
+    ``cost`` and ``web_search_requests`` are OpenRouter extensions
+    (present when the request opts into usage accounting); absent on
+    plain OpenAI responses.
+    """
+
+    prompt_tokens: int
+    completion_tokens: int
+    prompt_tokens_details: _OpenAIPromptTokensDetailsLike | None
+
+
+class _OpenAICompletionLike(Protocol):
+    """Structural type for an OpenAI SDK ``ChatCompletion`` object."""
+
+    model: str
+    usage: _OpenAIUsageLike | None
+
+
+def metadata_from_openai_completion(
+    resp: _OpenAICompletionLike,
+    *,
+    model_name: str | None = None,
+    provider: str = "openai",
+) -> ModelMetadata:
+    """Map an OpenAI-compatible ``ChatCompletion.usage`` onto a
+    :class:`ModelMetadata`.
+
+    Counterpart of :func:`metadata_from_anthropic_message` for the openai
+    transport (OpenAI, OpenRouter, self-hosted vLLM — anything the
+    :class:`krepis.llm.LLMClient` openai transport talks to). Duck-typed
+    via the structural Protocols above; ``openai`` is never imported.
+
+    Field mapping: ``prompt_tokens`` → input, ``completion_tokens`` →
+    output, ``prompt_tokens_details.cached_tokens`` → cache_read (implicit
+    provider-side prompt caching — there is no cache-WRITE class on this
+    wire format). OpenRouter extensions when present: ``usage.cost`` →
+    ``provider_reported_cost_usd`` (the aggregator's actually-billed USD —
+    canonical under ``:floor`` routing) and ``usage.web_search_requests``
+    → ``web_search_requests``.
+    """
+    u = getattr(resp, "usage", None)
+    details = getattr(u, "prompt_tokens_details", None) if u is not None else None
+    reported_cost = getattr(u, "cost", None) if u is not None else None
+    return ModelMetadata(
+        model_name=model_name if model_name is not None else resp.model,
+        provider=provider,
+        input_tokens=int(getattr(u, "prompt_tokens", 0) or 0) if u else 0,
+        output_tokens=int(getattr(u, "completion_tokens", 0) or 0) if u else 0,
+        cache_read_tokens=int(getattr(details, "cached_tokens", 0) or 0)
+            if details is not None else 0,
+        web_search_requests=int(getattr(u, "web_search_requests", 0) or 0)
+            if u else 0,
+        provider_reported_cost_usd=float(reported_cost)
+            if reported_cost is not None else None,
+    )
+
+
+# ── Generalized capture chokepoint ────────────────────────────────────────
+
+
+def _metadata_from_llm_result(result: Any, *, model_name: str | None) -> ModelMetadata:
+    """Map a :class:`krepis.llm.LLMResult` onto a :class:`ModelMetadata`.
+
+    Duck-typed (``result.usage`` is a :class:`krepis.llm.LLMUsage`) so this
+    module keeps zero imports from :mod:`krepis.llm`.
+    """
+    u = result.usage
+    return ModelMetadata(
+        model_name=model_name if model_name is not None else result.model,
+        provider=result.provider,
+        input_tokens=u.input_tokens,
+        output_tokens=u.output_tokens,
+        cache_read_tokens=u.cache_read_tokens,
+        cache_create_tokens=u.cache_create_tokens,
+        cache_create_1h_tokens=u.cache_create_1h_tokens,
+        web_search_requests=u.web_search_requests,
+        web_fetch_requests=u.web_fetch_requests,
+        provider_reported_cost_usd=u.provider_cost_usd,
+    )
+
+
+def record_llm_call(
+    result_or_msg: Any,
+    *,
+    provider: str | None = None,
+    model_name: str | None = None,
+    pricing: PriceTable | None = None,
+    tool_fees: ToolFeeTable | None = None,
+    at: datetime | date | None = None,
+    extra_fields: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Map ANY supported LLM response → priced JSONL-ready cost record.
+
+    Provider-agnostic generalization of :func:`record_anthropic_call` (which
+    remains as the Anthropic-only entry point for existing consumers).
+    Accepts, detected structurally in this order:
+
+    1. A :class:`krepis.llm.LLMResult` (has ``provider`` + ``usage`` with
+       ``provider_cost_usd``) — the adapter path; preferred.
+    2. An OpenAI-compatible ``ChatCompletion`` (has ``choices``) —
+       ``provider`` defaults to ``"openai"``; pass ``provider="openrouter"``
+       for OpenRouter responses so tool fees resolve at OpenRouter rates.
+    3. An Anthropic ``Message`` (has ``content`` + token-count usage).
+
+    **Cost source selection**: when the provider reported its own USD cost
+    (OpenRouter ``usage.cost``) that figure is recorded verbatim with
+    ``cost_source: "provider_reported"`` — under ``:floor`` routing the
+    actually-billed backend price varies below our card ceilings, so the
+    aggregator's number is canonical. Otherwise cost is recomputed from
+    the active :class:`PriceTable` (``cost_source: "price_card"``). If
+    neither is available, :exc:`PriceCardLookupError` propagates — never
+    a silent zero (``feedback_no_silent_fails``).
+
+    Returns the same flat record shape as :func:`record_anthropic_call`
+    plus ``provider`` and ``cost_source``.
+    """
+    if hasattr(result_or_msg, "provider") and hasattr(result_or_msg, "usage") and (
+        hasattr(getattr(result_or_msg, "usage"), "provider_cost_usd")
+    ):
+        metadata = _metadata_from_llm_result(result_or_msg, model_name=model_name)
+    elif hasattr(result_or_msg, "choices"):
+        metadata = metadata_from_openai_completion(
+            result_or_msg,
+            model_name=model_name,
+            provider=provider if provider is not None else "openai",
+        )
+    else:
+        metadata = metadata_from_anthropic_message(
+            result_or_msg, model_name=model_name
+        )
+    if provider is not None:
+        metadata.provider = provider
+
+    if metadata.provider_reported_cost_usd is not None:
+        metadata.cost_usd = metadata.provider_reported_cost_usd
+        cost_source = "provider_reported"
+    else:
+        table = pricing if pricing is not None else load_default_pricing()
+        fees = tool_fees if tool_fees is not None else load_default_tool_fees()
+        recompute_cost(metadata, table, tool_fee_table=fees, at=at)
+        cost_source = "price_card"
+
+    record: dict[str, Any] = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "provider": metadata.provider,
+        "model": metadata.model_name,
+        "input_tokens": metadata.input_tokens,
+        "output_tokens": metadata.output_tokens,
+        "cache_read_tokens": metadata.cache_read_tokens,
+        "cache_create_tokens": metadata.cache_create_tokens,
+        "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
+        "web_search_requests": metadata.web_search_requests,
+        "web_fetch_requests": metadata.web_fetch_requests,
+        "cost_usd": metadata.cost_usd,
+        "cost_source": cost_source,
     }
     if extra_fields:
         record.update(extra_fields)

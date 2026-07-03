@@ -53,6 +53,49 @@ cards:
     cache_create_per_1m: 6.25
     cache_create_1h_per_1m: 10.00
 
+  # ── Open-weight models served via OpenRouter ──────────────────────────
+  # Prices are OpenRouter LIST rates (verified against the live models API
+  # 2026-07-03) and function as CEILINGS: with `:floor` variant routing the
+  # actually-billed backend price is usually lower, and the canonical cost
+  # source is the provider-reported `usage.cost` captured by
+  # `record_llm_call` (cost_source: provider_reported). These cards are the
+  # repricing fallback when a response carried no reported cost.
+  #
+  # Cache rates: the OpenAI-compatible wire format has no cache-WRITE token
+  # class (cache_create never populated), and cache-READ discounts vary by
+  # routed backend — priced here at the full input rate so the fallback
+  # never UNDERSTATES spend.
+  - model_name: moonshotai/kimi-k2.6
+    effective_from: 2026-07-03
+    input_per_1m: 0.66
+    output_per_1m: 3.41
+    cache_read_per_1m: 0.66
+    cache_create_per_1m: 0.66
+  - model_name: deepseek/deepseek-v4-flash
+    effective_from: 2026-07-03
+    input_per_1m: 0.09
+    output_per_1m: 0.18
+    cache_read_per_1m: 0.09
+    cache_create_per_1m: 0.09
+  - model_name: deepseek/deepseek-v4-pro
+    effective_from: 2026-07-03
+    input_per_1m: 0.435
+    output_per_1m: 0.87
+    cache_read_per_1m: 0.435
+    cache_create_per_1m: 0.435
+  - model_name: openai/gpt-oss-120b
+    effective_from: 2026-07-03
+    input_per_1m: 0.03
+    output_per_1m: 0.15
+    cache_read_per_1m: 0.03
+    cache_create_per_1m: 0.03
+  - model_name: qwen/qwen3.7-plus
+    effective_from: 2026-07-03
+    input_per_1m: 0.32
+    output_per_1m: 1.28
+    cache_read_per_1m: 0.32
+    cache_create_per_1m: 0.32
+
 # Server-side tool fees (Anthropic ``Message.usage.server_tool_use``).
 # Billed as flat per-request fees, independent of which model invoked
 # the tool. Rates published by Anthropic as USD per 1,000 requests.
@@ -76,3 +119,12 @@ tool_fees:
   - tool_name: web_fetch
     effective_from: 2026-01-01
     per_1k_requests_usd: 0.00
+  # OpenRouter `openrouter:web_search` server tool (any model). Base rate
+  # $0.005/request = $5/1k (Exa/Parallel engines, verified 2026-07-03);
+  # the additional $0.001/result beyond 10 results per request is NOT
+  # modeled — the provider-reported `usage.cost` is the canonical number,
+  # this fee is the repricing fallback. Provider-scoped name per
+  # `_tool_request_counts` (Anthropic's bare `web_search` bills at $10/1k).
+  - tool_name: "openrouter:web_search"
+    effective_from: 2026-07-03
+    per_1k_requests_usd: 5.00
