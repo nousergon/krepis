@@ -4,7 +4,10 @@ krepis (Greek κρηπίς, the foundation course a structure stands on) is a
 small, typed library of building blocks for services running on AWS:
 structured logging, SSM-backed secrets, Telegram/SNS alert routing,
 bounded-backoff HTTP retry, S3 conditional-PUT writer locks, the Anthropic
-payload chokepoint, LLM cost telemetry, and trading-calendar/date helpers.
+payload chokepoint, the provider-agnostic LLM adapter (``krepis.llm`` —
+Anthropic / OpenAI / OpenRouter behind one call surface with runtime
+SSM-flippable model specs), LLM cost telemetry, and trading-calendar/date
+helpers.
 """
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
