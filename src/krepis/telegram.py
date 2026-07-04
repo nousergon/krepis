@@ -75,39 +75,55 @@ def _escape_markdown(text: str) -> str:
     )
 
 
-def send_message(text: str, *, disable_notification: bool = False) -> bool:
+def send_message(
+    text: str,
+    *,
+    disable_notification: bool = False,
+    bot_token: str | None = None,
+    chat_id: str | int | None = None,
+    message_thread_id: int | None = None,
+) -> bool:
     """Send a single Telegram message to the channel resolved from secrets.
 
     Loads ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` via
-    :func:`krepis.secrets.get_secret` (required=False). Applies
-    Markdown v1 escaping, ``POST``s with a 5-second timeout. Returns ``True``
-    on HTTP 200, ``False`` on any other outcome (logged at WARNING). Never
-    raises.
+    :func:`krepis.secrets.get_secret` (required=False) when ``bot_token`` /
+    ``chat_id`` are not passed explicitly. Applies Markdown v1 escaping,
+    ``POST``s with a 5-second timeout. Returns ``True`` on HTTP 200, ``False``
+    on any other outcome (logged at WARNING). Never raises.
+
+    Explicit ``bot_token`` / ``chat_id`` overrides allow flow-doctor (and other
+    multi-bot consumers) to route through this transport without clobbering the
+    process-global secret resolution path.
 
     :param text: The message body. Markdown v1 formatting (``*bold*``) is
         respected; other special characters are escaped automatically.
     :param disable_notification: If ``True``, the message is delivered into
         the chat silently (no phone push). Use for informational/digest
         traffic that should be visible but not buzz.
+    :param bot_token: Optional explicit bot token (skips secret lookup).
+    :param chat_id: Optional explicit chat id (skips secret lookup).
+    :param message_thread_id: Optional forum-topic id for supergroup routing.
     :returns: ``True`` if the Telegram API returned HTTP 200, ``False``
         otherwise (missing secrets, network error, non-200 response).
     """
-    token = get_secret("TELEGRAM_BOT_TOKEN", required=False)
-    chat_id = get_secret("TELEGRAM_CHAT_ID", required=False)
-    if not token or not chat_id:
+    token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", required=False)
+    resolved_chat = chat_id if chat_id is not None else get_secret("TELEGRAM_CHAT_ID", required=False)
+    if not token or resolved_chat in (None, ""):
         logger.warning(
             "Telegram not configured — TELEGRAM_BOT_TOKEN=%s TELEGRAM_CHAT_ID=%s",
             "set" if token else "MISSING",
-            "set" if chat_id else "MISSING",
+            "set" if resolved_chat not in (None, "") else "MISSING",
         )
         return False
 
     payload = {
-        "chat_id": chat_id,
+        "chat_id": resolved_chat,
         "text": _escape_markdown(text),
         "parse_mode": PARSE_MODE,
         "disable_notification": disable_notification,
     }
+    if message_thread_id is not None:
+        payload["message_thread_id"] = message_thread_id
 
     try:
         resp = requests.post(
