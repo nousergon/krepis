@@ -34,6 +34,7 @@ pip install krepis
 | `ec2_spot` | EC2 spot-instance resilience helpers |
 | `ssm_dispatcher` | SSM command dispatch |
 | `ssm_log_capture` | SSM run-command log capture |
+| `usage_pacing` | Linear-pace short-circuit against a rolling reset-window quota |
 
 ## License
 
