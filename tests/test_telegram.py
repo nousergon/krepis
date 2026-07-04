@@ -111,6 +111,24 @@ class TestDisableNotification:
         tg.send_message("loud", disable_notification=False)
         assert mock_post.call_args.kwargs["json"]["disable_notification"] is False
 
+    def test_message_thread_id_propagates(self, configured_env, mock_post):
+        tg.send_message("topic msg", message_thread_id=42)
+        assert mock_post.call_args.kwargs["json"]["message_thread_id"] == 42
+
+    def test_message_thread_id_omitted_when_unset(self, configured_env, mock_post):
+        tg.send_message("plain")
+        assert "message_thread_id" not in mock_post.call_args.kwargs["json"]
+
+    def test_explicit_bot_token_and_chat_id_override_secrets(
+        self, configured_env, mock_post, monkeypatch
+    ):
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+        assert tg.send_message("hello", bot_token="override-token", chat_id=-10099) is True
+        url = mock_post.call_args.args[0]
+        assert "override-token" in url
+        assert mock_post.call_args.kwargs["json"]["chat_id"] == -10099
+
 
 # ── send_message — secret resolution failures ───────────────────────────────
 
