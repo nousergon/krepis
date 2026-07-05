@@ -13,6 +13,9 @@ from krepis import http_retry
 from krepis.http_retry import (
     HttpRetryError,
     backoff_delay,
+    call_with_retry,
+    is_transient_boto_error,
+    is_transient_google_error,
     request_with_retry,
     scrub_api_keys,
 )
@@ -197,3 +200,96 @@ def test_custom_transient_status_set():
         "https://x", session=s2, transient_status={418}, max_attempts=3, sleep=_NOSLEEP,
     )
     assert out2.status_code == 500 and s2.request.call_count == 1  # 500 not transient here
+
+
+# ── call_with_retry + transient classifiers ──────────────────────────────────
+
+
+def _fake_google_service_unavailable(
+    msg: str = "503 The service is currently unavailable.",
+) -> BaseException:
+    cls = type("ServiceUnavailable", (Exception,), {"__module__": "google.api_core.exceptions"})
+    return cls(msg)
+
+
+def _fake_boto_client_error(code: str) -> BaseException:
+    cls = type("ClientError", (Exception,), {"__module__": "botocore.exceptions"})
+    exc = cls(f"An error occurred ({code})")
+    exc.response = {"Error": {"Code": code, "Message": "boom"}}  # type: ignore[attr-defined]
+    return exc
+
+
+def test_is_transient_google_error_matches_api_core_names():
+    assert is_transient_google_error(_fake_google_service_unavailable())
+    assert not is_transient_google_error(ValueError("bad voice"))
+
+
+def test_is_transient_boto_error_matches_throttle_codes():
+    assert is_transient_boto_error(_fake_boto_client_error("ThrottlingException"))
+    assert not is_transient_boto_error(_fake_boto_client_error("AccessDeniedException"))
+
+
+def test_call_with_retry_succeeds_after_transient_blip():
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise _fake_google_service_unavailable()
+        return "ok"
+
+    out = call_with_retry(
+        flaky,
+        is_retryable=is_transient_google_error,
+        max_attempts=5,
+        sleep=_NOSLEEP,
+        label="google-tts",
+    )
+    assert out == "ok" and calls["n"] == 3
+
+
+def test_call_with_retry_raises_after_exhaustion():
+    def always_503():
+        raise _fake_google_service_unavailable()
+
+    with pytest.raises(Exception, match="503"):
+        call_with_retry(
+            always_503,
+            is_retryable=is_transient_google_error,
+            max_attempts=3,
+            sleep=_NOSLEEP,
+        )
+
+
+def test_call_with_retry_skips_non_retryable():
+    def deterministic():
+        raise ValueError("deterministic")
+
+    with pytest.raises(ValueError, match="deterministic"):
+        call_with_retry(
+            deterministic,
+            is_retryable=is_transient_google_error,
+            sleep=_NOSLEEP,
+        )
+
+
+def test_call_with_retry_honors_retry_after_hint():
+    delays: list[float] = []
+
+    def rate_limited():
+        raise _fake_boto_client_error("ThrottlingException")
+
+    with pytest.raises(Exception):
+        call_with_retry(
+            rate_limited,
+            is_retryable=is_transient_boto_error,
+            max_attempts=2,
+            retry_after=lambda _e: 9,
+            sleep=lambda d: delays.append(d),
+        )
+    assert len(delays) == 1 and 9.0 <= delays[0] < 10.0
+
+
+def test_call_with_retry_max_attempts_must_be_positive():
+    with pytest.raises(ValueError, match="max_attempts must be >= 1"):
+        call_with_retry(lambda: 1, is_retryable=lambda _e: True, max_attempts=0)

@@ -25,6 +25,10 @@ Two layers are exported:
     a consumer with bespoke control flow (the rate-limited ``polygon_client``
     keeps its own loop + 403 handling + JSON parse + rate limiter, but shares
     the delay math and the scrubber).
+  * :func:`call_with_retry` — the generic callable loop for gRPC / boto /
+    subprocess and other non-HTTP consumers. Shares :func:`backoff_delay` and
+    ships :func:`is_transient_google_error` / :func:`is_transient_boto_error`
+    classifiers for the common provider surfaces.
 
 Design note (anti-over-engineering): this is deliberately NOT a
 pluggable-everything HTTP framework. It captures the one invariant the four
@@ -38,11 +42,13 @@ import logging as _logging
 import random as _random
 import re
 import time as _time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, TypeVar
 
 import requests
 
 _DEFAULT_LOGGER = _logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Transient HTTP status class: 429 (rate limit) + the retryable 5xx. A 4xx
 # other than 429 is a deterministic client error — retrying it is pointless,
@@ -197,3 +203,100 @@ def request_with_retry(
     # non-None because max_attempts >= 1 guarantees at least one assignment.
     assert resp is not None
     return resp
+
+
+# ── Generic callable retry (gRPC / boto / subprocess / any transient class) ──
+#
+# Mirrors the ``request_with_retry`` / ``invoke_lambda_with_retry`` split:
+# ``backoff_delay`` is the shared math; ``call_with_retry`` is the generic loop
+# for consumers whose control flow is not a plain HTTP GET or Lambda invoke.
+
+
+# google.api_core gRPC exception names in the transient class. Matched by name
+# (not isinstance) so callers without the google extra installed never import it.
+DEFAULT_TRANSIENT_GOOGLE_EXCEPTIONS: "frozenset[str]" = frozenset({
+    "ServiceUnavailable",
+    "InternalServerError",
+    "DeadlineExceeded",
+    "ResourceExhausted",
+    "Aborted",
+})
+
+# botocore ClientError codes in the transient class (Polly throttling, Lambda
+# throttle, generic AWS 5xx). Callers may pass a narrower ``codes`` set.
+DEFAULT_TRANSIENT_BOTO_ERROR_CODES: "frozenset[str]" = frozenset({
+    "ThrottlingException",
+    "TooManyRequestsException",
+    "ServiceUnavailable",
+    "InternalFailure",
+    "InternalServerError",
+    "ProvisionedThroughputExceededException",
+})
+
+
+def is_transient_google_error(
+    exc: BaseException,
+    *,
+    names: Iterable[str] = DEFAULT_TRANSIENT_GOOGLE_EXCEPTIONS,
+) -> bool:
+    """True for ``google.api_core`` blips worth retrying (503, overload, …)."""
+    mod = type(exc).__module__
+    return mod.startswith("google.api_core") and type(exc).__name__ in frozenset(names)
+
+
+def is_transient_boto_error(
+    exc: BaseException,
+    *,
+    codes: Iterable[str] = DEFAULT_TRANSIENT_BOTO_ERROR_CODES,
+) -> bool:
+    """True for ``botocore.exceptions.ClientError`` in the transient code class."""
+    if type(exc).__name__ != "ClientError" or not type(exc).__module__.startswith("botocore"):
+        return False
+    response = getattr(exc, "response", None) or {}
+    code = (response.get("Error") or {}).get("Code", "")
+    return code in frozenset(codes)
+
+
+def call_with_retry(
+    fn: Callable[[], _T],
+    *,
+    is_retryable: Callable[[BaseException], bool],
+    max_attempts: int = 3,
+    backoff_base: float = 1.0,
+    backoff_cap: float = 30.0,
+    retry_after: "Callable[[BaseException], str | float | None] | None" = None,
+    label: str = "",
+    logger: "_logging.Logger | None" = None,
+    sleep: "Callable[[float], None]" = _time.sleep,
+) -> _T:
+    """Run ``fn`` with bounded full-jitter backoff on retryable exceptions.
+
+    Retries when ``is_retryable(exc)`` is true, up to ``max_attempts``. On
+    exhaustion the **original** exception is re-raised (preserving type and
+    cause) — same terminal contract as ``request_with_retry`` returning the
+    last 503 for the caller to interpret.
+
+    ``retry_after(exc)`` may return a server hint (seconds) that replaces the
+    exponential term in :func:`backoff_delay`, mirroring HTTP ``Retry-After``.
+    ``sleep`` is injectable for tests. ``max_attempts`` must be >= 1.
+    """
+    if max_attempts < 1:
+        raise ValueError(f"max_attempts must be >= 1, got {max_attempts}")
+    log = logger or _DEFAULT_LOGGER
+    tag = label or "call"
+    for attempt in range(max_attempts):
+        try:
+            return fn()
+        except BaseException as exc:
+            if not is_retryable(exc) or attempt == max_attempts - 1:
+                raise
+            hint = retry_after(exc) if retry_after is not None else None
+            delay = backoff_delay(
+                attempt, base=backoff_base, cap=backoff_cap, retry_after=hint,
+            )
+            log.warning(
+                "%s transient %s — backing off %.1fs (attempt %d/%d)",
+                tag, type(exc).__name__, delay, attempt + 1, max_attempts,
+            )
+            sleep(delay)
+    raise RuntimeError(f"{tag} failed after {max_attempts} attempts")  # pragma: no cover
