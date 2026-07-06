@@ -78,7 +78,7 @@ class FakeAnthropic:
 
 def _openai_usage(
     prompt=100, completion=50, cached=0, cost=None, searches=None,
-    nested_searches=None,
+    nested_searches=None, nested_searches_obj=None,
 ):
     u = SimpleNamespace(
         prompt_tokens=prompt,
@@ -90,11 +90,19 @@ def _openai_usage(
     if searches is not None:
         u.web_search_requests = searches
     if nested_searches is not None:
-        # The REAL OpenRouter shape (confirmed live 2026-07-06): the search
-        # count lives under usage.server_tool_use_details.web_search_requests,
-        # not a flat usage.web_search_requests field.
+        # The REAL OpenRouter shape (confirmed live 2026-07-06, corrected
+        # after an initial getattr-based fix silently kept reading 0):
+        # server_tool_use_details is an unmodeled Pydantic "extra" field,
+        # so the SDK stores it as a plain dict — NOT an attribute-bearing
+        # object — even though the equivalent Anthropic field IS a proper
+        # nested object. Use a dict here to match reality.
+        u.server_tool_use_details = {"web_search_requests": nested_searches}
+    if nested_searches_obj is not None:
+        # Belt-and-suspenders: some other OpenAI-compatible provider might
+        # report this as a proper attribute-bearing object instead — the
+        # extraction code supports both shapes.
         u.server_tool_use_details = SimpleNamespace(
-            web_search_requests=nested_searches
+            web_search_requests=nested_searches_obj
         )
     return u
 
@@ -488,6 +496,21 @@ class TestGrounded:
             system="s", user_content="u", search=SearchOptions()
         )
         assert result.usage.web_search_requests == 9
+
+    def test_openrouter_nested_shape_as_attribute_object_also_works(self):
+        # Belt-and-suspenders: if some other OpenAI-compatible provider
+        # reports server_tool_use_details as a proper attribute-bearing
+        # object rather than a raw dict, that shape is read too.
+        fake = FakeOpenAI([
+            _openai_resp(
+                "grounded answer",
+                usage=_openai_usage(nested_searches_obj=7),
+            )
+        ])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.usage.web_search_requests == 7
 
     def test_force_first_on_openrouter_raises(self):
         client = _client(OPENROUTER_SPEC, FakeOpenAI([]))

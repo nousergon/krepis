@@ -302,10 +302,21 @@ class LLMClient:
         # flat read below always silently returned 0 despite real grounding
         # (55-75 citations per call) — which would have permanently broken
         # the ``min_web_searches`` production incident-guard floor on this
-        # transport. Prefer the nested shape; fall back to a flat field for
-        # any OpenAI-compatible provider that reports it that way instead.
+        # transport.
+        #
+        # ``server_tool_use_details`` is NOT a field the openai SDK's
+        # ``CompletionUsage`` model declares — it's an unrecognized/"extra"
+        # field, and Pydantic v2 stores those verbatim as the raw decoded
+        # JSON value (a plain ``dict``), not as a nested attribute-bearing
+        # object the way Anthropic's SDK properly types ``server_tool_use``.
+        # An initial fix here (krepis 0.11.1) used ``getattr(stu, ...)``,
+        # which silently returns the default on a ``dict`` (dicts have no
+        # attributes for their keys) — confirmed live 2026-07-06: it found
+        # the right field NAME but still always read 0. Handle both shapes.
         stu = getattr(u, "server_tool_use_details", None)
-        if stu is not None:
+        if isinstance(stu, dict):
+            usage.web_search_requests += int(stu.get("web_search_requests", 0) or 0)
+        elif stu is not None:
             usage.web_search_requests += int(
                 getattr(stu, "web_search_requests", 0) or 0
             )
