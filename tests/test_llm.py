@@ -76,7 +76,10 @@ class FakeAnthropic:
         return self._responses.pop(0)
 
 
-def _openai_usage(prompt=100, completion=50, cached=0, cost=None, searches=None):
+def _openai_usage(
+    prompt=100, completion=50, cached=0, cost=None, searches=None,
+    nested_searches=None,
+):
     u = SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
@@ -86,6 +89,13 @@ def _openai_usage(prompt=100, completion=50, cached=0, cost=None, searches=None)
         u.cost = cost
     if searches is not None:
         u.web_search_requests = searches
+    if nested_searches is not None:
+        # The REAL OpenRouter shape (confirmed live 2026-07-06): the search
+        # count lives under usage.server_tool_use_details.web_search_requests,
+        # not a flat usage.web_search_requests field.
+        u.server_tool_use_details = SimpleNamespace(
+            web_search_requests=nested_searches
+        )
     return u
 
 
@@ -446,6 +456,38 @@ class TestGrounded:
                 "parameters": {"engine": "exa", "max_results": 5},
             }
         ]
+
+    def test_openrouter_reads_nested_server_tool_use_details(self):
+        # The REAL response shape (confirmed live 2026-07-06, config#1659):
+        # the search count lives under
+        # usage.server_tool_use_details.web_search_requests, not a flat
+        # usage.web_search_requests field. Before this fix, real grounded
+        # OpenRouter calls always read web_search_requests as 0 regardless
+        # of how much searching actually happened — silently breaking any
+        # consumer's min-searches floor on this transport.
+        fake = FakeOpenAI([
+            _openai_resp(
+                "grounded answer",
+                usage=_openai_usage(nested_searches=5),
+            )
+        ])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.usage.web_search_requests == 5
+
+    def test_openrouter_nested_shape_takes_priority_over_flat(self):
+        # If a provider somehow reports both, the real (nested) shape wins.
+        fake = FakeOpenAI([
+            _openai_resp(
+                "grounded answer",
+                usage=_openai_usage(searches=1, nested_searches=9),
+            )
+        ])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.usage.web_search_requests == 9
 
     def test_force_first_on_openrouter_raises(self):
         client = _client(OPENROUTER_SPEC, FakeOpenAI([]))
