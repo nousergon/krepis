@@ -295,7 +295,22 @@ class LLMClient:
         details = getattr(u, "prompt_tokens_details", None)
         if details is not None:
             usage.cache_read_tokens += int(getattr(details, "cached_tokens", 0) or 0)
-        usage.web_search_requests += int(getattr(u, "web_search_requests", 0) or 0)
+        # OpenRouter nests the server-tool search count under
+        # ``server_tool_use_details`` (mirroring Anthropic's
+        # ``server_tool_use`` shape) rather than a flat ``web_search_requests``
+        # field on ``usage``. Confirmed live 2026-07-06 (config#1659): the
+        # flat read below always silently returned 0 despite real grounding
+        # (55-75 citations per call) — which would have permanently broken
+        # the ``min_web_searches`` production incident-guard floor on this
+        # transport. Prefer the nested shape; fall back to a flat field for
+        # any OpenAI-compatible provider that reports it that way instead.
+        stu = getattr(u, "server_tool_use_details", None)
+        if stu is not None:
+            usage.web_search_requests += int(
+                getattr(stu, "web_search_requests", 0) or 0
+            )
+        else:
+            usage.web_search_requests += int(getattr(u, "web_search_requests", 0) or 0)
         cost = getattr(u, "cost", None)
         if cost is not None:
             usage.provider_cost_usd = (usage.provider_cost_usd or 0.0) + float(cost)
