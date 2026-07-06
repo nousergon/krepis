@@ -191,6 +191,26 @@ class TestComplete:
         with pytest.raises(LLMConfigError, match="OPENROUTER_API_KEY"):
             client.complete(system="s", user_content="u")
 
+    def test_reasoning_forwarded_on_openrouter(self):
+        fake = FakeOpenAI([_openai_resp("hey")])
+        spec = ModelSpec(
+            "openrouter", "moonshotai/kimi-k2.6", max_tokens=1024,
+            reasoning={"exclude": True},
+        )
+        _client(spec, fake).complete(system="s", user_content="u")
+        assert fake.kwargs[0]["extra_body"] == {
+            "usage": {"include": True}, "reasoning": {"exclude": True},
+        }
+
+    def test_reasoning_on_anthropic_raises(self):
+        spec = ModelSpec(
+            "anthropic", "claude-haiku-4-5", max_tokens=1024,
+            reasoning={"effort": "low"},
+        )
+        client = _client(spec, FakeAnthropic([]))
+        with pytest.raises(LLMConfigError, match="reasoning"):
+            client.complete(system="s", user_content="u")
+
 
 # ── structured ────────────────────────────────────────────────────────────
 
@@ -306,6 +326,28 @@ class TestStructuredOpenAI:
         assert result.data == {"anything": 1}
         assert result.parsed is None
 
+    def test_reasoning_forwarded(self):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])
+        spec = ModelSpec(
+            "openrouter", "moonshotai/kimi-k2.6", max_tokens=1024,
+            reasoning={"max_tokens": 500},
+        )
+        _client(spec, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert fake.kwargs[0]["extra_body"]["reasoning"] == {"max_tokens": 500}
+
+    def test_reasoning_on_anthropic_raises(self):
+        spec = ModelSpec(
+            "anthropic", "claude-haiku-4-5", max_tokens=1024,
+            reasoning={"effort": "low"},
+        )
+        client = _client(spec, FakeAnthropic([]))
+        with pytest.raises(LLMConfigError, match="reasoning"):
+            client.structured(
+                system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+            )
+
     def test_exhaustion_raises(self):
         fake = FakeOpenAI([
             _openai_resp("not json at all"),
@@ -416,6 +458,33 @@ class TestGrounded:
     def test_plain_openai_provider_raises(self):
         client = _client(ModelSpec("openai", "gpt-x"), FakeOpenAI([]))
         with pytest.raises(LLMConfigError, match="complete_grounded"):
+            client.complete_grounded(
+                system="s", user_content="u", search=SearchOptions()
+            )
+
+    def test_reasoning_forwarded_on_openrouter(self):
+        # config#1659, 2026-07-06: without this, a reasoning-capable model
+        # can spend its whole budget on chain-of-thought and return an
+        # empty ``text`` even at a generous max_tokens (reproduced live
+        # with Kimi K2.6). Verifies the override actually reaches the
+        # wire.
+        fake = FakeOpenAI([_openai_resp("grounded answer")])
+        spec = ModelSpec(
+            "openrouter", "moonshotai/kimi-k2.6", max_tokens=1024,
+            reasoning={"exclude": True},
+        )
+        _client(spec, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert fake.kwargs[0]["extra_body"]["reasoning"] == {"exclude": True}
+
+    def test_reasoning_on_anthropic_raises(self):
+        spec = ModelSpec(
+            "anthropic", "claude-haiku-4-5", max_tokens=1024,
+            reasoning={"effort": "low"},
+        )
+        client = _client(spec, FakeAnthropic([]))
+        with pytest.raises(LLMConfigError, match="reasoning"):
             client.complete_grounded(
                 system="s", user_content="u", search=SearchOptions()
             )

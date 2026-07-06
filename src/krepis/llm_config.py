@@ -122,6 +122,27 @@ class ModelSpec:
     api_key_env
         Environment variable holding the API key. ``None`` uses the
         registry default for the provider.
+    reasoning
+        OpenRouter's unified reasoning-control object, forwarded verbatim
+        into ``extra_body["reasoning"]`` on the OpenAI transport (e.g.
+        ``{"effort": "low"}``, ``{"exclude": True}``,
+        ``{"max_tokens": 500}``). ``None`` (default) sends no override —
+        the model's own default reasoning behavior applies. Anthropic
+        transport has no equivalent capability; a non-``None`` value
+        there raises :exc:`LLMConfigError` at call time rather than being
+        silently dropped.
+
+        **Why this exists** (config#1659 live verification, 2026-07-06):
+        a reasoning-capable OpenRouter model (Kimi K2.6) given a long
+        system+user prompt spent its ENTIRE output budget on internal
+        chain-of-thought and returned essentially empty ``message.content``
+        — reproduced even at ``max_tokens=16000`` with
+        ``finish_reason="stop"`` (a clean stop, not truncation). Any of
+        the three ``reasoning`` variants above fixed it completely
+        (verified live); ``exclude`` was cheapest (no reasoning tokens
+        billed at all) while producing the longest content. Without this
+        knob a reasoning model can silently produce a well-formed, fully
+        billed, EMPTY response through this adapter.
     """
 
     provider: str
@@ -130,6 +151,7 @@ class ModelSpec:
     base_url: Optional[str] = None
     structured_outputs: bool = True
     api_key_env: Optional[str] = None
+    reasoning: Optional[dict] = None
 
     def _registry_defaults(self) -> Optional[ProviderDefaults]:
         return PROVIDER_REGISTRY.get(self.provider)
@@ -175,6 +197,7 @@ _SPEC_JSON_FIELDS = {
     "base_url",
     "structured_outputs",
     "api_key_env",
+    "reasoning",
 }
 
 

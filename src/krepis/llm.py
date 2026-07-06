@@ -239,6 +239,19 @@ class LLMClient:
         base_url = self.spec.base_url or ""
         return "openrouter.ai" in base_url
 
+    def _reject_reasoning_on_anthropic(self) -> None:
+        """``ModelSpec.reasoning`` has no anthropic-transport equivalent.
+
+        Fail loud rather than silently dropping it — a config-only knob
+        that quietly does nothing on the wrong transport is exactly the
+        failure mode ``feedback_no_silent_fails`` forbids.
+        """
+        if self.spec.transport == TRANSPORT_ANTHROPIC and self.spec.reasoning is not None:
+            raise LLMConfigError(
+                "ModelSpec.reasoning has no anthropic-transport equivalent "
+                "— set it only on an openai/openrouter ModelSpec."
+            )
+
     # ── usage extraction ──────────────────────────────────────────────
 
     @staticmethod
@@ -289,12 +302,24 @@ class LLMClient:
         return usage
 
     def _openai_extra_body(self) -> Optional[dict]:
-        # OpenRouter reports the actually-billed USD cost in usage when the
-        # request opts in — the canonical cost source for :floor routing,
-        # where the routed backend's price varies below our card ceilings.
+        body: dict = {}
         if self._is_openrouter():
-            return {"usage": {"include": True}}
-        return None
+            # OpenRouter reports the actually-billed USD cost in usage when
+            # the request opts in — the canonical cost source for :floor
+            # routing, where the routed backend's price varies below our
+            # card ceilings.
+            body["usage"] = {"include": True}
+        if self.spec.reasoning is not None:
+            # OpenRouter's unified reasoning-control object (e.g.
+            # {"effort": "low"}, {"exclude": True}). Without an explicit
+            # override, a reasoning-capable model can spend its entire
+            # output budget on chain-of-thought and return an empty
+            # message.content even at a generous max_tokens — reproduced
+            # live 2026-07-06 (config#1659) with Kimi K2.6 against a long
+            # production prompt: finish_reason="stop", ~15K reasoning
+            # chars, ~1 char of actual content. See ModelSpec.reasoning.
+            body["reasoning"] = self.spec.reasoning
+        return body or None
 
     # ── plain completion ──────────────────────────────────────────────
 
@@ -316,6 +341,7 @@ class LLMClient:
         discount shows up in ``usage.prompt_tokens_details.cached_tokens``)
         — there is nothing to forward and nothing is lost.
         """
+        self._reject_reasoning_on_anthropic()
         limit = max_tokens if max_tokens is not None else self.spec.max_tokens
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
@@ -407,6 +433,7 @@ class LLMClient:
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
+        self._reject_reasoning_on_anthropic()
 
         is_pydantic = hasattr(schema, "model_json_schema")
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
@@ -654,13 +681,19 @@ class LLMClient:
           ``searches`` is EMPTY (the response does not expose queries) and
           ``usage.web_search_requests`` carries the billed search count.
           ``force_first`` is not supported and raises
-          :exc:`~krepis.llm_config.LLMConfigError`.
+          :exc:`~krepis.llm_config.LLMConfigError`. ``spec.reasoning``, if
+          set, is forwarded into ``extra_body["reasoning"]`` — strongly
+          recommended for reasoning-capable models (see
+          :attr:`~krepis.llm_config.ModelSpec.reasoning`'s docstring for
+          why: an unset default can return an empty ``text`` even at a
+          generous ``max_tokens``).
 
         Any other openai-transport provider raises
         :exc:`~krepis.llm_config.LLMConfigError` — plain OpenAI-compatible
         endpoints have no server-side search; grounding there is the
         caller's job (fetch + inject context).
         """
+        self._reject_reasoning_on_anthropic()
         limit = max_tokens if max_tokens is not None else self.spec.max_tokens
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
@@ -714,6 +747,9 @@ class LLMClient:
         if tool_params:
             web_tool["parameters"] = tool_params
 
+        extra_body: dict = {"usage": {"include": True}, "tools": [web_tool]}
+        if self.spec.reasoning is not None:
+            extra_body["reasoning"] = self.spec.reasoning
         kwargs: dict = {
             "model": self.spec.model,
             "max_tokens": limit,
@@ -721,10 +757,7 @@ class LLMClient:
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
             ],
-            "extra_body": {
-                "usage": {"include": True},
-                "tools": [web_tool],
-            },
+            "extra_body": extra_body,
         }
         resp = self._transport_client().chat.completions.create(**kwargs)
         text = (resp.choices[0].message.content or "").strip()
