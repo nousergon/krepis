@@ -62,6 +62,17 @@ class TestParseJson:
         with pytest.raises(LLMConfigError):
             parse_model_spec("{broken json")
 
+    def test_reasoning_field_parsed(self):
+        spec = parse_model_spec(
+            '{"provider": "openrouter", "model": "moonshotai/kimi-k2.6", '
+            '"reasoning": {"effort": "low"}}'
+        )
+        assert spec.reasoning == {"effort": "low"}
+
+    def test_reasoning_defaults_to_none(self):
+        spec = parse_model_spec('{"provider": "openai", "model": "x"}')
+        assert spec.reasoning is None
+
 
 # ── ModelSpec transport / resolution ──────────────────────────────────────
 
