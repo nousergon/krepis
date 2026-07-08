@@ -67,3 +67,43 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
+
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Verify published sdist is byte-identical to this build
+        # Defense-in-depth: version-bump-check.yml blocks PR merges that
+        # would create a byte-divergent PyPI release, but it can't catch a
+        # direct push to main (bypassing PR review) or an out-of-band manual
+        # upload racing this workflow. `skip-existing: true` above silently
+        # no-ops if PyPI already has this version — verify after the fact
+        # that what's live on PyPI actually matches what we just built,
+        # rather than trusting the no-op was a true no-op.
+        # See alpha-engine-config#1424.
+        run: |
+          set -euo pipefail
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          local_sha=$(sha256sum dist/*.tar.gz | awk '{print $1}')
+
+          pypi_json=""
+          for _ in 1 2 3 4 5 6; do
+            if pypi_json=$(curl -sf "https://pypi.org/pypi/krepis/${version}/json"); then
+              break
+            fi
+            sleep 10
+          done
+          if [ -z "${pypi_json}" ]; then
+            echo "::error::Could not reach PyPI JSON API for krepis ${version} after publish — cannot verify byte-identity."
+            exit 1
+          fi
+
+          published_sha=$(echo "${pypi_json}" | python -c "import sys, json; data = json.load(sys.stdin); sdists = [u for u in data.get('urls', []) if u.get('packagetype') == 'sdist']; print(sdists[0]['digests']['sha256'] if sdists else '')")
+          if [ "${local_sha}" != "${published_sha}" ]; then
+            echo "::error::Published PyPI sdist for krepis ${version} does NOT match this build's bytes (local=${local_sha} pypi=${published_sha}). skip-existing silently kept an OLDER artifact live — main and PyPI have diverged for v${version}. See alpha-engine-config#1424."
+            exit 1
+          fi
+          echo "OK: PyPI v${version} sdist sha256 matches this build (${local_sha})."
