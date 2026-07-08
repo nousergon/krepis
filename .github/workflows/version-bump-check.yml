@@ -148,3 +148,62 @@ jobs:
             exit 1
           fi
           echo "OK: v${PR_VERSION} not yet tagged — auto-tag.yml will create it on merge."
+
+      - name: Require PyPI has no byte-divergent artifact for this version
+        # The tag check above only guards against LOCAL re-tagging. It says
+        # nothing about what's already published: publish.yml runs
+        # `skip-existing: true` unconditionally, so if PR_VERSION was ever
+        # uploaded to PyPI before (a manual release, a deleted-then-reused
+        # git tag, a hand-run workflow_dispatch) with DIFFERENT bytes than
+        # this PR produces, publish.yml will silently no-op on merge and
+        # PyPI stays pinned to the OLD artifact forever while main/the git
+        # tag point at the NEW one — a byte-divergence that version-bump-
+        # check previously had no way to catch (alpha-engine-config#1424:
+        # 0.5.0 on PyPI != 0.5.0 on main). Root-cause fix: compare content,
+        # not just the version string.
+        if: steps.detect.outputs.src_touched == 'true'
+        env:
+          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
+        run: |
+          set -euo pipefail
+          http_code=$(curl -s -o /tmp/pypi-release.json -w '%{http_code}' \
+            "https://pypi.org/pypi/krepis/${PR_VERSION}/json")
+          if [ "${http_code}" = "404" ]; then
+            echo "OK: v${PR_VERSION} not yet published to PyPI — nothing to diverge from."
+            exit 0
+          fi
+          if [ "${http_code}" != "200" ]; then
+            echo "::warning::PyPI JSON API returned HTTP ${http_code} for krepis ${PR_VERSION} — cannot verify byte-identity, failing closed rather than risk a silent divergence."
+            exit 1
+          fi
+
+          echo "PyPI already has a release for ${PR_VERSION} — verifying this PR's sdist is byte-identical before allowing merge."
+          python -m pip install --upgrade pip build >/dev/null
+          rm -rf /tmp/sdist-check && python -m build --sdist --outdir /tmp/sdist-check >/dev/null
+          local_sha=$(sha256sum /tmp/sdist-check/*.tar.gz | awk '{print $1}')
+          published_sha=$(python -c "import json; data = json.load(open('/tmp/pypi-release.json')); sdists = [u for u in data.get('urls', []) if u.get('packagetype') == 'sdist']; print(sdists[0]['digests']['sha256'] if sdists else '')")
+          if [ -z "${published_sha}" ]; then
+            echo "::warning::PyPI has a release for ${PR_VERSION} but no sdist artifact to compare against — cannot verify byte-identity, failing closed."
+            exit 1
+          fi
+          if [ "${local_sha}" != "${published_sha}" ]; then
+            cat >&2 <<EOF
+          ERROR: pyproject.toml::version v${PR_VERSION} is ALREADY published on
+          PyPI with DIFFERENT content than this PR's sdist.
+
+            local sdist sha256:  ${local_sha}
+            PyPI sdist sha256:   ${published_sha}
+
+          publish.yml's \`skip-existing: true\` will silently no-op on merge,
+          leaving PyPI's ${PR_VERSION} pinned to the OLD bytes while main's
+          git tag v${PR_VERSION} points at THIS PR's NEW bytes — the exact
+          byte-divergence class from alpha-engine-config#1424.
+
+          Fix: bump pyproject.toml::version to a version that has never been
+          published to PyPI (check https://pypi.org/pypi/krepis/json for the
+          full release list — local \`git tag --list\` is not sufficient,
+          since it can't see manual/out-of-band PyPI uploads).
+          EOF
+            exit 1
+          fi
+          echo "OK: v${PR_VERSION} already on PyPI but byte-identical to this PR's build — safe to no-op on publish."
