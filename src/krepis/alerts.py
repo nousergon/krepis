@@ -56,14 +56,13 @@ surveillance failure must not mask the primary error.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
 from typing import Final
+
+from krepis import _dedup
 
 logger = logging.getLogger(__name__)
 
@@ -71,13 +70,17 @@ DEFAULT_SNS_TOPIC_NAME: Final[str] = "alpha-engine-alerts"
 DEFAULT_REGION: Final[str] = "us-east-1"
 SEVERITY_PUSH: Final[frozenset[str]] = frozenset({"error", "critical"})
 
-# ── Dedup (v0.24.0) ──────────────────────────────────────────────────────────
+# ── Dedup (v0.24.0; marker mechanism lifted to krepis._dedup in v0.NEXT) ────
 # When the caller passes a ``dedup_key``, ``publish`` writes a marker at
 # ``s3://{dedup_bucket}/{DEDUP_MARKER_PREFIX}/{sha1(dedup_key)[:16]}.json``
 # after the first successful publish. Subsequent calls with the same
 # ``dedup_key`` within ``dedup_window_min`` minutes find the marker and
-# skip the publish. See the :func:`publish` docstring.
-DEFAULT_DEDUP_BUCKET: Final[str] = "alpha-engine-research"
+# skip the publish. See the :func:`publish` docstring. The underlying
+# S3-marker check/write mechanism now lives in :mod:`krepis._dedup`
+# (shared with :mod:`krepis.email_sender` — config#2291); this module keeps
+# its own ``DEDUP_MARKER_PREFIX`` namespace so the two dedup domains never
+# collide.
+DEFAULT_DEDUP_BUCKET: Final[str] = _dedup.DEFAULT_DEDUP_BUCKET
 DEDUP_MARKER_PREFIX: Final[str] = "_alerts/_dedup"
 DEFAULT_DEDUP_WINDOW_MIN: Final[int] = 60
 
@@ -183,15 +186,14 @@ def _publish_telegram(message: str, severity: str) -> ChannelResult:
 
 
 def _dedup_marker_key(dedup_key: str) -> str:
-    """Stable S3 key for a dedup_key marker.
+    """Stable S3 key for a dedup_key marker under this module's namespace.
 
-    Hashes the dedup_key so the on-disk path is opaque + bounded length
-    (S3 keys can be arbitrarily long but operator-facing S3 listings
-    are easier to read with fixed-width entries). The original
-    dedup_key is preserved inside the marker JSON body for debugging.
+    Thin wrapper over :func:`krepis._dedup.marker_key` — kept as a
+    module-level function (rather than inlining the call at each call
+    site) so existing tests / callers that reach into
+    ``alerts._dedup_marker_key`` keep working unchanged.
     """
-    digest = hashlib.sha1(dedup_key.encode("utf-8")).hexdigest()[:16]
-    return f"{DEDUP_MARKER_PREFIX}/{digest}.json"
+    return _dedup.marker_key(dedup_key, marker_prefix=DEDUP_MARKER_PREFIX)
 
 
 def _check_dedup_marker(
@@ -202,65 +204,10 @@ def _check_dedup_marker(
 ) -> tuple[bool, str]:
     """Check whether a recent publish for this dedup_key is still in window.
 
-    Returns ``(within_window, reason)``. ``within_window=True`` means
-    the caller should skip publish; ``False`` means proceed.
-
-    Fail-safe: any S3 error other than NoSuchKey returns
-    ``(False, "<error description>")`` so the caller proceeds to
-    publish. An extra alert is preferable to silently dropping a real
-    failure-surveillance event because the marker bucket was
-    unreachable.
-
-    ``dedup_window_min=None`` means "forever" — any existing marker
-    suppresses subsequent publishes indefinitely.
+    Thin wrapper over :func:`krepis._dedup.check_marker` — see that
+    function's docstring for the fail-safe contract.
     """
-    try:
-        import boto3
-        from botocore.exceptions import ClientError
-    except ImportError as exc:
-        return False, f"boto3 unavailable: {exc!r}"
-    client = boto3.client("s3")
-    try:
-        resp = client.get_object(Bucket=bucket, Key=marker_key)
-        payload = json.loads(resp["Body"].read())
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code == "NoSuchKey":
-            return False, "no marker"
-        logger.warning(
-            "alerts.publish: dedup marker check errored (fail-safe to publish): %s",
-            exc,
-        )
-        return False, f"marker check error: {exc!r}"
-    except Exception as exc:  # boto3 missing, network, JSON parse
-        logger.warning(
-            "alerts.publish: dedup marker parse failed (fail-safe to publish): %s",
-            exc,
-        )
-        return False, f"marker parse error: {exc!r}"
-
-    if dedup_window_min is None:
-        return True, f"marker exists; dedup_window_min=None (forever)"
-
-    last_at_str = payload.get("last_published_at") or payload.get("first_published_at")
-    if not last_at_str:
-        return False, "marker missing timestamp"
-    try:
-        last_at = datetime.fromisoformat(last_at_str.replace("Z", "+00:00"))
-    except ValueError:
-        return False, f"marker timestamp unparseable: {last_at_str!r}"
-
-    now = datetime.now(timezone.utc)
-    elapsed = now - last_at
-    window = timedelta(minutes=dedup_window_min)
-    if elapsed < window:
-        remaining = window - elapsed
-        return True, (
-            f"within {dedup_window_min}min window "
-            f"(last published {int(elapsed.total_seconds())}s ago; "
-            f"{int(remaining.total_seconds())}s remaining)"
-        )
-    return False, f"marker expired ({int(elapsed.total_seconds())}s ago > {dedup_window_min}min)"
+    return _dedup.check_marker(bucket, marker_key, dedup_window_min=dedup_window_min)
 
 
 def _write_dedup_marker(
@@ -272,62 +219,12 @@ def _write_dedup_marker(
 ) -> None:
     """Persist (or refresh) the dedup marker after a successful publish.
 
-    Read-modify-write: increments ``publish_count`` if the marker
-    already exists, otherwise starts a fresh marker. Best-effort — any
-    failure is logged at WARNING and swallowed (worst case: one
-    duplicate alert next time within the window).
+    Thin wrapper over :func:`krepis._dedup.write_marker`.
     """
-    try:
-        import boto3
-        from botocore.exceptions import ClientError
-    except ImportError as exc:
-        logger.warning(
-            "alerts.publish: dedup marker write skipped — boto3 unavailable: %s",
-            exc,
-        )
-        return
-    client = boto3.client("s3")
-    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    # Read-modify-write so first_published_at is preserved across window
-    # refreshes; publish_count grows monotonically.
-    first_published_at = now_iso
-    publish_count = 1
-    try:
-        resp = client.get_object(Bucket=bucket, Key=marker_key)
-        prior = json.loads(resp["Body"].read())
-        first_published_at = prior.get("first_published_at", now_iso)
-        publish_count = int(prior.get("publish_count", 0)) + 1
-    except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
-        if code != "NoSuchKey":
-            # Non-fatal — fall through to write a fresh marker.
-            logger.warning(
-                "alerts.publish: dedup marker RMW read failed (writing fresh): %s",
-                exc,
-            )
-    except Exception:  # JSON parse / corrupt marker — overwrite
-        pass
-
-    payload = {
-        "dedup_key": dedup_key,
-        "first_published_at": first_published_at,
-        "last_published_at": now_iso,
-        "publish_count": publish_count,
-        "message_preview": formatted_message[:200],
-    }
-    try:
-        client.put_object(
-            Bucket=bucket,
-            Key=marker_key,
-            Body=json.dumps(payload).encode("utf-8"),
-            ContentType="application/json",
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "alerts.publish: dedup marker write failed "
-            "(best-effort, swallowed; next call within window may re-publish): %s",
-            exc,
-        )
+    _dedup.write_marker(
+        bucket, marker_key,
+        dedup_key=dedup_key, message_preview=formatted_message,
+    )
 
 
 def publish(
