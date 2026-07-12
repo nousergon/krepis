@@ -45,6 +45,24 @@ must never block trade execution, EOD reconcile, or a Saturday-SF stage.
 ("Consolidate ``email_sender`` into ``krepis``"), PR 1 of the
 ~5-PR sequence (this PR = lib substrate + tests + version bump; PRs 2-N
 migrate each consumer with a lockstep requirements pin bump).
+
+**Dedup** (v0.NEXT, config#2291). ``send_email`` accepts an optional
+``dedup_key`` — when set, an S3 marker at
+``s3://{dedup_bucket}/{EMAIL_DEDUP_MARKER_PREFIX}/{sha1(dedup_key)[:16]}.json``
+gates the send exactly like :func:`krepis.alerts.publish`'s dedup (same
+underlying mechanism, lifted to :mod:`krepis._dedup` so both consolidation
+points share one marker-check/write implementation; separate marker
+namespace so alert dedup and email dedup never collide). Motivating case:
+five fleet digest producers (eod-report / model-zoo / analysis / director /
+backtester) share this chokepoint, and a producer that fires its digest
+call from more than one process/phase for the same logical unit of work
+(e.g. the backtester's Saturday-SF PredictorBacktest + PortfolioOptimizer-
+Backtest + main-backtest states each calling ``send_digest_email`` for the
+same ``trading_day``) previously sent one email per invocation instead of
+one per day (config#2291 — Brian got 3 near-identical digest emails for one
+trading_day). Pass a deterministic ``dedup_key`` (e.g.
+``f"{producer_slug}:{trading_day}"``) to collapse repeat/duplicate-cause
+sends to exactly one.
 """
 
 from __future__ import annotations
@@ -55,6 +73,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Final
 
+from krepis import _dedup
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -63,6 +82,15 @@ GMAIL_SMTP_HOST: Final[str] = "smtp.gmail.com"
 GMAIL_SMTP_PORT: Final[int] = 587
 SMTP_TIMEOUT_SEC: Final[int] = 30
 DEFAULT_AWS_REGION: Final[str] = "us-east-1"
+
+# ── Dedup (v0.NEXT) ──────────────────────────────────────────────────────────
+# Mirrors krepis.alerts' dedup (v0.24.0): an S3 marker gates repeat sends of
+# the same dedup_key within dedup_window_min. Separate marker prefix from
+# alerts' "_alerts/_dedup" so the two dedup domains never collide even
+# though both share the krepis._dedup mechanism + bucket default.
+EMAIL_DEDUP_MARKER_PREFIX: Final[str] = "_email/_dedup"
+DEFAULT_EMAIL_DEDUP_BUCKET: Final[str] = _dedup.DEFAULT_DEDUP_BUCKET
+DEFAULT_EMAIL_DEDUP_WINDOW_MIN: Final[int] = 1440  # 24h — one send per calendar day by default
 
 
 def _resolve_recipients(recipients: list[str] | None) -> list[str]:
@@ -154,6 +182,9 @@ def send_email(
     html: str | None = None,
     sender: str | None = None,
     region: str | None = None,
+    dedup_key: str | None = None,
+    dedup_window_min: int | None = DEFAULT_EMAIL_DEDUP_WINDOW_MIN,
+    dedup_bucket: str | None = None,
 ) -> bool:
     """Send a single email via Gmail SMTP (primary) or AWS SES (fallback).
 
@@ -161,9 +192,30 @@ def send_email(
     / ``AWS_REGION`` via :func:`krepis.secrets.get_secret`
     (``required=False``); explicit arguments override the resolved secrets.
     Gmail SMTP is used when an app password is available, otherwise SES.
-    Returns ``True`` only on a confirmed successful send; ``False`` on
-    missing config, auth failure, network error, or any other outcome
-    (logged). **Never raises** — callers are fire-and-forget.
+    Returns ``True`` only on a confirmed successful send (or on a
+    dedup-skip — see below); ``False`` on missing config, auth failure,
+    network error, or any other outcome (logged). **Never raises** —
+    callers are fire-and-forget.
+
+    **Dedup** (config#2291). When ``dedup_key`` is provided, the call
+    first checks an S3 marker at
+    ``s3://{dedup_bucket}/{EMAIL_DEDUP_MARKER_PREFIX}/{sha1(dedup_key)[:16]}.json``
+    (mirrors :func:`krepis.alerts.publish`'s dedup, same
+    :mod:`krepis._dedup` mechanism, separate marker namespace). If an
+    earlier send for the same key is within ``dedup_window_min`` minutes
+    (default 1440 = 24h; ``None`` = forever), THIS send is suppressed
+    (logged, no SMTP/SES attempt) and the call returns ``True`` — the
+    email is logically already in the recipient's inbox by virtue of the
+    earlier send. After a successful fresh send, the marker is written
+    (or refreshed) with an incremented send count. Use a deterministic key
+    scoped to the logical unit of work, e.g.
+    ``dedup_key=f"backtest-digest:{trading_day}"`` so multiple
+    phase/mode invocations that all try to email the same trading_day's
+    digest collapse to one actual send.
+
+    Dedup is best-effort: any S3 error during the check falls through to
+    sending (better an extra email than a silently dropped one because the
+    marker bucket was unreachable).
 
     :param subject: Email subject line.
     :param body: Plain-text body (always sent as the ``text/plain`` part).
@@ -174,8 +226,31 @@ def send_email(
     :param sender: Explicit From address. Overrides ``EMAIL_SENDER``.
     :param region: Explicit AWS region for the SES fallback. Overrides
         ``AWS_REGION`` (default ``us-east-1``).
-    :returns: ``True`` if the email was sent, ``False`` otherwise.
+    :param dedup_key: Opaque caller-chosen string. Same key + same window
+        ⇒ at most one actual send per window. ``None`` (default) disables
+        dedup entirely; legacy callers behave unchanged.
+    :param dedup_window_min: Window in minutes after which a fresh send is
+        allowed for the same ``dedup_key``. Default ``1440`` (24h). Pass
+        ``None`` for "forever" (send once per ``dedup_key`` for the
+        lifetime of the marker bucket).
+    :param dedup_bucket: S3 bucket holding the dedup markers. Defaults to
+        ``alpha-engine-research``.
+    :returns: ``True`` if the email was sent (or dedup-suppressed),
+        ``False`` otherwise.
     """
+    bucket = dedup_bucket or DEFAULT_EMAIL_DEDUP_BUCKET
+    marker_key: str | None = None
+    if dedup_key:
+        marker_key = _dedup.marker_key(dedup_key, marker_prefix=EMAIL_DEDUP_MARKER_PREFIX)
+        within_window, reason = _dedup.check_marker(
+            bucket, marker_key, dedup_window_min=dedup_window_min,
+        )
+        if within_window:
+            logger.info(
+                "send_email: skipped send for dedup_key=%r (%s)", dedup_key, reason,
+            )
+            return True
+
     sender = sender or get_secret("EMAIL_SENDER", required=False, default="") or ""
     to = _resolve_recipients(recipients)
     if not sender or not to:
@@ -191,16 +266,24 @@ def send_email(
     ).replace(" ", "")
 
     if app_password:
-        return _send_via_gmail(
+        sent = _send_via_gmail(
             sender=sender, recipients=to, subject=subject,
             plain_body=body, html=html, app_password=app_password,
         )
-    region = (
-        region
-        or get_secret("AWS_REGION", required=False, default="")
-        or DEFAULT_AWS_REGION
-    )
-    return _send_via_ses(
-        sender=sender, recipients=to, subject=subject,
-        plain_body=body, html=html, region=region,
-    )
+    else:
+        region = (
+            region
+            or get_secret("AWS_REGION", required=False, default="")
+            or DEFAULT_AWS_REGION
+        )
+        sent = _send_via_ses(
+            sender=sender, recipients=to, subject=subject,
+            plain_body=body, html=html, region=region,
+        )
+
+    if sent and marker_key:
+        _dedup.write_marker(
+            bucket, marker_key, dedup_key=dedup_key, message_preview=subject,
+        )
+
+    return sent
