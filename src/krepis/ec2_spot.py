@@ -164,6 +164,7 @@ def _build_run_instances_kwargs(
     volume_type: str,
     shutdown_behavior: str,
     tag_name: str | None,
+    extra_tags: dict[str, str] | None = None,
 ) -> dict:
     kwargs: dict = {
         "ImageId": image_id,
@@ -190,11 +191,25 @@ def _build_run_instances_kwargs(
                 "InstanceInterruptionBehavior": "terminate",
             },
         }
+    # Merge Name + extra_tags into ONE TagSpecifications entry so every
+    # discriminator tag rides the same RunInstances call atomically (root fix
+    # for alpha-engine-config#2292 / config#2267 site 2: a POST-LAUNCH
+    # create_tags call leaves a seconds-wide window where the box exists
+    # untagged — invisible to a dedupe guard, undiscoverable by the
+    # orphan-reaper's completion-marker key derivation). extra_tags wins on a
+    # key collision with Name (an explicit caller-supplied tag is more
+    # specific than the generic Name convenience param) — last-Key-wins is
+    # also how AWS itself would apply a duplicate-key Tags list.
+    tags = []
     if tag_name:
+        tags.append({"Key": "Name", "Value": tag_name})
+    if extra_tags:
+        tags.extend({"Key": k, "Value": v} for k, v in extra_tags.items())
+    if tags:
         kwargs["TagSpecifications"] = [
             {
                 "ResourceType": "instance",
-                "Tags": [{"Key": "Name", "Value": tag_name}],
+                "Tags": tags,
             }
         ]
     return kwargs
@@ -213,9 +228,20 @@ def launch(
     volume_type: str = "gp3",
     shutdown_behavior: str = "terminate",
     tag_name: str | None = None,
+    extra_tags: dict[str, str] | None = None,
     region: str = "us-east-1",
 ) -> str:
     """Launch a spot, rotating across instance_types × subnets on capacity error.
+
+    Args:
+        extra_tags: additional ``{key: value}`` instance tags merged into the
+            SAME ``TagSpecifications`` entry as the ``Name`` tag, so they ride
+            the RunInstances call atomically — the box is never observably
+            untagged. This is the root fix for the post-launch ``create_tags``
+            race (alpha-engine-config#2292): a caller that previously wrote
+            discriminator tags via a separate, post-launch ``create_tags``
+            call (with its own bounded retry) should pass them here instead
+            and delete that retry path entirely — one mechanism, not two.
 
     Returns:
         Instance ID of the first successful launch.
@@ -253,6 +279,7 @@ def launch(
                 volume_type=volume_type,
                 shutdown_behavior=shutdown_behavior,
                 tag_name=tag_name,
+                extra_tags=extra_tags,
             )
             try:
                 resp = ec2.run_instances(**kwargs)
@@ -490,6 +517,19 @@ def _split_csv(s: str) -> list[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+def _parse_extra_tags(pairs: list[str] | None) -> dict[str, str] | None:
+    """Parse repeated ``--extra-tag KEY=VALUE`` CLI args into a dict."""
+    if not pairs:
+        return None
+    tags: dict[str, str] = {}
+    for pair in pairs:
+        key, sep, value = pair.partition("=")
+        if not sep:
+            raise ValueError(f"--extra-tag must be KEY=VALUE, got: {pair!r}")
+        tags[key] = value
+    return tags
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m krepis.ec2_spot",
@@ -564,6 +604,19 @@ def main(argv: list[str] | None = None) -> int:
         "--name",
         default=None,
         help="Name tag applied to the launched instance.",
+    )
+    launch_p.add_argument(
+        "--extra-tag",
+        dest="extra_tags",
+        action="append",
+        default=None,
+        metavar="KEY=VALUE",
+        help=(
+            "Additional instance tag, KEY=VALUE. Pass multiple times for "
+            ">1 tag: --extra-tag repo=foo --extra-tag sha=abc123. Rides the "
+            "same RunInstances TagSpecifications entry as --name, so it is "
+            "atomic with launch (no post-launch create_tags race)."
+        ),
     )
     launch_p.add_argument(
         "--region",
@@ -678,6 +731,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        extra_tags = _parse_extra_tags(getattr(args, "extra_tags", None))
+    except ValueError as exc:
+        print(f"ec2_spot: bad input: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         instance_id = launch(
             instance_types=_split_csv(args.types),
             subnets=_split_csv(args.subnets),
@@ -690,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
             volume_type=args.volume_type,
             shutdown_behavior=args.shutdown_behavior,
             tag_name=args.name,
+            extra_tags=extra_tags,
             region=args.region,
         )
     except SpotCapacityExhausted as exc:

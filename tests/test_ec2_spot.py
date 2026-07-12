@@ -113,6 +113,57 @@ class TestLaunchHappyPath:
             {"Key": "Name", "Value": "alpha-engine-test-20260522"}
         ]
 
+    def test_extra_tags_merge_into_same_tag_specifications_entry(self, fake_boto3):
+        """Root fix for alpha-engine-config#2292: extra_tags must ride the
+        SAME TagSpecifications entry as Name — one atomic RunInstances call,
+        never a second create_tags round-trip."""
+        fake, ec2 = fake_boto3
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-extra"}]}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ec2_spot.launch(
+                instance_types=["c5.large"],
+                subnets=["subnet-A"],
+                tag_name="alpha-engine-sf-watch-spot",
+                extra_tags={"sf-watch-cadence": "saturday", "sf-watch-run-date": "2026-07-12"},
+                **_BASE_KWARGS,
+            )
+        kwargs = ec2.run_instances.call_args.kwargs
+        tag_specs = kwargs["TagSpecifications"]
+        assert len(tag_specs) == 1
+        assert tag_specs[0]["ResourceType"] == "instance"
+        assert tag_specs[0]["Tags"] == [
+            {"Key": "Name", "Value": "alpha-engine-sf-watch-spot"},
+            {"Key": "sf-watch-cadence", "Value": "saturday"},
+            {"Key": "sf-watch-run-date", "Value": "2026-07-12"},
+        ]
+
+    def test_extra_tags_without_tag_name_still_tag_at_launch(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-notname"}]}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ec2_spot.launch(
+                instance_types=["c5.large"],
+                subnets=["subnet-A"],
+                extra_tags={"ci-watch-repo": "nousergon/krepis"},
+                **_BASE_KWARGS,
+            )
+        kwargs = ec2.run_instances.call_args.kwargs
+        assert kwargs["TagSpecifications"][0]["Tags"] == [
+            {"Key": "ci-watch-repo", "Value": "nousergon/krepis"}
+        ]
+
+    def test_no_tags_at_all_omits_tag_specifications(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-notags"}]}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ec2_spot.launch(
+                instance_types=["c5.large"],
+                subnets=["subnet-A"],
+                **_BASE_KWARGS,
+            )
+        kwargs = ec2.run_instances.call_args.kwargs
+        assert "TagSpecifications" not in kwargs
+
     def test_no_spot_omits_market_options(self, fake_boto3):
         fake, ec2 = fake_boto3
         ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-od"}]}
@@ -404,6 +455,66 @@ class TestCli:
         assert kwargs["TagSpecifications"][0]["Tags"] == [
             {"Key": "Name", "Value": "alpha-engine-backtest-20260522"}
         ]
+
+    def test_extra_tag_flag_repeated_merges_all_tags(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-cli-extra"}]}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main(
+                [
+                    "launch",
+                    "--types",
+                    "c5.large",
+                    "--subnets",
+                    "subnet-A",
+                    "--image-id",
+                    "ami-X",
+                    "--key-name",
+                    "k",
+                    "--security-group",
+                    "sg-1",
+                    "--iam-profile",
+                    "p",
+                    "--name",
+                    "alpha-engine-ci-watch-spot",
+                    "--extra-tag",
+                    "ci-watch-repo=nousergon/krepis",
+                    "--extra-tag",
+                    "ci-watch-sha=abc123",
+                ]
+            )
+        assert rc == 0
+        kwargs = ec2.run_instances.call_args.kwargs
+        assert kwargs["TagSpecifications"][0]["Tags"] == [
+            {"Key": "Name", "Value": "alpha-engine-ci-watch-spot"},
+            {"Key": "ci-watch-repo", "Value": "nousergon/krepis"},
+            {"Key": "ci-watch-sha", "Value": "abc123"},
+        ]
+
+    def test_extra_tag_flag_malformed_returns_2(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main(
+                [
+                    "launch",
+                    "--types",
+                    "c5.large",
+                    "--subnets",
+                    "subnet-A",
+                    "--image-id",
+                    "ami-X",
+                    "--key-name",
+                    "k",
+                    "--security-group",
+                    "sg-1",
+                    "--iam-profile",
+                    "p",
+                    "--extra-tag",
+                    "no-equals-sign",
+                ]
+            )
+        assert rc == 2
+        ec2.run_instances.assert_not_called()
 
     def test_missing_subcommand_errors(self):
         with pytest.raises(SystemExit):
