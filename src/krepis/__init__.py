@@ -10,4 +10,4 @@ SSM-flippable model specs), LLM cost telemetry, and trading-calendar/date
 helpers.
 """
 
-__version__ = "0.11.2"
+__version__ = "0.12.0"
