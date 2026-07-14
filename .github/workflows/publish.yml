@@ -57,6 +57,22 @@ jobs:
       name: pypi
       url: https://pypi.org/project/krepis/
     steps:
+      # checkout MUST run before the artifact download below: actions/checkout
+      # defaults to `clean: true` (`git clean -ffdx`), which deletes any
+      # untracked files already in the workspace — including a dist/ directory
+      # populated by an earlier download-artifact step. Live-reproduced
+      # 2026-07-14 (krepis 0.12.2 release): the publish itself succeeded
+      # (PyPI confirmed byte-identical by hand), but this job's own verify
+      # step always failed with "dist/*.tar.gz: No such file or directory"
+      # because checkout ran AFTER download-artifact and silently wiped it —
+      # a false-negative on every single publish since this guard was added.
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -67,13 +83,6 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           skip-existing: true
-
-      - uses: actions/checkout@v6
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
 
       - name: Verify published sdist is byte-identical to this build
         # Defense-in-depth: version-bump-check.yml blocks PR merges that
