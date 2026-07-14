@@ -60,6 +60,20 @@ logger = logging.getLogger(__name__)
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
+# Special/control-token leakage: some open-weight models (confirmed live
+# 2026-07-14 with moonshotai/kimi-k2.6 via OpenRouter) emit their OWN
+# native function-calling token dialect (e.g. Kimi's
+# ``<|tool_calls_section_begin|>...<|tool_call_begin|>...<|tool_call_end|>``)
+# directly into ``message.content`` instead of a structured ``tool_calls``
+# field — even when the tool is declared as an OpenRouter SERVER-SIDE tool
+# that is supposed to be resolved before the response reaches us. The
+# gateway does not always intercept/execute it, so the raw protocol text
+# leaks through as if it were the final answer. This pattern is
+# model-agnostic on purpose (``<|...|>``) rather than matching Kimi's exact
+# tokens, since any vendor's internal control-token dialect leaking into
+# content is the same failure mode.
+_CONTROL_TOKEN_RE = re.compile(r"<\|[a-zA-Z0-9_]{1,60}\|>")
+
 _JSON_INSTRUCTION = (
     "\n\nRespond with ONLY a single JSON object matching this JSON Schema — "
     "no prose, no markdown fences:\n{schema}"
@@ -712,7 +726,13 @@ class LLMClient:
           recommended for reasoning-capable models (see
           :attr:`~krepis.llm_config.ModelSpec.reasoning`'s docstring for
           why: an unset default can return an empty ``text`` even at a
-          generous ``max_tokens``).
+          generous ``max_tokens``). Raises :exc:`LLMError` if the model
+          returned an unresolved tool call (structured ``tool_calls``,
+          ``finish_reason="tool_calls"``, or its own native tool-call
+          token dialect leaked into ``content``, e.g. Kimi K2's
+          ``<|tool_calls_section_begin|>...``) instead of a final answer —
+          the declared server-side tool was not honored for this model on
+          this transport (live incident 2026-07-14).
 
         Any other openai-transport provider raises
         :exc:`~krepis.llm_config.LLMConfigError` — plain OpenAI-compatible
@@ -786,7 +806,41 @@ class LLMClient:
             "extra_body": extra_body,
         }
         resp = self._transport_client().chat.completions.create(**kwargs)
-        text = (resp.choices[0].message.content or "").strip()
+        choice = resp.choices[0]
+        text = (choice.message.content or "").strip()
+
+        # A declared server-side tool (``openrouter:web_search``) is meant
+        # to be resolved by the gateway before the response reaches us — if
+        # the model instead requested it as a client-side tool call that
+        # never got executed (structured ``tool_calls`` present, or a
+        # ``finish_reason`` of ``"tool_calls"``), OR its own native
+        # tool-call token dialect leaked as literal text into ``content``,
+        # this is NOT a usable grounded answer. Raise loud so the caller's
+        # existing provider-fallback path (built for exactly this class of
+        # failure) engages instead of silently publishing garbage — live
+        # incident 2026-07-14: a 283-char "script" consisting of
+        # ``<|tool_calls_section_begin|>...`` shipped as a live episode.
+        unresolved_tool_call = getattr(choice.message, "tool_calls", None)
+        finish_reason = getattr(choice, "finish_reason", None)
+        if unresolved_tool_call or finish_reason == "tool_calls":
+            raise LLMError(
+                f"provider={self.spec.provider} model={self.spec.model}: "
+                f"grounded call returned an unresolved tool call instead of "
+                f"a final answer (finish_reason={finish_reason!r}) — the "
+                f"server-side web_search tool was not honored for this "
+                f"model on this transport.",
+                usage=self._usage_from_openai(resp),
+            )
+        if _CONTROL_TOKEN_RE.search(text):
+            raise LLMError(
+                f"provider={self.spec.provider} model={self.spec.model}: "
+                f"grounded response leaked raw control-token syntax into "
+                f"content ({_CONTROL_TOKEN_RE.search(text).group()!r}) — "
+                f"almost certainly an unresolved/malformed tool call, not "
+                f"usable text.",
+                usage=self._usage_from_openai(resp),
+            )
+
         return GroundedResult(
             text=text,
             model=getattr(resp, "model", self.spec.model),

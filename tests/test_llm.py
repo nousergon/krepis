@@ -107,12 +107,20 @@ def _openai_usage(
     return u
 
 
-def _openai_resp(content, usage=None, model="moonshotai/kimi-k2.6", annotations=None):
+def _openai_resp(
+    content, usage=None, model="moonshotai/kimi-k2.6", annotations=None,
+    finish_reason=None, tool_calls=None,
+):
     message = SimpleNamespace(content=content)
     if annotations is not None:
         message.annotations = annotations
+    if tool_calls is not None:
+        message.tool_calls = tool_calls
+    choice = SimpleNamespace(message=message)
+    if finish_reason is not None:
+        choice.finish_reason = finish_reason
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=message)],
+        choices=[choice],
         usage=usage or _openai_usage(),
         model=model,
     )
@@ -542,6 +550,61 @@ class TestGrounded:
             system="s", user_content="u", search=SearchOptions()
         )
         assert fake.kwargs[0]["extra_body"]["reasoning"] == {"exclude": True}
+
+    def test_openrouter_leaked_control_tokens_raises(self):
+        # Live incident 2026-07-14: moonshotai/kimi-k2.6 via OpenRouter
+        # emitted its own native tool-call token dialect straight into
+        # ``message.content`` instead of the declared server-side
+        # ``openrouter:web_search`` tool being resolved before the response
+        # reached us. The 283-char result shipped as a live podcast episode
+        # before this guard existed.
+        fake = FakeOpenAI([
+            _openai_resp(
+                "Welcome to Morning Signal. <|tool_calls_section_begin|>"
+                "<|tool_call_begin|>functions.openrouter_web_search:4"
+                "<|tool_call_argument_begin|>{\"query\": \"x\"}"
+                "<|tool_call_end|><|tool_calls_section_end|>"
+            )
+        ])
+        with pytest.raises(LLMError, match="control-token"):
+            _client(OPENROUTER_SPEC, fake).complete_grounded(
+                system="s", user_content="u", search=SearchOptions()
+            )
+
+    def test_openrouter_unresolved_tool_calls_field_raises(self):
+        fake = FakeOpenAI([
+            _openai_resp(
+                None,
+                tool_calls=[SimpleNamespace(id="c1", function=SimpleNamespace(
+                    name="openrouter_web_search", arguments="{}"
+                ))],
+            )
+        ])
+        with pytest.raises(LLMError, match="unresolved tool call"):
+            _client(OPENROUTER_SPEC, fake).complete_grounded(
+                system="s", user_content="u", search=SearchOptions()
+            )
+
+    def test_openrouter_finish_reason_tool_calls_raises(self):
+        fake = FakeOpenAI([
+            _openai_resp("", finish_reason="tool_calls")
+        ])
+        with pytest.raises(LLMError, match="unresolved tool call"):
+            _client(OPENROUTER_SPEC, fake).complete_grounded(
+                system="s", user_content="u", search=SearchOptions()
+            )
+
+    def test_openrouter_clean_text_with_finish_reason_stop_still_works(self):
+        # Regression guard: adding the finish_reason/tool_calls checks must
+        # not break the ordinary happy path once a transport DOES populate
+        # finish_reason="stop".
+        fake = FakeOpenAI([
+            _openai_resp("grounded answer", finish_reason="stop")
+        ])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.text == "grounded answer"
 
     def test_reasoning_on_anthropic_raises(self):
         spec = ModelSpec(
