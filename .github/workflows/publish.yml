@@ -73,6 +73,33 @@ jobs:
         with:
           python-version: "3.11"
 
+      # Read BEFORE the publish step below, so the result reflects
+      # pre-publish PyPI state — used to gate the verify step further down.
+      # Without this gate the verify step always compares a fresh rebuild
+      # of CURRENT main against a historical, version-pinned PyPI artifact
+      # and is GUARANTEED to "diverge" on every push that changes any file
+      # without also bumping pyproject.toml's version (docs, CI, unrelated
+      # refactors) — main's tree keeps moving, the published bytes for an
+      # already-released version never do (PyPI is immutable per version).
+      # That's not a real divergence, just two different points in time —
+      # live-reproduced 2026-07-14 immediately after fixing the OTHER bug
+      # in this file (checkout/download-artifact ordering) let this step
+      # finally run its actual logic for the first time, which then
+      # false-positive-failed on the very next unrelated push (krepis#23's
+      # own merge, no version bump) for exactly this reason.
+      - name: Check whether this version is already on PyPI
+        id: precheck
+        run: |
+          set -euo pipefail
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if curl -sf "https://pypi.org/pypi/krepis/${version}/json" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "krepis ${version} is already on PyPI — this run's publish step will no-op (skip-existing); nothing new to verify."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "krepis ${version} is not yet on PyPI — this run will publish it fresh."
+          fi
+
       - name: Download build artifacts
         uses: actions/download-artifact@v8
         with:
@@ -93,6 +120,12 @@ jobs:
         # that what's live on PyPI actually matches what we just built,
         # rather than trusting the no-op was a true no-op.
         # See alpha-engine-config#1424.
+        #
+        # Only meaningful when THIS run actually published a NEW version
+        # (precheck.outputs.exists == 'false') — see the precheck step's
+        # comment above for why running this unconditionally always
+        # false-positive-fails on any no-version-bump push.
+        if: steps.precheck.outputs.exists != 'true'
         run: |
           set -euo pipefail
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
