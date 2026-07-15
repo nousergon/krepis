@@ -76,6 +76,7 @@ __all__ = [
     "render_rubric",
     "build_structured_tool_spec",
     "parse_batch_tool_result",
+    "ToolResultNotFoundError",
     "encode_custom_id",
     "decode_custom_id",
 ]
@@ -244,6 +245,22 @@ def build_structured_tool_spec(
     }
 
 
+class ToolResultNotFoundError(ValueError):
+    """Raised by :func:`parse_batch_tool_result` when no ``tool_use`` block
+    named ``tool_name`` is found in the message.
+
+    Subclass of :class:`ValueError` so existing ``except ValueError``
+    callers still catch it, but a DISTINCT type from the schema
+    validation failures :func:`parse_batch_tool_result` lets propagate
+    (e.g. ``pydantic.ValidationError``, itself also a ``ValueError``
+    subclass) — a caller that wants to recognize specifically "the tool
+    was never called" (to build a diagnostic message pointing at the
+    provider's retained raw result) needs to tell that apart from "the
+    tool was called but its input failed schema validation", and
+    catching bare ``ValueError`` cannot distinguish the two.
+    """
+
+
 def parse_batch_tool_result(
     message_payload: Any, *, tool_name: str, schema: Optional[Any] = None,
 ) -> Any:
@@ -259,11 +276,15 @@ def parse_batch_tool_result(
     omit it (or pass a raw JSON-schema dict / ``None``) to get the raw
     ``input`` dict back unvalidated, leaving validation to the caller.
 
-    Raises ``ValueError`` if no matching ``tool_use`` block is found —
-    the judge LLM did not emit the structured output via the forced
-    tool, which the caller should treat the same as any other
-    terminal-parse-failure (the batch result is preserved on the
-    provider's side for the caller to re-pull and diagnose).
+    Raises :exc:`ToolResultNotFoundError` if no matching ``tool_use``
+    block is found — the judge LLM did not emit the structured output
+    via the forced tool, which the caller should treat the same as any
+    other terminal-parse-failure (the batch result is preserved on the
+    provider's side for the caller to re-pull and diagnose). Lets
+    ``schema.model_validate``'s own ``pydantic.ValidationError`` (a
+    DIFFERENT failure mode — the tool WAS called, but its input didn't
+    match the schema) propagate unwrapped so callers can distinguish
+    the two.
     """
     content = (
         message_payload["content"]
@@ -285,7 +306,7 @@ def parse_batch_tool_result(
             if schema is not None and hasattr(schema, "model_validate"):
                 return schema.model_validate(tool_input)
             return tool_input
-    raise ValueError(
+    raise ToolResultNotFoundError(
         f"No tool_use block named {tool_name!r} found in batch result "
         f"message; the judge LLM did not emit the structured output via "
         f"the forced tool — inspect the raw batch result on the "

@@ -21,10 +21,11 @@ import json
 import re
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from krepis.judge import (
     JudgeModelSpec,
+    ToolResultNotFoundError,
     build_structured_tool_spec,
     decode_custom_id,
     encode_custom_id,
@@ -194,8 +195,36 @@ def test_parse_batch_tool_result_accepts_sdk_object_shape():
 
 def test_parse_batch_tool_result_raises_when_tool_not_found():
     msg = _batch_message_dict("SomeOtherTool", {"x": 1})
-    with pytest.raises(ValueError, match="No tool_use block named"):
+    with pytest.raises(ToolResultNotFoundError, match="No tool_use block named"):
         parse_batch_tool_result(msg, tool_name="RubricEvalLLMOutput")
+
+
+def test_tool_result_not_found_error_is_value_error():
+    # Existing ``except ValueError`` callers must still catch this.
+    assert issubclass(ToolResultNotFoundError, ValueError)
+
+
+def test_parse_batch_tool_result_propagates_validation_error_distinctly():
+    """The tool WAS called (unlike test_..._raises_when_tool_not_found)
+    but its input fails schema validation — a caller must be able to
+    tell this apart from "tool never called" (e.g. to build a different
+    diagnostic message), which a bare ``except ValueError`` cannot do
+    since pydantic.ValidationError is itself a ValueError subclass."""
+    # score=99 violates the ge=1, le=5 constraint on _DimScore.score.
+    payload = {
+        "dimension_scores": [{"dimension": "clarity", "score": 99, "reasoning": "x"}],
+        "overall_reasoning": "y",
+    }
+    msg = _batch_message_dict("RubricEvalLLMOutput", payload)
+    with pytest.raises(ValidationError):
+        parse_batch_tool_result(msg, tool_name="RubricEvalLLMOutput", schema=_JudgeOutput)
+    # Confirm it is NOT a ToolResultNotFoundError (the two must stay distinct).
+    try:
+        parse_batch_tool_result(msg, tool_name="RubricEvalLLMOutput", schema=_JudgeOutput)
+    except ToolResultNotFoundError:
+        pytest.fail("schema validation failure must not raise ToolResultNotFoundError")
+    except ValidationError:
+        pass
 
 
 # ── encode_custom_id / decode_custom_id ──────────────────────────────────
