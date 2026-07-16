@@ -39,7 +39,11 @@ The function iterates ``(instance_type, subnet)`` combinations in the
 order given, attempting :func:`RunInstances` against each. On
 ``InsufficientInstanceCapacity`` / ``InsufficientHostCapacity`` /
 ``Unsupported`` (instance type not in AZ) → rotate to the next
-combination. On any other error (auth, quota, AMI not found) → raise.
+combination. On ``MaxSpotInstanceCountExceeded`` (the account-wide spot
+request quota, not a per-combination capacity gap) → skip rotation
+entirely and raise :class:`SpotCapacityExhausted` immediately, since
+every remaining combination would fail identically. On any other error
+(auth, AMI not found) → raise :class:`SpotLaunchError`.
 
 Caller controls the rotation order by listing types/subnets. Default
 shape we use in the fleet:
@@ -84,8 +88,9 @@ from typing import Final, Sequence
 
 logger = logging.getLogger(__name__)
 
-# Error codes (RunInstances) that mean "this combination is out of
-# capacity, try another." Anything else is a hard error.
+# Error codes (RunInstances) that mean "this (instance_type, subnet)
+# combination is out of capacity, try another." Anything else is a hard
+# error.
 CAPACITY_ERROR_CODES: Final[frozenset[str]] = frozenset(
     {
         "InsufficientInstanceCapacity",
@@ -94,6 +99,24 @@ CAPACITY_ERROR_CODES: Final[frozenset[str]] = frozenset(
                                 # the AZ's spot price exceeds bid
         "Unsupported",          # instance type not offered in AZ
         "InvalidAvailabilityZone",
+    }
+)
+
+# Error codes that mean "the ACCOUNT is out of spot capacity" — an
+# account/region-wide quota, not a property of any one (instance_type,
+# subnet) combination. Rotating through the remaining combinations cannot
+# help (every combination shares the same account-wide counter, so every
+# remaining attempt would return the identical error) — go straight to
+# SpotCapacityExhausted so the caller's on-demand fallback (a SEPARATE
+# quota) engages immediately instead of after N pointless rotations.
+# config#2687: `MaxSpotInstanceCountExceeded` was previously absent from
+# both sets, so it fell into "any other error" and raised bare
+# SpotLaunchError — which `nousergon_lib.spot_dispatch.launch_with_fallback`
+# only catches `SpotCapacityExhausted` from, so the on-demand fallback
+# never engaged even though on-demand had headroom.
+ACCOUNT_CAPACITY_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "MaxSpotInstanceCountExceeded",
     }
 )
 
@@ -287,6 +310,24 @@ def launch(
                 err = exc.response.get("Error", {})
                 code = err.get("Code", "UnknownError")
                 msg = err.get("Message", str(exc))
+                if code in ACCOUNT_CAPACITY_ERROR_CODES:
+                    logger.warning(
+                        "ec2_spot: %s — account-wide spot quota exhausted, "
+                        "no rotation can help (%s@%s)",
+                        code,
+                        instance_type,
+                        subnet_id,
+                    )
+                    print(
+                        f"ec2_spot: {code} for {instance_type}@{subnet_id} — "
+                        "account-wide spot quota exhausted, skipping remaining "
+                        "combinations",
+                        file=sys.stderr,
+                    )
+                    raise SpotCapacityExhausted(
+                        f"account-wide spot request quota exhausted ({code}): "
+                        f"{msg}"
+                    ) from exc
                 if code in CAPACITY_ERROR_CODES:
                     capacity_attempts.append(f"{instance_type}@{subnet_id}: {code}")
                     logger.warning(

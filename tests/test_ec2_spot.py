@@ -303,6 +303,46 @@ class TestFailureModes:
         )
 
 
+class TestAccountWideCapacityExhaustion:
+    """config#2687: MaxSpotInstanceCountExceeded is an account-wide quota,
+    not a per-(type, subnet) gap — must raise SpotCapacityExhausted (so
+    launch_with_fallback's on-demand fallback engages) WITHOUT wasting
+    rotation attempts, since every remaining combination shares the same
+    account-wide counter and would fail identically."""
+
+    def test_max_spot_instance_count_exceeded_raises_capacity_exhausted(
+        self, fake_boto3
+    ):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.side_effect = [
+            _capacity_error("MaxSpotInstanceCountExceeded")
+        ]
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with pytest.raises(ec2_spot.SpotCapacityExhausted) as exc_info:
+                ec2_spot.launch(
+                    instance_types=["c5.large", "m5.large"],
+                    subnets=["subnet-A", "subnet-B", "subnet-C"],
+                    **_BASE_KWARGS,
+                )
+        assert "MaxSpotInstanceCountExceeded" in str(exc_info.value)
+
+    def test_max_spot_instance_count_exceeded_does_not_rotate(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.side_effect = [
+            _capacity_error("MaxSpotInstanceCountExceeded")
+        ]
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with pytest.raises(ec2_spot.SpotCapacityExhausted):
+                ec2_spot.launch(
+                    instance_types=["c5.large", "m5.large"],
+                    subnets=["subnet-A", "subnet-B", "subnet-C"],
+                    **_BASE_KWARGS,
+                )
+        # ONE attempt — an account-wide quota error can't be rotated away,
+        # so the remaining 5 (type, subnet) combinations are never tried.
+        assert ec2.run_instances.call_count == 1
+
+
 class TestCli:
     def test_launch_subcommand_prints_instance_id_to_stdout(
         self, fake_boto3, capfd
