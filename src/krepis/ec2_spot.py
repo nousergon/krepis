@@ -39,7 +39,12 @@ The function iterates ``(instance_type, subnet)`` combinations in the
 order given, attempting :func:`RunInstances` against each. On
 ``InsufficientInstanceCapacity`` / ``InsufficientHostCapacity`` /
 ``Unsupported`` (instance type not in AZ) → rotate to the next
-combination. On any other error (auth, quota, AMI not found) → raise.
+combination. On an account-wide spot quota error (config#2698 —
+``MaxSpotInstanceCountExceeded`` / ``SpotInstanceRequestLimitExceeded`` /
+``MaxSpotFleetRequestCountExceeded``) → raise :class:`SpotQuotaExceededError`
+immediately, skipping rotation (every remaining combination draws on the
+same account-wide quota and would fail identically). On any other error
+(auth, AMI not found) → raise :class:`SpotLaunchError`.
 
 Caller controls the rotation order by listing types/subnets. Default
 shape we use in the fleet:
@@ -97,7 +102,28 @@ CAPACITY_ERROR_CODES: Final[frozenset[str]] = frozenset(
     }
 )
 
+# Error codes that mean "spot is unavailable ACCOUNT-WIDE" (a quota, not a
+# per-(type, subnet) capacity shortfall). Deliberately kept OUT of
+# CAPACITY_ERROR_CODES (config#2698): capacity semantics are "try the next
+# combination" — rotating never clears a quota error, every remaining
+# attempt in the loop would fail identically. Quota semantics are "spot is
+# closed account-wide, go on-demand" — the caller falls back exactly as it
+# already does for full capacity exhaustion (see
+# krepis.SpotQuotaExceededError / nousergon_lib.spot_dispatch.launch_with_fallback).
+QUOTA_ERROR_CODES: Final[frozenset[str]] = frozenset(
+    {
+        "MaxSpotInstanceCountExceeded",
+        "SpotInstanceRequestLimitExceeded",
+        "MaxSpotFleetRequestCountExceeded",
+    }
+)
+
 CAPACITY_EXIT_CODE: Final[int] = 64
+
+# CLI ``launch`` exit code for a quota error — distinct from CAPACITY_EXIT_CODE
+# (64) so a bash caller can tell "rotate/wait" (capacity) apart from "spot is
+# closed account-wide" (quota) instead of both collapsing into the same code.
+QUOTA_EXIT_CODE: Final[int] = 65
 
 # relaunch-decision CLI: exit 0 = RELAUNCH, this = HOLD (do not relaunch, fail
 # loud). Distinct from 64 (capacity) and 1 (generic) so a bash caller can branch
@@ -149,6 +175,21 @@ class SpotLaunchError(Exception):
 
 class SpotCapacityExhausted(SpotLaunchError):
     """Every (instance_type, subnet) combination returned a capacity error."""
+
+
+class SpotQuotaExceededError(SpotLaunchError):
+    """RunInstances returned an account-wide spot quota error (one of
+    :data:`QUOTA_ERROR_CODES`). Raised immediately on the FIRST quota error —
+    unlike :class:`SpotCapacityExhausted`, rotation is skipped entirely
+    because every remaining (type, subnet) combination draws on the same
+    account-wide quota and would fail identically. A sibling of
+    ``SpotCapacityExhausted`` (both are ``SpotLaunchError``, not each other)
+    so callers can branch on the two distinct semantics: "try on-demand
+    because every combo is out of capacity" vs. "try on-demand because spot
+    itself is closed account-wide" — see ``nousergon_lib.spot_dispatch.
+    launch_with_fallback``, which catches both and falls back to on-demand,
+    paging only on the quota case (quota pressure needs an operator's eyes;
+    ordinary capacity rotation exhaustion does not)."""
 
 
 def _build_run_instances_kwargs(
@@ -287,6 +328,26 @@ def launch(
                 err = exc.response.get("Error", {})
                 code = err.get("Code", "UnknownError")
                 msg = err.get("Message", str(exc))
+                if code in QUOTA_ERROR_CODES:
+                    # Account-wide — every remaining (type, subnet)
+                    # combination would fail identically, so rotation is
+                    # skipped outright (config#2698).
+                    logger.warning(
+                        "ec2_spot: %s (account-wide spot quota) for %s@%s — "
+                        "not rotating, caller should fall back to on-demand",
+                        code,
+                        instance_type,
+                        subnet_id,
+                    )
+                    print(
+                        f"ec2_spot: {code} (spot quota exceeded) for "
+                        f"{instance_type}@{subnet_id} — not rotating",
+                        file=sys.stderr,
+                    )
+                    raise SpotQuotaExceededError(
+                        f"RunInstances failed with account-wide spot quota "
+                        f"error {code} ({instance_type}@{subnet_id}): {msg}"
+                    ) from exc
                 if code in CAPACITY_ERROR_CODES:
                     capacity_attempts.append(f"{instance_type}@{subnet_id}: {code}")
                     logger.warning(
@@ -755,6 +816,9 @@ def main(argv: list[str] | None = None) -> int:
     except SpotCapacityExhausted as exc:
         print(f"ec2_spot: capacity exhausted: {exc}", file=sys.stderr)
         return CAPACITY_EXIT_CODE
+    except SpotQuotaExceededError as exc:
+        print(f"ec2_spot: spot quota exceeded: {exc}", file=sys.stderr)
+        return QUOTA_EXIT_CODE
     except SpotLaunchError as exc:
         print(f"ec2_spot: launch failed: {exc}", file=sys.stderr)
         return 1
