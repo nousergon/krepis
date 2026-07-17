@@ -62,7 +62,7 @@ import sys
 from dataclasses import dataclass, field
 from typing import Final
 
-from krepis import _dedup
+from krepis import _dedup, fleet_events
 
 logger = logging.getLogger(__name__)
 
@@ -354,7 +354,11 @@ def publish(
             result.sns = _publish_sns(arn, formatted, subject=subject)
 
     if telegram:
-        result.telegram = _publish_telegram(formatted, severity=severity)
+        # Suppress send_message's auto-emit hook — this publish call emits
+        # one rich event itself below; without the guard every publish
+        # would land twice on the Overseer intake bus.
+        with fleet_events.suppress_emission():
+            result.telegram = _publish_telegram(formatted, severity=severity)
 
     # ── Dedup marker write (post-publish, only if any channel succeeded) ─
     if marker_key and (result.sns.ok or result.telegram.ok):
@@ -362,6 +366,22 @@ def publish(
             bucket, marker_key,
             dedup_key=dedup_key, formatted_message=formatted,
         )
+
+    # ── Overseer intake event (side-channel; best-effort, never raises) ──
+    # Emitted only when channels were actually attempted: the test-env
+    # guard and dedup-skip paths return earlier, so suppressed repeats and
+    # test runs never reach the bus.
+    fleet_events.emit_alert_event(
+        origin="alerts.publish",
+        body=message,
+        severity_raw=severity,
+        source=source,
+        dedup_key=dedup_key,
+        channels={
+            "sns": result.sns.ok if sns else None,
+            "telegram": result.telegram.ok if telegram else None,
+        },
+    )
 
     return result
 

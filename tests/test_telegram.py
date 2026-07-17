@@ -229,3 +229,30 @@ class TestSendRollup:
         monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
         assert tg.send_rollup(["finding"]) is False
         mock_post.assert_not_called()
+
+
+class TestErrorBodyLogging:
+    """Non-200 bodies must never be logged raw: an HTML/proxy error page can
+    echo the request URL, which embeds the bot token (CodeQL
+    py/clear-text-logging-sensitive-data, krepis-PR32)."""
+
+    def test_telegram_json_description_is_logged(self, configured_env, mock_post, caplog):
+        mock_post.return_value.status_code = 400
+        mock_post.return_value.text = '{"ok":false,"error_code":400,"description":"Bad Request: parse error"}'
+        assert tg.send_message("x") is False
+        assert "Bad Request: parse error" in caplog.text
+
+    def test_non_json_body_is_suppressed(self, configured_env, mock_post, caplog):
+        leaky = "<html>404 https://api.telegram.org/botSECRET-TOKEN/sendMessage</html>"
+        mock_post.return_value.status_code = 404
+        mock_post.return_value.text = leaky
+        assert tg.send_message("x") is False
+        assert "SECRET-TOKEN" not in caplog.text
+        assert "<non-JSON body suppressed>" in caplog.text
+
+    def test_token_in_json_description_is_redacted(self, configured_env, mock_post, caplog):
+        mock_post.return_value.status_code = 502
+        mock_post.return_value.text = '{"description":"upstream error for https://api.telegram.org/bottest-token-abc123/sendMessage"}'
+        assert tg.send_message("x") is False
+        assert "test-token-abc123" not in caplog.text
+        assert "[REDACTED]" in caplog.text

@@ -1,0 +1,61 @@
+name: pip-audit
+
+# Blocking dependency-vulnerability gate on krepis's own declared deps.
+# alpha-engine-config#2530 (fleet pip-audit standardization).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Daily at 14:00 UTC — CVE feeds publish on a rolling cadence; daily
+    # is the smallest cadence that's actually useful (mirrors mnemon's
+    # pip-audit.yml and nousergon-lib's, both config#2530).
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install pip-audit
+        run: pip install pip-audit
+
+      - name: Audit declared dependencies
+        # `pip-audit . --strict` audits only the deps declared in
+        # pyproject.toml's base `dependencies` (not the optional extras,
+        # not the toolchain). Any vulnerability in a runtime dep fails
+        # the workflow; add `--ignore-vuln <ID>` here with a reason
+        # comment if a transitive dep has no fix release available.
+        #
+        # Ignored advisories:
+        #
+        # PYSEC-2026-141, PYSEC-2026-1999, PYSEC-2026-1998,
+        # PYSEC-2026-1994, PYSEC-2026-1996 (urllib3, <=2.6.3 on the
+        # resolved path): krepis's Python floor is 3.9 (the EC2
+        # always-on micro instance — see pyproject.toml
+        # `requires-python`), and botocore pins
+        # `urllib3<1.27,>=1.25.4` for `python_version < "3.10"`. That
+        # cap makes the pinned 1.26.x line the only urllib3 reachable
+        # under boto3 on 3.9; none of these advisories have a fix
+        # released within the 1.x line (fixes land only in 2.5.0+/
+        # 2.7.0). Revisit when botocore lifts the 3.9 urllib3 cap or
+        # krepis raises its Python floor.
+        #
+        # PYSEC-2026-2275 (requests, <2.33.0): local-attacker temp-file
+        # predictability in `requests.utils.extract_zipped_paths()`,
+        # which krepis does not call. Fix version 2.33.0 is not yet
+        # published on PyPI (latest is 2.32.5) — no upgrade is
+        # currently possible. Revisit once 2.33.0 ships.
+        run: pip-audit --strict --ignore-vuln PYSEC-2026-141 --ignore-vuln PYSEC-2026-1999 --ignore-vuln PYSEC-2026-1998 --ignore-vuln PYSEC-2026-1994 --ignore-vuln PYSEC-2026-1996 --ignore-vuln PYSEC-2026-2275 .

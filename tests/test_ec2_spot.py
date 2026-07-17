@@ -279,6 +279,49 @@ class TestFailureModes:
         # ONE attempt — non-capacity error did not retry
         assert ec2.run_instances.call_count == 1
 
+    @pytest.mark.parametrize(
+        "code",
+        [
+            "MaxSpotInstanceCountExceeded",
+            "SpotInstanceRequestLimitExceeded",
+            "MaxSpotFleetRequestCountExceeded",
+        ],
+    )
+    def test_quota_error_raises_spot_quota_exceeded_immediately_no_rotation(
+        self, fake_boto3, code
+    ):
+        """config#2698: a quota error is account-wide — rotating to the next
+        (type, subnet) combination can never clear it, so the FIRST quota
+        error must raise immediately, before trying any remaining combos."""
+        fake, ec2 = fake_boto3
+        ec2.run_instances.side_effect = [_other_error(code)]
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with pytest.raises(ec2_spot.SpotQuotaExceededError) as exc_info:
+                ec2_spot.launch(
+                    instance_types=["c5.large", "m5.large"],
+                    subnets=["subnet-A", "subnet-B", "subnet-C"],
+                    **_BASE_KWARGS,
+                )
+        assert code in str(exc_info.value)
+        # ONE attempt — quota error did not rotate across the remaining
+        # 5 (type, subnet) combinations.
+        assert ec2.run_instances.call_count == 1
+
+    def test_quota_error_is_a_spot_launch_error_not_a_capacity_exhausted(self):
+        """Quota and capacity are deliberately distinct branches (config#2698)
+        — quota must NOT be folded into SpotCapacityExhausted, since the
+        caller-visible semantics differ (rotate-exhausted vs. account-closed)."""
+        assert issubclass(ec2_spot.SpotQuotaExceededError, ec2_spot.SpotLaunchError)
+        assert not issubclass(
+            ec2_spot.SpotQuotaExceededError, ec2_spot.SpotCapacityExhausted
+        )
+        assert not issubclass(
+            ec2_spot.SpotCapacityExhausted, ec2_spot.SpotQuotaExceededError
+        )
+
+    def test_quota_codes_disjoint_from_capacity_codes(self):
+        assert ec2_spot.QUOTA_ERROR_CODES.isdisjoint(ec2_spot.CAPACITY_ERROR_CODES)
+
     def test_empty_types_raises_value_error(self):
         with pytest.raises(ValueError, match="instance_types"):
             ec2_spot.launch(
@@ -354,6 +397,33 @@ class TestCli:
             )
         assert rc == ec2_spot.CAPACITY_EXIT_CODE
         assert rc == 64
+
+    def test_quota_exceeded_returns_65_distinct_from_capacity_64(self, fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.run_instances.side_effect = [_other_error("MaxSpotInstanceCountExceeded")]
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main(
+                [
+                    "launch",
+                    "--types",
+                    "c5.large,m5.large",
+                    "--subnets",
+                    "subnet-A,subnet-B,subnet-C",
+                    "--image-id",
+                    "ami-X",
+                    "--key-name",
+                    "k",
+                    "--security-group",
+                    "sg-1",
+                    "--iam-profile",
+                    "p",
+                ]
+            )
+        assert rc == ec2_spot.QUOTA_EXIT_CODE
+        assert rc == 65
+        assert rc != ec2_spot.CAPACITY_EXIT_CODE
+        # ONE attempt — quota did not rotate across the other 5 combinations.
+        assert ec2.run_instances.call_count == 1
 
     def test_non_capacity_failure_returns_1(self, fake_boto3):
         fake, ec2 = fake_boto3
