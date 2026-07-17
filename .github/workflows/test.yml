@@ -17,7 +17,11 @@ concurrency:
 jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # Self-hosted ephemeral EC2-spot runner (krepis-runner-dispatcher Lambda,
+    # nousergon-data infrastructure/lambdas/krepis-runner-dispatcher) —
+    # multi-version Python tool-cache fix verified live on telos (7 rounds
+    # of real bugs found+fixed, see reference_uv_python_self_hosted_runner_fix_sequence_260717).
+    runs-on: [self-hosted, krepis-spot]
     strategy:
       fail-fast: false
       matrix:
