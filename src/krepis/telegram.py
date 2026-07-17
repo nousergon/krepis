@@ -150,6 +150,9 @@ def send_message(
                 detail = str(json.loads(resp.text).get("description", ""))[:200]
             except Exception:
                 detail = "<non-JSON body suppressed>"
+            # Defense in depth: even a hostile/MITM JSON body that echoes the
+            # request URL cannot leak the token past this replace.
+            detail = detail.replace(token, "[REDACTED]")
             logger.warning(
                 "Telegram API returned %d: %s", resp.status_code, detail
             )

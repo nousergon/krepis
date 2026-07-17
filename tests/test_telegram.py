@@ -249,3 +249,10 @@ class TestErrorBodyLogging:
         assert tg.send_message("x") is False
         assert "SECRET-TOKEN" not in caplog.text
         assert "<non-JSON body suppressed>" in caplog.text
+
+    def test_token_in_json_description_is_redacted(self, configured_env, mock_post, caplog):
+        mock_post.return_value.status_code = 502
+        mock_post.return_value.text = '{"description":"upstream error for https://api.telegram.org/bottest-token-abc123/sendMessage"}'
+        assert tg.send_message("x") is False
+        assert "test-token-abc123" not in caplog.text
+        assert "[REDACTED]" in caplog.text
