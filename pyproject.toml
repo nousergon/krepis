@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.14.0"
+version = "0.15.0"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -63,7 +63,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"krepis" = ["model_pricing.yaml", "py.typed"]
+"krepis" = ["model_pricing.yaml", "fleet_event_schema_v1.json", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

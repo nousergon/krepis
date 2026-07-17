@@ -49,6 +49,7 @@ from typing import Final
 
 import requests
 
+from krepis import fleet_events
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -125,6 +126,7 @@ def send_message(
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
 
+    ok = False
     try:
         resp = requests.post(
             TELEGRAM_API_URL.format(token=token),
@@ -133,16 +135,33 @@ def send_message(
         )
     except requests.RequestException:
         logger.warning("Telegram send failed (request exception)", exc_info=True)
-        return False
+    else:
+        if resp.status_code == 200:
+            ok = True
+        else:
+            logger.warning(
+                "Telegram API returned %d: %s",
+                resp.status_code,
+                resp.text[:200] if resp.text else "",
+            )
 
-    if resp.status_code == 200:
-        return True
-    logger.warning(
-        "Telegram API returned %d: %s",
-        resp.status_code,
-        resp.text[:200] if resp.text else "",
-    )
-    return False
+    # ── Overseer intake event (side-channel; best-effort, never raises) ──
+    # Direct sends (Lambdas, flow-doctor notifiers) get structured intake
+    # coverage here with zero caller changes; alerts.publish suppresses
+    # this hook and emits its own richer event. The not-configured early
+    # return above deliberately does NOT emit — no Telegram config means a
+    # non-production context. Severity is proxied from the silent flag.
+    if not fleet_events.emission_suppressed():
+        fleet_events.emit_alert_event(
+            origin="telegram.send_message",
+            body=text,
+            severity_raw=None,
+            dedup_key=None,
+            channels={"sns": None, "telegram": ok},
+            disable_notification=disable_notification,
+        )
+
+    return ok
 
 
 def send_rollup(
