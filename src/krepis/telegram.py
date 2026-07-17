@@ -44,11 +44,13 @@ sequence.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Final
 
 import requests
 
+from krepis import fleet_events
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -125,6 +127,7 @@ def send_message(
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
 
+    ok = False
     try:
         resp = requests.post(
             TELEGRAM_API_URL.format(token=token),
@@ -133,16 +136,44 @@ def send_message(
         )
     except requests.RequestException:
         logger.warning("Telegram send failed (request exception)", exc_info=True)
-        return False
+    else:
+        if resp.status_code == 200:
+            ok = True
+        else:
+            # Log only the parsed Telegram `description` field, never the raw
+            # body: the request URL embeds the bot token, and a non-Telegram
+            # error page (proxy 502, HTML 404) can echo the full URL — logging
+            # raw resp.text would leak the token in clear text. Telegram's own
+            # JSON error bodies never contain the token, so `description` is
+            # safe and carries the operationally useful part.
+            try:
+                detail = str(json.loads(resp.text).get("description", ""))[:200]
+            except Exception:
+                detail = "<non-JSON body suppressed>"
+            # Defense in depth: even a hostile/MITM JSON body that echoes the
+            # request URL cannot leak the token past this replace.
+            detail = detail.replace(token, "[REDACTED]")
+            logger.warning(
+                "Telegram API returned %d: %s", resp.status_code, detail
+            )
 
-    if resp.status_code == 200:
-        return True
-    logger.warning(
-        "Telegram API returned %d: %s",
-        resp.status_code,
-        resp.text[:200] if resp.text else "",
-    )
-    return False
+    # ── Overseer intake event (side-channel; best-effort, never raises) ──
+    # Direct sends (Lambdas, flow-doctor notifiers) get structured intake
+    # coverage here with zero caller changes; alerts.publish suppresses
+    # this hook and emits its own richer event. The not-configured early
+    # return above deliberately does NOT emit — no Telegram config means a
+    # non-production context. Severity is proxied from the silent flag.
+    if not fleet_events.emission_suppressed():
+        fleet_events.emit_alert_event(
+            origin="telegram.send_message",
+            body=text,
+            severity_raw=None,
+            dedup_key=None,
+            channels={"sns": None, "telegram": ok},
+            disable_notification=disable_notification,
+        )
+
+    return ok
 
 
 def send_rollup(
