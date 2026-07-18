@@ -79,6 +79,8 @@ __all__ = [
     "ToolResultNotFoundError",
     "encode_custom_id",
     "decode_custom_id",
+    "JudgeToolCallLeakError",
+    "check_openai_tool_response_for_leak",
 ]
 
 
@@ -312,6 +314,177 @@ def parse_batch_tool_result(
         f"the forced tool — inspect the raw batch result on the "
         f"provider's side."
     )
+
+
+# ── OpenAI-transport (OpenRouter) structured-output leak guard ──────────
+#
+# ``build_structured_tool_spec`` / ``parse_batch_tool_result`` above are
+# the Anthropic-Batches-API shape. A judge tier running on an
+# OpenAI-compatible transport (OpenRouter, per nousergon/alpha-engine-
+# config#2575 item 2/3) goes through :meth:`krepis.llm.LLMClient.structured`
+# instead, which already retries on schema-validation failure but does
+# NOT check ``finish_reason``/``tool_calls`` before parsing — unlike
+# :meth:`krepis.llm.LLMClient.complete_grounded`, which ships that guard
+# (``krepis#22``, 2026-07-14) for the grounded-search path only.
+#
+# Two DISTINCT live failure modes were confirmed against a real
+# OpenRouter judge call while building this guard (config#2575, 2026-07-18,
+# ``moonshotai/kimi-k2.6`` and generalized here to any OpenAI-transport
+# judge model — the failure family is provider-agnostic, not
+# Kimi-specific):
+#
+# 1. **Reasoning-budget truncation.** A reasoning-capable model spends its
+#    entire ``max_tokens`` budget on internal chain-of-thought before ever
+#    emitting the forced tool call: ``finish_reason="length"``,
+#    ``message.content`` is ``null``/empty, ``message.tool_calls`` is
+#    empty/absent. Passing this ``None``/empty payload into
+#    ``schema.model_validate(...)`` (or a bare ``json.loads``) either
+#    raises an opaque "expected dict, got NoneType" error indistinguishable
+#    from an ordinary schema-validation retry, or — worse — a caller that
+#    doesn't check first may treat the empty string as "nothing to
+#    parse yet" and silently skip. This is the OpenAI-transport analogue of
+#    the ``ModelSpec.reasoning`` empty-response gotcha documented on
+#    :class:`~krepis.llm_config.ModelSpec`.
+# 2. **Native tool-call token-dialect leak.** The model emits its own
+#    control-token dialect (e.g. Kimi's
+#    ``<|tool_calls_section_begin|>...<|tool_call_begin|>...``) as literal
+#    text in ``message.content`` instead of (or alongside) a structured
+#    ``tool_calls`` entry — the same class of leak
+#    :func:`krepis.llm.LLMClient.complete_grounded` already guards against
+#    for the grounded-search path (live incident 2026-07-14).
+#
+# Both are silent-failure risks for a JUDGE specifically because the
+# retry loop that already exists around every judge call
+# (``MAX_JUDGE_RETRIES`` in the consumer repo) treats ANY parse failure
+# identically — it cannot tell "the model produced garbage JSON" (an
+# ordinary stochastic non-conformance, ~20%/call, recoverable by
+# resampling) apart from "the model never produced a parseable payload at
+# all because of a structural transport issue" (not recoverable by
+# resampling alone — needs a reasoning-exclude / budget bump). This guard
+# lets a caller raise a DISTINCT, named exception for the second class so
+# it can be logged/metriced separately from an ordinary retry — closing
+# the "near-miss invisibility" gap noted in alpha-engine-config#2575's
+# own issue thread (2026-07-15/16 comments) for the sibling
+# Anthropic-Batches structural-parse-failure case.
+
+
+class JudgeToolCallLeakError(ValueError):
+    """An OpenAI-transport judge response failed to deliver a usable
+    structured tool call — either truncated before the tool call (a
+    reasoning-budget exhaustion) or the model's own tool-call token
+    dialect leaked into ``content`` instead of a structured call.
+
+    Subclass of :class:`ValueError` so existing broad ``except
+    ValueError`` retry loops keep working unchanged, but a DISTINCT type
+    from ordinary Pydantic ``ValidationError`` (itself a ``ValueError``
+    subclass) — a caller that wants to count/alert on leak/truncation
+    near-misses separately from ordinary stochastic schema
+    non-conformance needs to tell the two apart. See the module-level
+    comment above for the two confirmed failure shapes.
+    """
+
+    def __init__(self, message: str, *, reason: str, finish_reason: Optional[str]):
+        super().__init__(message)
+        self.reason = reason
+        """Machine-stable failure-mode tag: ``"truncated_before_tool_call"``
+        or ``"control_token_leak"`` — the two constants below."""
+        self.finish_reason = finish_reason
+        """The provider's raw ``finish_reason`` for this attempt, when
+        available. Included so a caller's near-miss metric can carry it as
+        a dimension without re-parsing the raw response."""
+
+
+REASON_TRUNCATED_BEFORE_TOOL_CALL = "truncated_before_tool_call"
+REASON_CONTROL_TOKEN_LEAK = "control_token_leak"
+
+_JUDGE_CONTROL_TOKEN_RE = re.compile(r"<\|[a-zA-Z0-9_]{1,60}\|>")
+"""Same pattern as ``krepis.llm._CONTROL_TOKEN_RE`` (kept as a separate
+module-level compile rather than importing the private name across
+modules — both mirror the Anthropic Batches API's
+``^[a-zA-Z0-9_-]{1,64}$`` custom_id charset convention of "generalize the
+class of token, not one vendor's exact spelling")."""
+
+
+def check_openai_tool_response_for_leak(
+    choice: Any, *, tool_name: str,
+) -> None:
+    """Raise :exc:`JudgeToolCallLeakError` if ``choice`` shows either
+    known leak/truncation signature; return ``None`` (no raise) otherwise.
+
+    ``choice`` is one ``response.choices[0]`` from an OpenAI-compatible
+    chat-completions response (SDK object OR its dict equivalent — same
+    duck-typed accept-both convention as :func:`parse_batch_tool_result`).
+
+    Call this BEFORE attempting to parse ``message.tool_calls`` /
+    ``message.content`` as the judge's structured output — it is a
+    pre-parse gate, not a replacement for schema validation. A response
+    that passes this check may still fail ordinary Pydantic validation
+    (garbage-but-well-formed arguments); that is the existing, expected
+    stochastic-non-conformance retry path and is NOT this guard's
+    concern.
+
+    Checks, in order:
+
+    1. **Truncation before the tool call.** ``finish_reason == "length"``
+       AND the message carries no ``tool_calls`` (or an empty list) —
+       the model ran out of budget before emitting the forced call.
+       Raises with ``reason=REASON_TRUNCATED_BEFORE_TOOL_CALL``.
+    2. **Control-token leak.** ``message.content`` (when present) matches
+       the ``<|...|>`` control-token pattern — the model's native
+       tool-call dialect leaked into the text channel instead of (or in
+       addition to) a structured call. Raises with
+       ``reason=REASON_CONTROL_TOKEN_LEAK`` regardless of whether
+       ``tool_calls`` is also present, since a leaking model's
+       accompanying ``tool_calls`` block (if any) is not trustworthy
+       either — live-confirmed pattern (2026-07-14 incident) is the leak
+       co-occurring with a malformed or absent structured call, not a
+       clean structured call plus stray text.
+
+    Does not itself inspect ``tool_calls[*].function.name`` against
+    ``tool_name`` — that's the caller's job once this pre-check passes
+    (mirrors :func:`parse_batch_tool_result`'s tool-name matching for the
+    Anthropic transport).
+    """
+    message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
+    finish_reason = (
+        choice.get("finish_reason") if isinstance(choice, dict)
+        else getattr(choice, "finish_reason", None)
+    )
+    tool_calls = (
+        (message or {}).get("tool_calls") if isinstance(message, dict)
+        else getattr(message, "tool_calls", None)
+    )
+    content = (
+        (message or {}).get("content") if isinstance(message, dict)
+        else getattr(message, "content", None)
+    ) or ""
+
+    if finish_reason == "length" and not tool_calls:
+        raise JudgeToolCallLeakError(
+            f"tool={tool_name!r}: response truncated before emitting the "
+            f"forced tool call (finish_reason='length', no tool_calls) — "
+            f"almost certainly a reasoning-capable model exhausting its "
+            f"token budget on internal chain-of-thought before the tool "
+            f"call. Raise max_tokens and/or set ModelSpec.reasoning="
+            f"{{'exclude': True}} (see krepis.llm_config.ModelSpec.reasoning "
+            f"docstring) rather than treating this as an ordinary parse "
+            f"retry.",
+            reason=REASON_TRUNCATED_BEFORE_TOOL_CALL,
+            finish_reason=finish_reason,
+        )
+
+    leak_match = _JUDGE_CONTROL_TOKEN_RE.search(content)
+    if leak_match:
+        raise JudgeToolCallLeakError(
+            f"tool={tool_name!r}: judge response leaked raw control-token "
+            f"syntax into content ({leak_match.group()!r}) — the model's "
+            f"native tool-call dialect was not resolved into a structured "
+            f"tool_calls entry by the gateway. Never parse `content` as "
+            f"the judge's structured output unconditionally; this is a "
+            f"transport/gateway failure, not a scoring input.",
+            reason=REASON_CONTROL_TOKEN_LEAK,
+            finish_reason=finish_reason,
+        )
 
 
 # ── Batch custom_id codec ─────────────────────────────────────────────────

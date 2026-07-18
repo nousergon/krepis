@@ -24,9 +24,13 @@ import pytest
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from krepis.judge import (
+    REASON_CONTROL_TOKEN_LEAK,
+    REASON_TRUNCATED_BEFORE_TOOL_CALL,
     JudgeModelSpec,
+    JudgeToolCallLeakError,
     ToolResultNotFoundError,
     build_structured_tool_spec,
+    check_openai_tool_response_for_leak,
     decode_custom_id,
     encode_custom_id,
     parse_batch_tool_result,
@@ -225,6 +229,134 @@ def test_parse_batch_tool_result_propagates_validation_error_distinctly():
         pytest.fail("schema validation failure must not raise ToolResultNotFoundError")
     except ValidationError:
         pass
+
+
+# ── check_openai_tool_response_for_leak ──────────────────────────────────
+#
+# Fixture shapes below are trimmed reproductions of REAL OpenRouter
+# responses captured live against ``moonshotai/kimi-k2.6`` and
+# ``deepseek/deepseek-v4-flash`` while building this guard
+# (alpha-engine-config#2575, 2026-07-18) — not hand-invented shapes. The
+# truncation fixture reproduces a live ``finish_reason="length"`` response
+# with ``content=None`` and no ``tool_calls`` (the model spent its entire
+# budget on chain-of-thought reasoning before the forced tool call); the
+# control-token-leak shape mirrors the documented 2026-07-14 incident
+# already guarded in ``krepis.llm.complete_grounded``.
+
+
+def _openai_choice_dict(*, finish_reason, content=None, tool_calls=None):
+    return {
+        "finish_reason": finish_reason,
+        "message": {"role": "assistant", "content": content, "tool_calls": tool_calls},
+    }
+
+
+class _FakeMessage:
+    def __init__(self, *, content=None, tool_calls=None):
+        self.content = content
+        self.tool_calls = tool_calls
+
+
+class _FakeChoice:
+    def __init__(self, *, finish_reason, content=None, tool_calls=None):
+        self.finish_reason = finish_reason
+        self.message = _FakeMessage(content=content, tool_calls=tool_calls)
+
+
+def test_check_leak_passes_clean_tool_call():
+    # Live-shape: deepseek/deepseek-v4-flash clean structured tool call
+    # (finish_reason="tool_calls", content=None, one well-formed tool_calls
+    # entry) — captured live 2026-07-18. Must NOT raise.
+    choice = _openai_choice_dict(
+        finish_reason="tool_calls",
+        content=None,
+        tool_calls=[{"id": "x", "type": "function",
+                      "function": {"name": "RubricEvalLLMOutput", "arguments": "{}"}}],
+    )
+    check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+
+
+def test_check_leak_passes_when_no_signature_present():
+    choice = _openai_choice_dict(finish_reason="stop", content="ignored prose")
+    check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+
+
+def test_check_leak_raises_on_truncation_before_tool_call_dict_shape():
+    # Live-shape: moonshotai/kimi-k2.6 with max_tokens=200, no reasoning
+    # exclusion — finish_reason="length", content=None, no tool_calls.
+    # Captured live 2026-07-18 (config#2575 item 3 validation).
+    choice = _openai_choice_dict(finish_reason="length", content=None, tool_calls=None)
+    with pytest.raises(JudgeToolCallLeakError) as exc_info:
+        check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+    assert exc_info.value.reason == REASON_TRUNCATED_BEFORE_TOOL_CALL
+    assert exc_info.value.finish_reason == "length"
+
+
+def test_check_leak_raises_on_truncation_sdk_object_shape():
+    """Same as the dict-shape test but against an SDK-object-like input
+    (attribute access, not dict subscription) — the OpenAI SDK's real
+    response type, which callers pass directly without dict-ifying."""
+    choice = _FakeChoice(finish_reason="length", content=None, tool_calls=None)
+    with pytest.raises(JudgeToolCallLeakError) as exc_info:
+        check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+    assert exc_info.value.reason == REASON_TRUNCATED_BEFORE_TOOL_CALL
+
+
+def test_check_leak_passes_truncation_with_empty_list_tool_calls():
+    # Empty list (not None) must be treated the same as absent.
+    choice = _openai_choice_dict(finish_reason="length", content=None, tool_calls=[])
+    with pytest.raises(JudgeToolCallLeakError):
+        check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+
+
+def test_check_leak_does_not_flag_truncation_when_tool_calls_present():
+    # finish_reason="length" but the tool call itself DID come through —
+    # not the truncation-before-tool-call failure mode this guards.
+    choice = _openai_choice_dict(
+        finish_reason="length", content=None,
+        tool_calls=[{"id": "x", "type": "function",
+                      "function": {"name": "RubricEvalLLMOutput", "arguments": "{}"}}],
+    )
+    check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+
+
+def test_check_leak_raises_on_control_token_leak_in_content():
+    # Mirrors the krepis.llm.complete_grounded live incident (2026-07-14):
+    # native tool-call dialect leaked into content as prose.
+    choice = _openai_choice_dict(
+        finish_reason="stop",
+        content="<|tool_calls_section_begin|>some leaked garbage<|tool_call_end|>",
+    )
+    with pytest.raises(JudgeToolCallLeakError) as exc_info:
+        check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+    assert exc_info.value.reason == REASON_CONTROL_TOKEN_LEAK
+
+
+def test_check_leak_raises_on_control_token_leak_even_with_tool_calls_present():
+    # Live-confirmed co-occurrence pattern: a leak alongside a tool_calls
+    # block is still untrustworthy, not just stray extra text.
+    choice = _openai_choice_dict(
+        finish_reason="stop",
+        content="<|tool_call_begin|>junk",
+        tool_calls=[{"id": "x", "type": "function",
+                      "function": {"name": "RubricEvalLLMOutput", "arguments": "{}"}}],
+    )
+    with pytest.raises(JudgeToolCallLeakError) as exc_info:
+        check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
+    assert exc_info.value.reason == REASON_CONTROL_TOKEN_LEAK
+
+
+def test_judge_tool_call_leak_error_is_value_error():
+    # Existing broad ``except ValueError`` retry loops must still catch it.
+    assert issubclass(JudgeToolCallLeakError, ValueError)
+
+
+def test_check_leak_handles_missing_message_gracefully():
+    # Defensive: a malformed choice with no message at all must not crash
+    # the guard itself with an AttributeError — treated as no-leak-signature
+    # (ordinary downstream parsing will fail loudly on the missing message).
+    choice = {"finish_reason": "stop"}
+    check_openai_tool_response_for_leak(choice, tool_name="RubricEvalLLMOutput")
 
 
 # ── encode_custom_id / decode_custom_id ──────────────────────────────────
