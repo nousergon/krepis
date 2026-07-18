@@ -261,7 +261,11 @@ def run(
         description: short label for SSM history + dispatcher logs.
         script: bash script body. Will be base64-wrapped + executed as
             a single AWS-RunShellScript command.
-        timeout_seconds: SSM command timeout (handed to SendCommand).
+        timeout_seconds: total command budget in seconds. Applied to BOTH
+            SendCommand's TimeoutSeconds (delivery) and the
+            AWS-RunShellScript ``executionTimeout`` document parameter
+            (runtime) — the latter otherwise defaults to 3600s and
+            silently caps any longer workload.
         output_bucket: S3 bucket for SSM to write the full stdout/stderr
             (past the 24KB inline cap). Optional; if unset, only inline
             output is available.
@@ -318,8 +322,18 @@ def run(
         "InstanceIds": [instance_id],
         "DocumentName": "AWS-RunShellScript",
         "Comment": description[:100],  # SSM Comment cap is 100 chars
+        # TimeoutSeconds is SSM's DELIVERY timeout (how long the service may
+        # take to hand the command to the agent). The RUNTIME cap is the
+        # document's executionTimeout parameter below — without it,
+        # AWS-RunShellScript applies its own default of 3600s and kills any
+        # longer workload regardless of timeout_seconds (2026-07-18: the
+        # weekly RAGIngestion sweep died at exactly 1h twice while the caller
+        # passed --timeout 14400).
         "TimeoutSeconds": int(timeout_seconds),
-        "Parameters": {"commands": [payload]},
+        "Parameters": {
+            "commands": [payload],
+            "executionTimeout": [str(int(timeout_seconds))],
+        },
     }
     if output_bucket:
         send_kwargs["OutputS3BucketName"] = output_bucket
@@ -526,7 +540,7 @@ def main(argv: list[str] | None = None) -> int:
         "--timeout",
         type=int,
         default=3600,
-        help="SSM command timeout in seconds (default: 3600).",
+        help="Total command budget in seconds — sets delivery TimeoutSeconds AND the runtime executionTimeout document parameter (default: 3600).",
     )
     run_p.add_argument(
         "--output-bucket",

@@ -493,6 +493,12 @@ class TestSendCommandShape:
         assert kw["InstanceIds"] == ["i-123"]
         assert kw["DocumentName"] == "AWS-RunShellScript"
         assert kw["TimeoutSeconds"] == 900
+        # Runtime cap: the AWS-RunShellScript document parameter, NOT
+        # TimeoutSeconds (delivery-only). Without it SSM applies its 3600s
+        # default and kills longer workloads — the 2026-07-18 weekly
+        # RAGIngestion incident (caller passed --timeout 14400, workload
+        # SIGKILLed at exactly 1h).
+        assert kw["Parameters"]["executionTimeout"] == ["900"]
         assert kw["OutputS3BucketName"] == "bkt"
         assert kw["OutputS3KeyPrefix"] == "pfx"
         # Payload is base64-wrapped (the inner command body)
