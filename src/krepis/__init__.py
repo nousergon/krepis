@@ -12,4 +12,4 @@ rendering, structured-output tool spec, batch custom_id codec, and the
 judge-model pin/re-anchor registry).
 """
 
-__version__ = "0.16.1"
+__version__ = "0.16.2"
