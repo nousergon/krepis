@@ -385,6 +385,42 @@ class TestStructuredOpenAI:
                 schema_name="emit_spec",
             )
 
+    def test_non_json_transport_response_retries_then_succeeds(self):
+        # Live incident 2026-07-20 (krepis#38): same transport-level
+        # non-JSON-body failure as complete_grounded's guard — this call
+        # site shares the identical unguarded ``.create()`` pattern.
+        import json as _json
+
+        calls = {"n": 0}
+
+        def _create(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _json.JSONDecodeError("Expecting value", "not json", 0)
+            return _openai_resp('{"name": "a", "score": 5}')
+
+        fake = FakeOpenAI([])
+        fake.chat.completions.create = _create
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.parsed == Spec(name="a", score=5)
+        assert calls["n"] == 2
+
+    def test_non_json_transport_response_raises_llmerror_after_exhaustion(self):
+        import json as _json
+
+        def _create(**kwargs):
+            raise _json.JSONDecodeError("Expecting value", "not json", 0)
+
+        fake = FakeOpenAI([])
+        fake.chat.completions.create = _create
+        with pytest.raises(LLMError, match="non-JSON response body"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+
 
 # ── complete_grounded ─────────────────────────────────────────────────────
 
@@ -551,45 +587,118 @@ class TestGrounded:
         )
         assert fake.kwargs[0]["extra_body"]["reasoning"] == {"exclude": True}
 
-    def test_openrouter_leaked_control_tokens_raises(self):
+    _LEAKED_RESP = _openai_resp(
+        "Welcome to Morning Signal. <|tool_calls_section_begin|>"
+        "<|tool_call_begin|>functions.openrouter_web_search:4"
+        "<|tool_call_argument_begin|>{\"query\": \"x\"}"
+        "<|tool_call_end|><|tool_calls_section_end|>"
+    )
+
+    def test_openrouter_leaked_control_tokens_raises_after_exhausting_retries(self):
         # Live incident 2026-07-14: moonshotai/kimi-k2.6 via OpenRouter
         # emitted its own native tool-call token dialect straight into
         # ``message.content`` instead of the declared server-side
         # ``openrouter:web_search`` tool being resolved before the response
         # reached us. The 283-char result shipped as a live podcast episode
-        # before this guard existed.
-        fake = FakeOpenAI([
-            _openai_resp(
-                "Welcome to Morning Signal. <|tool_calls_section_begin|>"
-                "<|tool_call_begin|>functions.openrouter_web_search:4"
-                "<|tool_call_argument_begin|>{\"query\": \"x\"}"
-                "<|tool_call_end|><|tool_calls_section_end|>"
-            )
-        ])
+        # before this guard existed. Queues the leaked response for BOTH
+        # attempts of the default ``attempts=2`` retry budget (see
+        # test_openrouter_leak_recovers_on_retry for the same-provider
+        # retry succeeding — the empirically-confirmed common case).
+        fake = FakeOpenAI([self._LEAKED_RESP, self._LEAKED_RESP])
         with pytest.raises(LLMError, match="control-token"):
             _client(OPENROUTER_SPEC, fake).complete_grounded(
                 system="s", user_content="u", search=SearchOptions()
             )
+        assert len(fake.kwargs) == 2
 
-    def test_openrouter_unresolved_tool_calls_field_raises(self):
-        fake = FakeOpenAI([
-            _openai_resp(
-                None,
-                tool_calls=[SimpleNamespace(id="c1", function=SimpleNamespace(
-                    name="openrouter_web_search", arguments="{}"
-                ))],
-            )
-        ])
+    def test_openrouter_unresolved_tool_calls_field_raises_after_exhausting_retries(self):
+        bad = _openai_resp(
+            None,
+            tool_calls=[SimpleNamespace(id="c1", function=SimpleNamespace(
+                name="openrouter_web_search", arguments="{}"
+            ))],
+        )
+        fake = FakeOpenAI([bad, bad])
         with pytest.raises(LLMError, match="unresolved tool call"):
             _client(OPENROUTER_SPEC, fake).complete_grounded(
                 system="s", user_content="u", search=SearchOptions()
             )
+        assert len(fake.kwargs) == 2
 
-    def test_openrouter_finish_reason_tool_calls_raises(self):
-        fake = FakeOpenAI([
-            _openai_resp("", finish_reason="tool_calls")
-        ])
+    def test_openrouter_finish_reason_tool_calls_raises_after_exhausting_retries(self):
+        bad = _openai_resp("", finish_reason="tool_calls")
+        fake = FakeOpenAI([bad, bad])
         with pytest.raises(LLMError, match="unresolved tool call"):
+            _client(OPENROUTER_SPEC, fake).complete_grounded(
+                system="s", user_content="u", search=SearchOptions()
+            )
+        assert len(fake.kwargs) == 2
+
+    def test_openrouter_leak_recovers_on_retry(self):
+        # Live incidents 2026-07-14/-16/-20 each confirmed a bare retry of
+        # the SAME call (same provider/model) resolves the leak — this is
+        # the empirically-common case the bounded retry exists for, so a
+        # single transient leak must NOT escalate to the caller's
+        # cross-provider fallback.
+        fake = FakeOpenAI([self._LEAKED_RESP, _openai_resp("grounded answer")])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.text == "grounded answer"
+        assert len(fake.kwargs) == 2
+
+    def test_attempts_below_one_raises(self):
+        client = _client(OPENROUTER_SPEC, FakeOpenAI([]))
+        with pytest.raises(ValueError, match="attempts must be >= 1"):
+            client.complete_grounded(
+                system="s", user_content="u", search=SearchOptions(),
+                attempts=0,
+            )
+
+    def test_openrouter_leak_retry_budget_configurable(self):
+        # attempts is a caller-tunable knob, not hardcoded.
+        fake = FakeOpenAI([self._LEAKED_RESP, self._LEAKED_RESP, self._LEAKED_RESP])
+        with pytest.raises(LLMError, match="control-token"):
+            _client(OPENROUTER_SPEC, fake).complete_grounded(
+                system="s", user_content="u", search=SearchOptions(),
+                attempts=3,
+            )
+        assert len(fake.kwargs) == 3
+
+    def test_openrouter_non_json_transport_response_retries_then_succeeds(self):
+        # Live incident 2026-07-20 (krepis#38): OpenRouter returned a
+        # malformed/non-JSON body on what the SDK treated as a successful
+        # transaction. Invisible to the SDK's own max_retries (parsing
+        # only fails after the response is already considered final) —
+        # this must be retried as an ordinary attempt failure, not crash
+        # the caller with a raw JSONDecodeError.
+        import json as _json
+
+        calls = {"n": 0}
+
+        def _create(**kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _json.JSONDecodeError("Expecting value", "not json", 0)
+            return _openai_resp("grounded answer")
+
+        fake = FakeOpenAI([])
+        fake.chat.completions.create = _create
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions()
+        )
+        assert result.text == "grounded answer"
+        assert calls["n"] == 2
+
+    def test_openrouter_non_json_transport_response_raises_llmerror_after_exhaustion(self):
+        import json as _json
+
+        def _create(**kwargs):
+            raise _json.JSONDecodeError("Expecting value", "not json", 0)
+
+        fake = FakeOpenAI([])
+        fake.chat.completions.create = _create
+        with pytest.raises(LLMError, match="non-JSON response body"):
             _client(OPENROUTER_SPEC, fake).complete_grounded(
                 system="s", user_content="u", search=SearchOptions()
             )

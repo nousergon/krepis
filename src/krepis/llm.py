@@ -636,12 +636,38 @@ class LLMClient:
             kwargs["extra_body"] = extra_body
 
         usage = LLMUsage()
-        last_error: Optional[Exception] = None
+        last_error: Any = None  # Exception (validation) or str (transport decode)
         raw_text = ""
         client = self._transport_client()
 
         for attempt in range(attempts):
-            resp = client.chat.completions.create(messages=messages, **kwargs)
+            try:
+                resp = client.chat.completions.create(messages=messages, **kwargs)
+            except json.JSONDecodeError as exc:
+                # The transport returned a non-JSON body on what the SDK
+                # treated as a successful transaction (e.g. an OpenRouter
+                # gateway hiccup) — this is invisible to the SDK's own
+                # ``max_retries`` (status/connection-based) since parsing
+                # only fails after the response is already considered
+                # final. Treat it as an ordinary bounded-retry attempt
+                # failure rather than letting it crash the caller with a
+                # raw, context-free JSONDecodeError (live incident
+                # 2026-07-20 — krepis#38).
+                last_error = (
+                    f"transport returned a non-JSON response body "
+                    f"({exc.__class__.__name__}: {exc})"
+                )
+                logger.warning(
+                    "llm structured provider=%s model=%s attempt=%d/%d: "
+                    "transport returned a non-JSON response body (%s: %s)",
+                    self.spec.provider,
+                    self.spec.model,
+                    attempt + 1,
+                    attempts,
+                    exc.__class__.__name__,
+                    exc,
+                )
+                continue
             self._usage_from_openai(resp, into=usage)
             raw_text = (resp.choices[0].message.content or "").strip()
             try:
@@ -706,6 +732,7 @@ class LLMClient:
         search: SearchOptions,
         max_tokens: Optional[int] = None,
         cache_system: bool = True,
+        attempts: int = 2,
     ) -> GroundedResult:
         """One web-search-grounded generation.
 
@@ -726,19 +753,43 @@ class LLMClient:
           recommended for reasoning-capable models (see
           :attr:`~krepis.llm_config.ModelSpec.reasoning`'s docstring for
           why: an unset default can return an empty ``text`` even at a
-          generous ``max_tokens``). Raises :exc:`LLMError` if the model
-          returned an unresolved tool call (structured ``tool_calls``,
-          ``finish_reason="tool_calls"``, or its own native tool-call
-          token dialect leaked into ``content``, e.g. Kimi K2's
-          ``<|tool_calls_section_begin|>...``) instead of a final answer —
-          the declared server-side tool was not honored for this model on
-          this transport (live incident 2026-07-14).
+          generous ``max_tokens``).
+
+          On this transport, each of the two known-transient OpenRouter
+          failure classes below is retried up to ``attempts`` times
+          (same provider/model, no caller involvement) before raising —
+          live incidents on 2026-07-14, -16, and -20 each confirmed a
+          bare retry of the SAME call succeeds immediately (the failure
+          is stochastic sampling/gateway noise, not a persistent
+          condition), so escalating straight to a caller's cross-provider
+          fallback on the first occurrence wastes that fallback tier on
+          what a retry would have resolved for free:
+
+          1. **Unresolved tool call.** The model returned structured
+             ``tool_calls``, ``finish_reason="tool_calls"``, or its own
+             native tool-call token dialect leaked into ``content`` (e.g.
+             Kimi K2's ``<|tool_calls_section_begin|>...``) instead of a
+             final answer — the declared server-side tool was not
+             honored for this model on this transport.
+          2. **Non-JSON transport response.** The gateway returned a
+             malformed/non-JSON body on what the SDK treated as a
+             successful transaction — invisible to the SDK's own
+             ``max_retries`` (status/connection-based) since parsing
+             only fails after the response is already considered final.
+
+          Raises :exc:`LLMError` — carrying the accumulated usage across
+          all attempts — only once ``attempts`` is exhausted; per the
+          class's own contract (see :class:`LLMError`), this signals a
+          PERSISTENT failure and is the caller's cue to escalate to its
+          own cross-provider fallback, not a first-occurrence signal.
 
         Any other openai-transport provider raises
         :exc:`~krepis.llm_config.LLMConfigError` — plain OpenAI-compatible
         endpoints have no server-side search; grounding there is the
         caller's job (fetch + inject context).
         """
+        if attempts < 1:
+            raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
         limit = max_tokens if max_tokens is not None else self.spec.max_tokens
 
@@ -805,51 +856,105 @@ class LLMClient:
             ],
             "extra_body": extra_body,
         }
-        resp = self._transport_client().chat.completions.create(**kwargs)
-        choice = resp.choices[0]
-        text = (choice.message.content or "").strip()
+        usage = LLMUsage()
+        last_error: Optional[str] = None
+        for attempt in range(attempts):
+            try:
+                resp = self._transport_client().chat.completions.create(**kwargs)
+            except json.JSONDecodeError as exc:
+                # The transport returned a non-JSON body on what the SDK
+                # treated as a successful transaction (e.g. an OpenRouter
+                # gateway hiccup) — invisible to the SDK's own
+                # ``max_retries`` since parsing only fails after the
+                # response is already considered final. Live incident
+                # 2026-07-20 (krepis#38): this crashed the caller with a
+                # raw, context-free JSONDecodeError instead of engaging
+                # the caller's cross-provider fallback, because it isn't
+                # a ``RuntimeError``/``LLMError`` subclass.
+                last_error = (
+                    f"transport returned a non-JSON response body "
+                    f"({exc.__class__.__name__}: {exc})"
+                )
+                logger.warning(
+                    "llm complete_grounded provider=%s model=%s "
+                    "attempt=%d/%d: %s",
+                    self.spec.provider,
+                    self.spec.model,
+                    attempt + 1,
+                    attempts,
+                    last_error,
+                )
+                continue
 
-        # A declared server-side tool (``openrouter:web_search``) is meant
-        # to be resolved by the gateway before the response reaches us — if
-        # the model instead requested it as a client-side tool call that
-        # never got executed (structured ``tool_calls`` present, or a
-        # ``finish_reason`` of ``"tool_calls"``), OR its own native
-        # tool-call token dialect leaked as literal text into ``content``,
-        # this is NOT a usable grounded answer. Raise loud so the caller's
-        # existing provider-fallback path (built for exactly this class of
-        # failure) engages instead of silently publishing garbage — live
-        # incident 2026-07-14: a 283-char "script" consisting of
-        # ``<|tool_calls_section_begin|>...`` shipped as a live episode.
-        unresolved_tool_call = getattr(choice.message, "tool_calls", None)
-        finish_reason = getattr(choice, "finish_reason", None)
-        if unresolved_tool_call or finish_reason == "tool_calls":
-            raise LLMError(
-                f"provider={self.spec.provider} model={self.spec.model}: "
-                f"grounded call returned an unresolved tool call instead of "
-                f"a final answer (finish_reason={finish_reason!r}) — the "
-                f"server-side web_search tool was not honored for this "
-                f"model on this transport.",
-                usage=self._usage_from_openai(resp),
-            )
-        if _CONTROL_TOKEN_RE.search(text):
-            raise LLMError(
-                f"provider={self.spec.provider} model={self.spec.model}: "
-                f"grounded response leaked raw control-token syntax into "
-                f"content ({_CONTROL_TOKEN_RE.search(text).group()!r}) — "
-                f"almost certainly an unresolved/malformed tool call, not "
-                f"usable text.",
-                usage=self._usage_from_openai(resp),
+            self._usage_from_openai(resp, into=usage)
+            choice = resp.choices[0]
+            text = (choice.message.content or "").strip()
+
+            # A declared server-side tool (``openrouter:web_search``) is
+            # meant to be resolved by the gateway before the response
+            # reaches us — if the model instead requested it as a
+            # client-side tool call that never got executed (structured
+            # ``tool_calls`` present, or a ``finish_reason`` of
+            # ``"tool_calls"``), OR its own native tool-call token dialect
+            # leaked as literal text into ``content``, this is NOT a
+            # usable grounded answer. Retry the same call (live incidents
+            # 2026-07-14/-16/-20 each confirmed this resolves on a bare
+            # retry — stochastic sampling noise, not a persistent
+            # condition) before raising loud so the caller's
+            # cross-provider fallback engages only on a genuinely
+            # persistent failure — live incident 2026-07-14: a 283-char
+            # "script" consisting of ``<|tool_calls_section_begin|>...``
+            # shipped as a live episode.
+            unresolved_tool_call = getattr(choice.message, "tool_calls", None)
+            finish_reason = getattr(choice, "finish_reason", None)
+            leak_match = _CONTROL_TOKEN_RE.search(text)
+            if unresolved_tool_call or finish_reason == "tool_calls" or leak_match:
+                if leak_match:
+                    last_error = (
+                        f"grounded response leaked raw control-token syntax "
+                        f"into content ({leak_match.group()!r}) — almost "
+                        f"certainly an unresolved/malformed tool call, not "
+                        f"usable text."
+                    )
+                else:
+                    last_error = (
+                        f"grounded call returned an unresolved tool call "
+                        f"instead of a final answer "
+                        f"(finish_reason={finish_reason!r}) — the "
+                        f"server-side web_search tool was not honored for "
+                        f"this model on this transport."
+                    )
+                logger.warning(
+                    "llm complete_grounded provider=%s model=%s "
+                    "attempt=%d/%d: %s",
+                    self.spec.provider,
+                    self.spec.model,
+                    attempt + 1,
+                    attempts,
+                    last_error,
+                )
+                continue
+
+            return GroundedResult(
+                text=text,
+                model=getattr(resp, "model", self.spec.model),
+                provider=self.spec.provider,
+                usage=usage,
+                raw_request=kwargs,
+                raw_response=resp,
+                searches=[],
+                citations=extract_openrouter_citations(resp),
             )
 
-        return GroundedResult(
-            text=text,
-            model=getattr(resp, "model", self.spec.model),
-            provider=self.spec.provider,
-            usage=self._usage_from_openai(resp),
-            raw_request=kwargs,
-            raw_response=resp,
-            searches=[],
-            citations=extract_openrouter_citations(resp),
+        raise LLMError(
+            f"provider={self.spec.provider} model={self.spec.model}: "
+            f"{last_error} Exhausted {attempts} attempt(s) — this is a "
+            f"bounded same-provider retry for known-transient OpenRouter "
+            f"failure classes (control-token leak / unresolved tool call "
+            f"/ malformed transport response); a persistent failure here "
+            f"is the caller's cue to escalate to its own cross-provider "
+            f"fallback.",
+            usage=usage,
         )
 
 
