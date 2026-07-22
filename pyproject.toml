@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.16.3"
-description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
+version = "0.17.0"
+description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS/Web Push alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
 # union syntax (``str | None``) is deferred via ``from __future__ import
@@ -53,6 +53,10 @@ flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.9"]
 # dropped them from the merged pyproject — restored in 0.9.1.)
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.40"]
+# krepis.webpush's send_push() transport. Lazy-imported at call time (same
+# shape as anthropic/openai above) - a consumer installs krepis[webpush]
+# only if it actually sends Web Push notifications.
+webpush = ["pywebpush>=1.14"]
 dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",

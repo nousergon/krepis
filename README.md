@@ -22,6 +22,7 @@ pip install krepis
 | `secrets` | SSM-backed secret resolution |
 | `alerts` | Telegram / SNS alert routing with S3-marker dedup (incl. CLI) |
 | `telegram` | Telegram transport |
+| `webpush` | Web Push (VAPID) transport — reaches an installed PWA/site regardless of tab state (`webpush` extra) |
 | `email_sender` | SES / SMTP email transport |
 | `http_retry` | Bounded-backoff HTTP retry with jitter |
 | `locks` | S3 conditional-PUT writer locks |
