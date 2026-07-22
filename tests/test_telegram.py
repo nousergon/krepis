@@ -57,6 +57,35 @@ class TestEscapeMarkdown:
         assert tg._escape_markdown("") == ""
 
 
+# ── _truncate_for_telegram (config-I3301) ───────────────────────────────────
+
+
+class TestTruncateForTelegram:
+    def test_short_text_passes_through_unchanged(self):
+        assert tg._truncate_for_telegram("hello") == "hello"
+
+    def test_text_at_exact_limit_passes_through_unchanged(self):
+        text = "x" * tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert tg._truncate_for_telegram(text) == text
+
+    def test_text_over_limit_is_truncated_to_max_chars(self):
+        text = "x" * (tg.TELEGRAM_MESSAGE_MAX_CHARS + 500)
+        result = tg._truncate_for_telegram(text)
+        assert len(result) == tg.TELEGRAM_MESSAGE_MAX_CHARS
+
+    def test_truncated_result_keeps_the_head(self):
+        text = "HEAD-IDENTIFYING-SUMMARY " + ("x" * (tg.TELEGRAM_MESSAGE_MAX_CHARS + 500))
+        result = tg._truncate_for_telegram(text)
+        assert result.startswith("HEAD-IDENTIFYING-SUMMARY")
+
+    def test_truncated_result_notes_original_length(self):
+        original_len = tg.TELEGRAM_MESSAGE_MAX_CHARS + 500
+        text = "x" * original_len
+        result = tg._truncate_for_telegram(text)
+        assert str(original_len) in result
+        assert "truncated" in result
+
+
 # ── send_message — happy path ───────────────────────────────────────────────
 
 
@@ -93,6 +122,20 @@ class TestSendMessageHappyPath:
         tg.send_message("*BUY AAPL*")
         payload = mock_post.call_args.kwargs["json"]
         assert payload["text"] == "*BUY AAPL*"
+
+    def test_oversized_text_is_truncated_before_send(self, configured_env, mock_post):
+        # config-I3301: alert_on_failure.sh dumped 30 raw journal lines with
+        # no length guard — Telegram rejected it (400) while a parallel SNS
+        # publish succeeded, masking the failure. send_message must never
+        # hand the API a payload over the hard limit.
+        oversized = "🚨 substrate-health-daily.service failed. Last 30 journal lines:\n" + (
+            "line of journal output\n" * 400
+        )
+        assert len(oversized) > tg.TELEGRAM_MESSAGE_MAX_CHARS
+        tg.send_message(oversized)
+        payload = mock_post.call_args.kwargs["json"]
+        assert len(payload["text"]) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert payload["text"].startswith("🚨 substrate-health-daily.service failed")
 
 
 # ── send_message — disable_notification flag ────────────────────────────────

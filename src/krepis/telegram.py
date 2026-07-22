@@ -37,6 +37,12 @@ are logged at WARNING and returned as ``False``. No exceptions propagate.
 This is by design — a failed Telegram notification must never block trade
 execution or surveillance Lambda completion.
 
+**Message length.** ``text`` over ``TELEGRAM_MESSAGE_MAX_CHARS`` (4096, the
+Bot API's hard limit) is truncated rather than sent as-is and rejected —
+config-I3301: an oversized message used to fail Telegram silently (HTTP 400)
+while a parallel SNS publish in the same ``krepis.alerts.publish`` call
+succeeded, masking the failure entirely from the caller.
+
 **Migration arc**: ``alpha-engine-config/private-docs/ROADMAP.md`` L1067
 ("Intraday data store → executor surveillance Lambda"), PR 1 of the 3-PR
 sequence.
@@ -58,6 +64,33 @@ logger = logging.getLogger(__name__)
 TELEGRAM_API_URL: Final[str] = "https://api.telegram.org/bot{token}/sendMessage"
 TELEGRAM_TIMEOUT_SEC: Final[int] = 5
 PARSE_MODE: Final[str] = "Markdown"
+# Telegram's hard per-message limit (Bot API `sendMessage.text`). A message
+# over this returns HTTP 400 with no partial delivery — and until
+# config-I3301, that failure was silent from the caller's perspective
+# whenever a parallel channel (e.g. `krepis.alerts.publish`'s SNS leg)
+# succeeded, masking it. First observed live 2026-07-22:
+# `alpha-engine-dashboard/infrastructure/alert_on_failure.sh` builds its
+# message from up to 30 raw `journalctl` lines with no length guard.
+TELEGRAM_MESSAGE_MAX_CHARS: Final[int] = 4096
+
+
+def _truncate_for_telegram(text: str) -> str:
+    """Truncate ``text`` to fit Telegram's ``TELEGRAM_MESSAGE_MAX_CHARS``
+    hard limit, appending a marker noting how much was cut. No-op when
+    already within the limit.
+
+    Keeps the HEAD of the message and truncates the TAIL: callers
+    front-load the identifying summary (severity/source/what-failed) per
+    ``krepis.alerts._format_message``'s convention and append supplementary
+    detail (journal excerpts, stack traces, findings lists) after — so
+    trimming the tail preserves the part an operator needs to triage at a
+    glance, at the cost of the least-essential detail.
+    """
+    if len(text) <= TELEGRAM_MESSAGE_MAX_CHARS:
+        return text
+    suffix = f"\n…(truncated, showing {TELEGRAM_MESSAGE_MAX_CHARS} of {len(text)} chars)"
+    keep = TELEGRAM_MESSAGE_MAX_CHARS - len(suffix)
+    return text[:keep] + suffix
 
 
 def _escape_markdown(text: str) -> str:
@@ -89,16 +122,21 @@ def send_message(
 
     Loads ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` via
     :func:`krepis.secrets.get_secret` (required=False) when ``bot_token`` /
-    ``chat_id`` are not passed explicitly. Applies Markdown v1 escaping,
-    ``POST``s with a 5-second timeout. Returns ``True`` on HTTP 200, ``False``
-    on any other outcome (logged at WARNING). Never raises.
+    ``chat_id`` are not passed explicitly. Truncates ``text`` to
+    ``TELEGRAM_MESSAGE_MAX_CHARS`` (config-I3301 — see
+    :func:`_truncate_for_telegram`), applies Markdown v1 escaping, ``POST``s
+    with a 5-second timeout. Returns ``True`` on HTTP 200, ``False`` on any
+    other outcome (logged at WARNING). Never raises.
 
     Explicit ``bot_token`` / ``chat_id`` overrides allow flow-doctor (and other
     multi-bot consumers) to route through this transport without clobbering the
     process-global secret resolution path.
 
     :param text: The message body. Markdown v1 formatting (``*bold*``) is
-        respected; other special characters are escaped automatically.
+        respected; other special characters are escaped automatically. Bodies
+        over ``TELEGRAM_MESSAGE_MAX_CHARS`` are truncated (tail-trimmed) with
+        a marker noting how much was cut, rather than failing the send
+        outright.
     :param disable_notification: If ``True``, the message is delivered into
         the chat silently (no phone push). Use for informational/digest
         traffic that should be visible but not buzz.
@@ -120,7 +158,7 @@ def send_message(
 
     payload = {
         "chat_id": resolved_chat,
-        "text": _escape_markdown(text),
+        "text": _escape_markdown(_truncate_for_telegram(text)),
         "parse_mode": PARSE_MODE,
         "disable_notification": disable_notification,
     }
