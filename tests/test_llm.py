@@ -109,7 +109,7 @@ def _openai_usage(
 
 def _openai_resp(
     content, usage=None, model="moonshotai/kimi-k2.6", annotations=None,
-    finish_reason=None, tool_calls=None,
+    finish_reason=None, tool_calls=None, served_provider=None,
 ):
     message = SimpleNamespace(content=content)
     if annotations is not None:
@@ -119,11 +119,17 @@ def _openai_resp(
     choice = SimpleNamespace(message=message)
     if finish_reason is not None:
         choice.finish_reason = finish_reason
-    return SimpleNamespace(
+    resp = SimpleNamespace(
         choices=[choice],
         usage=usage or _openai_usage(),
         model=model,
     )
+    if served_provider is not None:
+        # Mirrors OpenRouter's non-standard top-level `provider` field
+        # (confirmed live 2026-07-22) naming the routed upstream backend
+        # (e.g. "DeepInfra") — distinct from the static transport name.
+        resp.provider = served_provider
+    return resp
 
 
 class FakeOpenAI:
@@ -189,6 +195,30 @@ class TestComplete:
             system="sys", user_content="hi", cache_system=False
         )
         assert "cache_control" not in fake.payloads[0]["system"][0]
+
+    def test_anthropic_served_provider_is_none(self):
+        # Single-backend transport — no routing ambiguity, no field to read.
+        fake = FakeAnthropic([_anthropic_msg([_text_block("x")])])
+        result = _client(ANTHROPIC_SPEC, fake).complete(
+            system="sys", user_content="hi"
+        )
+        assert result.served_provider is None
+
+    def test_openrouter_served_provider_captured(self):
+        # config#3006 — jurisdiction/compliance checks read this field
+        # instead of parsing raw_response themselves.
+        fake = FakeOpenAI([_openai_resp("hey", served_provider="DeepInfra")])
+        result = _client(OPENROUTER_SPEC, fake).complete(
+            system="sys", user_content="hi"
+        )
+        assert result.served_provider == "DeepInfra"
+
+    def test_served_provider_absent_when_not_reported(self):
+        fake = FakeOpenAI([_openai_resp("hey")])
+        result = _client(OPENROUTER_SPEC, fake).complete(
+            system="sys", user_content="hi"
+        )
+        assert result.served_provider is None
 
     def test_openrouter_includes_usage_accounting(self):
         fake = FakeOpenAI([
@@ -351,6 +381,16 @@ class TestStructuredOpenAI:
         )
         assert result.data == {"anything": 1}
         assert result.parsed is None
+
+    def test_served_provider_captured(self):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', served_provider="AtlasCloud")
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.served_provider == "AtlasCloud"
 
     def test_reasoning_forwarded(self):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])

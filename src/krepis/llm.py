@@ -127,6 +127,18 @@ class LLMResult:
     # changes. Never mutated by the adapter after the call.
     raw_request: dict
     raw_response: Any = None
+    # The upstream inference backend that actually served this request —
+    # DISTINCT from ``provider`` (the static transport name, e.g.
+    # "openrouter"). OpenRouter's OpenAI-compatible response carries a
+    # non-standard top-level ``provider`` field (e.g. "DeepInfra",
+    # "SiliconFlow") naming the routed backend; verified live 2026-07-22
+    # via ``resp.provider`` on a real ``ChatCompletion`` (pydantic
+    # extra="allow" exposes it as a real attribute). ``None`` on the
+    # anthropic transport (single-backend, no routing ambiguity) and on
+    # any openai-compatible provider that doesn't emit the field.
+    # Consumers needing jurisdiction/compliance checks (config#3006) read
+    # this instead of parsing ``raw_response`` themselves.
+    served_provider: Optional[str] = None
 
 
 @dataclass
@@ -427,6 +439,7 @@ class LLMClient:
             text=text,
             model=getattr(resp, "model", self.spec.model),
             provider=self.spec.provider,
+            served_provider=getattr(resp, "provider", None),
             usage=self._usage_from_openai(resp),
             raw_request=kwargs,
             raw_response=resp,
@@ -676,6 +689,7 @@ class LLMClient:
                     text=raw_text,
                     model=getattr(resp, "model", self.spec.model),
                     provider=self.spec.provider,
+                    served_provider=getattr(resp, "provider", None),
                     usage=usage,
                     raw_request={"messages": messages, **kwargs},
                     raw_response=resp,
