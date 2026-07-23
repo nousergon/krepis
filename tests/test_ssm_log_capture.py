@@ -243,6 +243,8 @@ class TestCli:
                     "morning-enrich",
                     "--log",
                     str(isolated_logfile),
+                    "--correlation-id",
+                    "test-corr",
                     "--",
                     sys.executable,
                     "-c",
@@ -263,6 +265,8 @@ class TestCli:
                     "x",
                     "--log",
                     str(isolated_logfile),
+                    "--correlation-id",
+                    "test-corr",
                     "--",
                     sys.executable,
                     "-c",
@@ -295,3 +299,229 @@ class TestModuleEntrypoint:
         # ``python -m`` invocation works on the SSM target. Sentinel
         # check: import the module and verify ``main`` is callable.
         assert callable(ssm_log_capture.main)
+
+
+class TestFormatSubprocessFailure:
+    """§116 rule 4 "no naked rc" chokepoint — :func:`format_subprocess_failure`."""
+
+    def test_includes_step_name(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "spot-train",
+            returncode=1,
+            last_output_line=None,
+        )
+        assert "[spot-train]" in msg
+        assert "rc=1" in msg
+
+    def test_includes_last_output_line_when_given(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "enrich",
+            returncode=127,
+            last_output_line="FileNotFoundError: awscli not found",
+        )
+        assert "FileNotFoundError" in msg
+        assert "rc=127" in msg
+
+    def test_omits_output_line_when_none(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "test-step",
+            returncode=2,
+            last_output_line=None,
+        )
+        assert "no output captured" in msg
+        assert "rc=2" in msg
+
+    def test_never_bare_rc(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=255, last_output_line=None
+        )
+        # The message must contain the word "failed" and the step name,
+        # never just "exit status 255".
+        assert "failed" in msg
+        assert "ssm_log_capture: ERROR" in msg
+
+
+class TestCorrelationIdResolution:
+    """§116 rule 6 correlation-id resolution — :func:`_resolve_correlation_id`."""
+
+    def test_cli_arg_takes_precedence(self):
+        result = ssm_log_capture._resolve_correlation_id("cli-token-abc")
+        assert result == "cli-token-abc"
+
+    def test_env_var_fallback(self, monkeypatch):
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "env-token-xyz")
+        result = ssm_log_capture._resolve_correlation_id(None)
+        assert result == "env-token-xyz"
+
+    def test_neither_returns_none(self):
+        result = ssm_log_capture._resolve_correlation_id(None)
+        assert result is None
+
+    def test_cli_arg_overrides_env_var(self, monkeypatch):
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "env-token")
+        result = ssm_log_capture._resolve_correlation_id("cli-token")
+        assert result == "cli-token"
+
+
+class TestExitKeyWithCorrelationId:
+    """The correlation id is appended to the S3 key for traceability."""
+
+    def test_correlation_id_appended_to_key(self):
+        from datetime import datetime, timezone
+
+        key = ssm_log_capture._exit_key(
+            "spot-train",
+            now=datetime(2026, 7, 23, 12, 0, 0, tzinfo=timezone.utc),
+            host="ip-x.ec2.internal",
+            correlation_id="run-007",
+        )
+        assert key.endswith("-run-007.log")
+        assert "_ssm_logs/spot-train/" in key
+
+    def test_no_correlation_id_omits_suffix(self):
+        from datetime import datetime, timezone
+
+        key = ssm_log_capture._exit_key(
+            "test",
+            now=datetime(2026, 7, 23, 12, 0, 0, tzinfo=timezone.utc),
+            host="h",
+            correlation_id=None,
+        )
+        # No trailing -correlation_id before .log. The key already has
+        # dashes in the date (YYYY-MM-DD), so check that .log immediately
+        # follows the Z of the HHMMSSZ timestamp.
+        assert key.endswith("Z.log") or key.endswith(".log")
+
+
+class TestFailureMessageOnNonZeroExit:
+    """``run()`` prints a formatted failure message on non-zero exit (§116 rule 4)."""
+
+    def test_formatted_failure_on_nonzero(self, isolated_logfile, fake_boto3, capsys):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "test-step",
+                isolated_logfile,
+                [sys.executable, "-c", "import sys; sys.stderr.write('boom\\n'); sys.stderr.flush(); sys.exit(9)"],
+            )
+        assert rc == 9
+        err = capsys.readouterr().err
+        assert "[test-step]" in err
+        assert "failed" in err
+        assert "rc=9" in err
+        assert "boom" in err
+
+    def test_log_also_contains_failure_message(self, isolated_logfile, fake_boto3):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "step-x",
+                isolated_logfile,
+                [sys.executable, "-c", "import sys; sys.exit(5)"],
+            )
+        contents = isolated_logfile.read_text()
+        assert "ssm_log_capture: ERROR" in contents
+        assert "rc=5" in contents
+
+    def test_zero_exit_no_failure_message(self, isolated_logfile, fake_boto3, capsys):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "step-ok",
+                isolated_logfile,
+                ["true"],
+            )
+        assert rc == 0
+        err = capsys.readouterr().err
+        assert "ssm_log_capture: ERROR" not in err
+
+
+class TestCorrelationIdInLogAndKey:
+    """The correlation id appears in the log header and S3 key."""
+
+    def test_header_line_in_log(self, isolated_logfile, fake_boto3):
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "test",
+                isolated_logfile,
+                [sys.executable, "-c", "print('hello')"],
+                correlation_id="corr-001",
+            )
+        contents = isolated_logfile.read_text()
+        assert "# correlation-id: corr-001" in contents
+        assert "hello" in contents  # inner output follows the header
+
+    def test_s3_key_contains_correlation_id(self, isolated_logfile, fake_boto3):
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "test",
+                isolated_logfile,
+                ["true"],
+                correlation_id="corr-002",
+            )
+        s3.upload_file.assert_called_once()
+        args, _ = s3.upload_file.call_args
+        key = args[2]
+        assert "corr-002" in key
+
+
+class TestCliCorrelationIdRequired:
+    """The CLI requires --correlation-id or $RUN_TOKEN (§116 rule 6 chokepoint)."""
+
+    def test_missing_correlation_id_errors(self):
+        with pytest.raises(SystemExit):
+            ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", "/tmp/x.log", "--", "true"]
+            )
+
+    def test_with_correlation_id_succeeds(self, isolated_logfile, fake_boto3):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                [
+                    "run",
+                    "--slug", "test",
+                    "--log", str(isolated_logfile),
+                    "--correlation-id", "cli-corr-003",
+                    "--", sys.executable, "-c", "print('ok')",
+                ]
+            )
+        assert rc == 0
+
+    def test_env_var_fallback_accepted(self, isolated_logfile, fake_boto3, monkeypatch):
+        monkeypatch.setenv("RUN_TOKEN", "env-corr-004")
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                [
+                    "run",
+                    "--slug", "test",
+                    "--log", str(isolated_logfile),
+                    "--", sys.executable, "-c", "print('ok')",
+                ]
+            )
+        assert rc == 0
+
+
+class TestStepNameInCli:
+    """The --step-name argument customizes the failure message."""
+
+    def test_step_name_in_failure_message(self, isolated_logfile, fake_boto3, capsys):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                [
+                    "run",
+                    "--slug", "my-slug",
+                    "--log", str(isolated_logfile),
+                    "--step-name", "my-custom-step",
+                    "--correlation-id", "cid",
+                    "--", sys.executable, "-c", "import sys; sys.exit(3)",
+                ]
+            )
+        assert rc == 3
+        err = capsys.readouterr().err
+        # The failure message should contain the custom step name, not the slug
+        assert "[my-custom-step]" in err
