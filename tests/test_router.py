@@ -30,9 +30,9 @@ model_groups:
     - deepseek-v4-pro-max
     - deepseek-v4-pro-openrouter-max
   ultra:
-    - deepseek-v4-pro-max
-    - kimi-k3
     - glm-5.2
+    - kimi-k3
+    - deepseek-v4-pro-max
 
 models:
   - id: deepseek-v4-flash
@@ -147,7 +147,7 @@ models:
     route: openrouter
     model: moonshotai/kimi-k3
     group: ultra
-    group_role: primary
+    group_role: fallback
     params:
       max_tokens: 16384
     status: active
@@ -158,7 +158,7 @@ models:
     route: openrouter
     model: zhipuai/glm-5.2
     group: ultra
-    group_role: fallback
+    group_role: primary
     params:
       max_tokens: 16384
     status: active
@@ -198,13 +198,13 @@ class TestParseRegistry:
 
     def test_openrouter_model_has_openrouter_prefix(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        kimi = next(m for m in model_list if m["model_name"] == "ultra-kimi-k3")
-        assert "openrouter/moonshotai/kimi-k3" == kimi["litellm_params"]["model"]
+        glm = next(m for m in model_list if m["model_name"] == "glm-5.2")
+        assert "openrouter/zhipuai/glm-5.2" == glm["litellm_params"]["model"]
 
     def test_openrouter_model_uses_openrouter_key(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file, openrouter_key="test-openrouter-key")
-        kimi = next(m for m in model_list if m["model_name"] == "ultra-kimi-k3")
-        assert kimi["litellm_params"]["api_key"] == "test-openrouter-key"
+        glm = next(m for m in model_list if m["model_name"] == "glm-5.2")
+        assert glm["litellm_params"]["api_key"] == "test-openrouter-key"
 
     def test_egress_proxy_model_uses_placeholder_key(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
@@ -217,7 +217,7 @@ class TestParseRegistry:
         assert "deepseek-v4-flash" in model_names  # low primary
         assert "deepseek-v4-flash-max" in model_names  # med primary
         assert "deepseek-v4-pro-max" in model_names  # high primary
-        assert "deepseek-v4-pro-max" in model_names  # ultra primary
+        assert "glm-5.2" in model_names  # ultra primary
 
     def test_reasoning_param_included(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
@@ -289,8 +289,8 @@ class TestBuiltinModelList:
         model_names = {m["model_name"] for m in models}
         assert "med-openrouter" in model_names
         assert "high-openrouter" in model_names
-        assert "ultra-glm" in model_names
         assert "ultra-kimi" in model_names
+        assert "ultra-deepseek" in model_names
 
     def test_all_models_have_model_param(self):
         models = _router._builtin_model_list()

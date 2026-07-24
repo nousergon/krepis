@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 #   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
 #   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
 #   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
-#   ultra: deepseek-v4-pro (reasoning=max) → kimi-k3 → glm-5.2
+#   ultra: glm-5.2 → kimi-k3 → deepseek-v4-pro (reasoning=max)
 #
 # Initialized on first use so importing krepis.llm doesn't pay the Router
 # construction cost until a caller actually uses the litellm transport.
@@ -89,6 +89,32 @@ def _get_router() -> Any:
     from krepis.router import get_router as _router_get
 
     return _router_get()
+
+
+# Per-group fallback-state tracker so callers can detect sign-on / sign-off
+# transitions.  Keyed by group name ("low", "med", "high", "ultra"); True
+# means the last call for that group was served by a fallback model.
+_fallback_state: dict[str, bool] = {}
+
+
+def _check_fallback_transition(group: str, fallback_used: bool, served_model: str, primary: str) -> None:
+    """Log a warning/info when a group enters or exits fallback.
+
+    Called after every LiteLLM Router completion so the operator sees
+    exactly when a backup model signs on and when the primary recovers.
+    """
+    was_in_fallback = _fallback_state.get(group, False)
+    if fallback_used and not was_in_fallback:
+        logger.warning(
+            "🔄 group %r FALLBACK ENGAGED — primary %s failed, now served by %s",
+            group, primary, served_model,
+        )
+    elif not fallback_used and was_in_fallback:
+        logger.info(
+            "✅ group %r PRIMARY RESTORED — %s is healthy again",
+            group, primary,
+        )
+    _fallback_state[group] = fallback_used
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -476,12 +502,7 @@ class LLMClient:
             served_model = getattr(resp, "model", "")
             primary = _get_primary(self.spec.model)
             fallback_used = bool(primary and served_model and served_model != primary)
-            if fallback_used:
-                logger.warning(
-                    "litellm group %r: fallback model %s served — primary %s "
-                    "failed or was unavailable",
-                    self.spec.model, served_model, primary,
-                )
+            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
             text = (resp.choices[0].message.content or "").strip()
             return LLMResult(
                 text=text,
@@ -866,11 +887,7 @@ class LLMClient:
             primary = _get_primary(self.spec.model)
             if primary and served_model and served_model != primary:
                 fallback_used = True
-                logger.warning(
-                    "litellm group %r (structured): fallback model %s "
-                    "served — primary %s failed or was unavailable",
-                    self.spec.model, served_model, primary,
-                )
+            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
 
             self._usage_from_openai(resp, into=usage)
             raw_text = (resp.choices[0].message.content or "").strip()
