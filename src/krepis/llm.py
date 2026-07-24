@@ -43,6 +43,7 @@ from krepis.anthropic_payload import (
 )
 from krepis.llm_config import (
     TRANSPORT_ANTHROPIC,
+    TRANSPORT_LITELLM,
     TRANSPORT_OPENAI,
     LLMConfigError,
     ModelSpec,
@@ -57,6 +58,118 @@ from krepis.llm_search import (
 )
 
 logger = logging.getLogger(__name__)
+
+# ── LiteLLM Router (lazy singleton) ────────────────────────────────────────
+# When provider=litellm, calls route through a litellm.Router configured with
+# the model groups defined in LLM_MODEL_REGISTRY.yaml. The Router handles
+# fallback chains transparently — a call to model "low" tries the primary
+# in the low group, then falls back through the ordered chain on failure.
+#
+# Initialized on first use so importing krepis.llm doesn't pay the Router
+# construction cost (imports openai, builds model caches) until a caller
+# actually uses the litellm transport.
+
+_router: Any = None
+_router_lock: Any = None  # threading.Lock, lazy-imported
+
+
+def _get_router() -> Any:
+    """Return the module-level LiteLLM Router singleton, initializing on first call."""
+    global _router, _router_lock
+    if _router is not None:
+        return _router
+
+    from threading import Lock as _Lock
+
+    _router_lock = _Lock()
+    with _router_lock:
+        if _router is not None:
+            return _router
+
+        from litellm import Router as _Router
+
+        _router = _Router(
+            model_list=[
+                # ── low group ──────────────────────────────────────────
+                {
+                    "model_name": "low",
+                    "litellm_params": {
+                        "model": "openai/deepseek-v4-flash",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": "unused-placeholder-see-key-isolation-config3007",
+                    },
+                },
+                {
+                    "model_name": "low-fallback",
+                    "litellm_params": {
+                        "model": "openrouter/deepseek/deepseek-v4-flash",
+                        "api_key": os.environ.get("OPENROUTER_API_KEY", "test"),
+                    },
+                },
+                {
+                    "model_name": "low-claude",
+                    "litellm_params": {
+                        "model": "anthropic/claude-haiku-4-5-20251001",
+                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                    },
+                },
+                # ── med group ──────────────────────────────────────────
+                {
+                    "model_name": "med",
+                    "litellm_params": {
+                        "model": "openai/deepseek-v4-pro",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": "unused-placeholder-see-key-isolation-config3007",
+                    },
+                },
+                {
+                    "model_name": "med-fallback",
+                    "litellm_params": {
+                        "model": "openrouter/deepseek/deepseek-v4-pro",
+                        "api_key": os.environ.get("OPENROUTER_API_KEY", "test"),
+                    },
+                },
+                {
+                    "model_name": "med-sonnet",
+                    "litellm_params": {
+                        "model": "anthropic/claude-sonnet-5",
+                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                    },
+                },
+                # ── high group ─────────────────────────────────────────
+                {
+                    "model_name": "high",
+                    "litellm_params": {
+                        "model": "anthropic/claude-opus-4-8",
+                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                    },
+                },
+                {
+                    "model_name": "high-fallback",
+                    "litellm_params": {
+                        "model": "openai/deepseek-v4-pro",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": "unused-placeholder-see-key-isolation-config3007",
+                    },
+                },
+                # ── ultra group ────────────────────────────────────────
+                {
+                    "model_name": "ultra",
+                    "litellm_params": {
+                        "model": "anthropic/claude-fable-5",
+                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                    },
+                },
+            ],
+            fallbacks=[
+                {"low": ["low-fallback", "low-claude"]},
+                {"med": ["med-fallback", "med-sonnet"]},
+                {"high": ["high-fallback"]},
+            ],
+        )
+        logger.info("litellm Router initialized with %d models", len(_router.model_list))
+        return _router
+
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
@@ -420,6 +533,28 @@ class LLMClient:
                 raw_response=msg,
             )
 
+        if self.spec.transport == TRANSPORT_LITELLM:
+            # LiteLLM Router handles fallback chains — model is the group name.
+            router = _get_router()
+            resp = router.completion(
+                model=self.spec.model,  # "low", "med", "high", "ultra"
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+                max_tokens=limit,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            return LLMResult(
+                text=text,
+                model=getattr(resp, "model", self.spec.model),
+                provider=self.spec.provider,
+                served_provider=getattr(resp, "_hidden_params", {}).get("model_id", None),
+                usage=self._usage_from_openai(resp),
+                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
+                raw_response=resp,
+            )
+
         kwargs: dict = {
             "model": self.spec.model,
             "max_tokens": limit,
@@ -508,6 +643,17 @@ class LLMClient:
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             return self._structured_anthropic(
+                system=system,
+                user_content=user_content,
+                schema_dict=schema_dict,
+                schema_name=schema_name,
+                parse_and_validate=_parse_and_validate,
+                is_pydantic=is_pydantic,
+                attempts=attempts,
+                max_tokens=limit,
+            )
+        if self.spec.transport == TRANSPORT_LITELLM:
+            return self._structured_litellm(
                 system=system,
                 user_content=user_content,
                 schema_dict=schema_dict,
@@ -719,6 +865,78 @@ class LLMClient:
 
         raise LLMError(
             f"provider={self.spec.provider} model={self.spec.model}: "
+            f"structured output failed validation after {attempts} "
+            f"attempt(s): {last_error}",
+            usage=usage,
+        )
+
+    def _structured_litellm(
+        self,
+        *,
+        system: str,
+        user_content: str,
+        schema_dict: dict,
+        schema_name: str,
+        parse_and_validate: Callable[[Any], Any],
+        is_pydantic: bool,
+        attempts: int,
+        max_tokens: int,
+    ) -> StructuredResult:
+        """Structured completion via LiteLLM Router with fallback chains."""
+        json_instruction = _JSON_INSTRUCTION.format(
+            schema=json.dumps(schema_dict, indent=2)
+        )
+        usage = LLMUsage()
+        last_error: Optional[str] = None
+
+        for attempt in range(1, attempts + 1):
+            router = _get_router()
+            prompt = (
+                user_content + json_instruction
+                if attempt == 1
+                else user_content
+                + f"\n\nPrevious attempt failed: {last_error}\n"
+                + json_instruction
+            )
+            try:
+                resp = router.completion(
+                    model=self.spec.model,  # "low", "med", "high", "ultra"
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=max_tokens,
+                )
+            except Exception as exc:
+                last_error = str(exc)
+                if attempt == attempts:
+                    raise LLMError(
+                        f"litellm Router call failed after {attempts} "
+                        f"attempt(s) — all models in group "
+                        f"{self.spec.model!r} exhausted: {last_error}",
+                        usage=usage,
+                    ) from exc
+                continue
+
+            u = self._usage_from_openai(resp)
+            usage = LLMUsage.add(usage, u)
+            raw_text = (resp.choices[0].message.content or "").strip()
+            try:
+                parsed = self._extract_json(raw_text)
+                validated = parse_and_validate(parsed)
+            except Exception as exc:
+                last_error = str(exc)
+                continue
+            return StructuredResult(
+                parsed=validated if is_pydantic else None,
+                data=validated if not is_pydantic else None,
+                model=getattr(resp, "model", self.spec.model),
+                provider=self.spec.provider,
+                usage=usage,
+                raw_response=resp,
+            )
+
+        raise LLMError(
             f"structured output failed validation after {attempts} "
             f"attempt(s): {last_error}",
             usage=usage,

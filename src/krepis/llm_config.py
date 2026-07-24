@@ -56,6 +56,7 @@ class LLMConfigError(RuntimeError):
 
 TRANSPORT_ANTHROPIC = "anthropic"
 TRANSPORT_OPENAI = "openai"
+TRANSPORT_LITELLM = "litellm"
 
 
 @dataclass(frozen=True)
@@ -87,8 +88,8 @@ PROVIDER_REGISTRY: dict = {
         api_key_env="OPENROUTER_API_KEY",
     ),
     "litellm": ProviderDefaults(
-        transport=TRANSPORT_OPENAI,
-        base_url="http://127.0.0.1:8980/v1",
+        transport=TRANSPORT_LITELLM,
+        base_url=None,
         api_key_env="LITELLM_MASTER_KEY",
     ),
 }
