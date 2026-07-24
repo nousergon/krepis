@@ -180,7 +180,7 @@ class TestParseRegistry:
 
     def test_low_group_primary(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        low_primary = next(m for m in model_list if m["model_name"] == "deepseek-v4-flash")
+        low_primary = next(m for m in model_list if m["model_name"] == "low")
         assert "openai/deepseek-v4-flash" in low_primary["litellm_params"]["model"]
         assert "8972/v1" in low_primary["litellm_params"]["api_base"]
 
@@ -198,37 +198,37 @@ class TestParseRegistry:
 
     def test_openrouter_model_has_openrouter_prefix(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        glm = next(m for m in model_list if m["model_name"] == "glm-5.2")
-        assert "openrouter/zhipuai/glm-5.2" == glm["litellm_params"]["model"]
+        ultra = next(m for m in model_list if m["model_name"] == "ultra")
+        assert "openrouter/zhipuai/glm-5.2" == ultra["litellm_params"]["model"]
 
     def test_openrouter_model_uses_openrouter_key(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file, openrouter_key="test-openrouter-key")
-        glm = next(m for m in model_list if m["model_name"] == "glm-5.2")
-        assert glm["litellm_params"]["api_key"] == "test-openrouter-key"
+        ultra = next(m for m in model_list if m["model_name"] == "ultra")
+        assert ultra["litellm_params"]["api_key"] == "test-openrouter-key"
 
     def test_egress_proxy_model_uses_placeholder_key(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        ds = next(m for m in model_list if m["model_name"] == "deepseek-v4-flash")
-        assert "placeholder" in ds["litellm_params"]["api_key"]
+        low = next(m for m in model_list if m["model_name"] == "low")
+        assert "placeholder" in low["litellm_params"]["api_key"]
 
     def test_primary_model_named_as_group_name(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
         model_names = {m["model_name"] for m in model_list}
-        assert "deepseek-v4-flash" in model_names  # low primary
-        assert "deepseek-v4-flash-max" in model_names  # med primary
-        assert "deepseek-v4-pro-max" in model_names  # high primary
-        assert "glm-5.2" in model_names  # ultra primary
+        assert "low" in model_names
+        assert "med" in model_names
+        assert "high" in model_names
+        assert "ultra" in model_names
 
     def test_reasoning_param_included(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        flash_max = next(m for m in model_list if m["model_name"] == "deepseek-v4-flash-max")
-        extra = flash_max["litellm_params"].get("extra_body", {})
+        med_primary = next(m for m in model_list if m["model_name"] == "med")
+        extra = med_primary["litellm_params"].get("extra_body", {})
         assert extra.get("reasoning") == {"effort": "max"}
 
     def test_reasoning_exclude_included(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
-        ds = next(m for m in model_list if m["model_name"] == "deepseek-v4-flash")
-        extra = ds["litellm_params"].get("extra_body", {})
+        low = next(m for m in model_list if m["model_name"] == "low")
+        extra = low["litellm_params"].get("extra_body", {})
         assert extra.get("reasoning") == {"exclude": True}
 
 
@@ -261,55 +261,65 @@ class TestFindRegistry:
             found = _router._find_registry()
             assert found is None
 
-    def test_no_env_var_no_registry_returns_none(self, monkeypatch, tmp_path):
+    def test_returns_none_when_no_registry_found(self, monkeypatch, tmp_path):
+        """No env var, no private-docs/ walk match → None."""
         monkeypatch.chdir(tmp_path)
         found = _router._find_registry()
         assert found is None
 
 
-# ── _builtin_model_list ──────────────────────────────────────────────────
+# ── get_router (registry-only, no builtin fallback) ─────────────────────
 
-class TestBuiltinModelList:
-    def test_has_four_groups(self):
-        models = _router._builtin_model_list()
-        model_names = {m["model_name"] for m in models}
-        assert "low" in model_names
-        assert "med" in model_names
-        assert "high" in model_names
-        assert "ultra" in model_names
+class TestGetRouter:
+    def test_router_loads_from_registry_file(self, registry_file, monkeypatch):
+        """When LLM_MODEL_REGISTRY_PATH points at a valid file, the Router builds."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
+            assert router is not None
+            model_names = {m["model_name"] for m in router.model_list}
+            assert "low" in model_names
+            assert "med" in model_names
+            assert "high" in model_names
+            assert "ultra" in model_names
+        finally:
+            _router._router = None
 
-    def test_has_gemini_models(self):
-        models = _router._builtin_model_list()
-        model_names = {m["model_name"] for m in models}
-        assert "low-gemini-flash" in model_names
-        assert "low-gemini-pro" in model_names
+    def test_router_raises_when_no_registry_found(self, monkeypatch, tmp_path):
+        """Without LLM_MODEL_REGISTRY_PATH or a walk match, get_router raises."""
+        monkeypatch.chdir(tmp_path)
+        _router._router = None
+        try:
+            with pytest.raises(FileNotFoundError, match="LLM_MODEL_REGISTRY.yaml not found"):
+                _router.get_router()
+        finally:
+            _router._router = None
 
-    def test_has_fallback_models(self):
-        models = _router._builtin_model_list()
-        model_names = {m["model_name"] for m in models}
-        assert "med-openrouter" in model_names
-        assert "high-openrouter" in model_names
-        assert "ultra-kimi" in model_names
-        assert "ultra-deepseek" in model_names
+    def test_all_models_have_model_param(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
+            for m in router.model_list:
+                assert "model" in m["litellm_params"]
+        finally:
+            _router._router = None
 
-    def test_all_models_have_model_param(self):
-        models = _router._builtin_model_list()
-        for m in models:
-            assert "model" in m["litellm_params"]
-
-
-# ── _builtin_fallbacks ───────────────────────────────────────────────────
-
-class TestBuiltinFallbacks:
-    def test_has_all_four_groups(self):
-        fallbacks = _router._builtin_fallbacks()
-        groups = {list(fb.keys())[0] for fb in fallbacks}
-        assert groups == {"low", "med", "high", "ultra"}
-
-    def test_low_has_three_fallbacks(self):
-        fallbacks = _router._builtin_fallbacks()
-        low = next(fb for fb in fallbacks if "low" in fb)
-        assert len(low["low"]) == 3
+    def test_fallback_groups(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
+            groups = {list(fb.keys())[0] for fb in router.fallbacks}
+            assert groups == {"low", "med", "high", "ultra"}
+            low_fb = next(fb for fb in router.fallbacks if "low" in fb)
+            assert len(low_fb["low"]) == 3
+        finally:
+            _router._router = None
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
