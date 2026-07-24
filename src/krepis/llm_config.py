@@ -86,6 +86,11 @@ PROVIDER_REGISTRY: dict = {
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
     ),
+    "litellm": ProviderDefaults(
+        transport=TRANSPORT_OPENAI,
+        base_url="http://127.0.0.1:8980/v1",
+        api_key_env="LITELLM_MASTER_KEY",
+    ),
 }
 
 
