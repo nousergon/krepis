@@ -68,7 +68,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"krepis" = ["model_pricing.yaml", "fleet_event_schema_v1.json", "py.typed", "LLM_MODEL_REGISTRY.yaml"]
+"krepis" = ["model_pricing.yaml", "fleet_event_schema_v1.json", "py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

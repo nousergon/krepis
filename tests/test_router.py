@@ -261,59 +261,59 @@ class TestFindRegistry:
             found = _router._find_registry()
             assert found is None
 
-    def test_falls_back_to_shipped_registry(self, monkeypatch, tmp_path):
-        """When no env var and no cwd-relative registry, the shipped file is found."""
+    def test_returns_none_when_no_registry_found(self, monkeypatch, tmp_path):
+        """No env var, no private-docs/ walk match → None."""
         monkeypatch.chdir(tmp_path)
         found = _router._find_registry()
-        assert found is not None
-        assert found.name == "LLM_MODEL_REGISTRY.yaml"
+        assert found is None
 
 
-# ── get_router (registry-based, no builtin fallback) ────────────────────
+# ── get_router (registry-only, no builtin fallback) ─────────────────────
 
 class TestGetRouter:
-    def test_router_loads_from_shipped_yaml(self, monkeypatch, tmp_path):
-        """The shipped YAML is found and builds a working Router."""
-        monkeypatch.chdir(tmp_path)
-        # Clear the singleton so it rebuilds from the shipped file
+    def test_router_loads_from_registry_file(self, registry_file, monkeypatch):
+        """When LLM_MODEL_REGISTRY_PATH points at a valid file, the Router builds."""
         _router._router = None
-        router = _router.get_router()
-        assert router is not None
-        model_names = {m["model_name"] for m in router.model_list}
-        assert "low" in model_names
-        assert "med" in model_names
-        assert "high" in model_names
-        assert "ultra" in model_names
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
+            assert router is not None
+            model_names = {m["model_name"] for m in router.model_list}
+            assert "low" in model_names
+            assert "med" in model_names
+            assert "high" in model_names
+            assert "ultra" in model_names
+        finally:
+            _router._router = None
 
     def test_router_raises_when_no_registry_found(self, monkeypatch, tmp_path):
-        """Without the shipped YAML (or any override), get_router raises."""
+        """Without LLM_MODEL_REGISTRY_PATH or a walk match, get_router raises."""
         monkeypatch.chdir(tmp_path)
         _router._router = None
-        # Hide the shipped file by pointing __file__ somewhere else
-        real_file = _router.__file__
         try:
-            _router.__file__ = str(tmp_path / "nonexistent" / "router.py")
             with pytest.raises(FileNotFoundError, match="LLM_MODEL_REGISTRY.yaml not found"):
                 _router.get_router()
         finally:
-            _router.__file__ = real_file
             _router._router = None
 
-    def test_all_models_have_model_param(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
+    def test_all_models_have_model_param(self, registry_file, monkeypatch):
         _router._router = None
         try:
-            router = _router.get_router()
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
             for m in router.model_list:
                 assert "model" in m["litellm_params"]
         finally:
             _router._router = None
 
-    def test_fallback_groups(self, monkeypatch, tmp_path):
-        monkeypatch.chdir(tmp_path)
+    def test_fallback_groups(self, registry_file, monkeypatch):
         _router._router = None
         try:
-            router = _router.get_router()
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                router = _router.get_router()
             groups = {list(fb.keys())[0] for fb in router.fallbacks}
             assert groups == {"low", "med", "high", "ultra"}
             low_fb = next(fb for fb in router.fallbacks if "low" in fb)

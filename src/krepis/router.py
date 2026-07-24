@@ -55,8 +55,11 @@ def _find_registry() -> Optional[Path]:
     1. ``$LLM_MODEL_REGISTRY_PATH`` (explicit override)
     2. Walk up from cwd for ``private-docs/LLM_MODEL_REGISTRY.yaml``
        (alpha-engine-config convention)
-    3. Shipped default in the krepis package directory
-    4. None — caller falls back to hardcoded builtins
+
+    Returns ``None`` if neither is found — the caller (:func:`get_router`)
+    raises :exc:`FileNotFoundError` rather than falling back to a stale
+    duplicate.  There is exactly ONE source of truth for model groupings,
+    and it lives in ``alpha-engine-config/private-docs/``.
     """
     env_path = os.environ.get("LLM_MODEL_REGISTRY_PATH")
     if env_path:
@@ -77,11 +80,6 @@ def _find_registry() -> Optional[Path]:
         if parent == cwd:
             break
         cwd = parent
-
-    # Shipped default — lives next to router.py in the krepis package
-    shipped = Path(__file__).parent / "LLM_MODEL_REGISTRY.yaml"
-    if shipped.exists():
-        return shipped
 
     return None
 
@@ -190,10 +188,10 @@ def get_router() -> Any:
     """Return the module-level Router singleton, built from LLM_MODEL_REGISTRY.yaml.
 
     Raises :exc:`FileNotFoundError` if no registry file can be found —
-    there is no hardcoded fallback.  The shipped YAML in the krepis
-    package is the default; ``$LLM_MODEL_REGISTRY_PATH`` or a
-    ``private-docs/LLM_MODEL_REGISTRY.yaml`` walking up from cwd
-    override it.
+    there is no hardcoded fallback.  The single source of truth lives in
+    ``alpha-engine-config/private-docs/LLM_MODEL_REGISTRY.yaml``; set
+    ``$LLM_MODEL_REGISTRY_PATH`` to point at it explicitly, or run from
+    within a repo whose ``private-docs/`` directory contains the file.
     """
     global _router, _router_lock
     if _router is not None:
@@ -213,8 +211,10 @@ def get_router() -> Any:
         if not reg_path:
             raise FileNotFoundError(
                 "LLM_MODEL_REGISTRY.yaml not found — set "
-                "LLM_MODEL_REGISTRY_PATH or ensure the krepis package "
-                "is installed with its shipped registry file"
+                "LLM_MODEL_REGISTRY_PATH or run from within a repo "
+                "whose private-docs/ directory contains the file.  "
+                "The canonical copy lives in "
+                "alpha-engine-config/private-docs/LLM_MODEL_REGISTRY.yaml."
             )
 
         logger.info("building Router from %s", reg_path)
