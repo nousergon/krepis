@@ -63,10 +63,10 @@ def _builtin_model_list(openrouter_key: str = "") -> list[dict]:
         # high group
         {"model_name": "high", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
         {"model_name": "high-openrouter", "litellm_params": {"model": "openrouter/deepseek/deepseek-v4-pro", "api_key": openrouter_key, "extra_body": {"reasoning": {"effort": "max"}}}},
-        # ultra group
-        {"model_name": "ultra", "litellm_params": {"model": "openrouter/moonshotai/kimi-k3", "api_key": openrouter_key}},
-        {"model_name": "ultra-glm", "litellm_params": {"model": "openrouter/zhipuai/glm-5.2", "api_key": openrouter_key}},
-        {"model_name": "ultra-degrade", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
+        # ultra group — OpenRouter primary (GLM), Kimi fallback, DeepSeek last-resort
+        {"model_name": "ultra", "litellm_params": {"model": "openrouter/zhipuai/glm-5.2", "api_key": openrouter_key}},
+        {"model_name": "ultra-kimi", "litellm_params": {"model": "openrouter/moonshotai/kimi-k3", "api_key": openrouter_key}},
+        {"model_name": "ultra-deepseek", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
     ]
 
 
@@ -75,7 +75,7 @@ def _builtin_fallbacks() -> list[dict]:
         {"low": ["low-gemini-flash", "low-gpt-oss", "low-gemini-pro"]},
         {"med": ["med-openrouter", "med-degrade"]},
         {"high": ["high-openrouter"]},
-        {"ultra": ["ultra-glm", "ultra-degrade"]},
+        {"ultra": ["ultra-kimi", "ultra-deepseek"]},
     ]
 
 
@@ -264,6 +264,23 @@ def resolve_group(group: str) -> str:
                 break  # all fallbacks for this group exhausted
 
     return primary_model
+
+
+def get_group_primary(group: str) -> Optional[str]:
+    """Return the litellm model string for *group*'s primary model.
+
+    This is the value that ``resp.model`` will carry when the primary
+    (not a fallback) served the request.  Callers compare against it to
+    detect whether a fallback was engaged::
+
+        primary = get_group_primary("low")        # "openai/deepseek-v4-flash"
+        fallback_used = (resp.model != primary)
+    """
+    router = get_router()
+    for m in router.model_list:
+        if m["model_name"] == group:
+            return m["litellm_params"]["model"]
+    return None
 
 
 def _upstream_model_for(router: Any, model_name: str) -> Optional[str]:

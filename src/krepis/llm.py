@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 #   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
 #   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
 #   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
-#   ultra: kimi-k3 → glm-5.2 → deepseek-v4-pro (reasoning=max)
+#   ultra: glm-5.2 → kimi-k3 → deepseek-v4-pro (reasoning=max)
 #
 # Initialized on first use so importing krepis.llm doesn't pay the Router
 # construction cost until a caller actually uses the litellm transport.
@@ -89,6 +89,32 @@ def _get_router() -> Any:
     from krepis.router import get_router as _router_get
 
     return _router_get()
+
+
+# Per-group fallback-state tracker so callers can detect sign-on / sign-off
+# transitions.  Keyed by group name ("low", "med", "high", "ultra"); True
+# means the last call for that group was served by a fallback model.
+_fallback_state: dict[str, bool] = {}
+
+
+def _check_fallback_transition(group: str, fallback_used: bool, served_model: str, primary: str) -> None:
+    """Log a warning/info when a group enters or exits fallback.
+
+    Called after every LiteLLM Router completion so the operator sees
+    exactly when a backup model signs on and when the primary recovers.
+    """
+    was_in_fallback = _fallback_state.get(group, False)
+    if fallback_used and not was_in_fallback:
+        logger.warning(
+            "🔄 group %r FALLBACK ENGAGED — primary %s failed, now served by %s",
+            group, primary, served_model,
+        )
+    elif not fallback_used and was_in_fallback:
+        logger.info(
+            "✅ group %r PRIMARY RESTORED — %s is healthy again",
+            group, primary,
+        )
+    _fallback_state[group] = fallback_used
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
@@ -172,6 +198,13 @@ class LLMResult:
     # Consumers needing jurisdiction/compliance checks (config#3006) read
     # this instead of parsing ``raw_response`` themselves.
     served_provider: Optional[str] = None
+    # True when a fallback model in the group's chain served this request
+    # (the primary failed and LiteLLM's Router transparently tried the
+    # next model).  Always False on non-litellm transports.
+    fallback_used: bool = False
+    # The group name (or model id) that was requested — preserved so
+    # callers can tell WHAT was asked for separately from WHAT served it.
+    model_requested: str = ""
 
 
 @dataclass
@@ -455,6 +488,8 @@ class LLMClient:
 
         if self.spec.transport == TRANSPORT_LITELLM:
             # LiteLLM Router handles fallback chains — model is the group name.
+            from krepis.router import get_group_primary as _get_primary
+
             router = _get_router()
             resp = router.completion(
                 model=self.spec.model,  # "low", "med", "high", "ultra"
@@ -464,15 +499,21 @@ class LLMClient:
                 ],
                 max_tokens=limit,
             )
+            served_model = getattr(resp, "model", "")
+            primary = _get_primary(self.spec.model)
+            fallback_used = bool(primary and served_model and served_model != primary)
+            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
             text = (resp.choices[0].message.content or "").strip()
             return LLMResult(
                 text=text,
-                model=getattr(resp, "model", self.spec.model),
+                model=served_model or self.spec.model,
                 provider=self.spec.provider,
                 served_provider=getattr(resp, "_hidden_params", {}).get("model_id", None),
                 usage=self._usage_from_openai(resp),
                 raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
                 raw_response=resp,
+                fallback_used=fallback_used,
+                model_requested=self.spec.model,
             )
 
         kwargs: dict = {
@@ -803,11 +844,14 @@ class LLMClient:
         max_tokens: int,
     ) -> StructuredResult:
         """Structured completion via LiteLLM Router with fallback chains."""
+        from krepis.router import get_group_primary as _get_primary
+
         json_instruction = _JSON_INSTRUCTION.format(
             schema=json.dumps(schema_dict, indent=2)
         )
         usage = LLMUsage()
         last_error: Optional[str] = None
+        fallback_used = False
 
         for attempt in range(1, attempts + 1):
             router = _get_router()
@@ -833,13 +877,19 @@ class LLMClient:
                     raise LLMError(
                         f"litellm Router call failed after {attempts} "
                         f"attempt(s) — all models in group "
-                        f"{self.spec.model!r} exhausted: {last_error}",
+                        f"{self.spec.model!r} exhausted (primary → "
+                        f"fallbacks all failed): {last_error}",
                         usage=usage,
                     ) from exc
                 continue
 
-            u = self._usage_from_openai(resp)
-            usage = LLMUsage.add(usage, u)
+            served_model = getattr(resp, "model", "")
+            primary = _get_primary(self.spec.model)
+            if primary and served_model and served_model != primary:
+                fallback_used = True
+            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
+
+            self._usage_from_openai(resp, into=usage)
             raw_text = (resp.choices[0].message.content or "").strip()
             try:
                 parsed = self._extract_json(raw_text)
@@ -848,12 +898,16 @@ class LLMClient:
                 last_error = str(exc)
                 continue
             return StructuredResult(
+                text=raw_text,
                 parsed=validated if is_pydantic else None,
                 data=validated if not is_pydantic else None,
-                model=getattr(resp, "model", self.spec.model),
+                model=served_model or self.spec.model,
                 provider=self.spec.provider,
                 usage=usage,
+                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
                 raw_response=resp,
+                fallback_used=fallback_used,
+                model_requested=self.spec.model,
             )
 
         raise LLMError(
