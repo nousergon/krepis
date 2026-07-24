@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 # Model groups (no Anthropic — per Brian's 2026-07-24 ruling):
 #   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
 #   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
-#   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter → gemini-2.5-pro
+#   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
 #   ultra: kimi-k3 → glm-5.2 → deepseek-v4-pro (reasoning=max)
 #
 # Initialized on first use so importing krepis.llm doesn't pay the Router
@@ -175,14 +175,6 @@ def _get_router() -> Any:
                         "extra_body": {"reasoning": {"effort": "max"}},
                     },
                 },
-                {
-                    "model_name": "high-gemini",
-                    "litellm_params": {
-                        "model": "openai/gemini-2.5-pro",
-                        "api_base": "http://127.0.0.1:8974/v1beta/openai",
-                        "api_key": _egress_placeholder,
-                    },
-                },
                 # ── ultra group ────────────────────────────────────────
                 {
                     "model_name": "ultra",
@@ -211,7 +203,7 @@ def _get_router() -> Any:
             fallbacks=[
                 {"low": ["low-gemini-flash", "low-gpt-oss", "low-gemini-pro"]},
                 {"med": ["med-openrouter", "med-degrade"]},
-                {"high": ["high-openrouter", "high-gemini"]},
+                {"high": ["high-openrouter"]},
                 {"ultra": ["ultra-glm", "ultra-degrade"]},
             ],
         )
