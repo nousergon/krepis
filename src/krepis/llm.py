@@ -65,6 +65,12 @@ logger = logging.getLogger(__name__)
 # fallback chains transparently — a call to model "low" tries the primary
 # in the low group, then falls back through the ordered chain on failure.
 #
+# Model groups (no Anthropic — per Brian's 2026-07-24 ruling):
+#   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
+#   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
+#   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
+#   ultra: kimi-k3 → glm-5.2 → deepseek-v4-pro (reasoning=max)
+#
 # Initialized on first use so importing krepis.llm doesn't pay the Router
 # construction cost (imports openai, builds model caches) until a caller
 # actually uses the litellm transport.
@@ -88,6 +94,9 @@ def _get_router() -> Any:
 
         from litellm import Router as _Router
 
+        _openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
+
         _router = _Router(
             model_list=[
                 # ── low group ──────────────────────────────────────────
@@ -96,75 +105,106 @@ def _get_router() -> Any:
                     "litellm_params": {
                         "model": "openai/deepseek-v4-flash",
                         "api_base": "http://127.0.0.1:8972/v1",
-                        "api_key": "unused-placeholder-see-key-isolation-config3007",
+                        "api_key": _egress_placeholder,
                     },
                 },
                 {
-                    "model_name": "low-fallback",
+                    "model_name": "low-gemini-flash",
                     "litellm_params": {
-                        "model": "openrouter/deepseek/deepseek-v4-flash",
-                        "api_key": os.environ.get("OPENROUTER_API_KEY", "test"),
+                        "model": "openai/gemini-2.5-flash",
+                        "api_base": "http://127.0.0.1:8974/v1beta/openai",
+                        "api_key": _egress_placeholder,
                     },
                 },
                 {
-                    "model_name": "low-claude",
+                    "model_name": "low-gpt-oss",
                     "litellm_params": {
-                        "model": "anthropic/claude-haiku-4-5-20251001",
-                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                        "model": "openrouter/openai/gpt-oss-120b",
+                        "api_key": _openrouter_key,
+                    },
+                },
+                {
+                    "model_name": "low-gemini-pro",
+                    "litellm_params": {
+                        "model": "openai/gemini-2.5-pro",
+                        "api_base": "http://127.0.0.1:8974/v1beta/openai",
+                        "api_key": _egress_placeholder,
                     },
                 },
                 # ── med group ──────────────────────────────────────────
                 {
                     "model_name": "med",
                     "litellm_params": {
+                        "model": "openai/deepseek-v4-flash",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": _egress_placeholder,
+                        "extra_body": {"reasoning": {"effort": "max"}},
+                    },
+                },
+                {
+                    "model_name": "med-openrouter",
+                    "litellm_params": {
+                        "model": "openrouter/deepseek/deepseek-v4-flash",
+                        "api_key": _openrouter_key,
+                        "extra_body": {"reasoning": {"effort": "max"}},
+                    },
+                },
+                {
+                    "model_name": "med-degrade",
+                    "litellm_params": {
                         "model": "openai/deepseek-v4-pro",
                         "api_base": "http://127.0.0.1:8972/v1",
-                        "api_key": "unused-placeholder-see-key-isolation-config3007",
-                    },
-                },
-                {
-                    "model_name": "med-fallback",
-                    "litellm_params": {
-                        "model": "openrouter/deepseek/deepseek-v4-pro",
-                        "api_key": os.environ.get("OPENROUTER_API_KEY", "test"),
-                    },
-                },
-                {
-                    "model_name": "med-sonnet",
-                    "litellm_params": {
-                        "model": "anthropic/claude-sonnet-5",
-                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                        "api_key": _egress_placeholder,
                     },
                 },
                 # ── high group ─────────────────────────────────────────
                 {
                     "model_name": "high",
                     "litellm_params": {
-                        "model": "anthropic/claude-opus-4-8",
-                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                        "model": "openai/deepseek-v4-pro",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": _egress_placeholder,
+                        "extra_body": {"reasoning": {"effort": "max"}},
                     },
                 },
                 {
-                    "model_name": "high-fallback",
+                    "model_name": "high-openrouter",
                     "litellm_params": {
-                        "model": "openai/deepseek-v4-pro",
-                        "api_base": "http://127.0.0.1:8972/v1",
-                        "api_key": "unused-placeholder-see-key-isolation-config3007",
+                        "model": "openrouter/deepseek/deepseek-v4-pro",
+                        "api_key": _openrouter_key,
+                        "extra_body": {"reasoning": {"effort": "max"}},
                     },
                 },
                 # ── ultra group ────────────────────────────────────────
                 {
                     "model_name": "ultra",
                     "litellm_params": {
-                        "model": "anthropic/claude-fable-5",
-                        "api_key": os.environ.get("ANTHROPIC_API_KEY", "test"),
+                        "model": "openrouter/moonshotai/kimi-k3",
+                        "api_key": _openrouter_key,
+                    },
+                },
+                {
+                    "model_name": "ultra-glm",
+                    "litellm_params": {
+                        "model": "openrouter/zhipuai/glm-5.2",
+                        "api_key": _openrouter_key,
+                    },
+                },
+                {
+                    "model_name": "ultra-degrade",
+                    "litellm_params": {
+                        "model": "openai/deepseek-v4-pro",
+                        "api_base": "http://127.0.0.1:8972/v1",
+                        "api_key": _egress_placeholder,
+                        "extra_body": {"reasoning": {"effort": "max"}},
                     },
                 },
             ],
             fallbacks=[
-                {"low": ["low-fallback", "low-claude"]},
-                {"med": ["med-fallback", "med-sonnet"]},
-                {"high": ["high-fallback"]},
+                {"low": ["low-gemini-flash", "low-gpt-oss", "low-gemini-pro"]},
+                {"med": ["med-openrouter", "med-degrade"]},
+                {"high": ["high-openrouter"]},
+                {"ultra": ["ultra-glm", "ultra-degrade"]},
             ],
         )
         logger.info("litellm Router initialized with %d models", len(_router.model_list))
