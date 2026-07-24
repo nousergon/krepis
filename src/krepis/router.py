@@ -43,46 +43,21 @@ logger = logging.getLogger(__name__)
 
 _MAX_WALK_DEPTH = 8
 
-# ── builtin fallback (mirrors the pre-registry hardcoded list) ──────────
-
 _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
-
-
-def _builtin_model_list(openrouter_key: str = "") -> list[dict]:
-    """Hardcoded model list — used when the registry file can't be found."""
-    return [
-        # low group
-        {"model_name": "low", "litellm_params": {"model": "openai/deepseek-v4-flash", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder}},
-        {"model_name": "low-gemini-flash", "litellm_params": {"model": "openai/gemini-2.5-flash", "api_base": "http://127.0.0.1:8974/v1beta/openai", "api_key": _egress_placeholder}},
-        {"model_name": "low-gpt-oss", "litellm_params": {"model": "openrouter/openai/gpt-oss-120b", "api_key": openrouter_key}},
-        {"model_name": "low-gemini-pro", "litellm_params": {"model": "openai/gemini-2.5-pro", "api_base": "http://127.0.0.1:8974/v1beta/openai", "api_key": _egress_placeholder}},
-        # med group
-        {"model_name": "med", "litellm_params": {"model": "openai/deepseek-v4-flash", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
-        {"model_name": "med-openrouter", "litellm_params": {"model": "openrouter/deepseek/deepseek-v4-flash", "api_key": openrouter_key, "extra_body": {"reasoning": {"effort": "max"}}}},
-        {"model_name": "med-degrade", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder}},
-        # high group
-        {"model_name": "high", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
-        {"model_name": "high-openrouter", "litellm_params": {"model": "openrouter/deepseek/deepseek-v4-pro", "api_key": openrouter_key, "extra_body": {"reasoning": {"effort": "max"}}}},
-        # ultra group — OpenRouter primary (GLM), Kimi fallback, DeepSeek last-resort
-        {"model_name": "ultra", "litellm_params": {"model": "openrouter/zhipuai/glm-5.2", "api_key": openrouter_key}},
-        {"model_name": "ultra-kimi", "litellm_params": {"model": "openrouter/moonshotai/kimi-k3", "api_key": openrouter_key}},
-        {"model_name": "ultra-deepseek", "litellm_params": {"model": "openai/deepseek-v4-pro", "api_base": "http://127.0.0.1:8972/v1", "api_key": _egress_placeholder, "extra_body": {"reasoning": {"effort": "max"}}}},
-    ]
-
-
-def _builtin_fallbacks() -> list[dict]:
-    return [
-        {"low": ["low-gemini-flash", "low-gpt-oss", "low-gemini-pro"]},
-        {"med": ["med-openrouter", "med-degrade"]},
-        {"high": ["high-openrouter"]},
-        {"ultra": ["ultra-kimi", "ultra-deepseek"]},
-    ]
 
 
 # ── registry file discovery ─────────────────────────────────────────────
 
 def _find_registry() -> Optional[Path]:
-    """Resolve the registry file path."""
+    """Resolve the registry file path.
+
+    Lookup order:
+    1. ``$LLM_MODEL_REGISTRY_PATH`` (explicit override)
+    2. Walk up from cwd for ``private-docs/LLM_MODEL_REGISTRY.yaml``
+       (alpha-engine-config convention)
+    3. Shipped default in the krepis package directory
+    4. None — caller falls back to hardcoded builtins
+    """
     env_path = os.environ.get("LLM_MODEL_REGISTRY_PATH")
     if env_path:
         p = Path(env_path)
@@ -102,6 +77,12 @@ def _find_registry() -> Optional[Path]:
         if parent == cwd:
             break
         cwd = parent
+
+    # Shipped default — lives next to router.py in the krepis package
+    shipped = Path(__file__).parent / "LLM_MODEL_REGISTRY.yaml"
+    if shipped.exists():
+        return shipped
+
     return None
 
 
@@ -132,7 +113,10 @@ def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], l
                 logger.warning("model %r referenced in group %r not found in models list", mid, group_name)
                 continue
 
-            model_name = mid if i == 0 else f"{group_name}-{mid}"
+            # Primary is named after the GROUP ("low", "med", …) so
+            # router.completion(model="low") resolves to the first entry.
+            # Fallbacks get qualified: "low-gemini-2.5-flash", etc.
+            model_name = group_name if i == 0 else f"{group_name}-{mid}"
             litellm_params = _model_to_litellm_params(entry, openrouter_key)
 
             if model_name not in seen_models:
@@ -203,7 +187,14 @@ _router_lock: Any = None
 
 
 def get_router() -> Any:
-    """Return the module-level Router singleton, building from registry or builtins."""
+    """Return the module-level Router singleton, built from LLM_MODEL_REGISTRY.yaml.
+
+    Raises :exc:`FileNotFoundError` if no registry file can be found —
+    there is no hardcoded fallback.  The shipped YAML in the krepis
+    package is the default; ``$LLM_MODEL_REGISTRY_PATH`` or a
+    ``private-docs/LLM_MODEL_REGISTRY.yaml`` walking up from cwd
+    override it.
+    """
     global _router, _router_lock
     if _router is not None:
         return _router
@@ -219,13 +210,15 @@ def get_router() -> Any:
         openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
 
         reg_path = _find_registry()
-        if reg_path:
-            logger.info("building Router from %s", reg_path)
-            model_list, fallbacks = _parse_registry(reg_path, openrouter_key)
-        else:
-            logger.warning("LLM_MODEL_REGISTRY.yaml not found — using builtin model list")
-            model_list = _builtin_model_list(openrouter_key)
-            fallbacks = _builtin_fallbacks()
+        if not reg_path:
+            raise FileNotFoundError(
+                "LLM_MODEL_REGISTRY.yaml not found — set "
+                "LLM_MODEL_REGISTRY_PATH or ensure the krepis package "
+                "is installed with its shipped registry file"
+            )
+
+        logger.info("building Router from %s", reg_path)
+        model_list, fallbacks = _parse_registry(reg_path, openrouter_key)
 
         _router = _Router(model_list=model_list, fallbacks=fallbacks)
         logger.info("Router initialized: %d models, %d fallback groups", len(model_list), len(fallbacks))
