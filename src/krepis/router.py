@@ -299,6 +299,127 @@ def _upstream_model(litellm_model: str) -> str:
     return parts[1] if len(parts) > 1 else litellm_model
 
 
+# ── Registry helpers ─────────────────────────────────────────────────────
+
+_registry_cache: Optional[dict] = None
+
+
+def _get_registry() -> dict:
+    """Return the parsed registry dict, cached in-process."""
+    global _registry_cache
+    if _registry_cache is not None:
+        return _registry_cache
+
+    import yaml as _yaml
+
+    reg_path = _find_registry()
+    if not reg_path:
+        raise FileNotFoundError(
+            "LLM_MODEL_REGISTRY.yaml not found — set "
+            "LLM_MODEL_REGISTRY_PATH or run from within a repo "
+            "whose private-docs/ directory contains the file."
+        )
+    with open(reg_path) as f:
+        _registry_cache = _yaml.safe_load(f)
+    return _registry_cache
+
+
+def _model_entry(model_id: str) -> Optional[dict]:
+    """Look up a model entry by its ``id`` field."""
+    reg = _get_registry()
+    for m in reg.get("models", []):
+        if m["id"] == model_id:
+            return m
+    return None
+
+
+def _anthropic_base_url(entry: dict) -> str:
+    """Determine the Anthropic Messages API base URL for *entry*.
+
+    Only DeepSeek via egress proxy has an Anthropic-format proxy (port 8971).
+    Everything else routes through OpenRouter.
+    """
+    route = entry.get("route", "")
+    provider = entry.get("provider", "")
+    if route == "egress_proxy" and provider == "deepseek":
+        return "http://127.0.0.1:8971"
+    return "https://openrouter.ai/api"
+
+
+def _deployment_id(entry: dict) -> str:
+    """Determine the deployment/model ID for routing.
+
+    Egress-proxy entries use the bare model name; OpenRouter entries already
+    carry the full provider/model slug in their ``model`` field.
+    """
+    return entry["model"]
+
+
+def _auth_token_type(entry: dict) -> str:
+    """Determine the auth token type for *entry*."""
+    route = entry.get("route", "")
+    provider = entry.get("provider", "")
+    if route == "egress_proxy":
+        return "placeholder"
+    if route == "openrouter" or provider == "openrouter":
+        return "openrouter_key"
+    if provider == "anthropic":
+        return "anthropic_key"
+    return "placeholder"
+
+
+# ── Structured group resolution (for shell scripts) ──────────────────────
+
+def resolve_group_structured(group: str) -> dict[str, str]:
+    """Resolve *group* and return a structured routing dict.
+
+    The returned dict carries every field ``claude_to_model_router.sh`` needs
+    to set up the Claude CLI environment::
+
+        {
+            "model": "deepseek-v4-pro",              # cooldown-aware resolved model
+            "route": "egress_proxy",                 # egress_proxy | openrouter | direct
+            "provider": "deepseek",                  # deepseek | gemini | xai | openrouter | anthropic
+            "anthropic_base_url": "http://127.0.0.1:8971",
+            "deployment_id": "deepseek-v4-pro",      # model slug for the API
+            "auth_token_type": "placeholder",        # placeholder | openrouter_key | anthropic_key
+            "registry_id": "deepseek-v4-pro-max",    # registry entry id
+        }
+
+    Routing metadata (route, provider, base URL, etc.) is taken from the
+    group's PRIMARY model entry.  The ``model`` field is resolved via
+    :func:`resolve_group` so it reflects LiteLLM cooldown state.
+    """
+    reg = _get_registry()
+    groups = reg.get("model_groups", {})
+    known = sorted(groups)
+
+    if group not in groups:
+        raise ValueError(
+            f"Unknown model group: {group!r}; known: {', '.join(known)}"
+        )
+
+    primary_id = groups[group][0]
+    entry = _model_entry(primary_id)
+    if not entry:
+        raise ValueError(
+            f"Model entry {primary_id!r} (primary for group {group!r}) "
+            f"not found in registry models list"
+        )
+
+    model = resolve_group(group)
+
+    return {
+        "model": model,
+        "route": entry["route"],
+        "provider": entry["provider"],
+        "anthropic_base_url": _anthropic_base_url(entry),
+        "deployment_id": _deployment_id(entry),
+        "auth_token_type": _auth_token_type(entry),
+        "registry_id": entry["id"],
+    }
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def _cli() -> None:
@@ -313,12 +434,32 @@ def _cli() -> None:
     cmd = sys.argv[1]
 
     if cmd == "resolve":
-        if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra>", file=sys.stderr)
+        # Parse optional --json flag and positional <group>
+        use_json = False
+        group: Optional[str] = None
+        for a in sys.argv[2:]:
+            if a == "--json":
+                use_json = True
+            elif a in ("-h", "--help"):
+                print("Usage: python3 -m krepis.router resolve [--json] <low|med|high|ultra>", file=sys.stderr)
+                sys.exit(0)
+            elif not a.startswith("-"):
+                group = a
+            else:
+                print(f"Unknown flag: {a}", file=sys.stderr)
+                print("Usage: python3 -m krepis.router resolve [--json] <low|med|high|ultra>", file=sys.stderr)
+                sys.exit(1)
+
+        if group is None:
+            print("Usage: python3 -m krepis.router resolve [--json] <low|med|high|ultra>", file=sys.stderr)
             sys.exit(1)
-        group = sys.argv[2]
-        model = resolve_group(group)
-        print(model)
+
+        if use_json:
+            info = resolve_group_structured(group)
+            print(json.dumps(info))
+        else:
+            model = resolve_group(group)
+            print(model)
 
     elif cmd == "groups":
         router = get_router()
