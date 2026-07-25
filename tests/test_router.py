@@ -342,3 +342,178 @@ class TestCLI:
             with pytest.raises(SystemExit) as exc:
                 _router._cli()
             assert exc.value.code == 1
+
+
+# ── _anthropic_endpoint_for ───────────────────────────────────────────────
+
+class TestAnthropicEndpointFor:
+    def test_deepseek_egress_proxy_returns_8971(self):
+        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
+        assert _router._anthropic_endpoint_for(entry) == "http://127.0.0.1:8971"
+
+    def test_openrouter_returns_openrouter_api(self):
+        entry = {"route": "openrouter", "provider": "openrouter", "id": "test-or"}
+        assert _router._anthropic_endpoint_for(entry) == "https://openrouter.ai/api"
+
+    def test_openrouter_any_provider_returns_openrouter_api(self):
+        """OpenRouter route matches on route alone, regardless of provider."""
+        entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2"}
+        assert _router._anthropic_endpoint_for(entry) == "https://openrouter.ai/api"
+
+    def test_anthropic_direct_returns_empty(self):
+        entry = {"route": "direct", "provider": "anthropic", "id": "test-an"}
+        assert _router._anthropic_endpoint_for(entry) == ""
+
+    def test_gemini_egress_proxy_raises_valueerror(self):
+        entry = {"route": "egress_proxy", "provider": "gemini", "id": "test-gem"}
+        with pytest.raises(ValueError, match="does not serve"):
+            _router._anthropic_endpoint_for(entry)
+
+    def test_xai_egress_proxy_raises_valueerror(self):
+        entry = {"route": "egress_proxy", "provider": "xai", "id": "test-xai"}
+        with pytest.raises(ValueError, match="does not serve"):
+            _router._anthropic_endpoint_for(entry)
+
+
+# ── _anthropic_deployment_id ──────────────────────────────────────────────
+
+class TestAnthropicDeploymentId:
+    def test_egress_proxy_returns_bare_model(self):
+        entry = {"route": "egress_proxy", "model": "deepseek-v4-flash"}
+        assert _router._anthropic_deployment_id(entry) == "deepseek-v4-flash"
+
+    def test_openrouter_returns_full_slug(self):
+        entry = {"route": "openrouter", "model": "deepseek/deepseek-v4-flash"}
+        assert _router._anthropic_deployment_id(entry) == "deepseek/deepseek-v4-flash"
+
+    def test_anthropic_direct_returns_model_id(self):
+        entry = {"route": "direct", "provider": "anthropic", "model": "claude-sonnet-5"}
+        assert _router._anthropic_deployment_id(entry) == "claude-sonnet-5"
+
+
+# ── _resolve_group_json ────────────────────────────────────────────────
+
+class TestResolveGroupDetailed:
+    def test_med_returns_deepseek_egress(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("med")
+            assert info["model"] == "deepseek-v4-flash"
+            assert info["provider"] == "deepseek"
+            assert info["route"] == "egress_proxy"
+            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["deployment_id"] == "deepseek-v4-flash"
+            assert info["auth_token_type"] == "placeholder"
+            assert info["registry_id"] == "deepseek-v4-flash-max"
+        finally:
+            _router._router = None
+
+    def test_high_returns_deepseek_egress(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("high")
+            assert info["model"] == "deepseek-v4-pro"
+            assert info["provider"] == "deepseek"
+            assert info["route"] == "egress_proxy"
+            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["deployment_id"] == "deepseek-v4-pro"
+            assert info["auth_token_type"] == "placeholder"
+            assert info["registry_id"] == "deepseek-v4-pro-max"
+        finally:
+            _router._router = None
+
+    def test_ultra_returns_openrouter(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("ultra")
+            assert info["model"] == "zhipuai/glm-5.2"
+            assert info["provider"] == "openrouter"
+            assert info["route"] == "openrouter"
+            assert info["anthropic_base_url"] == "https://openrouter.ai/api"
+            assert info["deployment_id"] == "zhipuai/glm-5.2"
+            assert info["auth_token_type"] == "openrouter_key"
+            assert info["registry_id"] == "glm-5.2"
+        finally:
+            _router._router = None
+
+    def test_low_skips_gemini_returns_deepseek(self, registry_file, monkeypatch):
+        """Low group primary is gemini (not Anthropic-compat) — skips to deepseek."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("low")
+            # Should skip gemini-2.5-flash (not Anthropic-compat) → deepseek-v4-flash
+            assert info["provider"] == "deepseek"
+            assert info["route"] == "egress_proxy"
+            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["registry_id"] == "deepseek-v4-flash"
+            assert info["auth_token_type"] == "placeholder"
+        finally:
+            _router._router = None
+
+    def test_nonexistent_group_raises_valueerror(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with pytest.raises(ValueError, match="not found in registry"):
+                    _router._resolve_group_json("nonexistent")
+        finally:
+            _router._router = None
+
+    def test_all_keys_present(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("med")
+            for key in ("model", "provider", "route", "anthropic_base_url",
+                        "deployment_id", "auth_token_type", "group", "registry_id"):
+                assert key in info, f"Missing key: {key}"
+        finally:
+            _router._router = None
+
+
+# ── CLI resolve --json ──────────────────────────────────────────────────────
+
+class TestCLIResolveGroup:
+    def test_json_output(self, registry_file, monkeypatch, capsys):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "med", "--json"]):
+                    _router._cli()
+            captured = capsys.readouterr()
+            import json
+            data = json.loads(captured.out)
+            assert data["model"] == "deepseek-v4-flash"
+            assert data["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert data["auth_token_type"] == "placeholder"
+        finally:
+            _router._router = None
+
+    def test_plain_output(self, registry_file, monkeypatch, capsys):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "high"]):
+                    _router._cli()
+            captured = capsys.readouterr()
+            assert "deepseek-v4-pro" in captured.out
+        finally:
+            _router._router = None
+
+    def test_no_group_exits_1(self, capsys):
+        with mock.patch.object(sys, "argv", ["krepis.router", "resolve"]):
+            with pytest.raises(SystemExit) as exc:
+                _router._cli()
+            assert exc.value.code == 1
