@@ -50,7 +50,7 @@ _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 # Port 8971 carries the /anthropic upstream-prefix (Anthropic-format);
 # ports 8972/8973/8974 serve OpenAI-format (for LiteLLM, not CLI-compatible).
 # Entries NOT in this dict cannot serve as ANTHROPIC_BASE_URL for the
-# Claude CLI and are skipped by resolve_group_detailed.
+# Claude CLI and are skipped by _resolve_group_json.
 _ANTHROPIC_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
     ("egress_proxy", "deepseek"): "http://127.0.0.1:8971",
     ("openrouter", None):         "https://openrouter.ai/api",
@@ -362,28 +362,25 @@ def _upstream_model(litellm_model: str) -> str:
     return parts[1] if len(parts) > 1 else litellm_model
 
 
-def resolve_group_detailed(group: str) -> dict[str, str]:
-    """Resolve *group* to full routing info for the Claude Code CLI.
+# ── group resolution (structured, for shell scripts) ────────────────────
 
-    Iterates the group's fallback chain from
-    :file:`LLM_MODEL_REGISTRY.yaml` and returns the **first model whose
+def _resolve_group_json(group: str) -> dict:
+    """Return full routing info for *group* as a JSON-ready dict.
+
+    Reads the registry directly (bypasses the Router's cooldown state) and
+    iterates the group's fallback chain to find the **first model whose
     route+provider serves the Anthropic Messages API wire format**.
     Gemini and xAI egress-proxy ports (8974, 8973) speak OpenAI format
     only and are automatically skipped.
 
-    Returns a dict with every field the shell wrapper needs to configure
-    the session::
+    Produces a dict with every field a shell script needs to configure
+    the Claude CLI environment: endpoint URL, auth type, provider, route,
+    deployment ID, and registry ID.
 
-        {
-            "model":              "deepseek-v4-flash",
-            "provider":           "deepseek",
-            "route":              "egress_proxy",
-            "anthropic_base_url": "http://127.0.0.1:8971",
-            "deployment_id":      "deepseek-v4-flash",
-            "auth_token_type":    "placeholder",
-            "group":              "med",
-            "registry_id":        "deepseek-v4-flash-max",
-        }
+    The ``anthropic_base_url`` is the **Claude-CLI-compatible** endpoint:
+    Anthropic Messages API format.  Port 8971 (DeepSeek) and OpenRouter
+    speak this format; ports 8972/8973/8974 are OpenAI-format LiteLLM
+    endpoints and cannot serve ``exec claude`` directly.
 
     Raises :exc:`ValueError` if NO model in the group is Anthropic-compatible.
     """
@@ -433,7 +430,7 @@ def resolve_group_detailed(group: str) -> dict[str, str]:
         elif provider == "anthropic":
             auth_token_type = "anthropic_key"
         else:
-            auth_token_type = "unknown"
+            auth_token_type = "placeholder"
 
         return {
             "model": model_str,
@@ -460,44 +457,25 @@ def _cli() -> None:
     """Entry point for ``python3 -m krepis.router``."""
     if len(sys.argv) < 2:
         print("Usage: python3 -m krepis.router <command> [args]", file=sys.stderr)
-        print("  resolve <group>          — print first healthy model for group (LiteLLM)", file=sys.stderr)
-        print("  resolve-group <group>    — resolve group + Anthropic routing info for Claude CLI", file=sys.stderr)
-        print("  groups                   — list all model groups", file=sys.stderr)
-        print("  models                   — list all models in the Router", file=sys.stderr)
+        print("  resolve <group> [--json]  — print first healthy model for group", file=sys.stderr)
+        print("  groups                    — list all model groups", file=sys.stderr)
+        print("  models                    — list all models in the Router", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
 
     if cmd == "resolve":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra>", file=sys.stderr)
+            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json]", file=sys.stderr)
             sys.exit(1)
         group = sys.argv[2]
-        model = resolve_group(group)
-        print(model)
-
-    elif cmd == "resolve-group":
-        if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve-group <group> [--json]", file=sys.stderr)
-            sys.exit(1)
-        group = sys.argv[2]
-        use_json = "--json" in sys.argv
-
-        try:
-            info = resolve_group_detailed(group)
-        except ValueError as exc:
-            print(f"FATAL: {exc}", file=sys.stderr)
-            sys.exit(1)
-
-        if use_json:
-            print(json.dumps(info, indent=2))
+        want_json = "--json" in sys.argv
+        if want_json:
+            info = _resolve_group_json(group)
+            print(json.dumps(info))
         else:
-            print(f"Group:    {info['group']}")
-            print(f"Model:    {info['model']}")
-            print(f"Provider: {info['provider']}")
-            print(f"Route:    {info['route']}")
-            print(f"Endpoint: {info['anthropic_base_url']}")
-            print(f"DeployID: {info['deployment_id']}")
+            model = resolve_group(group)
+            print(model)
 
     elif cmd == "groups":
         router = get_router()
