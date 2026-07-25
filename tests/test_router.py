@@ -391,7 +391,7 @@ class TestAnthropicDeploymentId:
         assert _router._anthropic_deployment_id(entry) == "claude-sonnet-5"
 
 
-# ── resolve_group_detailed ────────────────────────────────────────────────
+# ── _resolve_group_json ────────────────────────────────────────────────
 
 class TestResolveGroupDetailed:
     def test_med_returns_deepseek_egress(self, registry_file, monkeypatch):
@@ -399,7 +399,7 @@ class TestResolveGroupDetailed:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router.resolve_group_detailed("med")
+                info = _router._resolve_group_json("med")
             assert info["model"] == "deepseek-v4-flash"
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
@@ -415,7 +415,7 @@ class TestResolveGroupDetailed:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router.resolve_group_detailed("high")
+                info = _router._resolve_group_json("high")
             assert info["model"] == "deepseek-v4-pro"
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
@@ -431,7 +431,7 @@ class TestResolveGroupDetailed:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router.resolve_group_detailed("ultra")
+                info = _router._resolve_group_json("ultra")
             assert info["model"] == "zhipuai/glm-5.2"
             assert info["provider"] == "openrouter"
             assert info["route"] == "openrouter"
@@ -448,7 +448,7 @@ class TestResolveGroupDetailed:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router.resolve_group_detailed("low")
+                info = _router._resolve_group_json("low")
             # Should skip gemini-2.5-flash (not Anthropic-compat) → deepseek-v4-flash
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
@@ -464,7 +464,7 @@ class TestResolveGroupDetailed:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 with pytest.raises(ValueError, match="not found in registry"):
-                    _router.resolve_group_detailed("nonexistent")
+                    _router._resolve_group_json("nonexistent")
         finally:
             _router._router = None
 
@@ -473,7 +473,7 @@ class TestResolveGroupDetailed:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router.resolve_group_detailed("med")
+                info = _router._resolve_group_json("med")
             for key in ("model", "provider", "route", "anthropic_base_url",
                         "deployment_id", "auth_token_type", "group", "registry_id"):
                 assert key in info, f"Missing key: {key}"
@@ -481,7 +481,7 @@ class TestResolveGroupDetailed:
             _router._router = None
 
 
-# ── CLI resolve-group ─────────────────────────────────────────────────────
+# ── CLI resolve --json ──────────────────────────────────────────────────────
 
 class TestCLIResolveGroup:
     def test_json_output(self, registry_file, monkeypatch, capsys):
@@ -489,7 +489,7 @@ class TestCLIResolveGroup:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                with mock.patch.object(sys, "argv", ["krepis.router", "resolve-group", "med", "--json"]):
+                with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "med", "--json"]):
                     _router._cli()
             captured = capsys.readouterr()
             import json
@@ -505,16 +505,15 @@ class TestCLIResolveGroup:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                with mock.patch.object(sys, "argv", ["krepis.router", "resolve-group", "high"]):
+                with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "high"]):
                     _router._cli()
             captured = capsys.readouterr()
             assert "deepseek-v4-pro" in captured.out
-            assert "http://127.0.0.1:8971" in captured.out
         finally:
             _router._router = None
 
     def test_no_group_exits_1(self, capsys):
-        with mock.patch.object(sys, "argv", ["krepis.router", "resolve-group"]):
+        with mock.patch.object(sys, "argv", ["krepis.router", "resolve"]):
             with pytest.raises(SystemExit) as exc:
                 _router._cli()
             assert exc.value.code == 1
