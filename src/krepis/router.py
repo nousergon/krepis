@@ -299,26 +299,117 @@ def _upstream_model(litellm_model: str) -> str:
     return parts[1] if len(parts) > 1 else litellm_model
 
 
+# ── group resolution (structured, for shell scripts) ────────────────────
+
+def _resolve_group_json(group: str) -> dict:
+    """Return full routing info for *group*'s primary model as a dict.
+
+    Reads the registry directly (bypasses the Router's cooldown state) to
+    produce a JSON object with every field a shell script needs to configure
+    the Claude CLI environment: endpoint URL, auth type, provider, route,
+    deployment ID, and registry ID.
+
+    The ``anthropic_base_url`` is the **Claude-CLI-compatible** endpoint:
+    Anthropic Messages API format.  Port 8971 (DeepSeek) and OpenRouter
+    speak this format; ports 8972/8973/8974 are OpenAI-format LiteLLM
+    endpoints and cannot serve ``exec claude`` directly.
+    """
+    reg_path = _find_registry()
+    if not reg_path:
+        raise FileNotFoundError(
+            "LLM_MODEL_REGISTRY.yaml not found — set "
+            "LLM_MODEL_REGISTRY_PATH or run from within a repo "
+            "whose private-docs/ directory contains the file."
+        )
+
+    import yaml as _yaml
+
+    with open(reg_path) as f:
+        doc = _yaml.safe_load(f)
+
+    groups = doc.get("model_groups", {})
+    models = {m["id"]: m for m in doc.get("models", [])}
+
+    group_ids = groups.get(group, [])
+    if not group_ids:
+        raise ValueError(f"group {group!r} not found in registry model_groups")
+
+    primary_id = group_ids[0]
+    entry = models.get(primary_id)
+    if not entry:
+        raise ValueError(
+            f"model {primary_id!r} referenced in group {group!r} not found in registry models"
+        )
+
+    provider = entry.get("provider", "")
+    route = entry.get("route", "")
+    model = entry.get("model", "")
+
+    # ── Derive Claude-CLI-compatible base URL ──────────────────────────
+    # Claude CLI speaks Anthropic Messages API.  Only port 8971 (DeepSeek
+    # Anthropic-format proxy) and OpenRouter speak this format.  Ports
+    # 8972/8973/8974 are OpenAI-format endpoints for LiteLLM.
+    if route == "egress_proxy":
+        if provider == "deepseek":
+            base_url = "http://127.0.0.1:8971"
+        else:
+            # Gemini / xAI have no Anthropic-format proxy — the shell
+            # script's proxy health check will reject these and fall
+            # back to OpenRouter.
+            base_url = "http://127.0.0.1:8971"
+    elif route == "openrouter":
+        base_url = "https://openrouter.ai/api"
+    elif provider == "anthropic":
+        base_url = "https://api.anthropic.com"
+    else:
+        base_url = "http://127.0.0.1:8971"
+
+    # ── Auth token type ────────────────────────────────────────────────
+    if route == "egress_proxy":
+        auth_type = "placeholder"
+    elif route == "openrouter":
+        auth_type = "openrouter_key"
+    elif provider == "anthropic":
+        auth_type = "anthropic_key"
+    else:
+        auth_type = "placeholder"
+
+    return {
+        "model": model,
+        "route": route,
+        "provider": provider,
+        "anthropic_base_url": base_url,
+        "deployment_id": model,  # bare name for egress_proxy, full slug for openrouter
+        "auth_token_type": auth_type,
+        "registry_id": primary_id,
+    }
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def _cli() -> None:
     """Entry point for ``python3 -m krepis.router``."""
     if len(sys.argv) < 2:
         print("Usage: python3 -m krepis.router <command> [args]", file=sys.stderr)
-        print("  resolve <group>  — print first healthy model for group", file=sys.stderr)
-        print("  groups           — list all model groups", file=sys.stderr)
-        print("  models           — list all models in the Router", file=sys.stderr)
+        print("  resolve <group> [--json]  — print first healthy model for group", file=sys.stderr)
+        print("  groups                    — list all model groups", file=sys.stderr)
+        print("  models                    — list all models in the Router", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
 
     if cmd == "resolve":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra>", file=sys.stderr)
+            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json]", file=sys.stderr)
             sys.exit(1)
         group = sys.argv[2]
-        model = resolve_group(group)
-        print(model)
+        want_json = "--json" in sys.argv
+        if want_json:
+            info = _resolve_group_json(group)
+            print(json.dumps(info))
+        else:
+            model = resolve_group(group)
+            print(model)
 
     elif cmd == "groups":
         router = get_router()
