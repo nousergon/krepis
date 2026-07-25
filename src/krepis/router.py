@@ -45,6 +45,18 @@ _MAX_WALK_DEPTH = 8
 
 _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 
+# Mapping of (route, provider) tuples to Anthropic Messages API base URLs.
+# Only these combinations speak the wire format the Claude CLI expects.
+# Port 8971 carries the /anthropic upstream-prefix (Anthropic-format);
+# ports 8972/8973/8974 serve OpenAI-format (for LiteLLM, not CLI-compatible).
+# Entries NOT in this dict cannot serve as ANTHROPIC_BASE_URL for the
+# Claude CLI and are skipped by _resolve_group_json.
+_ANTHROPIC_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
+    ("egress_proxy", "deepseek"): "http://127.0.0.1:8971",
+    ("openrouter", None):         "https://openrouter.ai/api",
+    ("direct", "anthropic"):      "",
+}
+
 
 # ── registry file discovery ─────────────────────────────────────────────
 
@@ -82,6 +94,57 @@ def _find_registry() -> Optional[Path]:
         cwd = parent
 
     return None
+
+
+# ── Anthropic wire-format helpers ─────────────────────────────────────────
+
+def _anthropic_endpoint_for(entry: dict) -> str:
+    """Return the Anthropic Messages API base URL for a registry model entry.
+
+    Raises :exc:`ValueError` if this entry's route+provider cannot serve
+    the Anthropic Messages API wire format (e.g. Gemini/xAI egress proxies
+    are OpenAI-format only).
+    """
+    route = entry.get("route", "")
+    provider = entry.get("provider", "")
+
+    key = (route, provider)
+    if key in _ANTHROPIC_COMPATIBLE_ENDPOINTS:
+        return _ANTHROPIC_COMPATIBLE_ENDPOINTS[key]
+
+    # Also try with None provider (for route-only lookup like openrouter)
+    if (route, None) in _ANTHROPIC_COMPATIBLE_ENDPOINTS:
+        return _ANTHROPIC_COMPATIBLE_ENDPOINTS[(route, None)]
+
+    raise ValueError(
+        f"Model entry {entry.get('id', '?')!r} "
+        f"(route={route!r}, provider={provider!r}) "
+        "does not serve the Anthropic Messages API wire format and "
+        "cannot be used as ANTHROPIC_BASE_URL for the Claude CLI"
+    )
+
+
+def _anthropic_deployment_id(entry: dict) -> str:
+    """Return the model string to set as ``ANTHROPIC_MODEL``.
+
+    * For *egress_proxy* routes: bare model name (e.g. ``deepseek-v4-flash``)
+      — the proxy translates to the upstream model ID.
+    * For *openrouter* routes: full OpenRouter slug (e.g.
+      ``deepseek/deepseek-v4-flash``) — already stored in the registry's
+      *model* field.
+    * For *anthropic* direct: canonical Anthropic model ID.
+    """
+    route = entry.get("route", "")
+    model = entry.get("model", "")
+
+    if route == "egress_proxy":
+        return model
+    elif route == "openrouter":
+        return model
+    elif route == "direct" and entry.get("provider") == "anthropic":
+        return model
+    else:
+        return model
 
 
 # ── registry → Router config ─────────────────────────────────────────────
@@ -302,10 +365,15 @@ def _upstream_model(litellm_model: str) -> str:
 # ── group resolution (structured, for shell scripts) ────────────────────
 
 def _resolve_group_json(group: str) -> dict:
-    """Return full routing info for *group*'s primary model as a dict.
+    """Return full routing info for *group* as a JSON-ready dict.
 
-    Reads the registry directly (bypasses the Router's cooldown state) to
-    produce a JSON object with every field a shell script needs to configure
+    Reads the registry directly (bypasses the Router's cooldown state) and
+    iterates the group's fallback chain to find the **first model whose
+    route+provider serves the Anthropic Messages API wire format**.
+    Gemini and xAI egress-proxy ports (8974, 8973) speak OpenAI format
+    only and are automatically skipped.
+
+    Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
     deployment ID, and registry ID.
 
@@ -313,7 +381,11 @@ def _resolve_group_json(group: str) -> dict:
     Anthropic Messages API format.  Port 8971 (DeepSeek) and OpenRouter
     speak this format; ports 8972/8973/8974 are OpenAI-format LiteLLM
     endpoints and cannot serve ``exec claude`` directly.
+
+    Raises :exc:`ValueError` if NO model in the group is Anthropic-compatible.
     """
+    import yaml as _yaml
+
     reg_path = _find_registry()
     if not reg_path:
         raise FileNotFoundError(
@@ -322,67 +394,61 @@ def _resolve_group_json(group: str) -> dict:
             "whose private-docs/ directory contains the file."
         )
 
-    import yaml as _yaml
-
     with open(reg_path) as f:
         doc = _yaml.safe_load(f)
 
-    groups = doc.get("model_groups", {})
-    models = {m["id"]: m for m in doc.get("models", [])}
+    models_by_id: dict[str, dict] = {m["id"]: m for m in doc.get("models", [])}
+    group_ids: list[str] = doc.get("model_groups", {}).get(group, [])
 
-    group_ids = groups.get(group, [])
     if not group_ids:
-        raise ValueError(f"group {group!r} not found in registry model_groups")
-
-    primary_id = group_ids[0]
-    entry = models.get(primary_id)
-    if not entry:
         raise ValueError(
-            f"model {primary_id!r} referenced in group {group!r} not found in registry models"
+            f"Model group {group!r} not found in registry. "
+            f"Available groups: {list(doc.get('model_groups', {}).keys())}"
         )
 
-    provider = entry.get("provider", "")
-    route = entry.get("route", "")
-    model = entry.get("model", "")
+    # Iterate the fallback chain — first Anthropic-compatible entry wins
+    for mid in group_ids:
+        entry = models_by_id.get(mid)
+        if entry is None:
+            continue
 
-    # ── Derive Claude-CLI-compatible base URL ──────────────────────────
-    # Claude CLI speaks Anthropic Messages API.  Only port 8971 (DeepSeek
-    # Anthropic-format proxy) and OpenRouter speak this format.  Ports
-    # 8972/8973/8974 are OpenAI-format endpoints for LiteLLM.
-    if route == "egress_proxy":
-        if provider == "deepseek":
-            base_url = "http://127.0.0.1:8971"
+        # Skip non-Anthropic-compatible entries (Gemini, xAI)
+        try:
+            anthropic_base_url = _anthropic_endpoint_for(entry)
+        except ValueError:
+            continue
+
+        model_str = entry.get("model", "")
+        route = entry.get("route", "")
+        provider = entry.get("provider", "")
+
+        # Determine auth token type
+        if route == "egress_proxy":
+            auth_token_type = "placeholder"
+        elif route == "openrouter":
+            auth_token_type = "openrouter_key"
+        elif provider == "anthropic":
+            auth_token_type = "anthropic_key"
         else:
-            # Gemini / xAI have no Anthropic-format proxy — the shell
-            # script's proxy health check will reject these and fall
-            # back to OpenRouter.
-            base_url = "http://127.0.0.1:8971"
-    elif route == "openrouter":
-        base_url = "https://openrouter.ai/api"
-    elif provider == "anthropic":
-        base_url = "https://api.anthropic.com"
-    else:
-        base_url = "http://127.0.0.1:8971"
+            auth_token_type = "placeholder"
 
-    # ── Auth token type ────────────────────────────────────────────────
-    if route == "egress_proxy":
-        auth_type = "placeholder"
-    elif route == "openrouter":
-        auth_type = "openrouter_key"
-    elif provider == "anthropic":
-        auth_type = "anthropic_key"
-    else:
-        auth_type = "placeholder"
+        return {
+            "model": model_str,
+            "provider": provider,
+            "route": route,
+            "anthropic_base_url": anthropic_base_url,
+            "deployment_id": _anthropic_deployment_id(entry),
+            "auth_token_type": auth_token_type,
+            "group": group,
+            "registry_id": mid,
+        }
 
-    return {
-        "model": model,
-        "route": route,
-        "provider": provider,
-        "anthropic_base_url": base_url,
-        "deployment_id": model,  # bare name for egress_proxy, full slug for openrouter
-        "auth_token_type": auth_type,
-        "registry_id": primary_id,
-    }
+    raise ValueError(
+        f"No model in group {group!r} supports the Anthropic Messages API "
+        f"wire format.  Available models: {group_ids}.  "
+        "Gemini and xAI egress-proxy routes speak OpenAI format only and "
+        "cannot serve the Claude CLI directly."
+    )
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
