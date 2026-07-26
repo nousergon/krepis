@@ -607,8 +607,11 @@ def _resolve_group_json(group: str) -> dict:
         _primary_model = _primary_entry.get("model", group)
         _primary_registry_id = _primary_entry.get("id", group)
 
+        _display_name = f"{_primary_model} ({group})"
+
         return {
             "model": group,
+            "display_name": _display_name,
             "provider": "litellm",
             "route": "litellm_proxy",
             "api_base_url": LITELLM_PROXY_URL,
@@ -687,8 +690,11 @@ def _resolve_group_json(group: str) -> dict:
             if key in entry:
                 cache_pricing[key] = entry[key]
 
+        _display_name = f"{model_str} ({group})"
+
         return {
             "model": model_str,
+            "display_name": _display_name,
             "provider": provider,
             "route": route,
             "api_base_url": api_base_url,
