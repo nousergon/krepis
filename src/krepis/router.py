@@ -696,6 +696,7 @@ def _resolve_group_json(group: str) -> dict:
             "auth_token_type": auth_token_type,
             "group": group,
             "registry_id": mid,
+            "primary_model": model_str,
             "capabilities": capabilities,
             "supports_automatic_prefix_caching": capabilities.get(
                 "automatic_prefix_caching", False
