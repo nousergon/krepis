@@ -212,14 +212,20 @@ def _model_to_litellm_params(entry: dict, openrouter_key: str) -> dict:
     elif route == "egress_proxy":
         litellm_params["model"] = f"openai/{model_id}"
         litellm_params["api_key"] = _egress_placeholder
-        # Map provider to egress proxy port
-        if provider == "deepseek":
-            litellm_params["api_base"] = "http://127.0.0.1:8972/v1"
-        elif provider in ("xai", "grok"):
-            litellm_params["api_base"] = "http://127.0.0.1:8973/v1"
-        elif provider == "gemini":
-            litellm_params["api_base"] = "http://127.0.0.1:8974/v1beta/openai"
+        # api_base is driven by the registry — no hardcoded provider→port map.
+        # Every egress_proxy entry MUST carry an api_base field pointing at its
+        # local proxy instance (e.g. "http://127.0.0.1:8972/v1").
+        api_base = entry.get("api_base")
+        if api_base:
+            litellm_params["api_base"] = api_base
+        else:
+            entry_id = entry.get("id", model_id)
+            logger.warning(
+                "egress_proxy entry %r missing api_base — "
+                "requests will fail without a base URL", entry_id
+            )
     else:
+        # Unknown route — treat as generic OpenAI-compatible, no proxy.
         litellm_params["model"] = f"openai/{model_id}"
         litellm_params["api_key"] = _egress_placeholder
 
