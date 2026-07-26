@@ -350,51 +350,51 @@ class TestCLI:
             assert exc.value.code == 1
 
 
-# ── _anthropic_endpoint_for ───────────────────────────────────────────────
+# ── _cli_endpoint_for ───────────────────────────────────────────────
 
 class TestAnthropicEndpointFor:
     def test_deepseek_egress_proxy_returns_8971(self):
         entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
-        assert _router._anthropic_endpoint_for(entry) == "http://127.0.0.1:8971"
+        assert _router._cli_endpoint_for(entry) == "http://127.0.0.1:8971"
 
     def test_openrouter_returns_openrouter_api(self):
         entry = {"route": "openrouter", "provider": "openrouter", "id": "test-or"}
-        assert _router._anthropic_endpoint_for(entry) == "https://openrouter.ai/api"
+        assert _router._cli_endpoint_for(entry) == "https://openrouter.ai/api"
 
     def test_openrouter_any_provider_returns_openrouter_api(self):
         """OpenRouter route matches on route alone, regardless of provider."""
         entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2"}
-        assert _router._anthropic_endpoint_for(entry) == "https://openrouter.ai/api"
+        assert _router._cli_endpoint_for(entry) == "https://openrouter.ai/api"
 
     def test_anthropic_direct_returns_empty(self):
         entry = {"route": "direct", "provider": "anthropic", "id": "test-an"}
-        assert _router._anthropic_endpoint_for(entry) == ""
+        assert _router._cli_endpoint_for(entry) == ""
 
     def test_gemini_egress_proxy_raises_valueerror(self):
         entry = {"route": "egress_proxy", "provider": "gemini", "id": "test-gem"}
         with pytest.raises(ValueError, match="does not serve"):
-            _router._anthropic_endpoint_for(entry)
+            _router._cli_endpoint_for(entry)
 
     def test_xai_egress_proxy_raises_valueerror(self):
         entry = {"route": "egress_proxy", "provider": "xai", "id": "test-xai"}
         with pytest.raises(ValueError, match="does not serve"):
-            _router._anthropic_endpoint_for(entry)
+            _router._cli_endpoint_for(entry)
 
 
-# ── _anthropic_deployment_id ──────────────────────────────────────────────
+# ── _cli_deployment_id ──────────────────────────────────────────────
 
 class TestAnthropicDeploymentId:
     def test_egress_proxy_returns_bare_model(self):
         entry = {"route": "egress_proxy", "model": "deepseek-v4-flash"}
-        assert _router._anthropic_deployment_id(entry) == "deepseek-v4-flash"
+        assert _router._cli_deployment_id(entry) == "deepseek-v4-flash"
 
     def test_openrouter_returns_full_slug(self):
         entry = {"route": "openrouter", "model": "deepseek/deepseek-v4-flash"}
-        assert _router._anthropic_deployment_id(entry) == "deepseek/deepseek-v4-flash"
+        assert _router._cli_deployment_id(entry) == "deepseek/deepseek-v4-flash"
 
     def test_anthropic_direct_returns_model_id(self):
         entry = {"route": "direct", "provider": "anthropic", "model": "claude-sonnet-5"}
-        assert _router._anthropic_deployment_id(entry) == "claude-sonnet-5"
+        assert _router._cli_deployment_id(entry) == "claude-sonnet-5"
 
 
 # ── _resolve_group_json ────────────────────────────────────────────────
@@ -409,7 +409,7 @@ class TestResolveGroupDetailed:
             assert info["model"] == "deepseek-v4-flash"
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
-            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["api_base_url"] == "http://127.0.0.1:8971"
             assert info["deployment_id"] == "deepseek-v4-flash"
             assert info["auth_token_type"] == "placeholder"
             assert info["registry_id"] == "deepseek-v4-flash-max"
@@ -425,7 +425,7 @@ class TestResolveGroupDetailed:
             assert info["model"] == "deepseek-v4-pro"
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
-            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["api_base_url"] == "http://127.0.0.1:8971"
             assert info["deployment_id"] == "deepseek-v4-pro"
             assert info["auth_token_type"] == "placeholder"
             assert info["registry_id"] == "deepseek-v4-pro-max"
@@ -441,7 +441,7 @@ class TestResolveGroupDetailed:
             assert info["model"] == "zhipuai/glm-5.2"
             assert info["provider"] == "openrouter"
             assert info["route"] == "openrouter"
-            assert info["anthropic_base_url"] == "https://openrouter.ai/api"
+            assert info["api_base_url"] == "https://openrouter.ai/api"
             assert info["deployment_id"] == "zhipuai/glm-5.2"
             assert info["auth_token_type"] == "openrouter_key"
             assert info["registry_id"] == "glm-5.2"
@@ -458,7 +458,7 @@ class TestResolveGroupDetailed:
             # Should skip gemini-2.5-flash (not Anthropic-compat) → deepseek-v4-flash
             assert info["provider"] == "deepseek"
             assert info["route"] == "egress_proxy"
-            assert info["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert info["api_base_url"] == "http://127.0.0.1:8971"
             assert info["registry_id"] == "deepseek-v4-flash"
             assert info["auth_token_type"] == "placeholder"
         finally:
@@ -480,7 +480,7 @@ class TestResolveGroupDetailed:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("med")
-            for key in ("model", "provider", "route", "anthropic_base_url",
+            for key in ("model", "provider", "route", "api_base_url",
                         "deployment_id", "auth_token_type", "group", "registry_id"):
                 assert key in info, f"Missing key: {key}"
         finally:
@@ -501,7 +501,7 @@ class TestCLIResolveGroup:
             import json
             data = json.loads(captured.out)
             assert data["model"] == "deepseek-v4-flash"
-            assert data["anthropic_base_url"] == "http://127.0.0.1:8971"
+            assert data["api_base_url"] == "http://127.0.0.1:8971"
             assert data["auth_token_type"] == "placeholder"
         finally:
             _router._router = None
