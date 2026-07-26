@@ -238,6 +238,14 @@ def _model_to_litellm_params(entry: dict, openrouter_key: str) -> dict:
             litellm_params["extra_body"] = {}
         litellm_params["extra_body"]["reasoning"] = reasoning
 
+    # Multi-tenant egress proxy: set X-Upstream-Host header so the single
+    # proxy on port 8990 routes to the correct upstream provider.
+    upstream_host = entry.get("upstream_host")
+    if upstream_host:
+        if "extra_headers" not in litellm_params:
+            litellm_params["extra_headers"] = {}
+        litellm_params["extra_headers"]["X-Upstream-Host"] = upstream_host
+
     # Apply RPM/TPM from registry if present
     if "rpm" in entry:
         litellm_params["rpm"] = entry["rpm"]
