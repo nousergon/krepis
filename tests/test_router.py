@@ -39,6 +39,7 @@ models:
     name: DeepSeek V4 Flash
     provider: deepseek
     route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: low
     group_role: primary
@@ -52,6 +53,7 @@ models:
     name: Gemini 2.5 Flash
     provider: gemini
     route: egress_proxy
+    api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-flash
     group: low
     group_role: fallback
@@ -74,6 +76,7 @@ models:
     name: Gemini 2.5 Pro
     provider: gemini
     route: egress_proxy
+    api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-pro
     group: low
     group_role: fallback
@@ -85,6 +88,7 @@ models:
     name: DeepSeek V4 Flash Max
     provider: deepseek
     route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: med
     group_role: primary
@@ -110,6 +114,7 @@ models:
     name: DeepSeek V4 Pro
     provider: deepseek
     route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: med
     group_role: fallback
@@ -121,6 +126,7 @@ models:
     name: DeepSeek V4 Pro Max
     provider: deepseek
     route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: high
     group_role: primary
