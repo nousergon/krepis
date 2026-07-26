@@ -45,17 +45,112 @@ _MAX_WALK_DEPTH = 8
 
 _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 
-# Mapping of (route, provider) tuples to Anthropic Messages API base URLs.
+# LiteLLM proxy — the central model router on the dashboard box.  When healthy,
+# this is the PREFERRED endpoint for the Claude CLI because it:
+#   1. Translates between wire formats (CLI format ↔ provider-native format),
+#      making every provider CLI-compatible regardless of its native API format.
+#   2. Handles fallback chains with cooldown via litellm.Router.
+#   3. Passes through prompt-caching hints and translates them to
+#      provider-specific caching mechanisms where applicable.
+#   4. Routes all traffic through egress proxies for DLP scanning.
+LITELLM_PROXY_URL = "http://127.0.0.1:8980"
+
+# Mapping of (route, provider) tuples to CLI-compatible base URLs.
 # Only these combinations speak the wire format the Claude CLI expects.
-# Port 8971 carries the /anthropic upstream-prefix (Anthropic-format);
-# ports 8972/8973/8974 serve OpenAI-format (for LiteLLM, not CLI-compatible).
-# Entries NOT in this dict cannot serve as ANTHROPIC_BASE_URL for the
-# Claude CLI and are skipped by _resolve_group_json.
-_ANTHROPIC_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
+# Port 8971 strips the /anthropic upstream-prefix (DeepSeek supports the
+# CLI wire format natively); ports 8972-8976 serve OpenAI-format (for
+# LiteLLM, not CLI-compatible).  The LiteLLM proxy (port 8980) is the
+# preferred path and is checked first in _resolve_group_json before
+# falling through to these per-provider endpoints.
+_CLI_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
     ("egress_proxy", "deepseek"): "http://127.0.0.1:8971",
     ("openrouter", None):         "https://openrouter.ai/api",
     ("direct", "anthropic"):      "",
+    ("litellm_proxy", None):      LITELLM_PROXY_URL,
 }
+
+
+# ── LiteLLM master key resolution ────────────────────────────────────────
+# Same resolution order as the LiteLLM proxy shim and the clauder script:
+#   1. LITELLM_MASTER_KEY env var
+#   2. secrets.env file (LITELLM_MASTER_KEY=...)
+#   3. AWS SSM /symposion/LITELLM_MASTER_KEY
+# Returns the key string, or None if unresolvable.
+
+def _resolve_litellm_master_key() -> Optional[str]:
+    import os as _os
+
+    # 1. Env var
+    _key = _os.environ.get("LITELLM_MASTER_KEY", "").strip()
+    if _key:
+        return _key
+
+    # 2. secrets.env (same path conventions as the shim)
+    _secrets_paths = [
+        _os.path.expanduser("~/Development/.llm-routing/secrets.env"),
+        _os.path.expanduser("~/.llm-routing/secrets.env"),
+    ]
+    for _sp in _secrets_paths:
+        try:
+            with open(_sp) as _sf:
+                for _line in _sf:
+                    _line = _line.strip()
+                    if _line.startswith("LITELLM_MASTER_KEY="):
+                        _val = _line.split("=", 1)[1].strip().strip('"').strip("'")
+                        if _val:
+                            return _val
+                        break
+        except (OSError, IOError):
+            continue
+
+    # 3. AWS SSM
+    try:
+        import subprocess as _sp
+        _result = _sp.run(
+            ["aws", "ssm", "get-parameter",
+             "--name", "/symposion/LITELLM_MASTER_KEY",
+             "--with-decryption", "--region", "us-east-1",
+             "--profile", "ne-admin",
+             "--query", "Parameter.Value", "--output", "text"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if _result.returncode == 0:
+            _val = _result.stdout.strip()
+            if _val and _val != "None":
+                return _val
+    except Exception:
+        pass
+
+    return None
+
+
+# ── LiteLLM config staleness check ──────────────────────────────────────
+# The LiteLLM proxy generates its config from the registry at boot.
+# If the registry file has been modified since the config was generated,
+# the running LiteLLM may be serving stale routing.  Returns:
+#   True  — registry is newer than config (STALE)
+#   False — config is current (registry mtime ≤ config mtime)
+#   None  — can't determine (no generated config found)
+
+def _litellm_config_is_stale(reg_path: Path) -> Optional[bool]:
+    try:
+        _reg_mtime = reg_path.stat().st_mtime
+    except OSError:
+        return None  # can't stat registry — proceed but flag
+
+    # The LiteLLM shim generates config to /tmp/litellm_config.generated.*.yaml
+    import glob as _glob
+    _configs = _glob.glob("/tmp/litellm_config.generated.*.yaml")
+    if not _configs:
+        return None  # no generated config found — can't determine staleness
+
+    # Use the newest generated config (there should only be one)
+    _config_mtime = max(
+        Path(_c).stat().st_mtime
+        for _c in _configs
+        if Path(_c).exists()
+    )
+    return _reg_mtime > _config_mtime
 
 
 # ── registry file discovery ─────────────────────────────────────────────
@@ -96,43 +191,43 @@ def _find_registry() -> Optional[Path]:
     return None
 
 
-# ── Anthropic wire-format helpers ─────────────────────────────────────────
+# ── CLI endpoint helpers ──────────────────────────────────────────────────
 
-def _anthropic_endpoint_for(entry: dict) -> str:
-    """Return the Anthropic Messages API base URL for a registry model entry.
+def _cli_endpoint_for(entry: dict) -> str:
+    """Return the CLI-compatible base URL for a registry model entry.
 
     Raises :exc:`ValueError` if this entry's route+provider cannot serve
-    the Anthropic Messages API wire format (e.g. Gemini/xAI egress proxies
-    are OpenAI-format only).
+    the wire format the Claude CLI expects (e.g. Gemini/xAI/Moonshot/Zhipu
+    egress proxies are OpenAI-format only — use LiteLLM for format translation).
     """
     route = entry.get("route", "")
     provider = entry.get("provider", "")
 
     key = (route, provider)
-    if key in _ANTHROPIC_COMPATIBLE_ENDPOINTS:
-        return _ANTHROPIC_COMPATIBLE_ENDPOINTS[key]
+    if key in _CLI_COMPATIBLE_ENDPOINTS:
+        return _CLI_COMPATIBLE_ENDPOINTS[key]
 
     # Also try with None provider (for route-only lookup like openrouter)
-    if (route, None) in _ANTHROPIC_COMPATIBLE_ENDPOINTS:
-        return _ANTHROPIC_COMPATIBLE_ENDPOINTS[(route, None)]
+    if (route, None) in _CLI_COMPATIBLE_ENDPOINTS:
+        return _CLI_COMPATIBLE_ENDPOINTS[(route, None)]
 
     raise ValueError(
         f"Model entry {entry.get('id', '?')!r} "
         f"(route={route!r}, provider={provider!r}) "
-        "does not serve the Anthropic Messages API wire format and "
-        "cannot be used as ANTHROPIC_BASE_URL for the Claude CLI"
+        "does not serve the CLI wire format and "
+        "cannot be used as a direct Claude CLI endpoint"
     )
 
 
-def _anthropic_deployment_id(entry: dict) -> str:
-    """Return the model string to set as ``ANTHROPIC_MODEL``.
+def _cli_deployment_id(entry: dict) -> str:
+    """Return the model string to set as the CLI model identifier.
 
     * For *egress_proxy* routes: bare model name (e.g. ``deepseek-v4-flash``)
       — the proxy translates to the upstream model ID.
     * For *openrouter* routes: full OpenRouter slug (e.g.
       ``deepseek/deepseek-v4-flash``) — already stored in the registry's
       *model* field.
-    * For *anthropic* direct: canonical Anthropic model ID.
+    * For *direct* routes: canonical provider model ID.
     """
     route = entry.get("route", "")
     model = entry.get("model", "")
@@ -381,22 +476,22 @@ def _upstream_model(litellm_model: str) -> str:
 def _resolve_group_json(group: str) -> dict:
     """Return full routing info for *group* as a JSON-ready dict.
 
-    Reads the registry directly (bypasses the Router's cooldown state) and
-    iterates the group's fallback chain to find the **first model whose
-    route+provider serves the Anthropic Messages API wire format**.
-    Gemini and xAI egress-proxy ports (8974, 8973) speak OpenAI format
-    only and are automatically skipped.
+    Reads the registry directly (bypasses the Router's cooldown state).
+    Prefers the LiteLLM proxy (port 8980) when healthy — it handles format
+    translation for all providers, making every registry model CLI-compatible.
+    Falls back to per-provider resolution when LiteLLM is unavailable.
 
     Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
-    deployment ID, and registry ID.
+    deployment ID, registry ID, capabilities (prompt_caching, etc.), and
+    cache pricing.
 
-    The ``anthropic_base_url`` is the **Claude-CLI-compatible** endpoint:
-    Anthropic Messages API format.  Port 8971 (DeepSeek) and OpenRouter
-    speak this format; ports 8972/8973/8974 are OpenAI-format LiteLLM
-    endpoints and cannot serve ``exec claude`` directly.
+    The ``api_base_url`` is the CLI-compatible endpoint.  The LiteLLM proxy
+    (port 8980) is the preferred path — it translates between CLI wire format
+    and provider-native formats.  DeepSeek (port 8971) and OpenRouter are
+    direct-fallback paths when LiteLLM is unavailable.
 
-    Raises :exc:`ValueError` if NO model in the group is Anthropic-compatible.
+    Raises :exc:`ValueError` if NO model in the group is CLI-compatible.
     """
     import yaml as _yaml
 
@@ -420,22 +515,160 @@ def _resolve_group_json(group: str) -> dict:
             f"Available groups: {list(doc.get('model_groups', {}).keys())}"
         )
 
-    # Iterate the fallback chain — first Anthropic-compatible entry wins
+    # ── Prefer LiteLLM proxy (format-translating central router) ──────────
+    # When the LiteLLM proxy is healthy on port 8980, it is ALWAYS the best
+    # endpoint for the Claude CLI: it translates between CLI wire format and
+    # provider-native formats, making every provider in the registry
+    # CLI-compatible regardless of its native API format.  It also handles
+    # fallback chains with cooldown and passes through caching hints.  All
+    # traffic still flows through egress proxies for DLP scanning (placeholder
+    # key → real key injection).
+    #
+    # Four SOTA checks gate the LiteLLM path:
+    #   1. Proxy health (port 8980 reachable)
+    #   2. Master key resolvable (env → secrets.env → SSM)
+    #   3. Running config not stale vs registry (LiteLLM boot-time config
+    #      newer than or equal to registry mtime)
+    #   4. Group exists in the registry (for the cache-capability lookup)
+    # Any check failing → fall through to per-provider resolution.
+    try:
+        import http.client as _http
+        conn = _http.HTTPConnection("127.0.0.1", 8980, timeout=2)
+        conn.request("GET", "/health")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        # 200 = no master key set; 401 = master key required but proxy alive.
+        _litellm_healthy = resp.status in (200, 401)
+    except Exception:
+        _litellm_healthy = False
+
+    _litellm_ok = False
+    _litellm_skip_reasons: list[str] = []
+
+    if not _litellm_healthy:
+        _litellm_skip_reasons.append("LiteLLM proxy on :8980 not reachable")
+    else:
+        # ── Check 2: master key resolvable ───────────────────────────────
+        _master_key = _resolve_litellm_master_key()
+        if _master_key is None:
+            _litellm_skip_reasons.append(
+                "LITELLM_MASTER_KEY not resolvable (env → secrets.env → SSM)")
+        else:
+            # ── Check 3: config not stale vs registry ────────────────────
+            _config_stale = _litellm_config_is_stale(reg_path)
+            if _config_stale is None:
+                # Can't determine (no generated config file found).
+                # Non-blocking — proceed with a staleness warning.
+                _litellm_ok = True
+            elif _config_stale:
+                _litellm_skip_reasons.append(
+                    "registry modified after LiteLLM boot — running config may be stale; "
+                    "kickstart LiteLLM: launchctl kickstart -k gui/$(id -u)/ai.nousergon.litellm-proxy-8980")
+            else:
+                _litellm_ok = True
+
+    if _litellm_ok:
+        # Derive caching capabilities from the group's actual registry entries.
+        # Two distinct caching mechanisms (mutually exclusive per model):
+        #   prompt_caching:            explicit cache_control {"type":"ephemeral"}
+        #                             breakpoints — CLI sends markers, server honors.
+        #   automatic_prefix_caching:  server-side transparent prefix caching —
+        #                             no client markers needed, cache hits are
+        #                             automatic on repeated prefixes.
+        # Any entry in the group with either flag means caching is available.
+        _group_pc = any(
+            models_by_id.get(mid, {}).get("capabilities", {}).get("prompt_caching", False)
+            for mid in group_ids
+        )
+        _group_apc = any(
+            models_by_id.get(mid, {}).get("capabilities", {}).get("automatic_prefix_caching", False)
+            for mid in group_ids
+        )
+
+        # Build cache pricing from the primary entry (first in chain)
+        _primary_entry = models_by_id.get(group_ids[0], {}) if group_ids else {}
+        _cache_pricing = {}
+        for _key in ("cost_per_1m_input", "cost_per_1m_output",
+                      "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
+            if _key in _primary_entry:
+                _cache_pricing[_key] = _primary_entry[_key]
+
+        # Derive max_tokens from the primary entry's params
+        _params = dict(_primary_entry.get("params", {}))
+        # LiteLLM doesn't set a default max_tokens — copy from the primary
+        # entry so the Claude CLI has a sensible limit.
+        if "max_tokens" not in _params:
+            _params["max_tokens"] = 8192
+
+        # The primary model from the registry — displayed to the user so they
+        # know which concrete model serves this group.  LiteLLM may internally
+        # fall back through the chain; the actual model appears in resp.model.
+        _primary_model = _primary_entry.get("model", group)
+        _primary_registry_id = _primary_entry.get("id", group)
+
+        return {
+            "model": group,
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": LITELLM_PROXY_URL,
+            "deployment_id": group,
+            "auth_token_type": "litellm_master_key",
+            "group": group,
+            "registry_id": f"litellm:group:{group}",
+            "primary_model": _primary_model,
+            "primary_registry_id": _primary_registry_id,
+            "capabilities": {
+                "web_search": False,
+                "tool_choice": False,
+                "prompt_caching": _group_pc,
+                "automatic_prefix_caching": _group_apc,
+                "batches": False,
+            },
+            "params": _params,
+            "cache_pricing": _cache_pricing,
+            # supports_prompt_caching: only true for explicit cache_control
+            # breakpoints.  automatic_prefix_caching works transparently on
+            # the server side without client markers.
+            "supports_prompt_caching": _group_pc,
+            "automatic_prefix_caching": _group_apc,
+            "skipped_entries": [],
+        }
+
+    # ── LiteLLM unavailable or gated — fall through to per-provider resolution ──
+    # Log skip reasons to stderr so operators can diagnose routing decisions.
+
+    if _litellm_skip_reasons:
+        _msg = "; ".join(_litellm_skip_reasons)
+        logger.warning("LiteLLM proxy skipped for group %r: %s", group, _msg)
+
+    skips: list[dict] = []
+
+    # Iterate the fallback chain — first CLI-compatible entry wins
     for mid in group_ids:
         entry = models_by_id.get(mid)
         if entry is None:
             continue
 
-        # Skip non-Anthropic-compatible entries (Gemini, xAI)
+        # Skip entries whose provider API doesn't speak the CLI wire format.
+        # Only DeepSeek (port 8971, natively CLI-compatible) and OpenRouter
+        # (server-side format translation) can serve the CLI directly.
+        # All other providers require the LiteLLM proxy for format translation.
         try:
-            anthropic_base_url = _anthropic_endpoint_for(entry)
+            api_base_url = _cli_endpoint_for(entry)
         except ValueError:
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": "Provider-native format only — requires LiteLLM proxy for CLI access",
+            })
             continue
 
         model_str = entry.get("model", "")
         route = entry.get("route", "")
         provider = entry.get("provider", "")
         capabilities = entry.get("capabilities", {})
+        params = entry.get("params", {})
 
         # Determine auth token type
         if route == "egress_proxy":
@@ -443,16 +676,23 @@ def _resolve_group_json(group: str) -> dict:
         elif route == "openrouter":
             auth_token_type = "openrouter_key"
         elif provider == "anthropic":
-            auth_token_type = "anthropic_key"
+            auth_token_type = "direct_api_key"
         else:
             auth_token_type = "placeholder"
+
+        # Extract cache pricing for the clauder script to decide caching config
+        cache_pricing = {}
+        for key in ("cost_per_1m_input", "cost_per_1m_output",
+                     "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
+            if key in entry:
+                cache_pricing[key] = entry[key]
 
         return {
             "model": model_str,
             "provider": provider,
             "route": route,
-            "anthropic_base_url": anthropic_base_url,
-            "deployment_id": _anthropic_deployment_id(entry),
+            "api_base_url": api_base_url,
+            "deployment_id": _cli_deployment_id(entry),
             "auth_token_type": auth_token_type,
             "group": group,
             "registry_id": mid,
@@ -460,13 +700,17 @@ def _resolve_group_json(group: str) -> dict:
             "supports_automatic_prefix_caching": capabilities.get(
                 "automatic_prefix_caching", False
             ),
+            "params": params,
+            "cache_pricing": cache_pricing,
+            "supports_prompt_caching": capabilities.get("prompt_caching", False),
+            "skipped_entries": skips if skips else [],
         }
 
     raise ValueError(
-        f"No model in group {group!r} supports the Anthropic Messages API "
-        f"wire format.  Available models: {group_ids}.  "
-        "Gemini and xAI egress-proxy routes speak OpenAI format only and "
-        "cannot serve the Claude CLI directly."
+        f"No model in group {group!r} is CLI-compatible. "
+        f"Available models: {group_ids}.  "
+        "All provider-native-format entries require the LiteLLM proxy "
+        "for CLI access — ensure LiteLLM is running on port 8980."
     )
 
 
