@@ -164,6 +164,12 @@ class LLMUsage:
     cache_read_tokens: int = 0
     cache_create_tokens: int = 0
     cache_create_1h_tokens: int = 0
+    # prompt_cache_miss_tokens — input tokens that missed the cache on
+    # providers that report it (DeepSeek's prompt_cache_miss_tokens).
+    # Together with cache_read_tokens this gives a cache-hit ratio:
+    #   hit_rate = cache_read / (cache_read + prompt_cache_miss)
+    # when both fields are populated (0 = provider didn't report it).
+    prompt_cache_miss_tokens: int = 0
     web_search_requests: int = 0
     web_fetch_requests: int = 0
     # Provider-reported USD cost when available (OpenRouter returns it in
@@ -366,6 +372,18 @@ class LLMClient:
         )
         usage.cache_create_1h_tokens += cache_1h
         usage.cache_create_tokens += max(cache_create_total - cache_1h, 0)
+        # DeepSeek's Anthropic-compatible endpoint returns
+        # prompt_cache_hit_tokens / prompt_cache_miss_tokens instead of
+        # Anthropic's cache_read_input_tokens / cache_creation_input_tokens.
+        # The Anthropic SDK stores unrecognized usage fields as extra
+        # attributes; read them via getattr so the standard Anthropic path
+        # (cache_read_input_tokens above) takes precedence when both exist.
+        ds_hit = int(getattr(u, "prompt_cache_hit_tokens", None) or 0)
+        if ds_hit:
+            usage.cache_read_tokens += ds_hit
+        ds_miss = int(getattr(u, "prompt_cache_miss_tokens", None) or 0)
+        if ds_miss:
+            usage.prompt_cache_miss_tokens += ds_miss
         stu = getattr(u, "server_tool_use", None)
         if stu is not None:
             usage.web_search_requests += int(
@@ -387,6 +405,13 @@ class LLMClient:
         details = getattr(u, "prompt_tokens_details", None)
         if details is not None:
             usage.cache_read_tokens += int(getattr(details, "cached_tokens", 0) or 0)
+        # DeepSeek-native cache fields — may appear at the usage top level
+        # (prompt_cache_hit_tokens / prompt_cache_miss_tokens) rather than
+        # inside prompt_tokens_details.cached_tokens.  The standard OpenAI
+        # path above takes precedence; these are fallbacks for providers that
+        # use the DeepSeek field names on their OpenAI-compatible endpoint.
+        usage.cache_read_tokens += int(getattr(u, "prompt_cache_hit_tokens", 0) or 0)
+        usage.prompt_cache_miss_tokens += int(getattr(u, "prompt_cache_miss_tokens", 0) or 0)
         # OpenRouter nests the server-tool search count under
         # ``server_tool_use_details`` (mirroring Anthropic's
         # ``server_tool_use`` shape) rather than a flat ``web_search_requests``

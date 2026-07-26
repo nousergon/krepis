@@ -435,6 +435,7 @@ def _resolve_group_json(group: str) -> dict:
         model_str = entry.get("model", "")
         route = entry.get("route", "")
         provider = entry.get("provider", "")
+        capabilities = entry.get("capabilities", {})
 
         # Determine auth token type
         if route == "egress_proxy":
@@ -455,6 +456,10 @@ def _resolve_group_json(group: str) -> dict:
             "auth_token_type": auth_token_type,
             "group": group,
             "registry_id": mid,
+            "capabilities": capabilities,
+            "supports_automatic_prefix_caching": capabilities.get(
+                "automatic_prefix_caching", False
+            ),
         }
 
     raise ValueError(
