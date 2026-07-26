@@ -96,6 +96,40 @@ cards:
     cache_read_per_1m: 0.32
     cache_create_per_1m: 0.32
 
+  # ── DeepSeek direct API (via egress proxy :8972) ──────────────────────────
+  # Cache rates use DeepSeek's published automatic prefix-caching discounts
+  # (https://api-docs.deepseek.com/guides/kv_cache/).  Automatic prefix
+  # caching has no cache-write upcharge — the server caches on disk
+  # transparently; cache_create_per_1m is set to the input rate.
+  - model_name: deepseek-v4-flash
+    effective_from: 2026-07-26
+    input_per_1m: 0.14
+    output_per_1m: 0.28
+    cache_read_per_1m: 0.028     # ~80% cache discount (0.14 → 0.028)
+    cache_create_per_1m: 0.14    # no write-upcharge for auto prefix caching
+  - model_name: deepseek-v4-pro
+    effective_from: 2026-07-26
+    input_per_1m: 1.74
+    output_per_1m: 3.48
+    cache_read_per_1m: 0.145     # ~92% cache discount (1.74 → 0.145)
+    cache_create_per_1m: 1.74    # no write-upcharge for auto prefix caching
+  # ── Moonshot / Kimi K3 direct API (via egress proxy :8975) ───────────────
+  # Automatic prefix-based prompt caching — 90% cache discount.
+  - model_name: kimi-k3
+    effective_from: 2026-07-26
+    input_per_1m: 3.00
+    output_per_1m: 15.00
+    cache_read_per_1m: 0.30      # 90% cache discount (3.00 → 0.30)
+    cache_create_per_1m: 3.00    # automatic prefix caching — no write upcharge
+  # ── Zhipu / GLM 5.2 direct API (via egress proxy :8976) ──────────────────
+  # Automatic prefix-based prompt caching — ~81% cache discount.
+  - model_name: glm-5.2
+    effective_from: 2026-07-26
+    input_per_1m: 1.40
+    output_per_1m: 4.40
+    cache_read_per_1m: 0.26      # ~81% cache discount (1.40 → 0.26)
+    cache_create_per_1m: 1.40    # automatic prefix caching — no write upcharge
+
 # Server-side tool fees (Anthropic ``Message.usage.server_tool_use``).
 # Billed as flat per-request fees, independent of which model invoked
 # the tool. Rates published by Anthropic as USD per 1,000 requests.
