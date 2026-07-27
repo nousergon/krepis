@@ -523,3 +523,108 @@ class TestCLIResolveGroup:
             with pytest.raises(SystemExit) as exc:
                 _router._cli()
             assert exc.value.code == 1
+
+
+# ── resolve contract: schema + versioning ────────────────────────────────
+# Regression cover for alpha-engine-config-I4453 (the anthropic_base_url ->
+# api_base_url rename that broke all four consumers) and I4454 (groom_driver
+# importing resolve_group_structured, which had never existed).
+
+import json as _json
+
+
+def _load_resolve_schema() -> dict:
+    schema_path = Path(_router.__file__).parent / "resolve_schema.json"
+    return _json.loads(schema_path.read_text())
+
+
+class TestResolveContract:
+    def test_schema_file_ships_with_the_package(self):
+        schema = _load_resolve_schema()
+        assert schema["type"] == "object"
+        assert "schema_version" in schema["required"]
+
+    def test_public_structured_resolver_is_exported(self):
+        """groom_driver binds to this name; a private _-prefixed function is
+        not a supported surface (alpha-engine-config-I4454)."""
+        assert hasattr(_router, "resolve_group_structured")
+        assert callable(_router.resolve_group_structured)
+
+    @pytest.mark.parametrize("group", ["low", "med", "high", "ultra"])
+    def test_every_group_validates_against_the_schema(
+            self, group, registry_file, monkeypatch):
+        jsonschema = pytest.importorskip("jsonschema")
+        schema = _load_resolve_schema()
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router.resolve_group_structured(group)
+            jsonschema.validate(instance=info, schema=schema)
+        finally:
+            _router._router = None
+
+    @pytest.mark.parametrize("group", ["low", "med", "high", "ultra"])
+    def test_required_fields_present_for_every_group(
+            self, group, registry_file, monkeypatch):
+        """Schema-independent guard, so the contract still holds when
+        jsonschema is not installed."""
+        schema = _load_resolve_schema()
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router.resolve_group_structured(group)
+        finally:
+            _router._router = None
+        missing = [k for k in schema["required"] if k not in info]
+        assert not missing, f"group {group!r} missing contract fields: {missing}"
+
+    def test_carries_schema_version(self, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router.resolve_group_structured("med")
+        finally:
+            _router._router = None
+        assert info["schema_version"] == _router.RESOLVE_SCHEMA_VERSION
+        assert _router.RESOLVE_SCHEMA_VERSION >= 2
+
+    def test_deprecated_alias_still_emitted_for_unmigrated_consumers(
+            self, registry_file, monkeypatch):
+        """Additive-then-remove (model-router-policy R19): the old name is
+        emitted alongside the new one for one release so a rename cannot
+        break consumers the way I4453 did."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router.resolve_group_structured("med")
+        finally:
+            _router._router = None
+        assert info["anthropic_base_url"] == info["api_base_url"]
+
+    def test_api_base_url_is_never_missing_or_none(
+            self, registry_file, monkeypatch):
+        """A missing/None base URL silently resolves to api.anthropic.com in
+        the Claude CLI -- the failure mode two consumers hit under I4453."""
+        for group in ("low", "med", "high", "ultra"):
+            _router._router = None
+            try:
+                with monkeypatch.context() as m:
+                    m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                    info = _router.resolve_group_structured(group)
+            finally:
+                _router._router = None
+            assert "api_base_url" in info
+            assert info["api_base_url"] is not None
+
+    def test_alias_table_names_a_removal_version(self):
+        """Every deprecated alias must declare when it goes away, so the
+        compatibility shim cannot become permanent."""
+        assert _router._DEPRECATED_RESOLVE_ALIASES
+        for old, new, remove_after in _router._DEPRECATED_RESOLVE_ALIASES:
+            assert isinstance(remove_after, int)
+            assert remove_after > _router.RESOLVE_SCHEMA_VERSION - 1
+            assert old != new
