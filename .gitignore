@@ -18,5 +18,9 @@ htmlcov/
 # OS / editor
 .DS_Store
 
-# Claude — version-tracked per-repo, never committed to sibling repos
+# Agent operating instructions — local-only.
+# nous-ergon-ops/policies/repository-tiering-policy.md §5.3: these describe how WE
+# work (PR cadence, release process, fleet policy), not how a contributor gets
+# started. Contributor-facing guidance belongs in CONTRIBUTING.md.
+AGENTS.md
 CLAUDE.md

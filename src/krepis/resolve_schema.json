@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nousergon.dev/schemas/krepis-router-resolve-v2.json",
+  "title": "krepis.router resolve contract",
+  "description": "The routing decision returned by krepis.router.resolve_group_structured() and printed by `python3 -m krepis.router resolve <group> --json`. This is a CROSS-REPO CONTRACT: consumers live in alpha-engine-config (groom driver, groom_run.sh, disposition audit, reviewed-merge sweep) and claude-code-config (the clauder wrapper). Evolve it ADDITIVELY -- emit a new field alongside the old for one release, migrate consumers, then remove. A same-commit rename has broken every consumer twice (alpha-engine-config-I4453, and the resolve-group->resolve CLI rename before it).",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "model",
+    "display_name",
+    "provider",
+    "route",
+    "api_base_url",
+    "deployment_id",
+    "auth_token_type",
+    "group",
+    "registry_id",
+    "capabilities",
+    "params"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "minimum": 2,
+      "description": "Contract version. Consumers MUST branch on this rather than probing for fields."
+    },
+    "model": {
+      "type": "string",
+      "description": "Model identifier for the resolved route. For the litellm_proxy route this is the GROUP name (the proxy resolves the chain); otherwise the concrete registry model string."
+    },
+    "display_name": {
+      "type": "string",
+      "description": "Human-readable label, e.g. 'deepseek-v4-pro (high)'. Display only -- never parse."
+    },
+    "provider": {
+      "type": "string",
+      "description": "Upstream provider, or 'litellm' when the central router is serving."
+    },
+    "route": {
+      "type": "string",
+      "enum": ["litellm_proxy", "egress_proxy", "openrouter", "direct"],
+      "description": "Which transport serves this group."
+    },
+    "api_base_url": {
+      "type": "string",
+      "description": "Base URL the client must target. Empty string means the provider SDK default (only valid for route=direct). Consumers MUST fail closed rather than treating a missing value as empty -- an empty base URL silently targets api.anthropic.com."
+    },
+    "anthropic_base_url": {
+      "type": "string",
+      "deprecated": true,
+      "description": "DEPRECATED alias for api_base_url, emitted through schema_version 2 only so unmigrated consumers keep working. Removed at schema_version 3. Do not add new reads."
+    },
+    "deployment_id": {
+      "type": "string",
+      "description": "The model identifier to send on the wire (bare name for egress_proxy, full slug for openrouter, group name for litellm_proxy)."
+    },
+    "auth_token_type": {
+      "type": "string",
+      "enum": ["placeholder", "openrouter_key", "litellm_master_key", "direct_api_key"],
+      "description": "Which credential the caller must present. 'placeholder' means the egress proxy injects the real key."
+    },
+    "group": {
+      "type": "string",
+      "description": "The model group that was resolved (low|med|high|ultra)."
+    },
+    "registry_id": {
+      "type": "string",
+      "description": "Registry entry id that served this resolution, or 'litellm:group:<group>'."
+    },
+    "primary_model": {
+      "type": "string",
+      "description": "The group's declared primary model. Present on the litellm_proxy route; the model actually served may differ if the proxy fell back."
+    },
+    "primary_registry_id": {
+      "type": "string",
+      "description": "Registry id of the group's declared primary."
+    },
+    "capabilities": {
+      "type": "object",
+      "description": "Per-model feature flags as declared in the registry.",
+      "properties": {
+        "web_search": {"type": "boolean"},
+        "tool_choice": {"type": "boolean"},
+        "prompt_caching": {"type": "boolean"},
+        "automatic_prefix_caching": {"type": "boolean"},
+        "batches": {"type": "boolean"}
+      }
+    },
+    "params": {
+      "type": "object",
+      "description": "Model params from the registry (max_tokens, reasoning, structured_outputs)."
+    },
+    "cache_pricing": {
+      "type": "object",
+      "description": "Price card for the resolved entry, in USD per 1M tokens.",
+      "properties": {
+        "cost_per_1m_input": {"type": "number"},
+        "cost_per_1m_output": {"type": "number"},
+        "cost_per_1m_cache_read": {"type": "number"},
+        "cost_per_1m_cache_write": {"type": "number"}
+      }
+    },
+    "supports_prompt_caching": {
+      "type": "boolean",
+      "description": "True only for explicit cache_control breakpoints. Automatic prefix caching needs no client markers."
+    },
+    "automatic_prefix_caching": {
+      "type": "boolean",
+      "description": "Server-side transparent prefix caching."
+    },
+    "supports_automatic_prefix_caching": {
+      "type": "boolean",
+      "description": "Per-entry form of automatic_prefix_caching, emitted on the per-provider route."
+    },
+    "skipped_entries": {
+      "type": "array",
+      "description": "Registry entries skipped during resolution, with the reason.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "registry_id": {"type": "string"},
+          "provider": {"type": "string"},
+          "reason": {"type": "string"}
+        }
+      }
+    }
+  }
+}
