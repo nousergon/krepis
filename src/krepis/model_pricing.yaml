@@ -22,12 +22,31 @@
 #                         the cost pipeline prices each slice at its own rate.
 #
 # **Cards for the same model MUST be sorted ascending by effective_from.**
-# When pricing changes, append a new card with the new effective_from rather
+# When pricing CHANGES, append a new card with the new effective_from rather
 # than editing an existing one — historical artifacts remain repriceable
 # against the rate that was active at their capture time.
 #
+# An ERRONEOUS card is different and IS corrected in place: no artifact was
+# ever correctly priced at a wrong rate, so appending would preserve the
+# error rather than any real history.  Corrections carry a comment saying so.
+#
+# **Prices are per (model, ROUTE), not per model.**  The same model can cost
+# different amounts direct vs. through an aggregator — deepseek-v4-flash
+# cache-read is $0.0028/M direct but $0.028/M via OpenRouter.  Never copy a
+# rate between a bare `model` card and a `provider/model` slug card.
+#
 # Sources:
-#   https://platform.claude.com/docs/en/about-claude/pricing  (verify periodically)
+#   Anthropic — https://platform.claude.com/docs/en/about-claude/pricing
+#   OpenRouter slugs — https://openrouter.ai/api/v1/models (`pricing` block)
+#   Direct open-weight providers — litellm's
+#     model_prices_and_context_window.json
+#
+# These cards are HAND-MAINTAINED and therefore drift.  A 2026-07-27 audit
+# found five wrong cards at once, including a 10x error on deepseek-v4-flash
+# cache-read and a 4x error on deepseek-v4-pro input.  The alpha-engine
+# registry now derives the same facts automatically
+# (alpha-engine-config/scripts/reconcile_llm_model_registry.py); unifying
+# this file under that reconciler is tracked as alpha-engine-config-I4501.
 #
 # version: 1
 cards:
@@ -54,66 +73,99 @@ cards:
     cache_create_1h_per_1m: 10.00
 
   # ── Open-weight models served via OpenRouter ──────────────────────────
-  # Prices are OpenRouter LIST rates (verified against the live models API
-  # 2026-07-03) and function as CEILINGS: with `:floor` variant routing the
-  # actually-billed backend price is usually lower, and the canonical cost
-  # source is the provider-reported `usage.cost` captured by
-  # `record_llm_call` (cost_source: provider_reported). These cards are the
-  # repricing fallback when a response carried no reported cost.
+  # Prices are OpenRouter LIST rates, RECONCILED against the live
+  # /api/v1/models API 2026-07-27.  The canonical cost source remains the
+  # provider-reported `usage.cost` captured by `record_llm_call`
+  # (cost_source: provider_reported); these cards are the repricing fallback
+  # when a response carried no reported cost.  With `:floor` variant routing
+  # the actually-billed backend price can differ in either direction.
   #
   # Cache rates: the OpenAI-compatible wire format has no cache-WRITE token
-  # class (cache_create never populated), and cache-READ discounts vary by
-  # routed backend — priced here at the full input rate so the fallback
-  # never UNDERSTATES spend.
+  # class, so cache_create_per_1m is set to the input rate throughout.
+  # cache_read_per_1m now carries OpenRouter's PUBLISHED `input_cache_read`
+  # rather than the input rate.  The former convention (cache_read = input,
+  # "so the fallback never UNDERSTATES spend") was well-intentioned but
+  # overstated by up to 120x — deepseek-v4-pro's real OpenRouter cache-read
+  # is $0.003625/M, not $0.435/M.  At our workload shape (~98.5% cache reads)
+  # that is not conservatism, it is a wrong number in the other direction.
   - model_name: moonshotai/kimi-k2.6
     effective_from: 2026-07-03
-    input_per_1m: 0.66
-    output_per_1m: 3.41
-    cache_read_per_1m: 0.66
-    cache_create_per_1m: 0.66
+    input_per_1m: 0.646
+    output_per_1m: 2.72
+    cache_read_per_1m: 0.1088
+    cache_create_per_1m: 0.646
   - model_name: deepseek/deepseek-v4-flash
     effective_from: 2026-07-03
-    input_per_1m: 0.09
-    output_per_1m: 0.18
-    cache_read_per_1m: 0.09
-    cache_create_per_1m: 0.09
+    input_per_1m: 0.14
+    output_per_1m: 0.28
+    cache_read_per_1m: 0.028     # 10x the DIRECT rate — OpenRouter margin
+    cache_create_per_1m: 0.14
   - model_name: deepseek/deepseek-v4-pro
     effective_from: 2026-07-03
     input_per_1m: 0.435
     output_per_1m: 0.87
-    cache_read_per_1m: 0.435
+    cache_read_per_1m: 0.003625  # same as direct — no margin on this model
     cache_create_per_1m: 0.435
   - model_name: openai/gpt-oss-120b
     effective_from: 2026-07-03
-    input_per_1m: 0.03
-    output_per_1m: 0.15
-    cache_read_per_1m: 0.03
-    cache_create_per_1m: 0.03
+    input_per_1m: 0.037
+    output_per_1m: 0.17
+    cache_read_per_1m: 0.037     # OpenRouter publishes no cache rate — = input
+    cache_create_per_1m: 0.037
   - model_name: qwen/qwen3.7-plus
     effective_from: 2026-07-03
     input_per_1m: 0.32
     output_per_1m: 1.28
-    cache_read_per_1m: 0.32
+    cache_read_per_1m: 0.064
     cache_create_per_1m: 0.32
+  - model_name: qwen/qwen3-max
+    effective_from: 2026-07-27
+    input_per_1m: 0.78
+    output_per_1m: 3.90
+    cache_read_per_1m: 0.156
+    cache_create_per_1m: 0.78
+  - model_name: moonshotai/kimi-k3
+    effective_from: 2026-07-27
+    input_per_1m: 3.00
+    output_per_1m: 15.00
+    cache_read_per_1m: 0.30
+    cache_create_per_1m: 3.00
+  - model_name: x-ai/grok-4.5
+    effective_from: 2026-07-27
+    input_per_1m: 2.00
+    output_per_1m: 6.00
+    cache_read_per_1m: 0.30      # cheaper than DIRECT xAI (0.50) — see below
+    cache_create_per_1m: 2.00
 
-  # ── DeepSeek direct API (via egress proxy :8972) ──────────────────────────
-  # Cache rates use DeepSeek's published automatic prefix-caching discounts
-  # (https://api-docs.deepseek.com/guides/kv_cache/).  Automatic prefix
-  # caching has no cache-write upcharge — the server caches on disk
-  # transparently; cache_create_per_1m is set to the input rate.
+  # ── DeepSeek direct API (via the egress proxy) ────────────────────────────
+  # Reconciled 2026-07-27 against litellm's model_prices_and_context_window
+  # database.  Automatic prefix caching has no cache-write upcharge — the
+  # server caches transparently; cache_create_per_1m is set to the input rate.
+  #
+  # NOTE the route asymmetry, which is why these cards are separate from the
+  # `deepseek/...` OpenRouter cards above and must never be copied between
+  # them: v4-flash cache-read is $0.0028/M direct vs $0.028/M via OpenRouter
+  # (10x), while v4-pro is $0.003625/M on both.
   - model_name: deepseek-v4-flash
     effective_from: 2026-07-26
     input_per_1m: 0.14
     output_per_1m: 0.28
-    cache_read_per_1m: 0.028     # ~80% cache discount (0.14 → 0.028)
+    cache_read_per_1m: 0.0028    # 98% cache discount (0.14 → 0.0028)
     cache_create_per_1m: 0.14    # no write-upcharge for auto prefix caching
   - model_name: deepseek-v4-pro
     effective_from: 2026-07-26
-    input_per_1m: 1.74
-    output_per_1m: 3.48
-    cache_read_per_1m: 0.145     # ~92% cache discount (1.74 → 0.145)
-    cache_create_per_1m: 1.74    # no write-upcharge for auto prefix caching
-  # ── Moonshot / Kimi K3 direct API (via egress proxy :8975) ───────────────
+    input_per_1m: 0.435
+    output_per_1m: 0.87
+    cache_read_per_1m: 0.003625  # 99% cache discount (0.435 → 0.003625)
+    cache_create_per_1m: 0.435   # no write-upcharge for auto prefix caching
+  # ── xAI / Grok direct API (via the egress proxy) ─────────────────────────
+  - model_name: grok-4.5
+    effective_from: 2026-07-27
+    input_per_1m: 2.00
+    output_per_1m: 6.00
+    cache_read_per_1m: 0.50
+    cache_create_per_1m: 2.00
+  # ── Moonshot / Kimi K3 direct API (via the egress proxy) ─────────────────
   # Automatic prefix-based prompt caching — 90% cache discount.
   - model_name: kimi-k3
     effective_from: 2026-07-26
