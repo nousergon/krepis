@@ -62,6 +62,25 @@ class ModelMetadata(BaseModel):
     # when the active price card carries one. Additive within the schema.
     cache_create_tokens: int = Field(default=0, ge=0)
     cache_create_1h_tokens: int = Field(default=0, ge=0)
+    # Input tokens that MISSED the cache, on providers that report it
+    # directly (DeepSeek's ``prompt_cache_miss_tokens``). This is the
+    # denominator half of the cache-hit rate that
+    # nous-ergon-ops/policies/prompt-caching-policy.md §6 makes a
+    # first-class metric:
+    #
+    #     hit_rate = cache_read / (cache_read + cache_miss)
+    #
+    # It is NOT redundant with ``input_tokens``. On Anthropic (M1,
+    # explicit breakpoints) ``input_tokens`` already IS the uncached
+    # remainder, so the rate is computable without this field. On
+    # automatic-prefix providers (M2 — DeepSeek, Moonshot, Zhipu, which
+    # carry the fleet's highest-volume traffic) the provider reports hit
+    # and miss as its own pair, and without the miss half the rate can
+    # only be approximated. Zero-defaulted and additive within the
+    # schema; zero means "not reported by this provider", which is why
+    # consumers must treat a zero denominator as unknown rather than as
+    # a 100% hit rate.
+    prompt_cache_miss_tokens: int = Field(default=0, ge=0)
     # Server-tool request counts (Anthropic ``Message.usage.server_tool_use``).
     # Distinct from token classes — these are flat per-request fees billed
     # via :class:`krepis.cost.ToolFee`, not the per-1M-token rate on the
