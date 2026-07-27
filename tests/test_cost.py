@@ -1207,13 +1207,19 @@ def test_record_llm_call_persists_cache_miss():
     assert denom and rec["cache_read_tokens"] / denom == 0.9
 
 
-# ── claude -p result normalization (subscription lane telemetry) ─────────
+# ── claude -p result normalization (harness transport) ───────────────────
+
+
+def _cc(result, **kw):
+    kw.setdefault("model_name", "deepseek-v4-flash")
+    kw.setdefault("provider", "deepseek")
+    return metadata_from_claude_code_result(result, **kw)
 
 
 def test_claude_code_result_reads_the_cache_fields():
-    """The whole point: these arrive on every `claude -p` run and were
-    being discarded, while the same dict's total_cost_usd was read."""
-    md = metadata_from_claude_code_result({
+    """The whole point: these arrive on every `claude -p` run and were being
+    discarded, while the same dict's total_cost_usd was read."""
+    md = _cc({
         "num_turns": 7,
         "total_cost_usd": 1.23,
         "usage": {
@@ -1226,37 +1232,51 @@ def test_claude_code_result_reads_the_cache_fields():
     assert md.cache_read_tokens == 48000
     assert md.cache_create_tokens == 1000
     assert md.input_tokens == 500
-    # On this transport input_tokens IS the uncached remainder, so the hit
-    # rate is computable with no miss field.
-    assert md.cache_read_tokens / (md.cache_read_tokens + md.input_tokens) > 0.98
 
 
-def test_subscription_run_records_no_provider_cost():
-    """total_cost_usd under a Max plan is notional API-equivalent, not money.
-    Recording it would inflate every spend total that sums this stream."""
-    md = metadata_from_claude_code_result({"total_cost_usd": 4.20, "usage": {}})
+def test_model_and_provider_are_required_not_defaulted():
+    """`claude -p` is a harness, not a provider. Defaulting either would bake
+    a Selection-plane fact into a Transport-plane adapter and mislabel every
+    non-Anthropic run in the cost stream."""
+    with pytest.raises(TypeError):
+        metadata_from_claude_code_result({}, provider="deepseek")
+    with pytest.raises(TypeError):
+        metadata_from_claude_code_result({}, model_name="deepseek-v4-flash")
+
+
+def test_the_served_model_is_recorded_not_the_harness():
+    md = _cc({"usage": {}}, model_name="glm-5.2", provider="openrouter")
+    assert md.model_name == "glm-5.2"
+    assert md.provider == "openrouter"
+
+
+def test_reported_cost_is_distrusted_by_default():
+    """The CLI prices from Anthropic's table. Routed to DeepSeek that figure
+    prices another provider's tokens at Anthropic rates; on a Max plan it is
+    notional rather than money. Either way, summing it fabricates spend."""
+    md = _cc({"total_cost_usd": 4.20, "usage": {}})
     assert md.provider_reported_cost_usd is None
 
 
-def test_non_subscription_run_keeps_the_reported_cost():
-    md = metadata_from_claude_code_result(
-        {"total_cost_usd": 4.20, "usage": {}}, subscription=False
-    )
+def test_reported_cost_kept_only_on_explicit_opt_in():
+    md = _cc({"total_cost_usd": 4.20, "usage": {}},
+             model_name="claude-opus-5", provider="anthropic",
+             trust_reported_cost=True)
     assert md.provider_reported_cost_usd == 4.20
 
 
 def test_model_usage_is_summed_when_present():
     """A headless run that delegates to a subagent bills across models; the
     top-level usage can then describe only the primary."""
-    md = metadata_from_claude_code_result({
+    md = _cc({
         "usage": {"input_tokens": 1, "cache_read_input_tokens": 1},
         "modelUsage": {
-            "claude-opus-5": {"input_tokens": 100, "output_tokens": 50,
-                              "cache_read_input_tokens": 900,
-                              "cache_creation_input_tokens": 10},
-            "claude-haiku-4-5": {"input_tokens": 20, "output_tokens": 5,
-                                 "cache_read_input_tokens": 100,
-                                 "cache_creation_input_tokens": 0},
+            "deepseek-v4-pro": {"input_tokens": 100, "output_tokens": 50,
+                                "cache_read_input_tokens": 900,
+                                "cache_creation_input_tokens": 10},
+            "deepseek-v4-flash": {"input_tokens": 20, "output_tokens": 5,
+                                  "cache_read_input_tokens": 100,
+                                  "cache_creation_input_tokens": 0},
         },
     })
     assert md.cache_read_tokens == 1000
@@ -1266,12 +1286,5 @@ def test_model_usage_is_summed_when_present():
 
 
 def test_missing_usage_is_zeros_not_a_crash():
-    md = metadata_from_claude_code_result({"num_turns": 1})
+    md = _cc({"num_turns": 1})
     assert md.input_tokens == 0 and md.cache_read_tokens == 0
-
-
-def test_model_name_defaults_and_overrides():
-    assert metadata_from_claude_code_result({}).model_name == "claude-code-cli"
-    assert metadata_from_claude_code_result(
-        {}, model_name="claude-sonnet-5"
-    ).model_name == "claude-sonnet-5"
