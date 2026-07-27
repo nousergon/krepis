@@ -289,6 +289,12 @@ class LLMClient:
         self._timeout = timeout
         self._max_retries = max_retries
         self._client: Any = None
+        if spec.supports_automatic_prefix_caching:
+            logger.info(
+                "LLMClient(%s/%s): automatic prefix caching is active for this model "
+                "(server-side, no client-side cache_control markers needed)",
+                spec.provider, spec.model,
+            )
 
     # ── transport plumbing ────────────────────────────────────────────
 
