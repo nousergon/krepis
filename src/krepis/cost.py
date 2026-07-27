@@ -868,6 +868,7 @@ def record_anthropic_call(
         "cache_read_tokens": metadata.cache_read_tokens,
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
+        "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
@@ -936,8 +937,24 @@ def metadata_from_openai_completion(
         provider=provider,
         input_tokens=int(getattr(u, "prompt_tokens", 0) or 0) if u else 0,
         output_tokens=int(getattr(u, "completion_tokens", 0) or 0) if u else 0,
-        cache_read_tokens=int(getattr(details, "cached_tokens", 0) or 0)
-            if details is not None else 0,
+        # Cache reads arrive under two spellings on this wire format. The
+        # standard OpenAI location is ``prompt_tokens_details.cached_tokens``;
+        # DeepSeek reports ``prompt_cache_hit_tokens`` /
+        # ``prompt_cache_miss_tokens`` at the usage top level instead. Summing
+        # rather than preferring one mirrors ``krepis.llm._usage_from_openai``
+        # exactly — providers report one spelling or the other, never both, and
+        # matching the sibling function matters more here than the theoretical
+        # double-count, because a divergence between the two normalizers is its
+        # own defect class.
+        cache_read_tokens=(
+            (int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0)
+            + (int(getattr(u, "prompt_cache_hit_tokens", 0) or 0) if u else 0)
+        ),
+        # The miss half of the hit-rate denominator. Without it the rate is
+        # only approximable on automatic-prefix providers — see
+        # ``ModelMetadata.prompt_cache_miss_tokens``.
+        prompt_cache_miss_tokens=int(getattr(u, "prompt_cache_miss_tokens", 0) or 0)
+            if u else 0,
         web_search_requests=int(getattr(u, "web_search_requests", 0) or 0)
             if u else 0,
         provider_reported_cost_usd=float(reported_cost)
@@ -963,6 +980,7 @@ def _metadata_from_llm_result(result: Any, *, model_name: str | None) -> ModelMe
         cache_read_tokens=u.cache_read_tokens,
         cache_create_tokens=u.cache_create_tokens,
         cache_create_1h_tokens=u.cache_create_1h_tokens,
+        prompt_cache_miss_tokens=u.prompt_cache_miss_tokens,
         web_search_requests=u.web_search_requests,
         web_fetch_requests=u.web_fetch_requests,
         provider_reported_cost_usd=u.provider_cost_usd,
@@ -1039,6 +1057,7 @@ def record_llm_call(
         "cache_read_tokens": metadata.cache_read_tokens,
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
+        "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,

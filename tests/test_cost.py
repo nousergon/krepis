@@ -25,7 +25,9 @@ from krepis.cost import (
     load_pricing,
     load_tool_fees,
     metadata_from_anthropic_message,
+    metadata_from_openai_completion,
     record_anthropic_call,
+    record_llm_call,
     recompute_cost,
 )
 from krepis.model_metadata import ModelMetadata
@@ -1126,3 +1128,79 @@ class TestRecordAnthropicCallOneHourField:
         record = record_anthropic_call(msg)
         assert record["cache_create_tokens"] == 100
         assert record["cache_create_1h_tokens"] == 300
+
+
+# ── cache-miss telemetry (prompt-caching-policy.md §6 / gate G6) ─────────
+
+
+class _Details:
+    def __init__(self, cached=0):
+        self.cached_tokens = cached
+
+
+class _Usage:
+    def __init__(self, **kw):
+        self.prompt_tokens = kw.pop("prompt_tokens", 0)
+        self.completion_tokens = kw.pop("completion_tokens", 0)
+        for k, val in kw.items():
+            setattr(self, k, val)
+
+
+class _Completion:
+    def __init__(self, usage, model="deepseek-v4-flash"):
+        self.model = model
+        self.usage = usage
+        self.choices = []
+
+
+def test_openai_metadata_reads_deepseek_native_cache_fields():
+    """DeepSeek reports hit/miss at the usage top level, not inside
+    prompt_tokens_details. Dropping the miss half makes the hit rate
+    unmeasurable on exactly the providers carrying the most traffic."""
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_cache_hit_tokens=900,
+                           prompt_cache_miss_tokens=100)),
+        provider="deepseek",
+    )
+    assert md.cache_read_tokens == 900
+    assert md.prompt_cache_miss_tokens == 100
+
+
+def test_openai_metadata_reads_standard_cached_tokens():
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_tokens_details=_Details(cached=700))),
+        provider="openrouter",
+    )
+    assert md.cache_read_tokens == 700
+    assert md.prompt_cache_miss_tokens == 0
+
+
+def test_openai_metadata_without_cache_fields_is_zero_not_error():
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=10, completion_tokens=5)),
+        provider="openrouter",
+    )
+    assert md.cache_read_tokens == 0
+    assert md.prompt_cache_miss_tokens == 0
+
+
+def test_record_llm_call_persists_cache_miss():
+    """The field has to survive all the way into the persisted record —
+    it was normalized into LLMUsage and then dropped at the ModelMetadata
+    boundary, so the metric could never be computed downstream."""
+    rec = record_llm_call(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_cache_hit_tokens=900,
+                           prompt_cache_miss_tokens=100,
+                           cost=0.001)),
+        provider="deepseek",
+        model_name="deepseek-v4-flash",
+    )
+    assert rec["cache_read_tokens"] == 900
+    assert rec["prompt_cache_miss_tokens"] == 100
+    # The rate the policy makes a first-class metric is now computable
+    # from the persisted record alone.
+    denom = rec["cache_read_tokens"] + rec["prompt_cache_miss_tokens"]
+    assert denom and rec["cache_read_tokens"] / denom == 0.9
