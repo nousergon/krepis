@@ -79,8 +79,14 @@ class TestVariantSuffixStrip:
     def test_floor_variant_resolves_to_bare_slug_card(self):
         table = load_default_pricing()
         card = table.get("deepseek/deepseek-v4-flash:floor", AT)
+        # The behaviour under test is the ``:floor`` suffix strip, which the
+        # resolved model_name proves.  Deliberately NOT asserting a literal
+        # rate: shipped prices are provider facts reconciled against upstream,
+        # so pinning one here makes a legitimate price correction look like a
+        # code regression (it did — this assertion failed on the 2026-07-27
+        # correction of a 10x-wrong cache-read rate).
         assert card.model_name == "deepseek/deepseek-v4-flash"
-        assert card.input_per_1m == pytest.approx(0.09)
+        assert card.input_per_1m > 0
 
     def test_unknown_model_still_raises(self):
         table = load_default_pricing()
@@ -110,9 +116,14 @@ class TestRecordLlmCall:
             usage=LLMUsage(input_tokens=1_000_000, output_tokens=0),
             raw_request={},
         )
+        card = load_default_pricing().get("moonshotai/kimi-k2.6", AT)
         record = record_llm_call(result, at=AT)
         assert record["cost_source"] == "price_card"
-        assert record["cost_usd"] == pytest.approx(0.66)
+        # Exactly 1M input tokens and zero output, so the billed amount is
+        # the card's per-1M input rate by construction.  Derived from the
+        # looked-up card rather than a literal: the card identity is what
+        # this test guards, not the provider's current price.
+        assert record["cost_usd"] == pytest.approx(card.input_per_1m)
 
     def test_anthropic_message_matches_record_anthropic_call_shape(self):
         record = record_llm_call(_anthropic_message(), at=AT)
@@ -129,8 +140,13 @@ class TestRecordLlmCall:
         )
         assert record["provider"] == "openrouter"
         assert record["cost_source"] == "price_card"
-        # 1000 in @ $0.09/M + 500 out @ $0.18/M (card via variant strip)
-        assert record["cost_usd"] == pytest.approx(0.00009 + 0.00009)
+        # 1000 input + 500 output priced off the ``:floor``-stripped card.
+        # Expectation derived from that card so a price correction upstream
+        # does not read as a regression here; the strip itself is pinned by
+        # TestVariantSuffixStrip above.
+        card = load_default_pricing().get("deepseek/deepseek-v4-flash", AT)
+        expected = (1000 / 1e6) * card.input_per_1m + (500 / 1e6) * card.output_per_1m
+        assert record["cost_usd"] == pytest.approx(expected)
 
     def test_unknown_model_no_provider_cost_raises(self):
         result = LLMResult(
