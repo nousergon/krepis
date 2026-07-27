@@ -907,6 +907,96 @@ class _OpenAICompletionLike(Protocol):
     usage: _OpenAIUsageLike | None
 
 
+def metadata_from_claude_code_result(
+    result: dict[str, Any],
+    *,
+    model_name: str,
+    provider: str,
+    trust_reported_cost: bool = False,
+) -> ModelMetadata:
+    """Map a ``claude -p --output-format json`` result → :class:`ModelMetadata`.
+
+    Counterpart of :func:`metadata_from_anthropic_message` for the headless
+    CLI transport. The groom driver, the disposition audit, the reviewed-merge
+    sweep and the Overseer's incident agents all shell out to ``claude -p``
+    and already parse this dict — they read ``num_turns`` and
+    ``total_cost_usd`` and **discard ``usage``**, which is where the cache
+    fields live. The telemetry was never missing, only unread.
+
+    **``claude -p`` is a HARNESS, not a provider.** This is the distinction
+    that makes ``model_name`` and ``provider`` required rather than defaulted.
+    The groom sets ``ANTHROPIC_BASE_URL`` / ``ANTHROPIC_MODEL`` from
+    ``krepis.router``, so the CLI is an agent runtime — tool loop, file edits,
+    bash — driven by whatever model the router resolved: DeepSeek, GLM,
+    Anthropic. Defaulting either field would bake a Selection-plane fact into
+    a Transport-plane adapter, which is the exact leak
+    ``model-portability-policy.md`` §2 names, and it would mislabel every
+    non-Anthropic run in the cost stream. Pass what the router resolved.
+
+    ``usage`` carries the standard Anthropic wire shape regardless of who
+    served it — ``input_tokens``, ``output_tokens``,
+    ``cache_creation_input_tokens``, ``cache_read_input_tokens`` — because the
+    CLI speaks that protocol to whatever endpoint it is pointed at. Newer
+    builds may also emit ``modelUsage`` keyed by model id; when present it is
+    summed, since one headless run can span models (a subagent on a cheaper
+    tier) and the top-level ``usage`` may then describe only part of the run.
+
+    **``total_cost_usd`` is untrustworthy by default, and in more than one
+    way.** The CLI computes it from Anthropic's own price table:
+
+    * routed to a non-Anthropic model — the figure prices *another provider's*
+      tokens at Anthropic rates, so it is simply wrong;
+    * running on a Max subscription — it is a notional API-equivalent, not
+      money that reaches an invoice, since the run is paid in plan quota.
+
+    Either way, feeding it into a stream that gets summed inflates or
+    fabricates spend silently. Set ``trust_reported_cost=True`` only when the
+    CLI genuinely talked to Anthropic on a pay-per-token key. Otherwise cost
+    is recomputed from the price card for the *served* model, which is what
+    :func:`record_llm_call` does when ``provider_reported_cost_usd`` is None.
+    """
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+
+    # `modelUsage` (newer CLI) is authoritative when present: a headless run
+    # that delegates to a subagent bills across more than one model, and the
+    # top-level `usage` can then account for only the primary.
+    per_model = result.get("modelUsage")
+    if isinstance(per_model, dict) and per_model:
+        totals: dict[str, int] = {}
+        for entry in per_model.values():
+            if not isinstance(entry, dict):
+                continue
+            for field in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                totals[field] = totals.get(field, 0) + int(entry.get(field) or 0)
+        if totals:
+            usage = totals
+
+    reported_cost = result.get("total_cost_usd") if trust_reported_cost else None
+
+    return ModelMetadata(
+        model_name=model_name,
+        provider=provider,
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+        cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+        cache_create_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+        # Left 0 rather than derived. On an explicit-breakpoint model
+        # `input_tokens` IS the uncached remainder, so the hit rate is
+        # computable without it; on an automatic-prefix model served through
+        # this harness the CLI does not surface a miss count at all. Zero
+        # means "not reported" everywhere else in this schema, and inventing
+        # a value here would break that for one transport.
+        provider_reported_cost_usd=(
+            float(reported_cost) if reported_cost is not None else None
+        ),
+    )
+
+
 def metadata_from_openai_completion(
     resp: _OpenAICompletionLike,
     *,
