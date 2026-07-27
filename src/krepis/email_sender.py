@@ -93,6 +93,25 @@ DEFAULT_EMAIL_DEDUP_BUCKET: Final[str] = _dedup.DEFAULT_DEDUP_BUCKET
 DEFAULT_EMAIL_DEDUP_WINDOW_MIN: Final[int] = 1440  # 24h — one send per calendar day by default
 
 
+def _redact_email(email: str) -> str:
+    """Redact an email address for safe logging: ``u***@domain``.
+
+    Single-character local parts become ``*@domain``; anything with no
+    ``@`` is returned as-is (not an email).  The full address always goes
+    to the wire—this is a *log redaction* helper, not an anonymizer.
+    """
+    if "@" not in email:
+        return email
+    local, _, domain = email.partition("@")
+    visible = local[:1] if local else ""
+    return f"{visible}***@{domain}"
+
+
+def _redact_recipients(recipients: list[str]) -> list[str]:
+    """Return a redacted copy of *recipients* suitable for log messages."""
+    return [_redact_email(r) for r in recipients]
+
+
 def _resolve_recipients(recipients: list[str] | None) -> list[str]:
     """Return the recipient list, preferring the explicit argument.
 
@@ -127,7 +146,7 @@ def _send_via_gmail(
             server.ehlo()
             server.login(sender, app_password)
             server.sendmail(sender, recipients, msg.as_string())
-        logger.info("Email sent via Gmail SMTP: %r -> %s", subject, recipients)
+        logger.info("Email sent via Gmail SMTP: %r -> %s", subject, _redact_recipients(recipients))
         return True
     except smtplib.SMTPAuthenticationError as e:
         logger.error(
@@ -164,7 +183,7 @@ def _send_via_ses(
             Destination={"ToAddresses": recipients},
             Message=message,
         )
-        logger.info("Email sent via SES: %r -> %s", subject, recipients)
+        logger.info("Email sent via SES: %r -> %s", subject, _redact_recipients(recipients))
         return True
     except ClientError as e:
         logger.error("SES send failed: %s", e.response["Error"]["Message"])
