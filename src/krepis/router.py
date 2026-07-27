@@ -43,6 +43,42 @@ logger = logging.getLogger(__name__)
 
 _MAX_WALK_DEPTH = 8
 
+# ── Resolution contract version ──────────────────────────────────────────
+# The dict returned by resolve_group_structured() / `resolve <group> --json`
+# is a CROSS-REPO CONTRACT with consumers in alpha-engine-config (groom
+# driver, groom_run.sh, disposition audit, reviewed-merge sweep) and
+# claude-code-config (the clauder wrapper).  It is versioned, schema'd
+# (resolve_schema.json), and evolved ADDITIVELY.
+#
+# Field renames are the recurring failure mode here: `resolve-group` -> `resolve`
+# broke the wrapper (2026-07-24), and `anthropic_base_url` -> `api_base_url`
+# broke all four alpha-engine-config consumers (alpha-engine-config-I4453) --
+# two of which degraded to an EMPTY base URL and targeted api.anthropic.com.
+#
+# Rule (model-router-policy R19): emit BOTH names for one release, migrate
+# consumers, then remove.  Never a same-commit rename.
+RESOLVE_SCHEMA_VERSION = 2
+
+# Fields kept only to avoid breaking not-yet-migrated consumers.  Each entry
+# is (deprecated_name, current_name, remove_after_version).
+_DEPRECATED_RESOLVE_ALIASES = (
+    ("anthropic_base_url", "api_base_url", 3),
+)
+
+
+def _with_compat_aliases(info: dict) -> dict:
+    """Add deprecated field aliases to a resolve-contract dict.
+
+    Keeps consumers that have not yet migrated working through one release,
+    per the additive-then-remove rule.  Drop an alias by removing its row
+    from :data:`_DEPRECATED_RESOLVE_ALIASES` once every consumer is migrated
+    and its contract test asserts the new name.
+    """
+    for old, new, _remove_after in _DEPRECATED_RESOLVE_ALIASES:
+        if new in info and old not in info:
+            info[old] = info[new]
+    return info
+
 _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 
 # LiteLLM proxy — the central model router on the dashboard box.  When healthy,
@@ -609,7 +645,8 @@ def _resolve_group_json(group: str) -> dict:
 
         _display_name = f"{_primary_model} ({group})"
 
-        return {
+        return _with_compat_aliases({
+            "schema_version": RESOLVE_SCHEMA_VERSION,
             "model": group,
             "display_name": _display_name,
             "provider": "litellm",
@@ -636,7 +673,7 @@ def _resolve_group_json(group: str) -> dict:
             "supports_prompt_caching": _group_pc,
             "automatic_prefix_caching": _group_apc,
             "skipped_entries": [],
-        }
+        })
 
     # ── LiteLLM unavailable or gated — fall through to per-provider resolution ──
     # Log skip reasons to stderr so operators can diagnose routing decisions.
@@ -692,7 +729,8 @@ def _resolve_group_json(group: str) -> dict:
 
         _display_name = f"{model_str} ({group})"
 
-        return {
+        return _with_compat_aliases({
+            "schema_version": RESOLVE_SCHEMA_VERSION,
             "model": model_str,
             "display_name": _display_name,
             "provider": provider,
@@ -710,7 +748,7 @@ def _resolve_group_json(group: str) -> dict:
             "cache_pricing": cache_pricing,
             "supports_prompt_caching": capabilities.get("prompt_caching", False),
             "skipped_entries": skips if skips else [],
-        }
+        })
 
     raise ValueError(
         f"No model in group {group!r} is CLI-compatible. "
@@ -718,6 +756,37 @@ def _resolve_group_json(group: str) -> dict:
         "All provider-native-format entries require the LiteLLM proxy "
         "for CLI access — ensure LiteLLM is running on port 8980."
     )
+
+
+def resolve_group_structured(group: str) -> dict:
+    """Resolve *group* to a full routing decision — the PUBLIC contract.
+
+    This is the supported entry point for programmatic callers.  It returns
+    the same dict the ``resolve <group> --json`` CLI prints, carrying every
+    field a caller needs to configure an LLM client: endpoint, model,
+    auth-token type, capabilities, params, and cache pricing.
+
+    The returned dict conforms to ``resolve_schema.json`` (validated in CI)
+    and carries ``schema_version`` (:data:`RESOLVE_SCHEMA_VERSION`).  Callers
+    MUST branch on ``schema_version`` rather than probing for fields.
+
+    Raises
+    ------
+    FileNotFoundError
+        No registry file could be located.
+    ValueError
+        *group* is not in the registry, or no model in it is reachable.
+
+    Notes
+    -----
+    ``alpha-engine-config``'s groom driver has imported this name since it was
+    written, while the module only ever exposed the private
+    ``_resolve_group_json`` — so the import failed on every run, the router
+    path was dead code, and routing silently fell back to an endpoint exported
+    by a bootstrap shell script (alpha-engine-config-I4454).  Consumers must
+    bind to a supported public surface; a leading underscore is not one.
+    """
+    return _resolve_group_json(group)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
