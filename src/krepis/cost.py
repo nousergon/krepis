@@ -907,6 +907,83 @@ class _OpenAICompletionLike(Protocol):
     usage: _OpenAIUsageLike | None
 
 
+def metadata_from_claude_code_result(
+    result: dict[str, Any],
+    *,
+    model_name: str | None = None,
+    subscription: bool = True,
+) -> ModelMetadata:
+    """Map a ``claude -p --output-format json`` result → :class:`ModelMetadata`.
+
+    Counterpart of :func:`metadata_from_anthropic_message` for the headless
+    CLI transport — the groom driver, the disposition audit, the reviewed-merge
+    sweep, and the Overseer's incident agents all shell out to ``claude -p``
+    and already parse this dict. They read ``num_turns`` and ``total_cost_usd``
+    from it and **discard ``usage``**, which is where the cache fields live.
+    That is the whole reason this exists: on the subscription lane the cache
+    telemetry was never missing, only unread.
+
+    ``usage`` carries the standard Anthropic shape — ``input_tokens``,
+    ``output_tokens``, ``cache_creation_input_tokens``,
+    ``cache_read_input_tokens``. Newer CLI builds may also emit ``modelUsage``
+    keyed by model id; when present it is summed, because a single headless
+    run can span models (a subagent on a cheaper tier) and the top-level
+    ``usage`` may then describe only part of the run.
+
+    **``subscription`` changes what the cost means, not just its value.**
+    Under a Claude Max plan ``total_cost_usd`` is a *notional API-equivalent*
+    figure, not money that will appear on any invoice — the run is paid for in
+    plan quota. Recording it as ``provider_reported_cost_usd`` would inflate
+    every spend total that sums this stream. So by default the cost is dropped
+    and the caller is expected to record the run's real currency (tokens
+    against quota) instead. Pass ``subscription=False`` only when the CLI was
+    genuinely routed to a pay-per-token backend, where the figure is real.
+    """
+    usage = result.get("usage") if isinstance(result.get("usage"), dict) else {}
+
+    # `modelUsage` (newer CLI) is authoritative when present: a headless run
+    # that delegates to a subagent bills across more than one model, and the
+    # top-level `usage` can then account for only the primary.
+    per_model = result.get("modelUsage")
+    if isinstance(per_model, dict) and per_model:
+        totals: dict[str, int] = {}
+        for entry in per_model.values():
+            if not isinstance(entry, dict):
+                continue
+            for field in (
+                "input_tokens",
+                "output_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ):
+                totals[field] = totals.get(field, 0) + int(entry.get(field) or 0)
+        if totals:
+            usage = totals
+
+    reported_cost = result.get("total_cost_usd")
+
+    return ModelMetadata(
+        model_name=(
+            model_name
+            if model_name is not None
+            else str(result.get("model") or "claude-code-cli")
+        ),
+        provider="anthropic",
+        input_tokens=int(usage.get("input_tokens") or 0),
+        output_tokens=int(usage.get("output_tokens") or 0),
+        cache_read_tokens=int(usage.get("cache_read_input_tokens") or 0),
+        cache_create_tokens=int(usage.get("cache_creation_input_tokens") or 0),
+        # Explicit-breakpoint (M1) transport: `input_tokens` IS the uncached
+        # remainder, so the hit rate is computable without a miss field. Left
+        # at 0 rather than derived, because 0 means "not reported" everywhere
+        # else in this schema and inventing a value here would break that.
+        provider_reported_cost_usd=None if subscription else (
+            float(reported_cost) if reported_cost is not None else None
+        ),
+    )
+
+
+
 def metadata_from_openai_completion(
     resp: _OpenAICompletionLike,
     *,

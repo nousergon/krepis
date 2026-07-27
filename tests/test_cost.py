@@ -25,6 +25,7 @@ from krepis.cost import (
     load_pricing,
     load_tool_fees,
     metadata_from_anthropic_message,
+    metadata_from_claude_code_result,
     metadata_from_openai_completion,
     record_anthropic_call,
     record_llm_call,
@@ -1204,3 +1205,73 @@ def test_record_llm_call_persists_cache_miss():
     # from the persisted record alone.
     denom = rec["cache_read_tokens"] + rec["prompt_cache_miss_tokens"]
     assert denom and rec["cache_read_tokens"] / denom == 0.9
+
+
+# ── claude -p result normalization (subscription lane telemetry) ─────────
+
+
+def test_claude_code_result_reads_the_cache_fields():
+    """The whole point: these arrive on every `claude -p` run and were
+    being discarded, while the same dict's total_cost_usd was read."""
+    md = metadata_from_claude_code_result({
+        "num_turns": 7,
+        "total_cost_usd": 1.23,
+        "usage": {
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "cache_creation_input_tokens": 1000,
+            "cache_read_input_tokens": 48000,
+        },
+    })
+    assert md.cache_read_tokens == 48000
+    assert md.cache_create_tokens == 1000
+    assert md.input_tokens == 500
+    # On this transport input_tokens IS the uncached remainder, so the hit
+    # rate is computable with no miss field.
+    assert md.cache_read_tokens / (md.cache_read_tokens + md.input_tokens) > 0.98
+
+
+def test_subscription_run_records_no_provider_cost():
+    """total_cost_usd under a Max plan is notional API-equivalent, not money.
+    Recording it would inflate every spend total that sums this stream."""
+    md = metadata_from_claude_code_result({"total_cost_usd": 4.20, "usage": {}})
+    assert md.provider_reported_cost_usd is None
+
+
+def test_non_subscription_run_keeps_the_reported_cost():
+    md = metadata_from_claude_code_result(
+        {"total_cost_usd": 4.20, "usage": {}}, subscription=False
+    )
+    assert md.provider_reported_cost_usd == 4.20
+
+
+def test_model_usage_is_summed_when_present():
+    """A headless run that delegates to a subagent bills across models; the
+    top-level usage can then describe only the primary."""
+    md = metadata_from_claude_code_result({
+        "usage": {"input_tokens": 1, "cache_read_input_tokens": 1},
+        "modelUsage": {
+            "claude-opus-5": {"input_tokens": 100, "output_tokens": 50,
+                              "cache_read_input_tokens": 900,
+                              "cache_creation_input_tokens": 10},
+            "claude-haiku-4-5": {"input_tokens": 20, "output_tokens": 5,
+                                 "cache_read_input_tokens": 100,
+                                 "cache_creation_input_tokens": 0},
+        },
+    })
+    assert md.cache_read_tokens == 1000
+    assert md.input_tokens == 120
+    assert md.output_tokens == 55
+    assert md.cache_create_tokens == 10
+
+
+def test_missing_usage_is_zeros_not_a_crash():
+    md = metadata_from_claude_code_result({"num_turns": 1})
+    assert md.input_tokens == 0 and md.cache_read_tokens == 0
+
+
+def test_model_name_defaults_and_overrides():
+    assert metadata_from_claude_code_result({}).model_name == "claude-code-cli"
+    assert metadata_from_claude_code_result(
+        {}, model_name="claude-sonnet-5"
+    ).model_name == "claude-sonnet-5"
