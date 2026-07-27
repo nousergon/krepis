@@ -44,7 +44,6 @@ from krepis.anthropic_payload import (
 from krepis.llm_config import (
     TRANSPORT_ANTHROPIC,
     TRANSPORT_LITELLM,
-    TRANSPORT_OPENAI,
     LLMConfigError,
     ModelSpec,
 )
@@ -211,6 +210,11 @@ class LLMResult:
     # The group name (or model id) that was requested — preserved so
     # callers can tell WHAT was asked for separately from WHAT served it.
     model_requested: str = ""
+    # Optional parameters the route could not honor, which the caller
+    # explicitly allowed to be dropped (on_unsupported="drop"). Empty on a
+    # fully-honored call. Present on the RESULT so a degraded call is visible
+    # in the artifact, not only in a log line.
+    dropped_params: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -295,6 +299,10 @@ class LLMClient:
                 "(server-side, no client-side cache_control markers needed)",
                 spec.provider, spec.model,
             )
+        # Parameters the route could not honor and the caller allowed us to
+        # drop. Surfaced on LLMResult so a degraded call is visible in the
+        # artifact rather than only in a log line.
+        self.dropped_params: list[str] = []
 
     # ── transport plumbing ────────────────────────────────────────────
 
@@ -342,6 +350,47 @@ class LLMClient:
             return True
         base_url = self.spec.base_url or ""
         return "openrouter.ai" in base_url
+
+    def _capability_gate(
+        self,
+        param: str,
+        supported: bool,
+        *,
+        on_unsupported: str,
+        detail: str = "",
+    ) -> bool:
+        """Decide what to do with *param* when the target route can't honor it.
+
+        Returns True when the caller should still send it.
+
+        Three outcomes, chosen explicitly rather than by omission
+        (``model-portability-policy`` §7 / I9): honor, degrade-and-record, or
+        raise. Default is ``raise`` — a config knob that quietly does nothing
+        is exactly the failure ``feedback_no_silent_fails`` forbids, and it is
+        indistinguishable from working.
+
+        Exists because the same argument to the same method used to mean three
+        different things across three transports: ``cache_system`` was honored
+        on anthropic, deliberately (and correctly) ignored on openai, and
+        SILENTLY dropped on litellm with no comment or signal
+        (alpha-engine-config-I4469). Routing every optional parameter through
+        one gate makes the next one impossible to forget.
+        """
+        if supported:
+            return True
+        if on_unsupported == "drop":
+            self.dropped_params.append(param)
+            logger.info(
+                "dropping %s: not supported by %s%s",
+                param, self.spec.model, f" ({detail})" if detail else "",
+            )
+            return False
+        raise LLMConfigError(
+            f"{param} is not supported by model {self.spec.model!r} "
+            f"(transport={self.spec.transport}){f' — {detail}' if detail else ''}. "
+            f"Pass on_unsupported='drop' to send the request without it and "
+            f"record the drop on the result."
+        )
 
     def _reject_reasoning_on_anthropic(self) -> None:
         """``ModelSpec.reasoning`` has no anthropic-transport equivalent.
@@ -480,6 +529,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         cache_system: bool = True,
         extra: Optional[dict] = None,
+        on_unsupported: str = "raise",
     ) -> LLMResult:
         """One plain text generation. Returns normalized :class:`LLMResult`.
 
@@ -520,6 +570,20 @@ class LLMClient:
         if self.spec.transport == TRANSPORT_LITELLM:
             # LiteLLM Router handles fallback chains — model is the group name.
             from krepis.router import get_group_primary as _get_primary
+            from krepis.router import group_supports_explicit_cache_breakpoints as _grp_pc
+
+            # cache_system asks for EXPLICIT cache_control breakpoints. Whether
+            # the served model honors them is a per-model fact resolved from
+            # the registry via the group's primary — never assumed, and never
+            # silently dropped, which is what this branch used to do.
+            if cache_system:
+                self._capability_gate(
+                    "cache_system",
+                    _grp_pc(self.spec.model),
+                    on_unsupported=on_unsupported,
+                    detail="the model serving this group uses automatic prefix "
+                           "caching (or none), which takes no client markers",
+                )
 
             router = _get_router()
             resp = router.completion(
@@ -545,6 +609,7 @@ class LLMClient:
                 raw_response=resp,
                 fallback_used=fallback_used,
                 model_requested=self.spec.model,
+                dropped_params=list(self.dropped_params),
             )
 
         kwargs: dict = {

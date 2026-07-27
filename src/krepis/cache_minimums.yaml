@@ -1,0 +1,74 @@
+# Minimum cacheable prompt-prefix length, per model, in tokens.
+#
+# A PROVIDER FACT, not a fleet decision — the same class as a price card,
+# which is why it ships inside this (public, pip-installable) package rather
+# than living in a private config repo. That distinction is load-bearing:
+# public repos cannot read a private registry at runtime, which is exactly
+# why an earlier consumer hardcoded its own copy and drifted.
+#
+# ── WHY THIS FILE EXISTS ─────────────────────────────────────────────────
+#
+# Below the minimum, a `cache_control` marker SILENTLY caches nothing. No
+# error, no warning — just `cache_creation_input_tokens: 0`, forever. It
+# also burns one of only four breakpoint slots per request. So a wrong
+# value fails in whichever direction it is wrong:
+#
+#   too LOW  -> markers placed on prefixes that never cache; slots wasted
+#   too HIGH -> caching declined for prefixes that would have cached, and
+#               the loss is invisible because nothing was ever attempted
+#
+# A 2026-07-27 audit found a hand-maintained copy in
+# crucible-research/scripts/measure_cache_prefixes.py with two of four
+# entries wrong, BOTH too high (opus-4-7 as 4096, sonnet-4-6 as 2048).
+# Prompt-splitting work on three call sites had been deferred as
+# not-worth-it against those inflated thresholds.
+#
+# ── THE TRAP ─────────────────────────────────────────────────────────────
+#
+# These values are NOT MONOTONIC across model generations. Newer is not
+# always lower and tier does not predict them:
+#
+#     Fable 5 / Opus 5      512   <- newest, lowest
+#     Opus 4.8 / Sonnet 5  1024
+#     Opus 4.7             2048
+#     Opus 4.6 / Haiku 4.5 4096   <- Haiku is the HIGHEST
+#
+# Haiku 4.5 at 4096 is the sharp case: a 3K-token prefix caches on Opus 5
+# and silently does not on Haiku — and Haiku is where mechanical/low-tier
+# work routes. Never infer a minimum from tier, recency, or a sibling
+# model. Look it up.
+#
+# ── MAINTENANCE ──────────────────────────────────────────────────────────
+#
+# Unlike prices, a given model's minimum does not change over time, so
+# there is no `effective_from` dimension — a model ID maps to one value for
+# its life. New models are added by PR with a doc link. If a value is ever
+# found wrong it is CORRECTED IN PLACE: no artifact was ever correctly
+# built against a wrong minimum, so preserving the error would preserve
+# nothing real.
+#
+# Source: https://platform.claude.com/docs/en/build-with-claude/prompt-caching
+# Verified: 2026-07-27
+#
+# Only providers with an EXPLICIT-BREAKPOINT mechanism appear here.
+# Automatic-prefix providers (DeepSeek, Moonshot, Zhipu and most
+# OpenAI-compatible endpoints) cache server-side with no client marker and
+# generally publish no minimum — absence here means "not applicable or not
+# published", never "zero".
+version: 1
+minimums:
+  claude-fable-5: 512
+  claude-mythos-5: 512
+  claude-opus-5: 512
+  claude-opus-4-8: 1024
+  claude-sonnet-5: 1024
+  claude-sonnet-4-6: 1024
+  claude-sonnet-4-5: 1024
+  claude-opus-4-1: 1024
+  claude-opus-4-0: 1024
+  claude-sonnet-4-0: 1024
+  claude-opus-4-7: 2048
+  claude-haiku-3-5: 2048
+  claude-opus-4-6: 4096
+  claude-opus-4-5: 4096
+  claude-haiku-4-5: 4096

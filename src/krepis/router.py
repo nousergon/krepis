@@ -43,6 +43,42 @@ logger = logging.getLogger(__name__)
 
 _MAX_WALK_DEPTH = 8
 
+# ── Resolution contract version ──────────────────────────────────────────
+# The dict returned by resolve_group_structured() / `resolve <group> --json`
+# is a CROSS-REPO CONTRACT with consumers in alpha-engine-config (groom
+# driver, groom_run.sh, disposition audit, reviewed-merge sweep) and
+# claude-code-config (the clauder wrapper).  It is versioned, schema'd
+# (resolve_schema.json), and evolved ADDITIVELY.
+#
+# Field renames are the recurring failure mode here: `resolve-group` -> `resolve`
+# broke the wrapper (2026-07-24), and `anthropic_base_url` -> `api_base_url`
+# broke all four alpha-engine-config consumers (alpha-engine-config-I4453) --
+# two of which degraded to an EMPTY base URL and targeted api.anthropic.com.
+#
+# Rule (model-router-policy R19): emit BOTH names for one release, migrate
+# consumers, then remove.  Never a same-commit rename.
+RESOLVE_SCHEMA_VERSION = 2
+
+# Fields kept only to avoid breaking not-yet-migrated consumers.  Each entry
+# is (deprecated_name, current_name, remove_after_version).
+_DEPRECATED_RESOLVE_ALIASES = (
+    ("anthropic_base_url", "api_base_url", 3),
+)
+
+
+def _with_compat_aliases(info: dict) -> dict:
+    """Add deprecated field aliases to a resolve-contract dict.
+
+    Keeps consumers that have not yet migrated working through one release,
+    per the additive-then-remove rule.  Drop an alias by removing its row
+    from :data:`_DEPRECATED_RESOLVE_ALIASES` once every consumer is migrated
+    and its contract test asserts the new name.
+    """
+    for old, new, _remove_after in _DEPRECATED_RESOLVE_ALIASES:
+        if new in info and old not in info:
+            info[old] = info[new]
+    return info
+
 _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 
 # LiteLLM proxy — the central model router on the dashboard box.  When healthy,
@@ -192,6 +228,56 @@ def _find_registry() -> Optional[Path]:
 
 
 # ── CLI endpoint helpers ──────────────────────────────────────────────────
+
+def _caching_flags(entry: dict) -> tuple[bool, bool]:
+    """Return ``(explicit_breakpoints, automatic_prefix)`` for one model entry.
+
+    The two caching mechanisms are **mutually exclusive** and impose opposite
+    client obligations:
+
+    * ``explicit_breakpoints`` — the client must mark cacheable segments with
+      ``cache_control: {"type": "ephemeral"}``. Anthropic-wire only.
+    * ``automatic_prefix`` — the server caches repeated prefixes
+      transparently. The client must send **no** markers; emitting them at a
+      provider that does not accept the field is at best a wasted breakpoint
+      and at worst a 400.
+
+    This is the ONE place either flag is read, so a mis-declared entry
+    produces one consistent answer everywhere rather than a different one per
+    call site.
+
+    Forward-compatible with the registry's move to a single
+    ``capabilities.caching_mechanism`` enum
+    (``explicit_breakpoint`` | ``automatic_prefix`` | ``none``), which makes
+    the invalid both-true state unrepresentable rather than merely forbidden
+    (alpha-engine-config-I4463). The enum wins when present; the two legacy
+    booleans are the fallback until every registry entry carries it.
+
+    An entry declaring BOTH legacy booleans is invalid. Rather than silently
+    picking one, this resolves to ``automatic_prefix`` — the safe direction:
+    a provider that caches transparently loses nothing by receiving no
+    markers, whereas sending markers to one that rejects unknown fields is an
+    outage. The registry validator rejects the state at PR time; this is the
+    runtime backstop for a registry that predates it.
+    """
+    caps = entry.get("capabilities") or {}
+
+    mechanism = caps.get("caching_mechanism")
+    if mechanism:
+        return mechanism == "explicit_breakpoint", mechanism == "automatic_prefix"
+
+    explicit = bool(caps.get("prompt_caching", False))
+    automatic = bool(caps.get("automatic_prefix_caching", False))
+    if explicit and automatic:
+        logger.warning(
+            "model %r declares BOTH prompt_caching and automatic_prefix_caching "
+            "— these are mutually exclusive; treating it as automatic_prefix "
+            "(no client markers), the non-breaking direction",
+            entry.get("id", "?"),
+        )
+        return False, True
+    return explicit, automatic
+
 
 def _cli_endpoint_for(entry: dict) -> str:
     """Return the CLI-compatible base URL for a registry model entry.
@@ -431,6 +517,40 @@ def resolve_group(group: str) -> str:
     return primary_model
 
 
+def group_supports_explicit_cache_breakpoints(group: str) -> bool:
+    """True when *group*'s primary honors explicit ``cache_control`` markers.
+
+    The question a client actually needs answered before emitting Anthropic
+    ephemeral cache breakpoints. Resolved from the PRIMARY — the entry that
+    will serve the request — not from an ``any()`` over the fallback chain,
+    which would claim support the served model may not have.
+
+    Returns False when the registry cannot be read: refusing to claim a
+    capability we could not verify is the safe direction, since the cost of a
+    false negative is a missed cache hit and the cost of a false positive is
+    markers sent to a provider that may reject them.
+    """
+    try:
+        reg_path = _find_registry()
+        if not reg_path:
+            return False
+        import yaml as _yaml
+        with open(reg_path) as f:
+            doc = _yaml.safe_load(f)
+        group_ids = (doc.get("model_groups") or {}).get(group) or []
+        if not group_ids:
+            return False
+        models_by_id = {m["id"]: m for m in doc.get("models", [])}
+        explicit, _automatic = _caching_flags(models_by_id.get(group_ids[0], {}))
+        return explicit
+    except Exception:
+        logger.warning(
+            "could not resolve caching capability for group %r — "
+            "assuming no explicit breakpoints", group, exc_info=True,
+        )
+        return False
+
+
 def get_group_primary(group: str) -> Optional[str]:
     """Return the litellm model string for *group*'s primary model.
 
@@ -569,25 +689,23 @@ def _resolve_group_json(group: str) -> dict:
                 _litellm_ok = True
 
     if _litellm_ok:
-        # Derive caching capabilities from the group's actual registry entries.
-        # Two distinct caching mechanisms (mutually exclusive per model):
-        #   prompt_caching:            explicit cache_control {"type":"ephemeral"}
-        #                             breakpoints — CLI sends markers, server honors.
-        #   automatic_prefix_caching:  server-side transparent prefix caching —
-        #                             no client markers needed, cache hits are
-        #                             automatic on repeated prefixes.
-        # Any entry in the group with either flag means caching is available.
-        _group_pc = any(
-            models_by_id.get(mid, {}).get("capabilities", {}).get("prompt_caching", False)
-            for mid in group_ids
-        )
-        _group_apc = any(
-            models_by_id.get(mid, {}).get("capabilities", {}).get("automatic_prefix_caching", False)
-            for mid in group_ids
-        )
-
-        # Build cache pricing from the primary entry (first in chain)
+        # Caching capability comes from the PRIMARY entry — the model that
+        # will actually serve the request — never from an any() over the
+        # whole fallback chain.
+        #
+        # It used to be any(). That declares a capability the served model
+        # may not have: a group whose primary does transparent prefix
+        # caching but whose fourth fallback honours explicit breakpoints
+        # reported "explicit breakpoints supported", so the CLI emitted
+        # Anthropic cache_control markers at a provider that never asked for
+        # them. Live on `ultra` until 2026-07-27
+        # (alpha-engine-config-I4463).
+        #
+        # Cache pricing below was already primary-derived, so the two are
+        # now consistent: everything describing "what serves this group"
+        # comes from one entry.
         _primary_entry = models_by_id.get(group_ids[0], {}) if group_ids else {}
+        _group_pc, _group_apc = _caching_flags(_primary_entry)
         _cache_pricing = {}
         for _key in ("cost_per_1m_input", "cost_per_1m_output",
                       "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
@@ -609,7 +727,8 @@ def _resolve_group_json(group: str) -> dict:
 
         _display_name = f"{_primary_model} ({group})"
 
-        return {
+        return _with_compat_aliases({
+            "schema_version": RESOLVE_SCHEMA_VERSION,
             "model": group,
             "display_name": _display_name,
             "provider": "litellm",
@@ -636,7 +755,7 @@ def _resolve_group_json(group: str) -> dict:
             "supports_prompt_caching": _group_pc,
             "automatic_prefix_caching": _group_apc,
             "skipped_entries": [],
-        }
+        })
 
     # ── LiteLLM unavailable or gated — fall through to per-provider resolution ──
     # Log skip reasons to stderr so operators can diagnose routing decisions.
@@ -690,9 +809,12 @@ def _resolve_group_json(group: str) -> dict:
             if key in entry:
                 cache_pricing[key] = entry[key]
 
+        _entry_pc, _entry_apc = _caching_flags(entry)
+
         _display_name = f"{model_str} ({group})"
 
-        return {
+        return _with_compat_aliases({
+            "schema_version": RESOLVE_SCHEMA_VERSION,
             "model": model_str,
             "display_name": _display_name,
             "provider": provider,
@@ -703,14 +825,14 @@ def _resolve_group_json(group: str) -> dict:
             "group": group,
             "registry_id": mid,
             "capabilities": capabilities,
-            "supports_automatic_prefix_caching": capabilities.get(
-                "automatic_prefix_caching", False
-            ),
+            # Same single reader as the LiteLLM branch, so the two paths
+            # cannot disagree about a model's caching mechanism.
+            "supports_automatic_prefix_caching": _entry_apc,
             "params": params,
             "cache_pricing": cache_pricing,
-            "supports_prompt_caching": capabilities.get("prompt_caching", False),
+            "supports_prompt_caching": _entry_pc,
             "skipped_entries": skips if skips else [],
-        }
+        })
 
     raise ValueError(
         f"No model in group {group!r} is CLI-compatible. "
@@ -718,6 +840,37 @@ def _resolve_group_json(group: str) -> dict:
         "All provider-native-format entries require the LiteLLM proxy "
         "for CLI access — ensure LiteLLM is running on port 8980."
     )
+
+
+def resolve_group_structured(group: str) -> dict:
+    """Resolve *group* to a full routing decision — the PUBLIC contract.
+
+    This is the supported entry point for programmatic callers.  It returns
+    the same dict the ``resolve <group> --json`` CLI prints, carrying every
+    field a caller needs to configure an LLM client: endpoint, model,
+    auth-token type, capabilities, params, and cache pricing.
+
+    The returned dict conforms to ``resolve_schema.json`` (validated in CI)
+    and carries ``schema_version`` (:data:`RESOLVE_SCHEMA_VERSION`).  Callers
+    MUST branch on ``schema_version`` rather than probing for fields.
+
+    Raises
+    ------
+    FileNotFoundError
+        No registry file could be located.
+    ValueError
+        *group* is not in the registry, or no model in it is reachable.
+
+    Notes
+    -----
+    ``alpha-engine-config``'s groom driver has imported this name since it was
+    written, while the module only ever exposed the private
+    ``_resolve_group_json`` — so the import failed on every run, the router
+    path was dead code, and routing silently fell back to an endpoint exported
+    by a bootstrap shell script (alpha-engine-config-I4454).  Consumers must
+    bind to a supported public surface; a leading underscore is not one.
+    """
+    return _resolve_group_json(group)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────

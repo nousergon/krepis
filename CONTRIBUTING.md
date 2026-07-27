@@ -41,6 +41,30 @@ python -m pytest -q
 The test suite must be green on the full supported Python matrix
 (3.9–3.13) before a PR is merged. New modules and behaviours need tests.
 
+## What a change has to satisfy
+
+These are enforced in review, and they exist because krepis is a dependency
+of pipelines that run unattended — a defect here surfaces several repos away,
+long after the change that caused it.
+
+**Fail loud.** A swallowed exception becomes a silent wrong answer somewhere
+downstream. Bare `except: pass`, a silent `return None`, and graceful-degrade
+on a writer are all defects — raise instead. Where a swallow is genuinely
+correct, an inline comment must name what is being swallowed and where it is
+recorded.
+
+**The public API is additive-only.** Consumers pin krepis, so renaming or
+removing an exported name breaks them at import time — in a way their own
+tests will not catch until deploy. Emit both names for a release, migrate,
+then remove. Never a same-commit rename.
+
+**Tests are hermetic.** No network, no AWS calls, no wall-clock dependence.
+Anything reaching outside the process gets a fixture or a fake.
+
+**Tests pin contracts, not incidental values.** A test asserting a specific
+upstream price breaks on a legitimate price change and teaches people to
+ignore it. Assert the behaviour, derive the expected value where it is data.
+
 ## Scope
 
 krepis holds only **general-purpose** primitives — logging, secrets,

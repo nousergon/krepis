@@ -25,7 +25,10 @@ from krepis.cost import (
     load_pricing,
     load_tool_fees,
     metadata_from_anthropic_message,
+    metadata_from_claude_code_result,
+    metadata_from_openai_completion,
     record_anthropic_call,
+    record_llm_call,
     recompute_cost,
 )
 from krepis.model_metadata import ModelMetadata
@@ -1126,3 +1129,162 @@ class TestRecordAnthropicCallOneHourField:
         record = record_anthropic_call(msg)
         assert record["cache_create_tokens"] == 100
         assert record["cache_create_1h_tokens"] == 300
+
+
+# ── cache-miss telemetry (prompt-caching-policy.md §6 / gate G6) ─────────
+
+
+class _Details:
+    def __init__(self, cached=0):
+        self.cached_tokens = cached
+
+
+class _Usage:
+    def __init__(self, **kw):
+        self.prompt_tokens = kw.pop("prompt_tokens", 0)
+        self.completion_tokens = kw.pop("completion_tokens", 0)
+        for k, val in kw.items():
+            setattr(self, k, val)
+
+
+class _Completion:
+    def __init__(self, usage, model="deepseek-v4-flash"):
+        self.model = model
+        self.usage = usage
+        self.choices = []
+
+
+def test_openai_metadata_reads_deepseek_native_cache_fields():
+    """DeepSeek reports hit/miss at the usage top level, not inside
+    prompt_tokens_details. Dropping the miss half makes the hit rate
+    unmeasurable on exactly the providers carrying the most traffic."""
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_cache_hit_tokens=900,
+                           prompt_cache_miss_tokens=100)),
+        provider="deepseek",
+    )
+    assert md.cache_read_tokens == 900
+    assert md.prompt_cache_miss_tokens == 100
+
+
+def test_openai_metadata_reads_standard_cached_tokens():
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_tokens_details=_Details(cached=700))),
+        provider="openrouter",
+    )
+    assert md.cache_read_tokens == 700
+    assert md.prompt_cache_miss_tokens == 0
+
+
+def test_openai_metadata_without_cache_fields_is_zero_not_error():
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=10, completion_tokens=5)),
+        provider="openrouter",
+    )
+    assert md.cache_read_tokens == 0
+    assert md.prompt_cache_miss_tokens == 0
+
+
+def test_record_llm_call_persists_cache_miss():
+    """The field has to survive all the way into the persisted record —
+    it was normalized into LLMUsage and then dropped at the ModelMetadata
+    boundary, so the metric could never be computed downstream."""
+    rec = record_llm_call(
+        _Completion(_Usage(prompt_tokens=1000, completion_tokens=50,
+                           prompt_cache_hit_tokens=900,
+                           prompt_cache_miss_tokens=100,
+                           cost=0.001)),
+        provider="deepseek",
+        model_name="deepseek-v4-flash",
+    )
+    assert rec["cache_read_tokens"] == 900
+    assert rec["prompt_cache_miss_tokens"] == 100
+    # The rate the policy makes a first-class metric is now computable
+    # from the persisted record alone.
+    denom = rec["cache_read_tokens"] + rec["prompt_cache_miss_tokens"]
+    assert denom and rec["cache_read_tokens"] / denom == 0.9
+
+
+# ── claude -p result normalization (harness transport) ───────────────────
+
+
+def _cc(result, **kw):
+    kw.setdefault("model_name", "deepseek-v4-flash")
+    kw.setdefault("provider", "deepseek")
+    return metadata_from_claude_code_result(result, **kw)
+
+
+def test_claude_code_result_reads_the_cache_fields():
+    """The whole point: these arrive on every `claude -p` run and were being
+    discarded, while the same dict's total_cost_usd was read."""
+    md = _cc({
+        "num_turns": 7,
+        "total_cost_usd": 1.23,
+        "usage": {
+            "input_tokens": 500,
+            "output_tokens": 200,
+            "cache_creation_input_tokens": 1000,
+            "cache_read_input_tokens": 48000,
+        },
+    })
+    assert md.cache_read_tokens == 48000
+    assert md.cache_create_tokens == 1000
+    assert md.input_tokens == 500
+
+
+def test_model_and_provider_are_required_not_defaulted():
+    """`claude -p` is a harness, not a provider. Defaulting either would bake
+    a Selection-plane fact into a Transport-plane adapter and mislabel every
+    non-Anthropic run in the cost stream."""
+    with pytest.raises(TypeError):
+        metadata_from_claude_code_result({}, provider="deepseek")
+    with pytest.raises(TypeError):
+        metadata_from_claude_code_result({}, model_name="deepseek-v4-flash")
+
+
+def test_the_served_model_is_recorded_not_the_harness():
+    md = _cc({"usage": {}}, model_name="glm-5.2", provider="openrouter")
+    assert md.model_name == "glm-5.2"
+    assert md.provider == "openrouter"
+
+
+def test_reported_cost_is_distrusted_by_default():
+    """The CLI prices from Anthropic's table. Routed to DeepSeek that figure
+    prices another provider's tokens at Anthropic rates; on a Max plan it is
+    notional rather than money. Either way, summing it fabricates spend."""
+    md = _cc({"total_cost_usd": 4.20, "usage": {}})
+    assert md.provider_reported_cost_usd is None
+
+
+def test_reported_cost_kept_only_on_explicit_opt_in():
+    md = _cc({"total_cost_usd": 4.20, "usage": {}},
+             model_name="claude-opus-5", provider="anthropic",
+             trust_reported_cost=True)
+    assert md.provider_reported_cost_usd == 4.20
+
+
+def test_model_usage_is_summed_when_present():
+    """A headless run that delegates to a subagent bills across models; the
+    top-level usage can then describe only the primary."""
+    md = _cc({
+        "usage": {"input_tokens": 1, "cache_read_input_tokens": 1},
+        "modelUsage": {
+            "deepseek-v4-pro": {"input_tokens": 100, "output_tokens": 50,
+                                "cache_read_input_tokens": 900,
+                                "cache_creation_input_tokens": 10},
+            "deepseek-v4-flash": {"input_tokens": 20, "output_tokens": 5,
+                                  "cache_read_input_tokens": 100,
+                                  "cache_creation_input_tokens": 0},
+        },
+    })
+    assert md.cache_read_tokens == 1000
+    assert md.input_tokens == 120
+    assert md.output_tokens == 55
+    assert md.cache_create_tokens == 10
+
+
+def test_missing_usage_is_zeros_not_a_crash():
+    md = _cc({"num_turns": 1})
+    assert md.input_tokens == 0 and md.cache_read_tokens == 0
