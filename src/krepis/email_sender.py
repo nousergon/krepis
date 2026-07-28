@@ -107,9 +107,14 @@ def _redact_email(email: str) -> str:
     return f"{visible}***@{domain}"
 
 
-def _redact_recipients(recipients: list[str]) -> list[str]:
-    """Return a redacted copy of *recipients* suitable for log messages."""
-    return [_redact_email(r) for r in recipients]
+def _redact_recipients(recipients: list[str]) -> str:
+    """Return a redacted, comma-separated string suitable for log messages.
+
+    Each address is redacted via :func:`_redact_email` and the results are
+    joined with ``, `` — the caller receives an opaque string, not a list,
+    so no raw address ever appears in a log message even transitively.
+    """
+    return ", ".join(_redact_email(r) for r in recipients)
 
 
 def _resolve_recipients(recipients: list[str] | None) -> list[str]:
@@ -146,7 +151,7 @@ def _send_via_gmail(
             server.ehlo()
             server.login(sender, app_password)
             server.sendmail(sender, recipients, msg.as_string())
-        logger.info("Email sent via Gmail SMTP: %r -> %s", subject, _redact_recipients(recipients))
+        logger.info("Email sent via Gmail SMTP: %r -> [%s]", subject, _redact_recipients(recipients))
         return True
     except smtplib.SMTPAuthenticationError as e:
         logger.error(
@@ -183,7 +188,7 @@ def _send_via_ses(
             Destination={"ToAddresses": recipients},
             Message=message,
         )
-        logger.info("Email sent via SES: %r -> %s", subject, _redact_recipients(recipients))
+        logger.info("Email sent via SES: %r -> [%s]", subject, _redact_recipients(recipients))
         return True
     except ClientError as e:
         logger.error("SES send failed: %s", e.response["Error"]["Message"])
