@@ -274,10 +274,15 @@ def _find_registry() -> Optional[Path]:
 
     Lookup order:
     1. ``$LLM_MODEL_REGISTRY_PATH`` (explicit override)
-    2. Walk up from cwd for ``private-docs/LLM_MODEL_REGISTRY.yaml``
+    2. AWS AppConfig — when ``KREPIS_APPCONFIG_APPLICATION`` is set, polls
+       AppConfig for the registry content and caches it to a local temp file
+       (config-I5199 AppConfig resolution path per Brian's 2026-07-28 ruling).
+       Cached with the AppConfig poll interval as TTL; falls through to disk
+       on any error (AppConfig unreachable, no config deployed, etc.).
+    3. Walk up from cwd for ``private-docs/LLM_MODEL_REGISTRY.yaml``
        (alpha-engine-config convention)
 
-    Returns ``None`` if neither is found — the caller (:func:`get_router`)
+    Returns ``None`` if none is found — the caller (:func:`get_router`)
     raises :exc:`FileNotFoundError` rather than falling back to a stale
     duplicate.  There is exactly ONE source of truth for model groupings,
     and it lives in ``alpha-engine-config/private-docs/``.
@@ -286,6 +291,15 @@ def _find_registry() -> Optional[Path]:
     if env_path:
         p = Path(env_path)
         return p if p.exists() else None
+
+    # ── Tier 2: AppConfig (config-I4799, Brian's 2026-07-28 Option-A ruling) ─
+    # AppConfig distributes the class→model mapping to consumers that cannot
+    # reach the private alpha-engine-config repo on disk (public repos, Lambda
+    # runtimes).  Opt-in: only activates when KREPIS_APPCONFIG_APPLICATION is
+    # set, so environments that have a local checkout are unaffected.
+    appconfig_path = _find_registry_from_appconfig()
+    if appconfig_path:
+        return appconfig_path
 
     # Walk up from cwd looking for alpha-engine-config/private-docs/
     cwd = Path.cwd().resolve()
@@ -303,6 +317,143 @@ def _find_registry() -> Optional[Path]:
         cwd = parent
 
     return None
+
+
+# ── AppConfig registry resolution (config-I4799) ──────────────────────────
+
+# AppConfig env-var opt-in — these MUST all be set for the AppConfig path to
+# activate.  Environments with a local alpha-engine-config checkout are
+# unaffected (the filesystem walk wins for them; AppConfig is only tried
+# when the walk-up fails).
+_APPCONFIG_ENV_APPLICATION = "KREPIS_APPCONFIG_APPLICATION"
+_APPCONFIG_ENV_CONFIG_PROFILE = "KREPIS_APPCONFIG_CONFIG_PROFILE"
+_APPCONFIG_ENV_ENVIRONMENT = "KREPIS_APPCONFIG_ENVIRONMENT"
+_APPCONFIG_DEFAULT_CLIENT_ID = "krepis"
+
+# Cache: the temp file path and its next-poll time (monotonic seconds).
+# Thread-safe behind _router_lock (reused from the Router singleton).
+_appconfig_cached_path: Optional[Path] = None
+_appconfig_next_poll_s: float = 0.0
+# Minimum poll interval enforced by AppConfig (the service returns a
+# RequiredMinimumPollIntervalInSeconds on start_configuration_session).
+_APPCONFIG_MIN_POLL_SECONDS = 15
+# Fallback poll interval when the service doesn't specify one.
+_APPCONFIG_DEFAULT_POLL_SECONDS = 300  # 5 min
+
+
+def _find_registry_from_appconfig() -> Optional[Path]:
+    """Poll AWS AppConfig for the LLM model registry and cache it locally.
+
+    Returns a :class:`Path` to the cached registry file on success, or
+    ``None`` when AppConfig is not configured / not reachable / has no
+    deployed configuration — the caller falls through to the filesystem walk.
+
+    Thread-safe: guarded by the module-level ``_router_lock`` so concurrent
+    callers don't race on the cache file.  Errors are logged and swallowed —
+    the AppConfig path is a best-effort distribution mechanism, and a
+    transient AppConfig outage must not prevent a run that has a local
+    checkout from working (the filesystem walk is the fallback).
+    """
+    global _appconfig_cached_path, _appconfig_next_poll_s
+
+    app_id = os.environ.get(_APPCONFIG_ENV_APPLICATION)
+    if not app_id:
+        return None  # Opt-in not set — skip AppConfig entirely
+
+    config_profile = os.environ.get(
+        _APPCONFIG_ENV_CONFIG_PROFILE, "llm-model-registry"
+    )
+    environment = os.environ.get(
+        _APPCONFIG_ENV_ENVIRONMENT, "production"
+    )
+
+    # ── Cache hit — return cached file if still fresh ────────────────────
+    import time as _time
+    from threading import Lock as _Lock
+
+    _lock = _router_lock or _Lock()
+    with _lock:
+        now = _time.monotonic()
+        if (
+            _appconfig_cached_path is not None
+            and _appconfig_cached_path.exists()
+            and now < _appconfig_next_poll_s
+        ):
+            return _appconfig_cached_path
+
+        # ── Cache miss or expired — poll AppConfig ───────────────────────
+        try:
+            import boto3 as _boto3
+            client = _boto3.client("appconfigdata", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+
+            # Start a configuration session.
+            session = client.start_configuration_session(
+                ApplicationIdentifier=app_id,
+                ConfigurationProfileIdentifier=config_profile,
+                EnvironmentIdentifier=environment,
+                RequiredMinimumPollIntervalInSeconds=_APPCONFIG_MIN_POLL_SECONDS,
+            )
+            token = session["InitialConfigurationToken"]
+
+            # Fetch the latest configuration.
+            response = client.get_latest_configuration(
+                ConfigurationToken=token,
+            )
+            content = response["Configuration"].read()
+            if not content:
+                logger.debug(
+                    "AppConfig returned empty configuration for %s/%s/%s",
+                    app_id, config_profile, environment,
+                )
+                return None
+
+            poll_interval = response.get(
+                "NextPollIntervalInSeconds", _APPCONFIG_DEFAULT_POLL_SECONDS
+            )
+
+            # Write to a stable temp file so callers only need a Path.
+            import tempfile as _tempfile
+            cache_dir = Path(_tempfile.gettempdir()) / "krepis-registry"
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_file = cache_dir / "LLM_MODEL_REGISTRY.yaml"
+            cache_file.write_bytes(content)
+
+            _appconfig_cached_path = cache_file
+            _appconfig_next_poll_s = now + max(
+                poll_interval, _APPCONFIG_MIN_POLL_SECONDS
+            )
+
+            logger.info(
+                "loaded LLM_MODEL_REGISTRY.yaml from AppConfig "
+                "(%s/%s/%s), cached at %s, next poll in %ss",
+                app_id, config_profile, environment,
+                cache_file, poll_interval,
+            )
+            return cache_file
+
+        except Exception:
+            logger.debug(
+                "AppConfig registry resolution failed — "
+                "falling through to filesystem walk",
+                exc_info=True,
+            )
+            # If we had a previously cached file that still exists, keep
+            # using it past its TTL rather than returning None — a stale
+            # registry beats no registry.
+            if (
+                _appconfig_cached_path is not None
+                and _appconfig_cached_path.exists()
+            ):
+                logger.warning(
+                    "AppConfig unreachable; serving stale cached registry "
+                    "from %s (last poll was %ss ago)",
+                    _appconfig_cached_path,
+                    now - (_appconfig_next_poll_s - poll_interval)
+                    if poll_interval
+                    else "unknown",
+                )
+                return _appconfig_cached_path
+            return None
 
 
 # ── CLI endpoint helpers ──────────────────────────────────────────────────
