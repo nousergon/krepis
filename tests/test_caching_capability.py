@@ -118,7 +118,7 @@ class TestCapabilityGate:
         from krepis.llm_config import ModelSpec
         # transport is DERIVED from provider on ModelSpec, not passed.
         spec = ModelSpec(provider="deepseek", model="med", max_tokens=1024)
-        return LLMClient(spec)
+        return LLMClient(spec, callsite_id="krepis-test")
 
     def test_supported_param_passes_through(self):
         c = self._client()

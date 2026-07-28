@@ -146,7 +146,11 @@ class FakeOpenAI:
 
 
 def _client(spec, fake):
-    return LLMClient(spec, client_factory=lambda _spec, _key: fake)
+    return LLMClient(
+        spec,
+        callsite_id="krepis-test",
+        client_factory=lambda _spec, _key: fake,
+    )
 
 
 ANTHROPIC_SPEC = ModelSpec("anthropic", "claude-haiku-4-5", max_tokens=1024)
@@ -243,7 +247,7 @@ class TestComplete:
 
     def test_missing_api_key_raises(self, monkeypatch):
         monkeypatch.delenv("OPENROUTER_API_KEY")
-        client = LLMClient(OPENROUTER_SPEC)
+        client = LLMClient(OPENROUTER_SPEC, callsite_id="krepis-test")
         with pytest.raises(LLMConfigError, match="OPENROUTER_API_KEY"):
             client.complete(system="s", user_content="u")
 
@@ -783,3 +787,101 @@ class TestExtractJson:
     def test_no_json_raises(self):
         with pytest.raises(ValueError, match="no JSON object"):
             _extract_json("nothing here")
+
+
+class TestCallsiteIdAndCostEmission:
+    """Cost attribution at the LLMClient chokepoint (alpha-engine-config-I5206).
+
+    The fleet ran 17 days with zero per-call cost telemetry because emission
+    lived in a research-specific tracker that was retired with its graph, and
+    nothing required attribution. These lock the properties that make that
+    unrepeatable: attribution cannot be omitted, and emission cannot take
+    down a call it observes.
+    """
+
+    def test_callsite_id_is_required(self):
+        """Omitting it is a TypeError, not a default — an optional
+        attribution field is one nobody fills."""
+        with pytest.raises(TypeError):
+            LLMClient(OPENROUTER_SPEC)
+
+    @pytest.mark.parametrize("bad", ["", "   ", None, 123])
+    def test_blank_or_non_string_callsite_id_rejected(self, bad):
+        with pytest.raises(ValueError, match="non-empty callsite_id"):
+            LLMClient(OPENROUTER_SPEC, callsite_id=bad)
+
+    def test_no_sink_means_no_emission_and_no_error(self):
+        """Default client emits nothing — public consumers pay nothing."""
+        fake = FakeOpenAI([_openai_resp("hi")])
+        client = _client(OPENROUTER_SPEC, fake)
+        result = client.complete(system="s", user_content="u")
+        assert result.text == "hi"
+        assert result.cost_emission_error is None
+
+    def test_sink_receives_record_stamped_with_callsite_id(self):
+        records = []
+        fake = FakeOpenAI([_openai_resp("hi")])
+        client = LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="director-plan",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=records.append,
+        )
+        result = client.complete(system="s", user_content="u")
+
+        assert len(records) == 1, "exactly one record per completed call"
+        rec = records[0]
+        assert rec["callsite_id"] == "director-plan"
+        # The G6 input set must be present — this is what a cache-hit-rate
+        # metric is computed from downstream.
+        for field_name in (
+            "input_tokens", "output_tokens", "cache_read_tokens",
+            "prompt_cache_miss_tokens", "cost_usd",
+        ):
+            assert field_name in rec, f"{field_name} missing from cost record"
+        assert result.cost_emission_error is None
+
+    def test_sink_failure_does_not_break_the_call(self):
+        """Emission runs AFTER the call succeeded. A telemetry fault must
+        not become a production outage — but it must stay visible."""
+        def _exploding_sink(_record):
+            raise RuntimeError("s3 unavailable")
+
+        fake = FakeOpenAI([_openai_resp("hi")])
+        client = LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="director-plan",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=_exploding_sink,
+        )
+        result = client.complete(system="s", user_content="u")
+
+        assert result.text == "hi", "the caller still gets its answer"
+        assert result.cost_emission_error is not None, (
+            "a swallowed emission failure must surface on the artifact, "
+            "not only in a log line"
+        )
+        assert "s3 unavailable" in result.cost_emission_error
+
+    def test_structured_calls_emit_too(self):
+        """The decorator sits on the method, not on one return path — so
+        every public entry point is covered, not just complete()."""
+        records = []
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}},
+            "required": ["a"],
+        }
+        fake = FakeOpenAI([_openai_resp('{"a": "b"}')])
+        client = LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="evaljudge-sync",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=records.append,
+        )
+        client.structured(
+            system="s", user_content="u",
+            schema=schema, schema_name="Probe",
+        )
+        assert len(records) == 1
+        assert records[0]["callsite_id"] == "evaljudge-sync"
