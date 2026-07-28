@@ -30,6 +30,7 @@ guessing (``feedback_no_silent_fails``).
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -215,6 +216,12 @@ class LLMResult:
     # fully-honored call. Present on the RESULT so a degraded call is visible
     # in the artifact, not only in a log line.
     dropped_params: list[str] = field(default_factory=list)
+    # Set when cost-record emission failed for this call (pricing lookup
+    # miss, sink write error). ``None`` on success and on clients with no
+    # ``cost_sink``. Emission never raises — see
+    # ``LLMClient._emit_cost_record`` — so this field is how a telemetry
+    # loss stays visible in the artifact rather than only in a log line.
+    cost_emission_error: Optional[str] = None
 
 
 @dataclass
@@ -263,6 +270,27 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
+def _emits_cost(method):
+    """Emit a priced cost record for whatever result *method* returns.
+
+    Applied at the PUBLIC method boundary rather than at each ``return``
+    site, deliberately. ``complete`` / ``structured`` / ``complete_grounded``
+    construct results at seven different points today; decorating the method
+    means a future return path cannot silently escape telemetry. A missed
+    return path would be invisible — no error, no log, just a call site that
+    quietly stops being accounted for — which is precisely the failure class
+    this arc exists to close (alpha-engine-config-I5206).
+    """
+
+    @functools.wraps(method)
+    def _wrapped(self, *args, **kwargs):
+        result = method(self, *args, **kwargs)
+        self._emit_cost_record(result)
+        return result
+
+    return _wrapped
+
+
 class LLMClient:
     """One (provider, model) client with a normalized call surface.
 
@@ -276,27 +304,102 @@ class LLMClient:
     ``(spec, api_key) -> transport_client`` returning an object exposing
     ``messages.create`` (anthropic transport) or ``chat.completions.create``
     (openai transport).
+
+    **Cost attribution.** ``callsite_id`` is REQUIRED. Every call this
+    client makes is billed to it, and it is the join key between spend and
+    the call site that caused it. It is required rather than optional
+    because an optional attribution field is one nobody fills: the fleet
+    ran 17 days with no per-call cost telemetry at all, and the recovery
+    plan depends on attribution being impossible to omit rather than merely
+    encouraged (alpha-engine-config-I5206).
+
+    krepis validates only that it is a non-empty string — this is a public,
+    pip-installable library and cannot read anyone's private call-site
+    registry. Consumers that keep one (the Nous Ergon fleet keeps
+    ``LLM_CALLSITE_REGISTRY.yaml``) validate membership in their own CI.
+
+    ``cost_sink`` is an optional ``callable(record: dict) -> None``. When
+    set, each completed call builds a priced record via
+    :func:`krepis.cost.record_llm_call` — carrying token counts, cache
+    read/write splits and USD — and hands it to the sink. Default ``None``
+    means no emission, so public consumers pay nothing for a feature they
+    have not asked for.
     """
 
     def __init__(
         self,
         spec: ModelSpec,
         *,
+        callsite_id: str,
         api_key: Optional[str] = None,
         client_factory: Optional[Callable[[ModelSpec, str], Any]] = None,
         timeout: float = 180.0,
         max_retries: int = 3,
+        cost_sink: Optional[Callable[[dict], None]] = None,
     ):
+        if not isinstance(callsite_id, str) or not callsite_id.strip():
+            raise ValueError(
+                "LLMClient requires a non-empty callsite_id — it is the join "
+                "key between spend and the call site that caused it. Pass the "
+                "identifier this call site is registered under."
+            )
         self.spec = spec
+        self.callsite_id = callsite_id
         self._api_key = api_key
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        self._cost_sink = cost_sink
         self._client: Any = None
         # Parameters the route could not honor and the caller allowed us to
         # drop. Surfaced on LLMResult so a degraded call is visible in the
         # artifact rather than only in a log line.
         self.dropped_params: list[str] = []
+
+    # ── cost emission ─────────────────────────────────────────────────
+
+    def _emit_cost_record(self, result: Any) -> None:
+        """Build a priced cost record for *result* and hand it to the sink.
+
+        No-op when no ``cost_sink`` is configured. **Never raises.**
+        """
+        if self._cost_sink is None:
+            return
+        try:
+            from krepis.cost import record_llm_call
+
+            record = record_llm_call(
+                result, extra_fields={"callsite_id": self.callsite_id}
+            )
+            self._cost_sink(record)
+        except Exception as exc:  # noqa: BLE001
+            # DELIBERATE non-raising degradation. Written rationale per the
+            # fail-loud rule, which forbids silent swallows by default:
+            #
+            # (a) Failure mode swallowed: cost-record construction or sink
+            #     write failed — an unpriced model card, an S3 error, a full
+            #     disk.
+            # (b) Why the primary deliverable survives: this runs AFTER the
+            #     LLM call returned successfully. The caller already holds
+            #     its answer. Raising here would convert a telemetry problem
+            #     into a production outage, which is a strictly worse trade
+            #     than losing one cost row.
+            # (c) Recording surface, three layers so no single miss hides it:
+            #     this ERROR log; ``result.cost_emission_error`` on the
+            #     artifact itself; and the ARTIFACT_REGISTRY freshness row on
+            #     ``decision_artifacts/_cost/``, which catches SUSTAINED loss
+            #     even if every individual log goes unread. That third layer
+            #     is the one that was missing for 17 days (I5206).
+            logger.error(
+                "cost emission failed for callsite_id=%s model=%s: %s",
+                self.callsite_id,
+                getattr(result, "model", "?"),
+                exc,
+            )
+            try:
+                result.cost_emission_error = str(exc)
+            except Exception:  # noqa: BLE001 — frozen/exotic result type
+                pass
 
     # ── transport plumbing ────────────────────────────────────────────
 
@@ -515,6 +618,7 @@ class LLMClient:
 
     # ── plain completion ──────────────────────────────────────────────
 
+    @_emits_cost
     def complete(
         self,
         *,
@@ -633,6 +737,7 @@ class LLMClient:
 
     # ── structured completion ─────────────────────────────────────────
 
+    @_emits_cost
     def structured(
         self,
         *,
@@ -1020,6 +1125,7 @@ class LLMClient:
 
     # ── grounded completion ───────────────────────────────────────────
 
+    @_emits_cost
     def complete_grounded(
         self,
         *,
