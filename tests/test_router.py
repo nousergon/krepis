@@ -3,6 +3,7 @@
 import os
 import sys
 import tempfile
+from unittest import mock
 from pathlib import Path
 from unittest import mock
 
@@ -177,6 +178,14 @@ def registry_file():
         f.write(REGISTRY_YAML)
     yield Path(f.name)
     os.unlink(f.name)
+
+
+@pytest.fixture(autouse=True)
+def _patch_egress_probe():
+    """Mock the egress proxy health probe so tests don't depend on a running
+    proxy (config#4923).  All egress_proxy routes appear healthy."""
+    with mock.patch.object(_router, "_probe_egress_proxy", return_value=True):
+        yield
 
 
 class TestParseRegistry:
@@ -372,13 +381,32 @@ class TestAnthropicEndpointFor:
 
     def test_gemini_egress_proxy_raises_valueerror(self):
         entry = {"route": "egress_proxy", "provider": "gemini", "id": "test-gem"}
-        with pytest.raises(ValueError, match="does not serve"):
+        with pytest.raises(ValueError, match="not a CLI-compatible endpoint"):
             _router._cli_endpoint_for(entry)
 
     def test_xai_egress_proxy_raises_valueerror(self):
         entry = {"route": "egress_proxy", "provider": "xai", "id": "test-xai"}
-        with pytest.raises(ValueError, match="does not serve"):
+        with pytest.raises(ValueError, match="not a CLI-compatible endpoint"):
             _router._cli_endpoint_for(entry)
+
+    def test_egress_proxy_env_override_wins(self):
+        """KREPIS_DEEPSEEK_EGRESS_URL env var overrides the hardcoded default."""
+        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
+        with mock.patch.dict(os.environ, {"KREPIS_DEEPSEEK_EGRESS_URL": "http://127.0.0.1:9999"}):
+            result = _router._cli_endpoint_for(entry)
+        assert result == "http://127.0.0.1:9999"
+
+    def test_litellm_proxy_url_resolved_from_env(self):
+        """KREPIS_LITELLM_PROXY_URL env var overrides the LITELLM_PROXY_URL constant."""
+        with mock.patch.dict(os.environ, {"KREPIS_LITELLM_PROXY_URL": "http://127.0.0.1:9090"}):
+            result = _router._resolve_litellm_proxy_url()
+        assert result == "http://127.0.0.1:9090"
+
+    def test_litellm_proxy_url_falls_back_to_constant(self):
+        """Without env var, _resolve_litellm_proxy_url returns the module constant."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = _router._resolve_litellm_proxy_url()
+        assert result == _router.LITELLM_PROXY_URL
 
 
 # ── _cli_deployment_id ──────────────────────────────────────────────
