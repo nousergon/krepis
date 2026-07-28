@@ -249,34 +249,23 @@ def _resolve_litellm_master_key() -> Optional[str]:
     return None
 
 
-# ── LiteLLM config staleness check ──────────────────────────────────────
-# The LiteLLM proxy generates its config from the registry at boot.
-# If the registry file has been modified since the config was generated,
-# the running LiteLLM may be serving stale routing.  Returns:
-#   True  — registry is newer than config (STALE)
-#   False — config is current (registry mtime ≤ config mtime)
-#   None  — can't determine (no generated config found)
-
-def _litellm_config_is_stale(reg_path: Path) -> Optional[bool]:
-    try:
-        _reg_mtime = reg_path.stat().st_mtime
-    except OSError:
-        return None  # can't stat registry — proceed but flag
-
-    # The LiteLLM shim generates config to /tmp/litellm_config.generated.*.yaml
-    import glob as _glob
-    _configs = _glob.glob("/tmp/litellm_config.generated.*.yaml")
-    if not _configs:
-        return None  # no generated config found — can't determine staleness
-
-    # Use the newest generated config (there should only be one)
-    _config_mtime = max(
-        Path(_c).stat().st_mtime
-        for _c in _configs
-        if Path(_c).exists()
-    )
-    return _reg_mtime > _config_mtime
-
+# ── LiteLLM config staleness check (RETIRED) ────────────────────────────
+# alpha-engine-config-I4452: this mtime-glob heuristic is RETIRED.  It
+# inferred staleness from filesystem mtimes over a /tmp glob, ran only in
+# a laptop CLI path, and nothing on any box called it.  The authoritative
+# provenance-based drift checker lives in alpha-engine-config:
+#
+#   scripts/check_router_config_provenance.py
+#
+# which compares a CONTENT DIGEST (sha256) stamped into the generated config
+# against a fresh hash of the live registry — a fact, not an inference.
+#
+# The auto-reconcile script (scripts/reconcile_litellm_config.py) runs on
+# a 10-minute timer and restarts the router on digest mismatch, satisfying
+# the 15-minute propagation SLO (R10) with no human step.
+#
+# The function has been removed; the caller (get_router) now skips this
+# check.  See alpha-engine-config-PR4773 and I4452 for details.
 
 # ── registry file discovery ─────────────────────────────────────────────
 
@@ -790,18 +779,22 @@ def _resolve_group_json(group: str) -> dict:
             _litellm_skip_reasons.append(
                 "LITELLM_MASTER_KEY not resolvable (env → secrets.env → SSM)")
         else:
-            # ── Check 3: config not stale vs registry ────────────────────
-            _config_stale = _litellm_config_is_stale(reg_path)
-            if _config_stale is None:
-                # Can't determine (no generated config file found).
-                # Non-blocking — proceed with a staleness warning.
-                _litellm_ok = True
-            elif _config_stale:
-                _litellm_skip_reasons.append(
-                    "registry modified after LiteLLM boot — running config may be stale; "
-                    "kickstart LiteLLM: launchctl kickstart -k gui/$(id -u)/ai.nousergon.litellm-proxy-8980")
-            else:
-                _litellm_ok = True
+            # ── Check 3: config staleness (RETIRED — externalized) ──────
+            # The mtime-glob heuristic (_litellm_config_is_stale) has been
+            # RETIRED.  It inferred staleness from filesystem mtimes over a
+            # /tmp glob — an inference, not a fact, and nothing called it.
+            #
+            # The authoritative check lives in alpha-engine-config:
+            #   scripts/check_router_config_provenance.py
+            # which compares a content digest (sha256) of the generated config
+            # against the live registry.  The auto-reconcile script
+            # (scripts/reconcile_litellm_config.py) runs on a 10-minute timer
+            # and restarts the router on digest mismatch (15-minute SLO, R10).
+            #
+            # This krepis path skips the staleness check: the external
+            # reconcile is authoritative.  Proceed assuming the config is
+            # current — the reconcile loop will fix it within minutes if not.
+            _litellm_ok = True
 
     if _litellm_ok:
         # Caching capability comes from the PRIMARY entry — the model that
