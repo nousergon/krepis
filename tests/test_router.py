@@ -11,6 +11,9 @@ import pytest
 
 from krepis import router as _router
 
+# Save reference to the real _probe_egress_proxy before the autouse fixture
+# patches it (so TestProbeEgressProxy can call through to the real function).
+_original_probe_egress_proxy = _router._probe_egress_proxy
 
 # ── _parse_registry ──────────────────────────────────────────────────────
 
@@ -409,6 +412,89 @@ class TestAnthropicEndpointFor:
         assert result == _router.LITELLM_PROXY_URL
 
 
+    def test_openrouter_env_override_wins(self):
+        """KREPIS_OPENROUTER_API_URL env var overrides the hardcoded default."""
+        entry = {"route": "openrouter", "provider": "openrouter", "id": "test-or"}
+        with mock.patch.dict(os.environ, {"KREPIS_OPENROUTER_API_URL": "https://custom.example.com/api"}):
+            result = _router._cli_endpoint_for(entry)
+        assert result == "https://custom.example.com/api"
+
+    def test_openrouter_env_override_catchall_any_provider(self):
+        """KREPIS_OPENROUTER_API_URL applies to any provider on the openrouter route."""
+        entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2"}
+        with mock.patch.dict(os.environ, {"KREPIS_OPENROUTER_API_URL": "https://custom.example.com/api"}):
+            result = _router._cli_endpoint_for(entry)
+        assert result == "https://custom.example.com/api"
+
+    def test_litellm_proxy_env_override_in_endpoint_for(self):
+        """KREPIS_LITELLM_PROXY_URL is used as the litellm_proxy route endpoint."""
+        entry = {"route": "litellm_proxy", "provider": "litellm", "id": "test-lm"}
+        with mock.patch.dict(os.environ, {"KREPIS_LITELLM_PROXY_URL": "http://127.0.0.1:9990"}):
+            result = _router._cli_endpoint_for(entry)
+        assert result == "http://127.0.0.1:9990"
+
+    def test_egress_proxy_env_override_empty_string_ignored(self):
+        """An empty env var override string is treated as unset — falls back to default."""
+        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
+        with mock.patch.dict(os.environ, {"KREPIS_DEEPSEEK_EGRESS_URL": ""}):
+            result = _router._cli_endpoint_for(entry)
+        assert result == "http://127.0.0.1:8971"
+
+
+# ── _probe_egress_proxy ──────────────────────────────────────────────────
+
+class TestProbeEgressProxy:
+    def test_returns_true_when_proxy_healthy(self):
+        """When the proxy returns 200, _probe_egress_proxy returns True."""
+        with mock.patch("http.client.HTTPConnection") as mock_conn:
+            mock_resp = mock.MagicMock()
+            mock_resp.status = 200
+            mock_conn.return_value.getresponse.return_value = mock_resp
+            result = _original_probe_egress_proxy("http://127.0.0.1:8971")
+        assert result is True
+
+    def test_returns_false_when_proxy_returns_500(self):
+        """When the proxy returns a non-200 status, _probe_egress_proxy returns False."""
+        with mock.patch("http.client.HTTPConnection") as mock_conn:
+            mock_resp = mock.MagicMock()
+            mock_resp.status = 500
+            mock_conn.return_value.getresponse.return_value = mock_resp
+            result = _original_probe_egress_proxy("http://127.0.0.1:8971")
+        assert result is False
+
+    def test_returns_false_on_connection_error(self):
+        """When the proxy is unreachable, _probe_egress_proxy returns False (no exception)."""
+        with mock.patch("http.client.HTTPConnection") as mock_conn:
+            mock_conn.return_value.request.side_effect = ConnectionRefusedError
+            result = _original_probe_egress_proxy("http://127.0.0.1:8971")
+        assert result is False
+
+    def test_returns_false_for_empty_url(self):
+        """An empty URL (direct route) is not an egress proxy — returns False."""
+        result = _original_probe_egress_proxy("")
+        assert result is False
+
+    def test_uses_urlparse_for_port_extraction(self):
+        """Custom port in the URL is honoured by urlparse."""
+        with mock.patch("http.client.HTTPConnection") as mock_conn:
+            mock_resp = mock.MagicMock()
+            mock_resp.status = 200
+            mock_conn.return_value.getresponse.return_value = mock_resp
+            _original_probe_egress_proxy("http://127.0.0.1:9999")
+        # Verify the connection was made to the right port
+        assert mock_conn.call_args[0][1] == 9999
+
+    def test_default_host_and_port_when_url_has_no_hostname(self):
+        """When the URL has no hostname (e.g. missing scheme), defaults to 127.0.0.1:8971."""
+        with mock.patch("http.client.HTTPConnection") as mock_conn:
+            mock_resp = mock.MagicMock()
+            mock_resp.status = 200
+            mock_conn.return_value.getresponse.return_value = mock_resp
+            _original_probe_egress_proxy("http://:8971")
+        assert mock_conn.call_args[0][0] == "127.0.0.1"
+        assert mock_conn.call_args[0][1] == 8971
+
+
 # ── _cli_deployment_id ──────────────────────────────────────────────
 
 class TestAnthropicDeploymentId:
@@ -513,6 +599,94 @@ class TestResolveGroupDetailed:
                 assert key in info, f"Missing key: {key}"
         finally:
             _router._router = None
+
+
+# ── _resolve_litellm_master_key ────────────────────────────────────────────
+
+class TestResolveLitellmMasterKey:
+    def test_env_var_wins(self):
+        """LITELLM_MASTER_KEY env var is the highest-priority source."""
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "test-master-key-env"}):
+            result = _router._resolve_litellm_master_key()
+        assert result == "test-master-key-env"
+
+    def test_env_var_empty_ignored(self):
+        """An empty or whitespace-only LITELLM_MASTER_KEY is treated as unset."""
+        with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "  "}):
+            result = _router._resolve_litellm_master_key()
+        # Should fall through to None since no secrets file or SSM is available
+        assert result is None
+
+    def test_secrets_file_found(self, tmp_path):
+        """A secrets.env file with LITELLM_MASTER_KEY=... is read."""
+        secrets_file = tmp_path / "secrets.env"
+        secrets_file.write_text("LITELLM_MASTER_KEY=test-master-key-secrets\n")
+        # Ensure no env var interferes; redirect expanduser to our temp dir
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("os.path.expanduser", return_value=str(secrets_file)):
+                result = _router._resolve_litellm_master_key()
+        assert result == "test-master-key-secrets"
+
+    def test_secrets_file_quoted_value_stripped(self, tmp_path):
+        """Quoted values in secrets.env are stripped."""
+        secrets_file = tmp_path / "secrets.env"
+        secrets_file.write_text('LITELLM_MASTER_KEY="test-quoted"\n')
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch("os.path.expanduser", return_value=str(secrets_file)):
+                result = _router._resolve_litellm_master_key()
+        assert result == "test-quoted"
+
+    def test_no_key_returns_none(self):
+        """When no source has the key, returns None."""
+        with mock.patch.dict(os.environ, {}, clear=True):
+            result = _router._resolve_litellm_master_key()
+        assert result is None
+
+
+# ── _litellm_config_is_stale ───────────────────────────────────────────────
+
+class TestLitellmConfigStale:
+    def test_no_configs_returns_none(self):
+        """When no generated config files exist, returns None."""
+        with mock.patch("glob.glob", return_value=[]):
+            result = _router._litellm_config_is_stale(Path("/tmp/mock-registry.yaml"))
+        assert result is None
+
+    def test_config_newer_than_registry_returns_false(self, tmp_path):
+        """When the config is newer, returns False (not stale)."""
+        reg = tmp_path / "registry.yaml"
+        reg.write_text("registry")
+        cfg = tmp_path / "litellm_config.generated.abc123.yaml"
+        cfg.write_text("config")
+        # Make config newer than registry
+        reg_mtime = reg.stat().st_mtime
+        cfg_mtime = cfg_mtime_after = reg_mtime + 10
+        import os as _os
+        _os.utime(str(cfg), (cfg_mtime_after, cfg_mtime_after))
+        with mock.patch("glob.glob", return_value=[str(cfg)]):
+            result = _router._litellm_config_is_stale(reg)
+        assert result is False
+
+    def test_registry_newer_than_config_returns_true(self, tmp_path):
+        """When the registry is newer than the config, returns True (stale)."""
+        reg = tmp_path / "registry.yaml"
+        reg.write_text("registry")
+        cfg = tmp_path / "litellm_config.generated.abc123.yaml"
+        cfg.write_text("config")
+        # Make registry newer than config
+        cfg_mtime = cfg.stat().st_mtime
+        reg_mtime_after = cfg_mtime + 10
+        import os as _os
+        _os.utime(str(reg), (reg_mtime_after, reg_mtime_after))
+        with mock.patch("glob.glob", return_value=[str(cfg)]):
+            result = _router._litellm_config_is_stale(reg)
+        assert result is True
+
+    def test_registry_stat_fails_returns_none(self):
+        """When the registry can't be statted, returns None."""
+        with mock.patch("pathlib.Path.stat", side_effect=OSError):
+            result = _router._litellm_config_is_stale(Path("/nonexistent/reg.yaml"))
+        assert result is None
 
 
 # ── CLI resolve --json ──────────────────────────────────────────────────────
