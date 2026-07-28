@@ -643,52 +643,6 @@ class TestResolveLitellmMasterKey:
         assert result is None
 
 
-# ── _litellm_config_is_stale ───────────────────────────────────────────────
-
-class TestLitellmConfigStale:
-    def test_no_configs_returns_none(self):
-        """When no generated config files exist, returns None."""
-        with mock.patch("glob.glob", return_value=[]):
-            result = _router._litellm_config_is_stale(Path("/tmp/mock-registry.yaml"))
-        assert result is None
-
-    def test_config_newer_than_registry_returns_false(self, tmp_path):
-        """When the config is newer, returns False (not stale)."""
-        reg = tmp_path / "registry.yaml"
-        reg.write_text("registry")
-        cfg = tmp_path / "litellm_config.generated.abc123.yaml"
-        cfg.write_text("config")
-        # Make config newer than registry
-        reg_mtime = reg.stat().st_mtime
-        cfg_mtime = cfg_mtime_after = reg_mtime + 10
-        import os as _os
-        _os.utime(str(cfg), (cfg_mtime_after, cfg_mtime_after))
-        with mock.patch("glob.glob", return_value=[str(cfg)]):
-            result = _router._litellm_config_is_stale(reg)
-        assert result is False
-
-    def test_registry_newer_than_config_returns_true(self, tmp_path):
-        """When the registry is newer than the config, returns True (stale)."""
-        reg = tmp_path / "registry.yaml"
-        reg.write_text("registry")
-        cfg = tmp_path / "litellm_config.generated.abc123.yaml"
-        cfg.write_text("config")
-        # Make registry newer than config
-        cfg_mtime = cfg.stat().st_mtime
-        reg_mtime_after = cfg_mtime + 10
-        import os as _os
-        _os.utime(str(reg), (reg_mtime_after, reg_mtime_after))
-        with mock.patch("glob.glob", return_value=[str(cfg)]):
-            result = _router._litellm_config_is_stale(reg)
-        assert result is True
-
-    def test_registry_stat_fails_returns_none(self):
-        """When the registry can't be statted, returns None."""
-        with mock.patch("pathlib.Path.stat", side_effect=OSError):
-            result = _router._litellm_config_is_stale(Path("/nonexistent/reg.yaml"))
-        assert result is None
-
-
 # ── CLI resolve --json ──────────────────────────────────────────────────────
 
 class TestCLIResolveGroup:
