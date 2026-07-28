@@ -91,6 +91,16 @@ _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 #   4. Routes all traffic through egress proxies for DLP scanning.
 LITELLM_PROXY_URL = "http://127.0.0.1:8980"
 
+# Env-var overrides for every CLI-compatible endpoint (config#4923).
+# Each resolves at resolution time from (env var → default constant), so a
+# box-level bootstrap can export the override alongside its --port without
+# krepis needing a config file or code change.
+_ENV_OVERRIDE_MAP: dict[tuple[str, str | None], str] = {
+    ("egress_proxy", "deepseek"): "KREPIS_DEEPSEEK_EGRESS_URL",
+    ("openrouter", None):         "KREPIS_OPENROUTER_API_URL",
+    ("litellm_proxy", None):      "KREPIS_LITELLM_PROXY_URL",
+}
+
 # Mapping of (route, provider) tuples to CLI-compatible base URLs.
 # Only these combinations speak the wire format the Claude CLI expects.
 # Port 8971 strips the /anthropic upstream-prefix (DeepSeek supports the
@@ -104,6 +114,85 @@ _CLI_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
     ("direct", "anthropic"):      "",
     ("litellm_proxy", None):      LITELLM_PROXY_URL,
 }
+
+
+def _resolve_litellm_proxy_url() -> str:
+    """LiteLLM proxy URL, from ``KREPIS_LITELLM_PROXY_URL`` env var or the
+    module-level :data:`LITELLM_PROXY_URL` constant.
+
+    This is the URL the LiteLLM health probe targets and the ``api_base_url``
+    returned on the LiteLLM route — keeping the two in sync with one source
+    of truth (config#4923)."""
+    return os.environ.get("KREPIS_LITELLM_PROXY_URL", LITELLM_PROXY_URL)
+
+
+def _resolve_cli_endpoint(route: str, provider: str | None) -> str:
+    """Resolve a CLI-compatible endpoint for *(route, provider)* at call time.
+
+    Resolution order:
+    1. Per-route env var (``_ENV_OVERRIDE_MAP`` → ``os.environ``)
+    2. Module-level ``_CLI_COMPATIBLE_ENDPOINTS`` default
+
+    Returns the endpoint URL or ``""`` for provider-default routes (``direct``).
+    Raises :exc:`ValueError` if the combination is not CLI-compatible.
+    """
+    # 1. Check env override by exact (route, provider) key
+    precise_key = (route, provider)
+    if provider is not None and precise_key in _ENV_OVERRIDE_MAP:
+        override = os.environ.get(_ENV_OVERRIDE_MAP[precise_key])
+        if override:
+            return override
+
+    # 2. Check env override by (route, None) key (catch-all for the route)
+    catchall_key = (route, None)
+    if catchall_key in _ENV_OVERRIDE_MAP:
+        override = os.environ.get(_ENV_OVERRIDE_MAP[catchall_key])
+        if override:
+            return override
+
+    # 3. Check exact match in the default map
+    if precise_key in _CLI_COMPATIBLE_ENDPOINTS:
+        return _CLI_COMPATIBLE_ENDPOINTS[precise_key]
+
+    # 4. Check catch-all by route
+    if catchall_key in _CLI_COMPATIBLE_ENDPOINTS:
+        return _CLI_COMPATIBLE_ENDPOINTS[catchall_key]
+
+    raise ValueError(
+        f"({route!r}, {provider!r}) is not a CLI-compatible endpoint "
+        "and cannot be resolved"
+    )
+
+
+def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
+    """Probe an egress proxy's health endpoint.
+
+    Returns ``True`` if the proxy responds with ``200`` at ``/__proxy_health__``.
+    Used by :func:`_cli_endpoint_for` to fail at resolve time rather than
+    returning a dead endpoint (config#4923).
+
+    Pure / no side-effects beyond the network call.  Tested by mocking
+    ``http.client``.
+    """
+    if not url:
+        return False  # empty URL (direct route) is not an egress proxy
+    try:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or 8971
+
+        import http.client as _http
+
+        conn = _http.HTTPConnection(host, port, timeout=timeout)
+        conn.request("GET", "/__proxy_health__")
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        return resp.status == 200
+    except Exception:
+        return False
 
 
 # ── LiteLLM master key resolution ────────────────────────────────────────
@@ -271,6 +360,16 @@ def _caching_flags(entry: dict) -> tuple[bool, bool]:
 def _cli_endpoint_for(entry: dict) -> str:
     """Return the CLI-compatible base URL for a registry model entry.
 
+    Resolves the endpoint from env var overrides first (config#4923), then
+    falls back to the default ``_CLI_COMPATIBLE_ENDPOINTS`` literal.
+
+    For ``egress_proxy`` routes: probes the resolved proxy at
+    ``/__proxy_health__`` before returning.  An unreachable proxy raises
+    :exc:`ValueError` with a message naming the URL and the env override var
+    — so the caller falls through to the next model (same pattern as the
+    LiteLLM health check) rather than returning a dead endpoint that would
+    surface later as an opaque ConnectionRefused inside an LLM agent.
+
     Raises :exc:`ValueError` if this entry's route+provider cannot serve
     the wire format the Claude CLI expects (e.g. Gemini/xAI/Moonshot/Zhipu
     egress proxies are OpenAI-format only — use LiteLLM for format translation).
@@ -278,20 +377,23 @@ def _cli_endpoint_for(entry: dict) -> str:
     route = entry.get("route", "")
     provider = entry.get("provider", "")
 
-    key = (route, provider)
-    if key in _CLI_COMPATIBLE_ENDPOINTS:
-        return _CLI_COMPATIBLE_ENDPOINTS[key]
+    endpoint = _resolve_cli_endpoint(route, provider)
 
-    # Also try with None provider (for route-only lookup like openrouter)
-    if (route, None) in _CLI_COMPATIBLE_ENDPOINTS:
-        return _CLI_COMPATIBLE_ENDPOINTS[(route, None)]
+    # For egress_proxy routes: probe the proxy before returning.
+    # A dead proxy means the route is unusable — fail at resolve time
+    # rather than returning an endpoint nobody verified (config#4923).
+    if route == "egress_proxy" and endpoint:
+        env_var_key = _ENV_OVERRIDE_MAP.get((route, provider))
+        env_var_hint = f" (override: ${env_var_key})" if env_var_key else ""
+        if not _probe_egress_proxy(endpoint):
+            raise ValueError(
+                f"Egress proxy at {endpoint!r} is not reachable"
+                f"{env_var_hint}. "
+                "Set the override to a healthy proxy address, or ensure the "
+                "local proxy is running on the configured port."
+            )
 
-    raise ValueError(
-        f"Model entry {entry.get('id', '?')!r} "
-        f"(route={route!r}, provider={provider!r}) "
-        "does not serve the CLI wire format and "
-        "cannot be used as a direct Claude CLI endpoint"
-    )
+    return endpoint
 
 
 def _cli_deployment_id(entry: dict) -> str:
@@ -586,9 +688,11 @@ def _resolve_group_json(group: str) -> dict:
     """Return full routing info for *group* as a JSON-ready dict.
 
     Reads the registry directly (bypasses the Router's cooldown state).
-    Prefers the LiteLLM proxy (port 8980) when healthy — it handles format
-    translation for all providers, making every registry model CLI-compatible.
-    Falls back to per-provider resolution when LiteLLM is unavailable.
+    Prefers the LiteLLM proxy when healthy (port resolved from
+    ``KREPIS_LITELLM_PROXY_URL`` env var or :data:`LITELLM_PROXY_URL`
+    constant) — it handles format translation for all providers, making
+    every registry model CLI-compatible.  Falls back to per-provider
+    resolution when LiteLLM is unavailable.
 
     Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
@@ -596,9 +700,11 @@ def _resolve_group_json(group: str) -> dict:
     cache pricing.
 
     The ``api_base_url`` is the CLI-compatible endpoint.  The LiteLLM proxy
-    (port 8980) is the preferred path — it translates between CLI wire format
-    and provider-native formats.  DeepSeek (port 8971) and OpenRouter are
-    direct-fallback paths when LiteLLM is unavailable.
+    is the preferred path — it translates between CLI wire format and
+    provider-native formats.  DeepSeek and OpenRouter are direct-fallback
+    paths when LiteLLM is unavailable.  Every endpoint is resolvable via
+    an env override (config#4923), so box-level bootstraps can export the
+    override alongside their ``--port`` from a single configuration value.
 
     Raises :exc:`ValueError` if NO model in the group is CLI-compatible.
     """
@@ -625,38 +731,47 @@ def _resolve_group_json(group: str) -> dict:
         )
 
     # ── Prefer LiteLLM proxy (format-translating central router) ──────────
-    # When the LiteLLM proxy is healthy on port 8980, it is ALWAYS the best
-    # endpoint for the Claude CLI: it translates between CLI wire format and
-    # provider-native formats, making every provider in the registry
-    # CLI-compatible regardless of its native API format.  It also handles
-    # fallback chains with cooldown and passes through caching hints.  All
-    # traffic still flows through egress proxies for DLP scanning (placeholder
-    # key → real key injection).
+    # When the LiteLLM proxy is healthy, it is ALWAYS the best endpoint for
+    # the Claude CLI: it translates between CLI wire format and provider-native
+    # formats, making every provider in the registry CLI-compatible regardless
+    # of its native API format.  It also handles fallback chains with cooldown
+    # and passes through caching hints.  All traffic still flows through egress
+    # proxies for DLP scanning (placeholder key → real key injection).
+    #
+    # The probe URL comes from _resolve_litellm_proxy_url() so the port is
+    # configurable via KREPIS_LITELLM_PROXY_URL env var (config#4923).
     #
     # Four SOTA checks gate the LiteLLM path:
-    #   1. Proxy health (port 8980 reachable)
+    #   1. Proxy health (port reachable at the resolved URL)
     #   2. Master key resolvable (env → secrets.env → SSM)
     #   3. Running config not stale vs registry (LiteLLM boot-time config
     #      newer than or equal to registry mtime)
     #   4. Group exists in the registry (for the cache-capability lookup)
     # Any check failing → fall through to per-provider resolution.
+    _litellm_url = _resolve_litellm_proxy_url()
+    _litellm_reachable = False
     try:
+        from urllib.parse import urlparse as _urlparse
+        _parsed = _urlparse(_litellm_url)
+        _host = _parsed.hostname or "127.0.0.1"
+        _port = _parsed.port or 8980
         import http.client as _http
-        conn = _http.HTTPConnection("127.0.0.1", 8980, timeout=2)
+        conn = _http.HTTPConnection(_host, _port, timeout=2)
         conn.request("GET", "/health")
         resp = conn.getresponse()
         resp.read()
         conn.close()
         # 200 = no master key set; 401 = master key required but proxy alive.
-        _litellm_healthy = resp.status in (200, 401)
+        _litellm_reachable = resp.status in (200, 401)
     except Exception:
-        _litellm_healthy = False
+        _litellm_reachable = False
 
     _litellm_ok = False
     _litellm_skip_reasons: list[str] = []
 
-    if not _litellm_healthy:
-        _litellm_skip_reasons.append("LiteLLM proxy on :8980 not reachable")
+    if not _litellm_reachable:
+        _litellm_skip_reasons.append(
+            f"LiteLLM proxy at {_litellm_url} not reachable")
     else:
         # ── Check 2: master key resolvable ───────────────────────────────
         _master_key = _resolve_litellm_master_key()
@@ -726,7 +841,7 @@ def _resolve_group_json(group: str) -> dict:
             "display_name": _display_name,
             "provider": "litellm",
             "route": "litellm_proxy",
-            "api_base_url": LITELLM_PROXY_URL,
+            "api_base_url": _litellm_url,
             "deployment_id": group,
             "auth_token_type": "litellm_master_key",
             "group": group,
