@@ -249,6 +249,34 @@ class TestParseRegistry:
         extra = low["litellm_params"].get("extra_body", {})
         assert extra.get("reasoning") == {"exclude": True}
 
+    def test_deprecated_model_excluded_from_model_list(self):
+        """Deprecated models are filtered out of the model_list (R4)."""
+        yaml = REGISTRY_YAML + """
+  - id: deprecated-anthropic
+    name: Claude Haiku 4.5 (deprecated)
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
+    model: deepseek-deprecated
+    group: low
+    group_role: fallback
+    status: deprecated
+"""
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+            f.write(yaml)
+        path = Path(f.name)
+        try:
+            model_list, fallbacks = _router._parse_registry(path)
+            # deprecated-anthropic should NOT appear in model_list
+            names = {m["model_name"] for m in model_list}
+            assert "low-deprecated-anthropic" not in names
+            # The existing low fallback chain should still have the other
+            # fallbacks (no crash, just the deprecated model silently omitted)
+            low_fb = next(fb for fb in fallbacks if "low" in fb)
+            assert "low-gemini-2.5-flash" in low_fb["low"]
+        finally:
+            os.unlink(path)
+
 
 # ── _upstream_model ──────────────────────────────────────────────────────
 

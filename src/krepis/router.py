@@ -436,7 +436,13 @@ def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], l
     seen_models: set[str] = set()
 
     groups = doc.get("model_groups", {})
-    models = {m["id"]: m for m in doc.get("models", [])}
+    # Filter out deprecated models — they stay in the registry as documentation
+    # but must never reach the Router's model_list (model-router-policy R4).
+    # The LLM_MODEL_REGISTRY.yaml validator already rejects deprecated entries
+    # inside groups at PR time; this is runtime defense-in-depth for a group
+    # whose registry was valid when loaded but drifted (or if the router is
+    # pointed at a registry before the validator was introduced for that file).
+    models = {m["id"]: m for m in doc.get("models", []) if m.get("status") != "deprecated"}
 
     for group_name, group_ids in groups.items():
         fallback_chain: list[str] = []
