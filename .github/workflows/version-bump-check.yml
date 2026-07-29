@@ -43,7 +43,7 @@ jobs:
     name: pyproject version bumped for src/ changes
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           # Need the base branch + tags so we can diff vs main and check
           # ``git tag --list`` for the proposed new version.
