@@ -41,6 +41,8 @@ inherits the invariant without re-discovering it the hard way.
   user message" constraint.
 - :data:`DEFAULT_WEB_SEARCH_MAX_USES` — runaway-cost insurance cap
   default; lifted from morning-signal PR #33.
+- :data:`MAX_CACHE_BREAKPOINTS` — hard API limit on
+  ``cache_control`` markers per request (``4``).
 - :func:`build_messages_payload` — construct the kwargs dict to splat
   into ``client.messages.create(**payload)``. Always validates before
   returning.
@@ -48,6 +50,8 @@ inherits the invariant without re-discovering it the hard way.
   payload. Raises :exc:`ValueError` on known-incompatible shapes.
 - :func:`build_web_search_tool` — convenience builder for the
   ``web_search_20250305`` tool spec with the runaway-cost cap default.
+- :func:`ensure_message_breakpoint_spacing` — place intermediate
+  ``cache_control`` markers in multi-turn ``messages[]`` per §3.7.
 - :exc:`PayloadInvariantError` — subclass of ``ValueError`` raised by
   :func:`validate_payload`. Distinct type so callers can catch payload
   bugs separately from other ValueErrors.
@@ -87,6 +91,22 @@ SERVER_TOOL_PREFIXES: tuple[str, ...] = (
 # morning-signal PR #33.
 DEFAULT_WEB_SEARCH_MAX_USES: int = 20
 
+# Hard API limit on the number of ``cache_control`` markers per request.
+# The Anthropic Messages API rejects any request carrying more than 4
+# ``cache_control`` breakpoints with an HTTP 400 error. This limit is
+# provider-enforced and model-independent, so the check is unconditional.
+MAX_CACHE_BREAKPOINTS: int = 4
+
+# Content-block threshold for the 20-block lookback rule (§3.7 of the
+# prompt-caching policy). When a multi-turn request has more than this
+# many consecutive content blocks since the last ``cache_control``
+# breakpoint, an intermediate breakpoint should be placed. The constant
+# is exported so callers that construct multi-turn payloads can call
+# :func:`ensure_message_breakpoint_spacing` after building their
+# ``messages[]`` list but before passing it to the payload builder.
+_LOOKBACK_WINDOW: int = 20
+_INTERMEDIATE_BREAKPOINT_INTERVAL: int = 15
+
 
 class PayloadInvariantError(ValueError):
     """Raised by :func:`validate_payload` on a known-incompatible
@@ -106,6 +126,104 @@ def _has_server_tool(tools: list[dict] | None) -> bool:
     )
 
 
+def _count_cache_breakpoints(payload: dict[str, Any]) -> int:
+    """Count explicit ``cache_control`` markers across *payload*.
+
+    Checks the ``system`` field (a list of content blocks per the
+    Anthropic Messages API) and the ``content`` lists inside each
+    message in ``messages[]``.
+
+    A ``cache_control`` marker placed on a segment below the model's
+    ``cache_min_tokens`` still counts against the hard 4-breakpoint
+    ceiling set by the Anthropic API — the provider returns HTTP 400
+    when the total exceeds :data:`MAX_CACHE_BREAKPOINTS` regardless of
+    whether individual markers are effective. So this function counts
+    markers unconditionally; it does not check token lengths.
+    """
+    count = 0
+    for block in (payload.get("system") or []):
+        if isinstance(block, dict) and "cache_control" in block:
+            count += 1
+    for msg in (payload.get("messages") or []):
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and "cache_control" in block:
+                    count += 1
+        elif isinstance(content, dict) and "cache_control" in content:
+            count += 1
+    return count
+
+
+def ensure_message_breakpoint_spacing(
+    messages: list[dict[str, Any]],
+    *,
+    supports_explicit_breakpoints: bool = True,
+) -> list[dict[str, Any]]:
+    """Place intermediate ``cache_control`` breakpoints in a multi-turn
+    ``messages[]`` list per the 20-block lookback rule (§3.7 of the
+    prompt-caching policy).
+
+    When *supports_explicit_breakpoints* is ``False`` (the model uses
+    automatic prefix caching or none), the messages are returned
+    unchanged — this is the no-op-on-M2/M4 path.
+
+    When ``True``, the function walks each message's ``content`` list
+    and counts consecutive content blocks since the last
+    ``cache_control`` marker. If the gap reaches
+    :data:`_LOOKBACK_WINDOW` (20) blocks, an intermediate breakpoint
+    is placed on the next content block. Further breakpoints follow
+    at roughly :data:`_INTERMEDIATE_BREAKPOINT_INTERVAL` (15) blocks.
+
+    **Current code paths produce at most one system-block breakpoint
+    and a single user message, so this function is a no-op on today's
+    production traffic.** It exists as a forward-looking guard so that
+    the next person who extends the payload builder to handle multi-turn
+    conversations with many content blocks inherits the rule rather than
+    rediscovering it.
+
+    The function mutates content-block dicts **in place** and returns
+    the same list reference, matching the pattern used by
+    :func:`build_messages_payload` and
+    :func:`build_batches_request_params`.
+
+    Returns:
+        The same *messages* list (mutated in place), for convenience.
+    """
+    if not supports_explicit_breakpoints:
+        return messages
+
+    blocks_since_breakpoint = 0
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            # String content or dict content — single block, no
+            # subdivision where intermediate breakpoints would go.
+            # A dict content block COULD carry cache_control; count it.
+            if isinstance(content, dict) and "cache_control" in content:
+                blocks_since_breakpoint = 0
+            elif isinstance(content, dict):
+                blocks_since_breakpoint += 1
+            elif isinstance(content, str):
+                blocks_since_breakpoint += 1
+            continue
+
+        for block in content:
+            if not isinstance(block, dict):
+                blocks_since_breakpoint += 1
+                continue
+            if "cache_control" in block:
+                blocks_since_breakpoint = 0
+                continue
+            blocks_since_breakpoint += 1
+            if (blocks_since_breakpoint >= _LOOKBACK_WINDOW
+                    and (blocks_since_breakpoint - _LOOKBACK_WINDOW)
+                    % _INTERMEDIATE_BREAKPOINT_INTERVAL == 0):
+                block["cache_control"] = {"type": "ephemeral"}
+
+    return messages
+
+
 def validate_payload(payload: dict[str, Any]) -> None:
     """Raise :exc:`PayloadInvariantError` on a known-incompatible
     Anthropic ``messages.create()`` payload shape.
@@ -116,6 +234,11 @@ def validate_payload(payload: dict[str, Any]) -> None:
        contains any type with a :data:`SERVER_TOOL_PREFIXES` prefix
        AND ``payload["messages"][-1]["role"] == "assistant"``,
        Anthropic returns HTTP 400. Surfaced 2026-05-26.
+
+    2. **4-breakpoint ceiling.** The Anthropic Messages API rejects
+       requests with more than :data:`MAX_CACHE_BREAKPOINTS` (4)
+       ``cache_control`` markers. Counted across both the ``system``
+       field and message ``content`` blocks.
 
     The validator is a producer-side chokepoint: failing here at
     construction time means the bug class can't reach a production
@@ -137,6 +260,15 @@ def validate_payload(payload: dict[str, Any]) -> None:
                 "with a user message.' Either drop the prefill or drop "
                 "the server tool."
             )
+
+    breakpoint_count = _count_cache_breakpoints(payload)
+    if breakpoint_count > MAX_CACHE_BREAKPOINTS:
+        raise PayloadInvariantError(
+            f"Anthropic payload invariant violated: {breakpoint_count} "
+            f"cache_control markers exceeds the hard API limit of "
+            f"{MAX_CACHE_BREAKPOINTS}. The Anthropic Messages API "
+            "rejects requests with more than 4 cache_control markers."
+        )
 
 
 def build_web_search_tool(
