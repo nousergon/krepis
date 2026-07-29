@@ -436,15 +436,55 @@ def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], l
     seen_models: set[str] = set()
 
     groups = doc.get("model_groups", {})
-    models = {m["id"]: m for m in doc.get("models", [])}
+    raw_models = {m["id"]: m for m in doc.get("models", [])}
+
+    # Filter to LIVE models before iterating.  Deprecated entries may stay
+    # in the registry as documentation but must not reach the runtime router
+    # (model-router-policy R4).  The same filter is applied by the LiteLLM
+    # config generator in alpha-engine-config; keeping it here means both
+    # derivation paths respect the same rule regardless of which one is used.
+    models = {
+        mid: entry
+        for mid, entry in raw_models.items()
+        if entry.get("status") != "deprecated"
+    }
+    for mid in raw_models:
+        if raw_models[mid].get("status") == "deprecated":
+            logger.info(
+                "model %r is status=deprecated — excluded from Router", mid
+            )
 
     for group_name, group_ids in groups.items():
         fallback_chain: list[str] = []
-        for i, mid in enumerate(group_ids):
-            entry = models.get(mid)
+        # Build a LIVE-only group list so the primary alias comes from the
+        # first surviving entry and deprecated models in the fallback chain
+        # are silently dropped (R4: no reachable deprecated model).
+        live_group_ids: list[str] = []
+        for mid in group_ids:
+            entry = raw_models.get(mid)
             if entry is None:
-                logger.warning("model %r referenced in group %r not found in models list", mid, group_name)
+                logger.warning(
+                    "model %r referenced in group %r not found in models list",
+                    mid, group_name,
+                )
                 continue
+            if entry.get("status") == "deprecated":
+                logger.info(
+                    "model %r in group %r is status=deprecated — excluded",
+                    mid, group_name,
+                )
+                continue
+            live_group_ids.append(mid)
+
+        if not live_group_ids:
+            logger.warning(
+                "group %r has no live members — no alias generated",
+                group_name,
+            )
+            continue
+
+        for i, mid in enumerate(live_group_ids):
+            entry = models[mid]
 
             # Primary is named after the GROUP ("low", "med", …) so
             # router.completion(model="low") resolves to the first entry.
