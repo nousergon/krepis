@@ -353,14 +353,66 @@ class TestCorrelationIdResolution:
         result = ssm_log_capture._resolve_correlation_id(None)
         assert result == "env-token-xyz"
 
-    def test_neither_returns_none(self):
-        result = ssm_log_capture._resolve_correlation_id(None)
-        assert result is None
+    def test_auto_generates_when_neither_set(self, monkeypatch):
+        monkeypatch.delenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        with patch.object(ssm_log_capture.uuid, "uuid4", return_value=MagicMock(hex="aabbccddee00")):
+            result = ssm_log_capture._resolve_correlation_id(None)
+        assert result == "aabbccddee00"
+        assert isinstance(result, str)
 
     def test_cli_arg_overrides_env_var(self, monkeypatch):
         monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "env-token")
         result = ssm_log_capture._resolve_correlation_id("cli-token")
         assert result == "cli-token"
+
+    def test_ssm_command_id_fallback(self, monkeypatch):
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, "ssm-cmd-001")
+        result = ssm_log_capture._resolve_correlation_id(None)
+        assert result == "ssm-cmd-001"
+
+    def test_ssm_command_id_overridden_by_run_token(self, monkeypatch):
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "run-token-val")
+        monkeypatch.setenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, "ssm-cmd-val")
+        result = ssm_log_capture._resolve_correlation_id(None)
+        assert result == "run-token-val"
+
+    def test_auto_generate_uuid_when_nothing_set(self, monkeypatch):
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, raising=False)
+        with patch.object(ssm_log_capture.uuid, "uuid4", return_value=MagicMock(hex="abcdef1234567890")):
+            result = ssm_log_capture._resolve_correlation_id(None)
+        assert result == "abcdef123456"
+        # uuid4().hex[:12] — 12 hex chars
+
+    def test_auto_generates_warning_logged_when_uuid_fallback(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, raising=False)
+        with patch.object(ssm_log_capture.uuid, "uuid4", return_value=MagicMock(hex="deadbeef1234")):
+            with caplog.at_level(logging.WARNING):
+                ssm_log_capture._resolve_correlation_id(None)
+        assert "auto-generated correlation_id" in caplog.text
+        assert "deadbeef1234" in caplog.text
+
+    def test_ssm_command_id_warning_logged(self, monkeypatch, caplog):
+        import logging
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        monkeypatch.setenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, "ssm-warn-001")
+        with caplog.at_level(logging.WARNING):
+            ssm_log_capture._resolve_correlation_id(None)
+        assert "SSM_COMMAND_ID" in caplog.text
+        assert "ssm-warn-001" in caplog.text
+
+    def test_auto_generate_is_non_empty_string(self, monkeypatch):
+        """Never return None — auto-generation guarantees a str."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, raising=False)
+        with patch.object(ssm_log_capture.uuid, "uuid4", return_value=MagicMock(hex="abc123")):
+            result = ssm_log_capture._resolve_correlation_id(None)
+        assert isinstance(result, str)
+        assert len(result) > 0
 
 
 class TestExitKeyWithCorrelationId:
@@ -467,14 +519,25 @@ class TestCorrelationIdInLogAndKey:
         assert "corr-002" in key
 
 
-class TestCliCorrelationIdRequired:
-    """The CLI requires --correlation-id or $RUN_TOKEN (§116 rule 6 chokepoint)."""
+class TestCliCorrelationIdAutoGeneration:
+    """The CLI auto-generates a correlation-id when none is provided (§116 rule 6
+    graceful-degradation fix — config#4223)."""
 
-    def test_missing_correlation_id_errors(self):
-        with pytest.raises(SystemExit):
-            ssm_log_capture.main(
-                ["run", "--slug", "x", "--log", "/tmp/x.log", "--", "true"]
-            )
+    def test_missing_correlation_id_auto_generates(self, isolated_logfile, fake_boto3, monkeypatch):
+        monkeypatch.delenv(ssm_log_capture.SSM_COMMAND_ID_ENV_VAR, raising=False)
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(ssm_log_capture.uuid, "uuid4", return_value=MagicMock(hex="aabbccddee001122")):
+                rc = ssm_log_capture.main(
+                    ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+                )
+        assert rc == 0
+        s3.upload_file.assert_called_once()
+        # No longer hard-errors — auto-generation succeeded; uuid4().hex[:12] lands in the S3 key
+        args, _ = s3.upload_file.call_args
+        key = args[2]
+        assert "aabbccddee00" in key  # hex[:12] — 12 chars
 
     def test_with_correlation_id_succeeds(self, isolated_logfile, fake_boto3):
         fake, _ = fake_boto3

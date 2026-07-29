@@ -124,6 +124,13 @@ S3_PREFIX: Final[str] = "_ssm_logs"
 # without a CLI change.
 CORRELATION_ID_ENV_VAR: Final[str] = "RUN_TOKEN"
 
+# Env var read as a best-effort fallback for auto-generation when neither
+# ``--correlation-id`` nor ``$RUN_TOKEN`` is set. Set by the SSM agent on
+# the EC2 instance; not a substitute for a deliberate correlation id, but
+# better than failing the entire dispatch (the 2026-07-25 weekly-SF failure
+# mode — config#4223).
+SSM_COMMAND_ID_ENV_VAR: Final[str] = "SSM_COMMAND_ID"
+
 
 def _exit_key(
     slug: str,
@@ -211,23 +218,40 @@ def format_subprocess_failure(
     )
 
 
-def _resolve_correlation_id(cli_arg: str | None) -> str | None:
+def _resolve_correlation_id(cli_arg: str | None) -> str:
     """Resolve correlation id from CLI arg, env var, or auto-generate.
 
     Precedence:
     1. Explicit ``cli_arg`` (from ``--correlation-id``).
     2. ``$RUN_TOKEN`` env var.
-    3. ``None`` — the CLI enforces presence when ``--correlation-id`` is
-       absent, but the Python API returns None so callers can choose their
-       own resolution. The :func:`main` function (CLI entrypoint) errors
-       before running if both sources are absent.
+    3. ``$SSM_COMMAND_ID`` env var (best-effort SSM-agent correlation).
+    4. Auto-generated uuid4 hex (last resort).
+
+    Step 4 ensures the CLI never hard-fails when neither a deliberate
+    correlation id nor a dispatch token is present (the 2026-07-25
+    weekly-SF failure mode — config#4223). A WARNING is logged in steps
+    3 and 4 so operators know traceability is degraded.
     """
     if cli_arg:
         return cli_arg
     env_val = os.environ.get(CORRELATION_ID_ENV_VAR)
     if env_val:
         return env_val
-    return None
+    ssm_cmd_id = os.environ.get(SSM_COMMAND_ID_ENV_VAR)
+    if ssm_cmd_id:
+        logger.warning(
+            "ssm_log_capture: no --correlation-id or $RUN_TOKEN — "
+            "using $SSM_COMMAND_ID=%s (traceability degraded)",
+            ssm_cmd_id,
+        )
+        return ssm_cmd_id
+    auto_id = uuid.uuid4().hex[:12]
+    logger.warning(
+        "ssm_log_capture: no --correlation-id, $RUN_TOKEN, or $SSM_COMMAND_ID — "
+        "auto-generated correlation_id=%s (traceability degraded)",
+        auto_id,
+    )
+    return auto_id
 
 
 def _write_correlation_header(logf, correlation_id: str | None) -> None:
@@ -453,17 +477,13 @@ def main(argv: list[str] | None = None) -> int:
     if not inner:
         parser.error("inner command required after `--`")
 
-    # §116 rule 6 chokepoint: every dispatched workload must carry a
-    # correlation id. Reject before running so the gap is never silent.
-    correlation_id = args.correlation_id or os.environ.get(CORRELATION_ID_ENV_VAR)
-    if not correlation_id:
-        parser.error(
-            "--correlation-id is required (or set $RUN_TOKEN) — the fleet "
-            "§116 rule 6 (logging standard) requires every log surface to "
-            "carry a run/execution correlation id for traceability. Without "
-            "one, a new dispatched workload's logs cannot be correlated back "
-            "to its triggering execution."
-        )
+    # §116 rule 6 chokepoint: correlation id is resolved from CLI arg,
+    # $RUN_TOKEN, $SSM_COMMAND_ID, or auto-generated (uuid4) as last
+    # resort — see :func:`_resolve_correlation_id`. The hard-fail that
+    # previously existed here was removed after the 2026-07-25 weekly-SF
+    # kill (config#4223); a WARNING is emitted when the id is auto-generated
+    # so operators know traceability is degraded.
+    correlation_id = _resolve_correlation_id(args.correlation_id)
 
     return run(
         args.slug,
