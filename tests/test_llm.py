@@ -8,8 +8,10 @@ from pydantic import BaseModel, Field
 from krepis.llm import (
     LLMClient,
     LLMError,
+    NullChoicesError,
     SearchOptions,
     _extract_json,
+    _first_choice,
 )
 from krepis.llm_config import LLMConfigError, ModelSpec
 
@@ -885,3 +887,134 @@ class TestCallsiteIdAndCostEmission:
         )
         assert len(records) == 1
         assert records[0]["callsite_id"] == "evaljudge-sync"
+
+
+# ── null-choices bodies (the 200 that carries the provider's error) ────────
+
+
+def _null_choices_resp(choices=None, model="moonshotai/kimi-k2.6"):
+    """OpenRouter's shape for an upstream provider failure: HTTP 200, no
+    ``choices``, an ``error`` object in the body. The SDK builds this without
+    complaint, so nothing is raised until something reads ``choices[0]``."""
+    return SimpleNamespace(
+        choices=choices,
+        error={"message": "upstream provider error", "code": 502},
+        id="gen-null-choices",
+        model=model,
+        usage=None,
+    )
+
+
+class TestNullChoices:
+    """A null/empty ``choices`` body is a retryable transport failure.
+
+    Regression guard: this was fixed locally in
+    ``crucible-research/thinktank/client.py::_NullChoicesError`` because this
+    chokepoint lacked it. Measured 2026-07-30 on
+    crucible-research#530 (the migration onto this library): the migrated
+    client raised ``TypeError: 'NoneType' object is not subscriptable`` —
+    the fork's protection was being dropped by adopting the shared code.
+    """
+
+    @pytest.mark.parametrize("choices", [None, []])
+    def test_first_choice_raises_typed_error_naming_the_provider_error(self, choices):
+        with pytest.raises(NullChoicesError) as exc_info:
+            _first_choice(_null_choices_resp(choices))
+        message = str(exc_info.value)
+        assert "upstream provider error" in message, (
+            "the provider's own error message must reach the log — the "
+            "original TypeError discarded it unread"
+        )
+        assert "gen-null-choices" in message
+
+    @pytest.mark.parametrize("choices", [None, []])
+    def test_structured_retries_a_null_choices_body(self, choices, monkeypatch):
+        monkeypatch.setattr("krepis.llm._retry_backoff_sleep", lambda _a: None)
+        fake = FakeOpenAI([
+            _null_choices_resp(choices),
+            _openai_resp('{"name": "ok", "score": 7}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.name == "ok"
+        assert len(fake.kwargs) == 2, "the bad body must cost one attempt, not the call"
+
+    def test_structured_gives_up_with_a_diagnosable_llm_error(self, monkeypatch):
+        monkeypatch.setattr("krepis.llm._retry_backoff_sleep", lambda _a: None)
+        fake = FakeOpenAI([_null_choices_resp(), _null_choices_resp()])
+        with pytest.raises(LLMError) as exc_info:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert "upstream provider error" in str(exc_info.value)
+
+    def test_grounded_retries_a_null_choices_body(self, monkeypatch):
+        monkeypatch.setattr("krepis.llm._retry_backoff_sleep", lambda _a: None)
+        fake = FakeOpenAI([
+            _null_choices_resp(),
+            _openai_resp("grounded answer", finish_reason="stop"),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).complete_grounded(
+            system="s", user_content="u", search=SearchOptions(),
+        )
+        assert result.text == "grounded answer"
+        assert len(fake.kwargs) == 2
+
+    def test_complete_converts_it_to_llm_error_not_a_bare_exception(self):
+        """``complete`` has no retry loop, so there is nothing to classify the
+        failure into — the module contract says a failed call raises LLMError."""
+        fake = FakeOpenAI([_null_choices_resp()])
+        with pytest.raises(LLMError) as exc_info:
+            _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert "upstream provider error" in str(exc_info.value)
+
+    def test_a_healthy_response_is_untouched(self):
+        fake = FakeOpenAI([_openai_resp('{"name": "fine", "score": 1}')])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.name == "fine"
+        assert len(fake.kwargs) == 1
+
+
+class TestRetryBackoff:
+    """Body-level retries back off. They used to run in a tight loop, which is
+    the worst possible cadence against a briefly-unhealthy gateway."""
+
+    def test_structured_sleeps_between_attempts_with_growing_bound(self, monkeypatch):
+        slept: list[int] = []
+        monkeypatch.setattr("krepis.llm._retry_backoff_sleep", slept.append)
+        fake = FakeOpenAI([
+            _null_choices_resp(),
+            _openai_resp('{"name": "ok", "score": 2}'),
+        ])
+        _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert slept == [0], "one failed attempt, one backoff, keyed by attempt index"
+
+    def test_no_backoff_after_the_final_attempt(self, monkeypatch):
+        slept: list[int] = []
+        monkeypatch.setattr("krepis.llm._retry_backoff_sleep", slept.append)
+        fake = FakeOpenAI([_null_choices_resp(), _null_choices_resp()])
+        with pytest.raises(LLMError):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert slept == [0], "never sleep after the attempt that gives up"
+
+    def test_delay_is_bounded_and_jittered(self):
+        from krepis.llm import _RETRY_DELAY_CAP_S, _retry_backoff_sleep
+
+        seen: list[float] = []
+        import krepis.llm as _mod
+
+        real_sleep = _mod._time.sleep
+        _mod._time.sleep = seen.append
+        try:
+            for attempt in range(8):
+                _retry_backoff_sleep(attempt)
+        finally:
+            _mod._time.sleep = real_sleep
+        assert all(0.0 <= d <= _RETRY_DELAY_CAP_S for d in seen), seen

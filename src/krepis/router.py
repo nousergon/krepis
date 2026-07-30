@@ -229,13 +229,26 @@ def _resolve_litellm_master_key() -> Optional[str]:
             continue
 
     # 3. AWS SSM
+    return _litellm_master_key_from_ssm()
+
+
+def _litellm_master_key_from_ssm() -> Optional[str]:
+    """Last-resort lookup of the master key from SSM.
+
+    Split out of ``_resolve_litellm_master_key`` so tests can neutralise the one
+    leg that reaches outside the process. Until 2026-07-30 this ran inline and
+    the laptop had no working AWS credentials, so six tests in test_router.py
+    passed only because the call always failed — they were asserting the state
+    of the machine, not the behaviour of the code. Giving the laptop a machine
+    identity that actually works turned all six red at once.
+    """
     try:
         import subprocess as _sp
         _result = _sp.run(
             ["aws", "ssm", "get-parameter",
              "--name", "/symposion/LITELLM_MASTER_KEY",
              "--with-decryption", "--region", "us-east-1",
-             "--profile", "ne-admin",
+             "--profile", "ne-laptop-daemon",
              "--query", "Parameter.Value", "--output", "text"],
             capture_output=True, text=True, timeout=5,
         )

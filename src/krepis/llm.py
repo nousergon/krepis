@@ -34,7 +34,9 @@ import functools
 import json
 import logging
 import os
+import random as _random
 import re
+import time as _time
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional
 
@@ -137,6 +139,62 @@ _JSON_INSTRUCTION = (
     "\n\nRespond with ONLY a single JSON object matching this JSON Schema — "
     "no prose, no markdown fences:\n{schema}"
 )
+
+# Bounded jittered backoff between attempts of the retry loops below. The
+# SDK's own ``max_retries`` backs off for status/connection failures, but it
+# never sees the BODY-level failures this module retries (a non-JSON body, a
+# null-choices body, an unresolved tool call) — those were retried in a tight
+# loop, which is the worst possible cadence against a gateway that is briefly
+# unhealthy. Full jitter, same shape as ``krepis.http_retry.backoff_delay``.
+_RETRY_BASE_DELAY_S = 2.0
+_RETRY_DELAY_CAP_S = 30.0
+
+
+def _retry_backoff_sleep(attempt: int) -> None:
+    """Sleep before re-issuing attempt ``attempt`` (0-indexed, already failed)."""
+    delay = min(_RETRY_BASE_DELAY_S * (2**attempt), _RETRY_DELAY_CAP_S)
+    _time.sleep(_random.uniform(0, delay))
+
+
+class NullChoicesError(Exception):
+    """A 200 response whose ``choices`` is null or empty.
+
+    OpenRouter reports an upstream provider failure in the BODY of a 200 —
+    ``choices`` null (or empty) with an ``error`` object beside it — rather
+    than as an HTTP error. The SDK builds that object without complaint, so it
+    raises nothing, and the natural ``resp.choices[0]`` then raises
+    ``TypeError: 'NoneType' object is not subscriptable``: a bare exception
+    that escapes every bounded-retry loop and discards the provider's own
+    error message unread.
+
+    Modelling it as a typed exception lets it share the retry path with the
+    other body-level transport failures. Lifted from
+    ``crucible-research/thinktank/client.py::_NullChoicesError``, which had to
+    solve this locally because this chokepoint did not
+    (alpha-engine-config#5223 / crucible-research#530).
+    """
+
+
+def _first_choice(resp: Any) -> Any:
+    """Return ``resp.choices[0]`` or raise :class:`NullChoicesError`.
+
+    Every ``choices[0]`` read on an OpenAI-shaped response goes through here —
+    a guard applied at four of five sites is not a guard.
+    """
+    choices = getattr(resp, "choices", None)
+    if not choices:
+        raise NullChoicesError(
+            f"provider returned no choices "
+            f"(error={getattr(resp, 'error', None)!r}, "
+            f"id={getattr(resp, 'id', None)!r}, "
+            f"model={getattr(resp, 'model', None)!r})"
+        )
+    return choices[0]
+
+
+def _choice_text(resp: Any) -> str:
+    """First choice's message content, stripped. Raises on null choices."""
+    return (_first_choice(resp).message.content or "").strip()
 
 
 class LLMError(RuntimeError):
@@ -616,6 +674,23 @@ class LLMClient:
             body["reasoning"] = self.spec.reasoning
         return body or None
 
+    def _choice_text_or_llm_error(self, resp: Any) -> str:
+        """``_choice_text`` for the SINGLE-SHOT paths, as a documented error.
+
+        :meth:`complete` has no retry loop of its own, so there is nothing to
+        classify a null-choices body INTO. The module contract is that a failed
+        call on the configured provider raises :exc:`LLMError` — so convert,
+        rather than letting the caller catch a bare ``NullChoicesError`` (or,
+        before the guard existed, a ``TypeError`` naming nothing at all).
+        """
+        try:
+            return _choice_text(resp)
+        except NullChoicesError as exc:
+            raise LLMError(
+                f"provider={self.spec.provider} model={self.spec.model}: {exc}",
+                usage=self._usage_from_openai(resp),
+            ) from exc
+
     # ── plain completion ──────────────────────────────────────────────
 
     @_emits_cost
@@ -696,7 +771,7 @@ class LLMClient:
             primary = _get_primary(self.spec.model)
             fallback_used = bool(primary and served_model and served_model != primary)
             _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
-            text = (resp.choices[0].message.content or "").strip()
+            text = self._choice_text_or_llm_error(resp)
             return LLMResult(
                 text=text,
                 model=served_model or self.spec.model,
@@ -724,7 +799,7 @@ class LLMClient:
         if extra:
             kwargs.update(extra)
         resp = self._transport_client().chat.completions.create(**kwargs)
-        text = (resp.choices[0].message.content or "").strip()
+        text = self._choice_text_or_llm_error(resp)
         return LLMResult(
             text=text,
             model=getattr(resp, "model", self.spec.model),
@@ -958,33 +1033,44 @@ class LLMClient:
         for attempt in range(attempts):
             try:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
-            except json.JSONDecodeError as exc:
-                # The transport returned a non-JSON body on what the SDK
-                # treated as a successful transaction (e.g. an OpenRouter
-                # gateway hiccup) — this is invisible to the SDK's own
-                # ``max_retries`` (status/connection-based) since parsing
-                # only fails after the response is already considered
-                # final. Treat it as an ordinary bounded-retry attempt
-                # failure rather than letting it crash the caller with a
-                # raw, context-free JSONDecodeError (live incident
-                # 2026-07-20 — krepis#38).
+                self._usage_from_openai(resp, into=usage)
+                raw_text = _choice_text(resp)
+            except (json.JSONDecodeError, NullChoicesError) as exc:
+                # Two body-level transport failures on what the SDK treated as
+                # a SUCCESSFUL transaction, both invisible to its own
+                # ``max_retries`` (status/connection-based) because the
+                # response was already considered final:
+                #
+                # - a non-JSON body (live incident 2026-07-20, krepis#38);
+                # - a null/empty ``choices`` array carrying the provider's
+                #   error in the body (OpenRouter's shape for an upstream
+                #   failure) — previously escaped as a bare
+                #   ``TypeError: 'NoneType' object is not subscriptable``.
+                #
+                # Both are ordinary bounded-retry attempt failures, not caller
+                # crashes.
+                # Cause-specific wording: "which body-level failure" is the
+                # first thing an operator needs off the log line.
+                kind = (
+                    "a null-choices response body"
+                    if isinstance(exc, NullChoicesError)
+                    else "a non-JSON response body"
+                )
                 last_error = (
-                    f"transport returned a non-JSON response body "
+                    f"transport returned {kind} "
                     f"({exc.__class__.__name__}: {exc})"
                 )
                 logger.warning(
-                    "llm structured provider=%s model=%s attempt=%d/%d: "
-                    "transport returned a non-JSON response body (%s: %s)",
+                    "llm structured provider=%s model=%s attempt=%d/%d: %s",
                     self.spec.provider,
                     self.spec.model,
                     attempt + 1,
                     attempts,
-                    exc.__class__.__name__,
-                    exc,
+                    last_error,
                 )
+                if attempt < attempts - 1:
+                    _retry_backoff_sleep(attempt)
                 continue
-            self._usage_from_openai(resp, into=usage)
-            raw_text = (resp.choices[0].message.content or "").strip()
             try:
                 parsed = parse_and_validate(_extract_json(raw_text))
                 return StructuredResult(
@@ -1085,8 +1171,14 @@ class LLMClient:
             _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
 
             self._usage_from_openai(resp, into=usage)
-            raw_text = (resp.choices[0].message.content or "").strip()
             try:
+                # _choice_text is inside the guarded block: a null/empty
+                # ``choices`` body is a retryable provider failure here too,
+                # not a bare TypeError escaping the loop. No explicit backoff
+                # on this branch — the Router's fallback chain means the next
+                # attempt goes to a DIFFERENT model, so sleeping first would
+                # delay a call that is not hitting the unhealthy endpoint.
+                raw_text = _choice_text(resp)
                 parsed = self._extract_json(raw_text)
                 validated = parse_and_validate(parsed)
             except Exception as exc:
@@ -1263,18 +1355,26 @@ class LLMClient:
         for attempt in range(attempts):
             try:
                 resp = self._transport_client().chat.completions.create(**kwargs)
-            except json.JSONDecodeError as exc:
-                # The transport returned a non-JSON body on what the SDK
-                # treated as a successful transaction (e.g. an OpenRouter
-                # gateway hiccup) — invisible to the SDK's own
-                # ``max_retries`` since parsing only fails after the
-                # response is already considered final. Live incident
-                # 2026-07-20 (krepis#38): this crashed the caller with a
-                # raw, context-free JSONDecodeError instead of engaging
-                # the caller's cross-provider fallback, because it isn't
-                # a ``RuntimeError``/``LLMError`` subclass.
+                self._usage_from_openai(resp, into=usage)
+                choice = _first_choice(resp)
+            except (json.JSONDecodeError, NullChoicesError) as exc:
+                # Two body-level failures on what the SDK treated as a
+                # successful transaction, both invisible to its own
+                # ``max_retries`` because the response was already considered
+                # final: a non-JSON body (live incident 2026-07-20, krepis#38)
+                # and a null/empty ``choices`` carrying the provider's error in
+                # the body. Neither is a ``RuntimeError``/``LLMError``
+                # subclass, so unclassified they crash the caller instead of
+                # engaging its cross-provider fallback.
+                # Cause-specific wording: "which body-level failure" is the
+                # first thing an operator needs off the log line.
+                kind = (
+                    "a null-choices response body"
+                    if isinstance(exc, NullChoicesError)
+                    else "a non-JSON response body"
+                )
                 last_error = (
-                    f"transport returned a non-JSON response body "
+                    f"transport returned {kind} "
                     f"({exc.__class__.__name__}: {exc})"
                 )
                 logger.warning(
@@ -1286,10 +1386,10 @@ class LLMClient:
                     attempts,
                     last_error,
                 )
+                if attempt < attempts - 1:
+                    _retry_backoff_sleep(attempt)
                 continue
 
-            self._usage_from_openai(resp, into=usage)
-            choice = resp.choices[0]
             text = (choice.message.content or "").strip()
 
             # A declared server-side tool (``openrouter:web_search``) is
