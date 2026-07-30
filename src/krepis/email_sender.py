@@ -127,7 +127,7 @@ def _send_via_gmail(
             server.ehlo()
             server.login(sender, app_password)
             server.sendmail(sender, recipients, msg.as_string())
-        logger.info("Email sent via Gmail SMTP: %r -> %s", subject, recipients)
+        logger.info("Email sent via Gmail SMTP: %r -> %d recipient(s)", subject, len(recipients))
         return True
     except smtplib.SMTPAuthenticationError as e:
         logger.error(
@@ -164,7 +164,7 @@ def _send_via_ses(
             Destination={"ToAddresses": recipients},
             Message=message,
         )
-        logger.info("Email sent via SES: %r -> %s", subject, recipients)
+        logger.info("Email sent via SES: %r -> %d recipient(s)", subject, len(recipients))
         return True
     except ClientError as e:
         logger.error("SES send failed: %s", e.response["Error"]["Message"])
