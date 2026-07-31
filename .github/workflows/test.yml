@@ -4,6 +4,9 @@ name: Tests
 # main so a change can't ship before being validated against the floor of
 # declared support (3.9 — the EC2 always-on micro instance).
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]

@@ -34,6 +34,9 @@ name: Version-bump check
 #     invariant) — this workflow extends the chokepoint from
 #     internal-consistency to external-monotonicity.
 
+permissions:
+  contents: read
+
 on:
   pull_request:
     branches: [main]
