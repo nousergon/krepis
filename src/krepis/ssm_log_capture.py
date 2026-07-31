@@ -92,11 +92,16 @@ is appended before ``.log`` for traceability.
 
 The ``--correlation-id`` CLI argument (or ``$RUN_TOKEN`` env var) is the
 fleet-wide chokepoint guaranteeing every log surface carries a run/execution
-correlation id. When neither is present the CLI errors before running —
-a new dispatched workload cannot use this module without providing one.
-The correlation id appears as a ``# correlation-id: <id>`` header line at
-the top of the captured log file and is appended to the S3 key for
-traceability.
+correlation id. When neither is present the CLI AUTO-GENERATES one — best
+effort from ``$SSM_COMMAND_ID`` (set by the SSM agent on the box for
+long-running commands), falling back to a uuid4 — and logs a WARNING that
+traceability is degraded (config#4223). The flag/env remain the signal of
+intent ("I've provided a correlation id"); their absence degrades gracefully
+rather than hard-failing, because a hard failure mid-pipeline (the
+2026-07-25 weekly-SF kill, config#4223) took every downstream log surface
+down with it. The correlation id appears as a ``# correlation-id: <id>``
+header line at the top of the captured log file and is appended to the S3
+key for traceability.
 
 It is also **exported to the inner command as ``$RUN_TOKEN``**. Resolution
 reads env -> CLI; the export is what makes the reverse direction exist, so a
@@ -133,6 +138,13 @@ S3_PREFIX: Final[str] = "_ssm_logs"
 # variable lets the SF-dispatched callers inherit the dispatcher's token
 # without a CLI change.
 CORRELATION_ID_ENV_VAR: Final[str] = "RUN_TOKEN"
+
+# Env var the SSM agent itself sets on the box for long-running commands
+# (``aws ssm send-command``/Step Functions SSM states). Best-effort source
+# for an auto-generated correlation id (config#4223): when the CLI flag and
+# $RUN_TOKEN are both absent, a command dispatched through SSM still gets a
+# stable, execution-scoped id from this rather than a throwaway uuid4.
+SSM_COMMAND_ID_ENV_VAR: Final[str] = "SSM_COMMAND_ID"
 
 
 def _child_env(
@@ -251,15 +263,15 @@ def format_subprocess_failure(
 
 
 def _resolve_correlation_id(cli_arg: str | None) -> str | None:
-    """Resolve correlation id from CLI arg, env var, or auto-generate.
+    """Resolve correlation id from CLI arg or env var.
 
     Precedence:
     1. Explicit ``cli_arg`` (from ``--correlation-id``).
     2. ``$RUN_TOKEN`` env var.
-    3. ``None`` — the CLI enforces presence when ``--correlation-id`` is
-       absent, but the Python API returns None so callers can choose their
-       own resolution. The :func:`main` function (CLI entrypoint) errors
-       before running if both sources are absent.
+    3. ``None`` — the Python API returns None so callers can choose their
+       own resolution. The :func:`main` function (CLI entrypoint)
+       auto-generates when both sources are absent (config#4223) — the
+       CLI never errors on a missing correlation id.
     """
     if cli_arg:
         return cli_arg
@@ -267,6 +279,24 @@ def _resolve_correlation_id(cli_arg: str | None) -> str | None:
     if env_val:
         return env_val
     return None
+
+
+def _auto_generate_correlation_id() -> str:
+    """Best-effort correlation id for the no-flag/no-env case (config#4223).
+
+    Precedence:
+    1. ``$SSM_COMMAND_ID`` — set by the SSM agent on the box for
+       long-running commands, so an SSM-dispatched workload without an
+       explicit id still gets a stable, execution-scoped one.
+    2. A fresh uuid4.
+
+    The caller logs at WARNING when this path fires, so operators know
+    traceability is degraded (no cross-surface correlation was declared).
+    """
+    ssm_id = os.environ.get(SSM_COMMAND_ID_ENV_VAR)
+    if ssm_id:
+        return ssm_id
+    return str(uuid.uuid4())
 
 
 def _write_correlation_header(logf, correlation_id: str | None) -> None:
@@ -473,9 +503,10 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help=(
             "Run/execution correlation id embedded in the log file header "
-            "and S3 key for traceability. Falls back to $RUN_TOKEN env var. "
-            "Required by the fleet §116 rule 6 chokepoint: when both are "
-            "absent, the command refuses to run."
+            "and S3 key for traceability. Falls back to $RUN_TOKEN env var, "
+            "then to an auto-generated id ($SSM_COMMAND_ID or uuid4) with a "
+            "WARNING — the fleet §116 rule 6 chokepoint (config#4223): "
+            "absence degrades gracefully, never hard-fails."
         ),
     )
     run_p.add_argument(
@@ -497,16 +528,22 @@ def main(argv: list[str] | None = None) -> int:
     if not inner:
         parser.error("inner command required after `--`")
 
-    # §116 rule 6 chokepoint: every dispatched workload must carry a
-    # correlation id. Reject before running so the gap is never silent.
+    # §116 rule 6 chokepoint: every dispatched workload carries a correlation
+    # id. When none is declared (flag or $RUN_TOKEN), AUTO-GENERATE one
+    # (config#4223) and log at WARNING so operators know traceability is
+    # degraded. A hard failure here is what killed the 2026-07-25 weekly SF
+    # mid-execution — the krepis update deployed between SF phases took every
+    # downstream ssm_log_capture caller down with it. The chokepoint's job is
+    # that no log surface LACKS an id, and auto-generation satisfies that;
+    # the flag/env remain the declared-intent signal.
     correlation_id = args.correlation_id or os.environ.get(CORRELATION_ID_ENV_VAR)
     if not correlation_id:
-        parser.error(
-            "--correlation-id is required (or set $RUN_TOKEN) — the fleet "
-            "§116 rule 6 (logging standard) requires every log surface to "
-            "carry a run/execution correlation id for traceability. Without "
-            "one, a new dispatched workload's logs cannot be correlated back "
-            "to its triggering execution."
+        correlation_id = _auto_generate_correlation_id()
+        logger.warning(
+            "ssm_log_capture: no --correlation-id and no $%s — auto-generated "
+            "correlation id %r (traceability degraded: logs will not correlate "
+            "to the triggering execution without it)",
+            CORRELATION_ID_ENV_VAR, correlation_id,
         )
 
     return run(
