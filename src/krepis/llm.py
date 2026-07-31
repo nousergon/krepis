@@ -459,7 +459,7 @@ class LLMClient:
             ) from exc
         if verdict.should_block:
             logger.warning(
-                "dlp: BLOCKED %s request — %s (scan=%.0fms cache=%.0%%)",
+                "dlp: BLOCKED %s request — %s (scan=%.0fms cache=%.0f%%)",
                 context,
                 verdict.reason,
                 verdict.scan_ms,
@@ -469,7 +469,7 @@ class LLMClient:
                 f"DLP scan blocked outbound request: {verdict.reason}"
             )
         logger.debug(
-            "dlp: ok %s request (scan=%.0fms cache=%.0%%)",
+            "dlp: ok %s request (scan=%.0fms cache=%.0f%%)",
             context,
             verdict.scan_ms,
             verdict.cache_ratio,
