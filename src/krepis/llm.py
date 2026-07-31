@@ -58,6 +58,10 @@ from krepis.llm_search import (
     extract_openrouter_citations,
     final_text_after_last_tool,
 )
+from krepis.session_dlp import (
+    check_request,
+    dlp_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -416,6 +420,61 @@ class LLMClient:
 
     # ── cost emission ─────────────────────────────────────────────────
 
+    def _dlp_scan_request(self, payload: dict, *, context: str = "") -> None:
+        """Scan *payload* (the exact dict about to be sent) for secrets.
+
+        Raises :exc:`LLMError` on a block or scan failure (fail-closed).
+        No-op when DLP is administratively disabled
+        (``KREPIS_DLP_DISABLED=1``).
+
+        Called by every public method before forwarding to the transport —
+        one chokepoint, called at each of the three methods rather than via
+        a reusable decorator, because the payload dict is constructed
+        differently per transport (Anthropic vs OpenAI-kwargs vs LiteLLM).
+        A future consolidation may unify the payload shape; until then this
+        explicit call at each site is the unambiguous single-point hook the
+        Lambda-path DLP gap requires (``alpha-engine-config-I4927``).
+        """
+        if not dlp_enabled():
+            return
+        try:
+            body = json.dumps(payload, default=str).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            logger.warning(
+                "dlp: could not serialize request payload for scanning (%s) — "
+                "failing closed (the request will NOT be forwarded)",
+                exc,
+            )
+            raise LLMError(
+                f"DLP scan could not serialize request payload: {exc}"
+            ) from exc
+        try:
+            verdict = check_request(body)
+        except Exception as exc:
+            logger.error(
+                "dlp: scan raised for %s request: %s", context, exc
+            )
+            raise LLMError(
+                f"DLP scan failed (fail-closed): {exc}"
+            ) from exc
+        if verdict.should_block:
+            logger.warning(
+                "dlp: BLOCKED %s request — %s (scan=%.0fms cache=%.0%%)",
+                context,
+                verdict.reason,
+                verdict.scan_ms,
+                verdict.cache_ratio,
+            )
+            raise LLMError(
+                f"DLP scan blocked outbound request: {verdict.reason}"
+            )
+        logger.debug(
+            "dlp: ok %s request (scan=%.0fms cache=%.0%%)",
+            context,
+            verdict.scan_ms,
+            verdict.cache_ratio,
+        )
+
     def _emit_cost_record(self, result: Any) -> None:
         """Build a priced cost record for *result* and hand it to the sink.
 
@@ -725,6 +784,7 @@ class LLMClient:
                 cache_system=cache_system,
                 extra=extra,
             )
+            self._dlp_scan_request(payload, context=f"complete anthropic model={self.spec.model}")
             msg = self._transport_client().messages.create(**payload)
             text = "\n\n".join(
                 getattr(b, "text", "")
@@ -759,6 +819,17 @@ class LLMClient:
                 )
 
             router = _get_router()
+            self._dlp_scan_request(
+                {
+                    "model": self.spec.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user_content},
+                    ],
+                    "max_tokens": limit,
+                },
+                context=f"complete litellm group={self.spec.model}",
+            )
             resp = router.completion(
                 model=self.spec.model,  # "low", "med", "high", "ultra"
                 messages=[
@@ -798,6 +869,7 @@ class LLMClient:
             kwargs["extra_body"] = extra_body
         if extra:
             kwargs.update(extra)
+        self._dlp_scan_request(kwargs, context=f"complete openai model={self.spec.model}")
         resp = self._transport_client().chat.completions.create(**kwargs)
         text = self._choice_text_or_llm_error(resp)
         return LLMResult(
@@ -941,6 +1013,8 @@ class LLMClient:
         for attempt in range(attempts):
             payload = dict(base_payload)
             payload["messages"] = messages
+            if attempt == 0:
+                self._dlp_scan_request(payload, context=f"structured anthropic model={self.spec.model}")
             msg = client.messages.create(**payload)
             self._usage_from_anthropic(msg, into=usage)
             tool_input = self._extract_tool_input(msg, schema_name)
@@ -1032,6 +1106,9 @@ class LLMClient:
 
         for attempt in range(attempts):
             try:
+                if attempt == 0:
+                    scan_payload: dict = {"messages": messages, **kwargs}
+                    self._dlp_scan_request(scan_payload, context=f"structured openai model={self.spec.model}")
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 raw_text = _choice_text(resp)
@@ -1144,6 +1221,18 @@ class LLMClient:
                 + json_instruction
             )
             try:
+                if attempt == 1:
+                    self._dlp_scan_request(
+                        {
+                            "model": self.spec.model,
+                            "messages": [
+                                {"role": "system", "content": system},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "max_tokens": max_tokens,
+                        },
+                        context=f"structured litellm group={self.spec.model}",
+                    )
                 resp = router.completion(
                     model=self.spec.model,  # "low", "med", "high", "ultra"
                     messages=[
@@ -1301,6 +1390,7 @@ class LLMClient:
                 cache_system=cache_system,
                 extra=extra,
             )
+            self._dlp_scan_request(payload, context=f"grounded anthropic model={self.spec.model}")
             msg = self._transport_client().messages.create(**payload)
             return GroundedResult(
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
@@ -1354,6 +1444,8 @@ class LLMClient:
         last_error: Optional[str] = None
         for attempt in range(attempts):
             try:
+                if attempt == 0:
+                    self._dlp_scan_request(kwargs, context=f"grounded openrouter model={self.spec.model}")
                 resp = self._transport_client().chat.completions.create(**kwargs)
                 self._usage_from_openai(resp, into=usage)
                 choice = _first_choice(resp)
