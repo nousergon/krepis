@@ -697,7 +697,7 @@ def _upstream_model(litellm_model: str) -> str:
 
 # ── group resolution (structured, for shell scripts) ────────────────────
 
-def _resolve_group_json(group: str) -> dict:
+def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
     """Return full routing info for *group* as a JSON-ready dict.
 
     Reads the registry directly (bypasses the Router's cooldown state).
@@ -706,6 +706,18 @@ def _resolve_group_json(group: str) -> dict:
     constant) — it handles format translation for all providers, making
     every registry model CLI-compatible.  Falls back to per-provider
     resolution when LiteLLM is unavailable.
+
+    Parameters
+    ----------
+    group
+        The model group name (``low``, ``med``, ``high``, ``ultra``).
+    exclude_route
+        Optional route type to exclude. When set (e.g.
+        ``"egress_proxy"``), the resolver skips entries whose ``route``
+        field matches this value — both the LiteLLM proxy path and the
+        per-provider fallback loop. Used by the clauder wrapper's
+        degraded path to skip directly-routed entries and fall through
+        to OpenRouter (alpha-engine-config-I4465).
 
     Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
@@ -782,7 +794,12 @@ def _resolve_group_json(group: str) -> dict:
     _litellm_ok = False
     _litellm_skip_reasons: list[str] = []
 
-    if not _litellm_reachable:
+    # When exclude_route is "litellm_proxy", skip the LiteLLM proxy path
+    # entirely and go straight to per-provider resolution.
+    if exclude_route == "litellm_proxy":
+        _litellm_skip_reasons.append(
+            f"LiteLLM proxy excluded by exclude_route={exclude_route!r}")
+    elif not _litellm_reachable:
         _litellm_skip_reasons.append(
             f"LiteLLM proxy at {_litellm_url} not reachable")
     else:
@@ -893,6 +910,20 @@ def _resolve_group_json(group: str) -> dict:
         if entry is None:
             continue
 
+        # Skip entries whose route matches exclude_route. The clauder
+        # wrapper's degraded path re-calls with exclude_route="egress_proxy"
+        # when the DeepSeek egress proxy is unhealthy, so we skip directly-
+        # routed entries and fall through to OpenRouter without waiting for
+        # the egress proxy health probe timeout (alpha-engine-config-I4465).
+        _entry_route = entry.get("route", "")
+        if exclude_route and _entry_route == exclude_route:
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": f"Excluded by route constraint (exclude_route={exclude_route!r})",
+            })
+            continue
+
         # Skip entries whose provider API doesn't speak the CLI wire format.
         # Only DeepSeek (port 8971, natively CLI-compatible) and OpenRouter
         # (server-side format translation) can serve the CLI directly.
@@ -963,7 +994,7 @@ def _resolve_group_json(group: str) -> dict:
     )
 
 
-def resolve_group_structured(group: str) -> dict:
+def resolve_group_structured(group: str, exclude_route: str | None = None) -> dict:
     """Resolve *group* to a full routing decision — the PUBLIC contract.
 
     This is the supported entry point for programmatic callers.  It returns
@@ -991,7 +1022,7 @@ def resolve_group_structured(group: str) -> dict:
     by a bootstrap shell script (alpha-engine-config-I4454).  Consumers must
     bind to a supported public surface; a leading underscore is not one.
     """
-    return _resolve_group_json(group)
+    return _resolve_group_json(group, exclude_route=exclude_route)
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -1009,12 +1040,17 @@ def _cli() -> None:
 
     if cmd == "resolve":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json]", file=sys.stderr)
+            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exclude-route <route>]", file=sys.stderr)
             sys.exit(1)
         group = sys.argv[2]
         want_json = "--json" in sys.argv
+        exclude_route: str | None = None
+        for i, arg in enumerate(sys.argv):
+            if arg == "--exclude-route" and i + 1 < len(sys.argv):
+                exclude_route = sys.argv[i + 1]
+                break
         if want_json:
-            info = _resolve_group_json(group)
+            info = _resolve_group_json(group, exclude_route=exclude_route)
             print(json.dumps(info))
         else:
             model = resolve_group(group)
