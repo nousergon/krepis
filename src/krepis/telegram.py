@@ -231,8 +231,18 @@ def send_message(
         except Exception:
             detail = "<non-JSON body suppressed>"
         # Defense in depth: even a hostile/MITM JSON body that echoes the
-        # request URL cannot leak the token past this replace.
-        detail = detail.replace(token, "[REDACTED]")
+        # request URL cannot leak the token into the log.
+        #
+        # Drop the whole description rather than splicing the secret out of it.
+        # A surgical `detail.replace(token, ...)` reads as safer but puts the
+        # credential on a live dataflow path from the secret into the log sink —
+        # correct only for as long as nobody reorders these two lines, and
+        # `py/clear-text-logging-sensitive-data` flags it for exactly that
+        # reason. There is nothing to preserve anyway: a body echoing our bot
+        # token is not a Telegram error body, so its content is not the
+        # operationally useful field this branch exists to log.
+        if token in detail:
+            detail = "<description echoing the bot token suppressed> [REDACTED]"
         logger.warning("Telegram API returned %d: %s", resp.status_code, detail)
         return False, detail
 
