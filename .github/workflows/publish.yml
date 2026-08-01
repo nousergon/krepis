@@ -10,6 +10,9 @@ name: Publish to PyPI
 # pypi). Until that exists the publish job fails by design — see the repo
 # README / handoff notes. workflow_dispatch is kept for manual recovery.
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
