@@ -525,3 +525,125 @@ class TestStepNameInCli:
         err = capsys.readouterr().err
         # The failure message should contain the custom step name, not the slug
         assert "[my-custom-step]" in err
+
+
+class TestCorrelationIdReachesTheChild:
+    """The resolved correlation id must be exported to the inner command as
+    ``$RUN_TOKEN`` (alpha-engine-config-I5956).
+
+    Resolution reads env -> CLI. Without this export the reverse direction
+    does not exist, so a correlation id supplied as a CLI flag names only the
+    parent's own log. A launcher that then dispatches nested work to a second
+    box reads ``$RUN_TOKEN``, finds it unset, and mints its own id — which is
+    what happened on 2026-07-31: the whole PredictorTraining branch shipped
+    under a fabricated ``spot-reference-20260731`` and its failure was
+    unfindable by the execution that owned it.
+
+    Reverting ``_child_env`` to the pre-fix
+    ``env=env if env is not None else os.environ.copy()`` makes
+    ``test_cli_correlation_id_is_visible_to_the_child`` fail — the guard is
+    demonstrated failing, per overseer-policy invariant 13.
+    """
+
+    ECHO_RUN_TOKEN = [
+        sys.executable,
+        "-c",
+        "import os; print('RUN_TOKEN=' + os.environ.get('RUN_TOKEN', '<unset>'))",
+    ]
+
+    def test_cli_correlation_id_is_visible_to_the_child(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """THE REGRESSION: passed by flag, read by the child from the env."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                correlation_id="watch-rerun-2026-07-31-1",
+            )
+        assert rc == 0
+        assert (
+            "RUN_TOKEN=watch-rerun-2026-07-31-1" in isolated_logfile.read_text()
+        ), "a CLI-supplied correlation id did not reach the inner command"
+
+    def test_env_supplied_run_token_still_reaches_the_child(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "from-the-env")
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run("slug", isolated_logfile, self.ECHO_RUN_TOKEN)
+        assert rc == 0
+        assert "RUN_TOKEN=from-the-env" in isolated_logfile.read_text()
+
+    def test_cli_arg_wins_over_env_for_the_child_too(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """The child must see the SAME id the parent's log and S3 key carry —
+        otherwise parent and nested logs disagree, which is the bug."""
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "stale-env-value")
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                correlation_id="explicit-wins",
+            )
+        assert rc == 0
+        assert "RUN_TOKEN=explicit-wins" in isolated_logfile.read_text()
+
+    def test_explicit_env_override_still_carries_the_correlation_id(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """``env=`` supplies the BASE environment; the correlation id is
+        layered on top rather than dropped."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                env={"PATH": os.environ.get("PATH", "")},
+                correlation_id="layered-on-top",
+            )
+        assert rc == 0
+        assert "RUN_TOKEN=layered-on-top" in isolated_logfile.read_text()
+
+    def test_no_correlation_id_does_not_fabricate_one(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """Absent a resolved id, do not invent one — a fabricated correlation
+        id that looks real is worse than an absent one."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run("slug", isolated_logfile, self.ECHO_RUN_TOKEN)
+        assert rc == 0
+        assert "RUN_TOKEN=<unset>" in isolated_logfile.read_text()
+
+
+class TestChildEnvUnit:
+    """Unit-level cover for the helper the above exercises end to end."""
+
+    def test_layers_correlation_id_onto_inherited_env(self, monkeypatch):
+        monkeypatch.setenv("SOME_OTHER_VAR", "kept")
+        child = ssm_log_capture._child_env(None, "abc-123")
+        assert child["RUN_TOKEN"] == "abc-123"
+        assert child["SOME_OTHER_VAR"] == "kept"
+
+    def test_layers_correlation_id_onto_explicit_env(self):
+        child = ssm_log_capture._child_env({"BASE": "yes"}, "abc-123")
+        assert child == {"BASE": "yes", "RUN_TOKEN": "abc-123"}
+
+    def test_absent_correlation_id_leaves_env_untouched(self):
+        assert ssm_log_capture._child_env({"BASE": "yes"}, None) == {"BASE": "yes"}
+
+    def test_does_not_mutate_the_callers_dict(self):
+        caller = {"BASE": "yes"}
+        ssm_log_capture._child_env(caller, "abc-123")
+        assert caller == {"BASE": "yes"}, "caller's env dict was mutated"

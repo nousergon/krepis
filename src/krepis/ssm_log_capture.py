@@ -97,6 +97,16 @@ a new dispatched workload cannot use this module without providing one.
 The correlation id appears as a ``# correlation-id: <id>`` header line at
 the top of the captured log file and is appended to the S3 key for
 traceability.
+
+It is also **exported to the inner command as ``$RUN_TOKEN``**. Resolution
+reads env -> CLI; the export is what makes the reverse direction exist, so a
+launcher that dispatches nested work (its own ``SendCommand`` to a second
+box) carries the caller's id down instead of minting one. Without it a
+correlation id supplied as a CLI flag names only the parent's own log, and
+every nested workload becomes unfindable by the execution that owns it —
+measured 2026-07-31, when a whole PredictorTraining branch shipped under a
+fabricated id and its failure was invisible to sf-watch
+(alpha-engine-config-I5949 / I5956).
 """
 
 from __future__ import annotations
@@ -123,6 +133,35 @@ S3_PREFIX: Final[str] = "_ssm_logs"
 # variable lets the SF-dispatched callers inherit the dispatcher's token
 # without a CLI change.
 CORRELATION_ID_ENV_VAR: Final[str] = "RUN_TOKEN"
+
+
+def _child_env(
+    env: dict[str, str] | None, correlation_id: str | None
+) -> dict[str, str]:
+    """Build the inner command's environment, carrying the correlation id down.
+
+    The resolved correlation id identifies THIS capture, so the child must
+    observe the same value — a launcher that dispatches nested work reads it
+    from ``$RUN_TOKEN`` and has no other way to learn it. Resolution reads
+    env -> CLI; without this the reverse direction does not exist, so a
+    correlation id supplied as a CLI flag names the parent's own log and
+    reaches nothing the parent then launches.
+
+    Measured consequence (2026-07-31, ne-weekly-freshness-pipeline): the SF
+    passed ``--correlation-id watch-rerun-2026-07-31-1``; the child
+    ``spot_train.sh`` saw ``RUN_TOKEN`` unset, took its developer fallback,
+    and shipped the whole PredictorTraining branch under a fabricated
+    ``spot-reference-20260731``. The training failure that broke that run was
+    therefore unfindable by execution (alpha-engine-config-I5949 / I5956).
+
+    An explicit ``env`` override still supplies the base environment; the
+    resolved correlation id is layered on top so the parent log and every
+    nested log agree on one id.
+    """
+    child = dict(env) if env is not None else os.environ.copy()
+    if correlation_id:
+        child[CORRELATION_ID_ENV_VAR] = correlation_id
+    return child
 
 
 def _exit_key(
@@ -270,8 +309,10 @@ def run(
 
     When ``correlation_id`` is resolved (explicitly or from the env var),
     a ``# correlation-id: <id>`` header line is written at the top of the
-    captured log file, and the value is appended to the S3 key
-    (``-{correlation_id}`` before ``.log``).
+    captured log file, the value is appended to the S3 key
+    (``-{correlation_id}`` before ``.log``), and it is exported to the inner
+    command as ``$RUN_TOKEN`` so a launcher that dispatches nested work
+    carries the same id rather than minting its own.
 
     Args:
         slug: log slug used in the S3 key (e.g., ``"morning-enrich"``).
@@ -280,6 +321,9 @@ def run(
             directly — no shell parsing, no quoting surface).
         bucket: S3 bucket override (default: ``alpha-engine-research``).
         env: environment override for the subprocess (default: inherit).
+            Supplies the base environment only — the resolved correlation id
+            is layered on top as ``$RUN_TOKEN``, so the parent log and every
+            nested log agree on one id.
         correlation_id: run/execution correlation id for the log surface.
             When ``None``, resolved from ``$RUN_TOKEN`` env var. The CLI
             enforces presence as the §116 rule 6 chokepoint; the Python
@@ -307,7 +351,7 @@ def run(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env=env if env is not None else os.environ.copy(),
+                env=_child_env(env, resolved_correlation_id),
             )
             assert proc.stdout is not None
             fd = proc.stdout.fileno()
