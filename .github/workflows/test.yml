@@ -37,7 +37,59 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Run pytest
-        run: python -m pytest -q --cov=krepis --cov-report=term-missing --cov-fail-under=90
+        run: python -m pytest -q --cov=krepis --cov-report=term-missing --cov-report=json --cov-fail-under=90
+
+      # Upload coverage JSON so the badge job can read it (only from 3.13 on main).
+      - name: Upload coverage artifact
+        if: ${{ github.ref == 'refs/heads/main' && matrix.python-version == '3.13' }}
+        uses: actions/upload-artifact@4d810e26b67e7c5a09ed91409154b13f49e3f2ad  # v5
+        with:
+          name: coverage-json
+          path: coverage.json
+          retention-days: 1
+
+  # Publish a shields.io-compatible coverage badge on push to main.
+  # Runs after the test matrix so the coverage JSON artifact is available.
+  coverage-badge:
+    name: Update coverage badge
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: [test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write  # pushing to badges branch
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Download coverage artifact
+        uses: actions/download-artifact@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          name: coverage-json
+
+      - name: Generate badge JSON
+        run: |
+          TOTAL=$(python3 -c "import json; print(f'{json.load(open(\"coverage.json\"))[\"totals\"][\"percent_covered\"]:.0f}')")
+          echo "Coverage: ${TOTAL}%"
+          COLOR=$([ "$TOTAL" -ge 90 ] && echo "green" || ([ "$TOTAL" -ge 80 ] && echo "yellow" || echo "red"))
+          mkdir -p badges
+          cat > badges/coverage.json <<EOF
+          {
+            "schemaVersion": 1,
+            "label": "coverage",
+            "message": "${TOTAL}%",
+            "color": "${COLOR}"
+          }
+          EOF
+
+      - name: Push to badges branch
+        uses: peaceiris/actions-gh-pages@4e74c14597cb2ac1509b8cfb8e4bdcfa8ce22321  # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./badges
+          publish_branch: badges
+          force_orphan: true
+          commit_message: "ci: update coverage badge [skip ci]"
+          user_name: "github-actions[bot]"
+          user_email: "github-actions[bot]@users.noreply.github.com"
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds stay silent. Reusable workflow + transport
@@ -45,5 +97,5 @@ jobs:
   notify-main-failure:
     needs: [test]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@549b3c9cbeac49ab660e5f0d1f023fcde245e23e
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@549b3c9cbeac49aa660e5f0d1f023fcde245e23e
     secrets: inherit
