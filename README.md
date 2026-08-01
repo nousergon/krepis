@@ -4,7 +4,6 @@
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)]()
 [![Typed](https://img.shields.io/badge/typed-PEP_561-blue.svg)]()
 [![Tests](https://github.com/nousergon/krepis/actions/workflows/test.yml/badge.svg)](https://github.com/nousergon/krepis/actions/workflows/test.yml)
-[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/nousergon/krepis/badges/coverage.json)](https://github.com/nousergon/krepis/actions/workflows/test.yml)
 
 **krepis** (Greek κρηπίς — the foundation course a structure stands on) is a
 small, typed library of general-purpose Python primitives for building
