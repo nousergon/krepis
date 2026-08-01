@@ -13,6 +13,9 @@
 #   nousergon/crucible-dashboard/.github/workflows/claude-assistant.yml
 name: Claude PR Assistant
 
+permissions:
+  contents: read
+
 on:
   issue_comment:
     types: [created]
