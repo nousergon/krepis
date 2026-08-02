@@ -3,6 +3,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.9+-blue.svg)]()
 [![Typed](https://img.shields.io/badge/typed-PEP_561-blue.svg)]()
+[![Tests](https://github.com/nousergon/krepis/actions/workflows/test.yml/badge.svg)](https://github.com/nousergon/krepis/actions/workflows/test.yml)
 
 **krepis** (Greek κρηπίς — the foundation course a structure stands on) is a
 small, typed library of general-purpose Python primitives for building
@@ -36,6 +37,22 @@ pip install krepis
 | `ssm_dispatcher` | SSM command dispatch |
 | `ssm_log_capture` | SSM run-command log capture |
 | `usage_pacing` | Linear-pace short-circuit against a rolling reset-window quota |
+
+## Development
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
+```
+
+Run the test suite:
+
+```bash
+python -m pytest -q
+```
+
+A healthy result is all tests passing with coverage ≥ 90%. The CI matrix
+tests Python 3.9 through 3.13 on every PR and push to `main`.
 
 ## License
 

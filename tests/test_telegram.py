@@ -299,3 +299,113 @@ class TestErrorBodyLogging:
         assert tg.send_message("x") is False
         assert "test-token-abc123" not in caplog.text
         assert "[REDACTED]" in caplog.text
+
+
+# ── plain-text fallback on a Markdown entity parse failure ──────────────────
+
+
+_ENTITY_400 = (
+    '{"ok":false,"error_code":400,"description":"Bad Request: '
+    "can't parse entities: Can't find end of the entity starting at byte "
+    'offset 355"}'
+)
+
+# The live message shape that was dropped six times in 21 days: a caller
+# template with intentional bold, into which a Step Functions failure cause was
+# interpolated — and that cause carried git's fetch summary line. The lone `*`
+# in ` * branch` makes the asterisk count odd, leaving a bold entity open.
+# `_escape_markdown` cannot fix this without breaking every intentional bold.
+_REAL_DROPPED_MESSAGE = (
+    "*Fleet-SF Watch — AUTO-FIX*\n"
+    "Weekly Freshness SF: FAILED\n"
+    "Cause: `From https://github.com/nousergon/crucible-backtester\n"
+    " * branch            main       -> FETCH_HEAD\n"
+    "ssm_log_capture: ERROR: [backtester] failed (rc=75)`"
+)
+
+
+def _responses(*specs):
+    """Sequence of mock responses, one per successive ``requests.post`` call."""
+    return [MagicMock(status_code=code, text=body) for code, body in specs]
+
+
+class TestMarkdownEntityFallback:
+    def test_unpaired_asterisk_message_is_redelivered_as_plain_text(
+        self, configured_env, mock_post
+    ):
+        mock_post.side_effect = _responses((400, _ENTITY_400), (200, "ok"))
+        assert tg.send_message(_REAL_DROPPED_MESSAGE) is True
+        assert mock_post.call_count == 2
+
+    def test_retry_drops_parse_mode_and_changes_nothing_else(
+        self, configured_env, mock_post
+    ):
+        mock_post.side_effect = _responses((400, _ENTITY_400), (200, "ok"))
+        tg.send_message(_REAL_DROPPED_MESSAGE, message_thread_id=77)
+        first = mock_post.call_args_list[0].kwargs["json"]
+        retry = mock_post.call_args_list[1].kwargs["json"]
+        assert first["parse_mode"] == tg.PARSE_MODE
+        assert "parse_mode" not in retry
+        # Everything the operator needs must survive the degradation: only the
+        # rendering is allowed to change, never the content or the routing.
+        assert retry["text"] == first["text"]
+        assert retry["chat_id"] == first["chat_id"]
+        assert retry["message_thread_id"] == 77
+        assert retry["disable_notification"] == first["disable_notification"]
+
+    def test_non_entity_400_is_not_retried(self, configured_env, mock_post):
+        # "chat not found" is not fixable by dropping parse_mode; retrying would
+        # double the request and delay the failure log for no gain.
+        mock_post.side_effect = _responses(
+            (400, '{"description":"Bad Request: chat not found"}'), (200, "ok")
+        )
+        assert tg.send_message("hello") is False
+        assert mock_post.call_count == 1
+
+    def test_non_json_400_is_not_retried(self, configured_env, mock_post):
+        mock_post.side_effect = _responses((400, "<html>gateway</html>"), (200, "ok"))
+        assert tg.send_message("hello") is False
+        assert mock_post.call_count == 1
+
+    def test_plain_text_retry_that_also_fails_returns_false(
+        self, configured_env, mock_post
+    ):
+        mock_post.side_effect = _responses(
+            (400, _ENTITY_400), (500, '{"description":"Internal Server Error"}')
+        )
+        assert tg.send_message(_REAL_DROPPED_MESSAGE) is False
+        assert mock_post.call_count == 2
+
+    def test_retry_outcome_is_logged(self, configured_env, mock_post, caplog):
+        mock_post.side_effect = _responses((400, _ENTITY_400), (200, "ok"))
+        tg.send_message(_REAL_DROPPED_MESSAGE)
+        assert "redelivered" in caplog.text
+
+    def test_network_exception_is_not_treated_as_a_parse_failure(
+        self, configured_env, mock_post
+    ):
+        # No description at all must not fall through into the retry branch.
+        mock_post.side_effect = requests.Timeout("timed out")
+        assert tg.send_message(_REAL_DROPPED_MESSAGE) is False
+        assert mock_post.call_count == 1
+
+
+class TestIsEntityParseError:
+    def test_matches_the_live_telegram_description(self):
+        assert tg._is_entity_parse_error(
+            "Bad Request: can't parse entities: Can't find end of the entity "
+            "starting at byte offset 355"
+        )
+
+    def test_is_case_insensitive(self):
+        assert tg._is_entity_parse_error("BAD REQUEST: CAN'T PARSE ENTITIES: x")
+
+    def test_does_not_match_unrelated_400s(self):
+        for other in (
+            "Bad Request: chat not found",
+            "Bad Request: message is too long",
+            "Forbidden: bot was blocked by the user",
+            "<non-JSON body suppressed>",
+            "",
+        ):
+            assert not tg._is_entity_parse_error(other)
