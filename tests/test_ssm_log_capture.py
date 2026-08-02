@@ -22,6 +22,7 @@ the 2026-05-22 lift from inline-bash-trap to lib CLI:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -467,14 +468,81 @@ class TestCorrelationIdInLogAndKey:
         assert "corr-002" in key
 
 
-class TestCliCorrelationIdRequired:
-    """The CLI requires --correlation-id or $RUN_TOKEN (§116 rule 6 chokepoint)."""
+class TestCliCorrelationIdAutoGeneration:
+    """§116 rule 6 chokepoint degrades gracefully (config#4223): with neither
+    --correlation-id nor $RUN_TOKEN, the CLI auto-generates an id (best-effort
+    $SSM_COMMAND_ID, else uuid4) and logs a WARNING instead of refusing to run
+    — a hard failure is what killed the 2026-07-25 weekly SF mid-execution."""
 
-    def test_missing_correlation_id_errors(self):
-        with pytest.raises(SystemExit):
-            ssm_log_capture.main(
-                ["run", "--slug", "x", "--log", "/tmp/x.log", "--", "true"]
+    def test_missing_correlation_id_auto_generates_and_runs(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
             )
+        assert rc == 0
+        # A header line with SOME id was written, and that same id lands in
+        # the S3 key so the log is still findable per execution.
+        contents = isolated_logfile.read_text()
+        assert "# correlation-id: " in contents
+        cid = contents.split("# correlation-id: ", 1)[1].splitlines()[0]
+        s3.upload_file.assert_called_once()
+        args, _ = s3.upload_file.call_args
+        assert cid in args[2]
+
+    def test_ssm_command_id_env_is_used_when_present(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        # Best-effort source: the SSM agent sets $SSM_COMMAND_ID on the box
+        # for long-running commands, so an SSM-dispatched workload without an
+        # explicit id still gets a stable, execution-scoped one.
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.setenv("SSM_COMMAND_ID", "ssm-cmd-12345")
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        assert "# correlation-id: ssm-cmd-12345" in isolated_logfile.read_text()
+        args, _ = s3.upload_file.call_args
+        assert "ssm-cmd-12345" in args[2]
+
+    def test_uuid4_fallback_shape(self, isolated_logfile, fake_boto3, monkeypatch):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        contents = isolated_logfile.read_text()
+        assert "# correlation-id: " in contents
+        cid = contents.split("# correlation-id: ", 1)[1].splitlines()[0]
+        assert re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cid
+        ), f"expected a uuid4-shaped auto-generated correlation id, got {cid!r}"
+
+    def test_warning_logged_when_auto_generated(
+        self, isolated_logfile, fake_boto3, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        assert any(
+            "auto-generated" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
 
     def test_with_correlation_id_succeeds(self, isolated_logfile, fake_boto3):
         fake, _ = fake_boto3
