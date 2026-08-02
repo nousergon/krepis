@@ -24,6 +24,12 @@ def _api_keys(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter-key")
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    # DLP is fail-closed when gitleaks is absent (e.g. CI runners); unit
+    # tests of LLM transport/retries/structured-output are not exercising
+    # the DLP path — session_dlp tests cover that separately, with skips
+    # when gitleaks is unavailable.  Disable DLP here so the LLM transport
+    # unit tests don't all block on a missing gitleaks binary.
+    monkeypatch.setenv("KREPIS_DLP_DISABLED", "1")
 
 
 def _text_block(text):

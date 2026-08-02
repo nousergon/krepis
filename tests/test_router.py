@@ -600,6 +600,22 @@ class TestResolveGroupDetailed:
         finally:
             _router._router = None
 
+    def test_exclude_route_egress_proxy_skips_to_openrouter(self, registry_file, monkeypatch):
+        """Med group primary is egress_proxy - with exclude_route=egress_proxy
+        it should skip to the OpenRouter fallback (deepseek-v4-flash-openrouter-max)."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                info = _router._resolve_group_json("med", exclude_route="egress_proxy")
+            assert info["route"] == "openrouter"
+            assert info["provider"] == "openrouter"
+            assert info["auth_token_type"] == "openrouter_key"
+            assert info["deployment_id"] == "deepseek/deepseek-v4-flash"
+            assert info["registry_id"] == "deepseek-v4-flash-openrouter-max"
+        finally:
+            _router._router = None
+
 
 # ── _resolve_litellm_master_key ────────────────────────────────────────────
 

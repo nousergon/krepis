@@ -22,6 +22,7 @@ the 2026-05-22 lift from inline-bash-trap to lib CLI:
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -467,14 +468,81 @@ class TestCorrelationIdInLogAndKey:
         assert "corr-002" in key
 
 
-class TestCliCorrelationIdRequired:
-    """The CLI requires --correlation-id or $RUN_TOKEN (§116 rule 6 chokepoint)."""
+class TestCliCorrelationIdAutoGeneration:
+    """§116 rule 6 chokepoint degrades gracefully (config#4223): with neither
+    --correlation-id nor $RUN_TOKEN, the CLI auto-generates an id (best-effort
+    $SSM_COMMAND_ID, else uuid4) and logs a WARNING instead of refusing to run
+    — a hard failure is what killed the 2026-07-25 weekly SF mid-execution."""
 
-    def test_missing_correlation_id_errors(self):
-        with pytest.raises(SystemExit):
-            ssm_log_capture.main(
-                ["run", "--slug", "x", "--log", "/tmp/x.log", "--", "true"]
+    def test_missing_correlation_id_auto_generates_and_runs(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
             )
+        assert rc == 0
+        # A header line with SOME id was written, and that same id lands in
+        # the S3 key so the log is still findable per execution.
+        contents = isolated_logfile.read_text()
+        assert "# correlation-id: " in contents
+        cid = contents.split("# correlation-id: ", 1)[1].splitlines()[0]
+        s3.upload_file.assert_called_once()
+        args, _ = s3.upload_file.call_args
+        assert cid in args[2]
+
+    def test_ssm_command_id_env_is_used_when_present(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        # Best-effort source: the SSM agent sets $SSM_COMMAND_ID on the box
+        # for long-running commands, so an SSM-dispatched workload without an
+        # explicit id still gets a stable, execution-scoped one.
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.setenv("SSM_COMMAND_ID", "ssm-cmd-12345")
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        assert "# correlation-id: ssm-cmd-12345" in isolated_logfile.read_text()
+        args, _ = s3.upload_file.call_args
+        assert "ssm-cmd-12345" in args[2]
+
+    def test_uuid4_fallback_shape(self, isolated_logfile, fake_boto3, monkeypatch):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        contents = isolated_logfile.read_text()
+        assert "# correlation-id: " in contents
+        cid = contents.split("# correlation-id: ", 1)[1].splitlines()[0]
+        assert re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", cid
+        ), f"expected a uuid4-shaped auto-generated correlation id, got {cid!r}"
+
+    def test_warning_logged_when_auto_generated(
+        self, isolated_logfile, fake_boto3, monkeypatch, caplog
+    ):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.delenv("SSM_COMMAND_ID", raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.main(
+                ["run", "--slug", "x", "--log", str(isolated_logfile), "--", "true"]
+            )
+        assert rc == 0
+        assert any(
+            "auto-generated" in r.message and r.levelname == "WARNING"
+            for r in caplog.records
+        )
 
     def test_with_correlation_id_succeeds(self, isolated_logfile, fake_boto3):
         fake, _ = fake_boto3
@@ -525,3 +593,125 @@ class TestStepNameInCli:
         err = capsys.readouterr().err
         # The failure message should contain the custom step name, not the slug
         assert "[my-custom-step]" in err
+
+
+class TestCorrelationIdReachesTheChild:
+    """The resolved correlation id must be exported to the inner command as
+    ``$RUN_TOKEN`` (alpha-engine-config-I5956).
+
+    Resolution reads env -> CLI. Without this export the reverse direction
+    does not exist, so a correlation id supplied as a CLI flag names only the
+    parent's own log. A launcher that then dispatches nested work to a second
+    box reads ``$RUN_TOKEN``, finds it unset, and mints its own id — which is
+    what happened on 2026-07-31: the whole PredictorTraining branch shipped
+    under a fabricated ``spot-reference-20260731`` and its failure was
+    unfindable by the execution that owned it.
+
+    Reverting ``_child_env`` to the pre-fix
+    ``env=env if env is not None else os.environ.copy()`` makes
+    ``test_cli_correlation_id_is_visible_to_the_child`` fail — the guard is
+    demonstrated failing, per overseer-policy invariant 13.
+    """
+
+    ECHO_RUN_TOKEN = [
+        sys.executable,
+        "-c",
+        "import os; print('RUN_TOKEN=' + os.environ.get('RUN_TOKEN', '<unset>'))",
+    ]
+
+    def test_cli_correlation_id_is_visible_to_the_child(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """THE REGRESSION: passed by flag, read by the child from the env."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                correlation_id="watch-rerun-2026-07-31-1",
+            )
+        assert rc == 0
+        assert (
+            "RUN_TOKEN=watch-rerun-2026-07-31-1" in isolated_logfile.read_text()
+        ), "a CLI-supplied correlation id did not reach the inner command"
+
+    def test_env_supplied_run_token_still_reaches_the_child(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "from-the-env")
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run("slug", isolated_logfile, self.ECHO_RUN_TOKEN)
+        assert rc == 0
+        assert "RUN_TOKEN=from-the-env" in isolated_logfile.read_text()
+
+    def test_cli_arg_wins_over_env_for_the_child_too(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """The child must see the SAME id the parent's log and S3 key carry —
+        otherwise parent and nested logs disagree, which is the bug."""
+        monkeypatch.setenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, "stale-env-value")
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                correlation_id="explicit-wins",
+            )
+        assert rc == 0
+        assert "RUN_TOKEN=explicit-wins" in isolated_logfile.read_text()
+
+    def test_explicit_env_override_still_carries_the_correlation_id(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """``env=`` supplies the BASE environment; the correlation id is
+        layered on top rather than dropped."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug",
+                isolated_logfile,
+                self.ECHO_RUN_TOKEN,
+                env={"PATH": os.environ.get("PATH", "")},
+                correlation_id="layered-on-top",
+            )
+        assert rc == 0
+        assert "RUN_TOKEN=layered-on-top" in isolated_logfile.read_text()
+
+    def test_no_correlation_id_does_not_fabricate_one(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        """Absent a resolved id, do not invent one — a fabricated correlation
+        id that looks real is worse than an absent one."""
+        monkeypatch.delenv(ssm_log_capture.CORRELATION_ID_ENV_VAR, raising=False)
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run("slug", isolated_logfile, self.ECHO_RUN_TOKEN)
+        assert rc == 0
+        assert "RUN_TOKEN=<unset>" in isolated_logfile.read_text()
+
+
+class TestChildEnvUnit:
+    """Unit-level cover for the helper the above exercises end to end."""
+
+    def test_layers_correlation_id_onto_inherited_env(self, monkeypatch):
+        monkeypatch.setenv("SOME_OTHER_VAR", "kept")
+        child = ssm_log_capture._child_env(None, "abc-123")
+        assert child["RUN_TOKEN"] == "abc-123"
+        assert child["SOME_OTHER_VAR"] == "kept"
+
+    def test_layers_correlation_id_onto_explicit_env(self):
+        child = ssm_log_capture._child_env({"BASE": "yes"}, "abc-123")
+        assert child == {"BASE": "yes", "RUN_TOKEN": "abc-123"}
+
+    def test_absent_correlation_id_leaves_env_untouched(self):
+        assert ssm_log_capture._child_env({"BASE": "yes"}, None) == {"BASE": "yes"}
+
+    def test_does_not_mutate_the_callers_dict(self):
+        caller = {"BASE": "yes"}
+        ssm_log_capture._child_env(caller, "abc-123")
+        assert caller == {"BASE": "yes"}, "caller's env dict was mutated"
