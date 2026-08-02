@@ -63,6 +63,12 @@ RESOLVE_SCHEMA_VERSION = 2
 # is (deprecated_name, current_name, remove_after_version).
 _DEPRECATED_RESOLVE_ALIASES = (
     ("anthropic_base_url", "api_base_url", 3),
+    # supports_automatic_prefix_caching was the per-provider path's name for
+    # the same field the LiteLLM path already emits as automatic_prefix_caching.
+    # The wrapper reads the shorter name, so on the per-provider path it
+    # silently defaulted to False (krepis-I100). Both names are now emitted in
+    # both paths; remove the alias once every consumer reads the canonical name.
+    ("supports_automatic_prefix_caching", "automatic_prefix_caching", 4),
 )
 
 
@@ -1131,6 +1137,7 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
             # Same single reader as the LiteLLM branch, so the two paths
             # cannot disagree about a model's caching mechanism.
             "supports_automatic_prefix_caching": _entry_apc,
+            "automatic_prefix_caching": _entry_apc,
             "params": params,
             "cache_pricing": cache_pricing,
             "supports_prompt_caching": _entry_pc,
