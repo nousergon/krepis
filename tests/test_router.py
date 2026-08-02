@@ -805,7 +805,7 @@ class TestResolveContract:
             try:
                 with monkeypatch.context() as m:
                     m.delenv("LITELLM_MASTER_KEY", raising=False)
-                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                    m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                     info = _router.resolve_group_structured(group)
             finally:
                 _router._router = None
