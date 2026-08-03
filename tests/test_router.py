@@ -529,6 +529,119 @@ class TestAnthropicDeploymentId:
 
 # ── _resolve_group_json ────────────────────────────────────────────────
 
+class TestLitellmProbeSpeaksTheDeclaredScheme:
+    """The health probe must speak the scheme its URL declares.
+
+    It was `HTTPConnection` unconditionally with a default port of 8980 —
+    correct for exactly one deployment, a loopback proxy on the box. The moment
+    the router got a TLS edge (model-router-policy §3.4a) the probe spoke plain
+    HTTP at a TLS listener, the handshake failed, and the path was reported
+    "not reachable" — indistinguishable from the router being down.
+
+    Measured live 2026-08-03: the router answered `/v1/models` with 23 models
+    over `https://router.nousergon.ai:8443` while this probe called it
+    unreachable, and resolution fell through to openrouter.ai.
+    """
+
+    class _Resp:
+        status = 401  # what an authenticating edge returns to an unauthenticated probe
+
+        def read(self):
+            return b""
+
+    def _capture(self, monkeypatch):
+        seen = {}
+
+        class _Conn:
+            def __init__(self, host, port, timeout=None):
+                seen.update(host=host, port=port, timeout=timeout,
+                            cls=type(self).__name__)
+
+            def request(self, *a, **kw):
+                pass
+
+            def getresponse(self):
+                return TestLitellmProbeSpeaksTheDeclaredScheme._Resp()
+
+            def close(self):
+                pass
+
+        class _Https(_Conn):
+            pass
+
+        class _Http(_Conn):
+            pass
+
+        monkeypatch.setattr(_router._http_client, "HTTPSConnection", _Https)
+        monkeypatch.setattr(_router._http_client, "HTTPConnection", _Http)
+        return seen
+
+    def test_https_url_uses_a_tls_connection_and_port_443(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                info = _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["cls"] == "_Https", (
+            "the probe used a plaintext connection for an https:// URL — the "
+            "TLS handshake fails and the router is reported unreachable"
+        )
+        assert seen["port"] == 443, (
+            f"an https:// URL with no explicit port probed {seen['port']}, not 443"
+        )
+        assert info["route"] == "litellm_proxy"
+
+    def test_explicit_port_is_honoured(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Https", 8443)
+
+    def test_http_url_still_uses_plaintext_and_8980(self, registry_file, monkeypatch):
+        """The loopback case must not regress — R27d permits it."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Http", 8980)
+
+    def test_probe_timeout_allows_for_a_tls_handshake(self, registry_file, monkeypatch):
+        """2s suited a loopback proxy. A cold Lambda's TLS handshake to an
+        internet edge does not reliably fit in it, and the failure is silent."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["timeout"] >= 5, (
+            f"probe timeout is {seen['timeout']}s — too tight for a TLS "
+            "handshake from a cold start"
+        )
+
+
 class TestResolveGroupDetailed:
     def test_med_returns_deepseek_egress(self, registry_file, monkeypatch):
         _router._router = None
