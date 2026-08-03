@@ -32,6 +32,7 @@ Registry lookup
 
 from __future__ import annotations
 
+import http.client as _http_client
 import json
 import logging
 import os
@@ -395,6 +396,13 @@ def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
 #   3. AWS SSM, parameter named by KREPIS_LITELLM_MASTER_KEY_SSM_PARAM
 # Returns the key string, or None if unresolvable.
 LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
+
+# Health-probe timeout, seconds. Was 2, which suited a loopback proxy and
+# nothing else: a TLS handshake to an internet-facing edge from a cold Lambda
+# does not reliably complete in 2s, and the failure mode is silent — the route
+# is reported unreachable and resolution falls through to a direct provider.
+# Deliberately still short; this gates a routing decision, not a request.
+LITELLM_PROBE_TIMEOUT_S = float(os.environ.get("KREPIS_LITELLM_PROBE_TIMEOUT_S", "5"))
 
 def _resolve_litellm_master_key() -> Optional[str]:
     import os as _os
@@ -1196,21 +1204,54 @@ def _resolve_group_json(
     # Any check failing → fall through to per-provider resolution.
     _litellm_url = _resolve_litellm_proxy_url()
     _litellm_reachable = False
+    _litellm_probe_error = ""
     try:
         from urllib.parse import urlparse as _urlparse
         _parsed = _urlparse(_litellm_url)
         _host = _parsed.hostname or "127.0.0.1"
-        _port = _parsed.port or 8980
-        import http.client as _http
-        conn = _http.HTTPConnection(_host, _port, timeout=2)
+        _scheme = (_parsed.scheme or "http").lower()
+
+        # The probe MUST speak the scheme the URL declares.
+        #
+        # This used to be `HTTPConnection` unconditionally, with a default port
+        # of 8980 — correct for exactly one deployment: a loopback proxy on the
+        # box. The moment the router got a TLS edge (model-router-policy §3.4a,
+        # alpha-engine-config-I6194) the probe spoke plain HTTP at a TLS
+        # listener, the handshake failed, and the whole path was reported as
+        # "LiteLLM proxy at https://... not reachable" — indistinguishable from
+        # the router being down. Measured live 2026-08-03: the router answered
+        # `/v1/models` with 23 models over that exact URL while this probe
+        # called it unreachable.
+        #
+        # R27f makes the URL, port and TLS posture part of the layer-4
+        # contract. A probe that can only speak one of them is a resolver
+        # holding a transport fact the contract already states.
+        if _scheme == "https":
+            _default_port = 443
+            _conn_cls = _http_client.HTTPSConnection
+        else:
+            _default_port = 8980
+            _conn_cls = _http_client.HTTPConnection
+        _port = _parsed.port or _default_port
+
+        conn = _conn_cls(_host, _port, timeout=LITELLM_PROBE_TIMEOUT_S)
         conn.request("GET", "/health")
         resp = conn.getresponse()
         resp.read()
         conn.close()
         # 200 = no master key set; 401 = master key required but proxy alive.
+        # 401 is the EXPECTED answer through an authenticating edge (R27c): the
+        # edge refuses the unauthenticated probe, which proves it is up and
+        # guarding, and is not a reason to route elsewhere.
         _litellm_reachable = resp.status in (200, 401)
-    except Exception:
+        if not _litellm_reachable:
+            _litellm_probe_error = f"unexpected status {resp.status}"
+    except Exception as exc:  # noqa: BLE001 - reason is surfaced in the skip
+        # The reason is kept and reported. A bare swallow made "TLS handshake
+        # failed against a plaintext probe" and "the router is down" the same
+        # log line for as long as the two could differ.
         _litellm_reachable = False
+        _litellm_probe_error = f"{type(exc).__name__}: {exc}"
 
     _litellm_ok = False
     _litellm_skip_reasons: list[str] = []
@@ -1222,7 +1263,8 @@ def _resolve_group_json(
     # inversion §3.4a exists to forbid.
     if not _litellm_reachable:
         _litellm_skip_reasons.append(
-            f"LiteLLM proxy at {_litellm_url} not reachable")
+            f"LiteLLM proxy at {_litellm_url} not reachable"
+            + (f" ({_litellm_probe_error})" if _litellm_probe_error else ""))
     else:
         # ── Check 2: master key resolvable ───────────────────────────────
         _master_key = _resolve_litellm_master_key()
@@ -1494,7 +1536,7 @@ def resolve_group_structured(
     format they speak* (``wire``), and nothing else about routing.  Which
     entries those two facts admit is a registry decision, resolved above the
     consumer (model-router-policy §2 layer 5, R28/R29).  ``exclude_route`` was
-    removed in 0.29.0 after both call sites migrated; see
+    removed in 0.30.0 after both call sites migrated; see
     :func:`_resolve_group_json`.
     """
     return _resolve_group_json(
@@ -1529,11 +1571,11 @@ def _cli() -> None:
         wire = DEFAULT_WIRE
         for i, arg in enumerate(sys.argv):
             if arg == "--exclude-route":
-                # Removed in 0.29.0. Exiting beats silently ignoring it: a
+                # Removed in 0.30.0. Exiting beats silently ignoring it: a
                 # caller passing it believes it is narrowing the chain, and a
                 # flag that is accepted-and-dropped resolves to something the
                 # caller did not ask for.
-                print("--exclude-route was removed in krepis 0.29.0. Declare --exec-context instead and let the registry's reachable_from decide (model-router-policy R28/R29).", file=sys.stderr)
+                print("--exclude-route was removed in krepis 0.30.0. Declare --exec-context instead and let the registry's reachable_from decide (model-router-policy R28/R29).", file=sys.stderr)
                 sys.exit(2)
             elif arg == "--exec-context" and i + 1 < len(sys.argv):
                 exec_context = sys.argv[i + 1]
