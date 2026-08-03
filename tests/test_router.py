@@ -15,6 +15,11 @@ from krepis import router as _router
 # patches it (so TestProbeEgressProxy can call through to the real function).
 _original_probe_egress_proxy = _router._probe_egress_proxy
 
+# Same trick for the SSM leg: conftest's autouse `_no_ssm_master_key_lookup_from_tests`
+# stubs it for the whole suite, so TestLitellmMasterKeyFromSSM — the one class
+# that tests the leg itself — has to hold the real function.
+_original_litellm_master_key_from_ssm = _router._litellm_master_key_from_ssm
+
 # ── _parse_registry ──────────────────────────────────────────────────────
 
 REGISTRY_YAML = """
@@ -673,6 +678,90 @@ class TestResolveLitellmMasterKey:
         with mock.patch.dict(os.environ, {}, clear=True):
             result = _router._resolve_litellm_master_key()
         assert result is None
+
+
+class TestLitellmMasterKeyFromSSM:
+    """The SSM leg must work wherever krepis runs, and say so when it does not.
+
+    This leg used to shell out to `aws ssm get-parameter --profile
+    ne-laptop-daemon`. Verified 2026-08-03 against the Director Lambda, it
+    could not have worked there for three independent reasons — the
+    `public.ecr.aws/lambda/python:3.12` image ships no `aws` binary, there is
+    no such profile in a Lambda, and `alpha-engine-evaluator-role` grants SSM
+    on `/alpha-engine/*` but the parameter is `/symposion/...`. Every one was
+    swallowed by `except Exception: pass`, so the LiteLLM route would simply
+    have been skipped as unauthenticated the first time the Director could
+    actually reach the router.
+    """
+
+    def test_uses_boto3_and_no_aws_profile(self, monkeypatch):
+        """The credential chain is the execution context's, not a named profile."""
+        calls = {}
+
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                calls.update(kw)
+                return {"Parameter": {"Value": "key-from-ssm"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.delenv("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", raising=False)
+
+        assert _original_litellm_master_key_from_ssm() == "key-from-ssm"
+        assert calls["Name"] == _router.LITELLM_MASTER_KEY_SSM_PARAM
+        assert calls["WithDecryption"] is True
+        # boto3.client("ssm", region_name=...) — never a profile/session name.
+        _, kwargs = fake_boto3.client.call_args
+        assert "profile_name" not in kwargs
+
+    def test_parameter_name_is_overridable(self, monkeypatch):
+        """A fleet-specific SSM path is a fact about our account, not routing.
+
+        This is what lets a per-consumer credential (R22) replace the shared
+        master key without a code change.
+        """
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                return {"Parameter": {"Value": f"key-for-{kw['Name']}"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.setenv(
+            "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", "/alpha-engine/director/LITELLM_KEY")
+
+        assert _original_litellm_master_key_from_ssm() == \
+            "key-for-/alpha-engine/director/LITELLM_KEY"
+
+    def test_failure_is_logged_with_its_reason(self, monkeypatch, caplog):
+        """Returns None — but "access denied" and "no such parameter" are
+        different fixes, and a bare swallow makes them the same event."""
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                raise RuntimeError("AccessDeniedException: not authorized")
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "AccessDenied" in caplog.text
+
+    def test_missing_boto3_is_reported_not_swallowed(self, monkeypatch, caplog):
+        real_import = __import__
+
+        def _no_boto3(name, *a, **kw):
+            if name == "boto3":
+                raise ImportError("No module named 'boto3'")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.delitem(sys.modules, "boto3", raising=False)
+        monkeypatch.setattr("builtins.__import__", _no_boto3)
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "boto3" in caplog.text
 
 
 # ── CLI resolve --json ──────────────────────────────────────────────────────

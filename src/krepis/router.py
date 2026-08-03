@@ -392,8 +392,9 @@ def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
 # Same resolution order as the LiteLLM proxy shim and the clauder script:
 #   1. LITELLM_MASTER_KEY env var
 #   2. secrets.env file (LITELLM_MASTER_KEY=...)
-#   3. AWS SSM /symposion/LITELLM_MASTER_KEY
+#   3. AWS SSM, parameter named by KREPIS_LITELLM_MASTER_KEY_SSM_PARAM
 # Returns the key string, or None if unresolvable.
+LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
 
 def _resolve_litellm_master_key() -> Optional[str]:
     import os as _os
@@ -426,7 +427,7 @@ def _resolve_litellm_master_key() -> Optional[str]:
 
 
 def _litellm_master_key_from_ssm() -> Optional[str]:
-    """Last-resort lookup of the master key from SSM.
+    """Last-resort lookup of the master key from SSM, via boto3.
 
     Split out of ``_resolve_litellm_master_key`` so tests can neutralise the one
     leg that reaches outside the process. Until 2026-07-30 this ran inline and
@@ -434,25 +435,69 @@ def _litellm_master_key_from_ssm() -> Optional[str]:
     passed only because the call always failed — they were asserting the state
     of the machine, not the behaviour of the code. Giving the laptop a machine
     identity that actually works turned all six red at once.
-    """
-    try:
-        import subprocess as _sp
-        _result = _sp.run(
-            ["aws", "ssm", "get-parameter",
-             "--name", "/symposion/LITELLM_MASTER_KEY",
-             "--with-decryption", "--region", "us-east-1",
-             "--profile", "ne-laptop-daemon",
-             "--query", "Parameter.Value", "--output", "text"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if _result.returncode == 0:
-            _val = _result.stdout.strip()
-            if _val and _val != "None":
-                return _val
-    except Exception:
-        pass
 
-    return None
+    This used to shell out to the ``aws`` CLI with ``--profile
+    ne-laptop-daemon``, and it could only ever have worked on the laptop.
+    Verified 2026-08-03 against the Director Lambda, where it fails three
+    times over: ``public.ecr.aws/lambda/python:3.12`` ships no ``aws`` binary,
+    so the ``subprocess.run`` raises ``FileNotFoundError``; there is no
+    ``ne-laptop-daemon`` profile in a Lambda; and ``alpha-engine-evaluator-role``
+    grants SSM only on ``/alpha-engine/*``, not ``/symposion/*``.
+
+    All three failures were swallowed by a bare ``except Exception: pass``, so
+    the only symptom was the LiteLLM path being skipped with a generic
+    "not resolvable" — indistinguishable from the proxy being down. That would
+    have surfaced as a mysterious routing failure the first time the Director
+    could actually reach the router (alpha-engine-config-I6194), not before.
+
+    Three changes:
+
+    * **boto3, not a subprocess.** The credential chain is then whatever the
+      execution context provides — an instance profile, a task role, a Lambda
+      role, or the laptop's own — which is what "portable" means here. No
+      profile name in library code.
+    * **The parameter name is overridable** via
+      ``KREPIS_LITELLM_MASTER_KEY_SSM_PARAM``. A fleet-specific path baked into
+      an MIT library is a fact about our account, not about routing.
+    * **The failure is recorded, not swallowed.** The caller needs to tell
+      "no credentials", "no such parameter" and "access denied" apart; each is
+      a different fix. This still returns ``None`` rather than raising — the
+      SSM leg is one of three sources and an unresolvable key is a legitimate
+      skip — but it says why, at WARNING.
+    """
+    param = os.environ.get(
+        "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", LITELLM_MASTER_KEY_SSM_PARAM
+    )
+    try:
+        import boto3  # noqa: PLC0415 - optional, resolved at call time
+    except ImportError:
+        logger.warning(
+            "LiteLLM master key: boto3 is not installed, so SSM parameter %r "
+            "cannot be read. Install boto3 or set LITELLM_MASTER_KEY.", param,
+        )
+        return None
+
+    try:
+        _ssm = boto3.client("ssm", region_name=os.environ.get(
+            "AWS_REGION", "us-east-1"))
+        _val = _ssm.get_parameter(
+            Name=param, WithDecryption=True)["Parameter"]["Value"].strip()
+    except Exception as exc:  # noqa: BLE001 - reason is logged, see docstring
+        logger.warning(
+            "LiteLLM master key: SSM parameter %r could not be read (%s: %s). "
+            "This is one of three sources; resolution continues, but if the "
+            "LiteLLM route is then skipped as unauthenticated, this is why.",
+            param, type(exc).__name__, exc,
+        )
+        return None
+
+    if not _val or _val == "None":
+        logger.warning(
+            "LiteLLM master key: SSM parameter %r resolved to an empty value.",
+            param,
+        )
+        return None
+    return _val
 
 
 # ── LiteLLM config staleness check (RETIRED) ────────────────────────────
