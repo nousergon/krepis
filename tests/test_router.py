@@ -15,6 +15,11 @@ from krepis import router as _router
 # patches it (so TestProbeEgressProxy can call through to the real function).
 _original_probe_egress_proxy = _router._probe_egress_proxy
 
+# Same trick for the SSM leg: conftest's autouse `_no_ssm_master_key_lookup_from_tests`
+# stubs it for the whole suite, so TestLitellmMasterKeyFromSSM — the one class
+# that tests the leg itself — has to hold the real function.
+_original_litellm_master_key_from_ssm = _router._litellm_master_key_from_ssm
+
 # ── _parse_registry ──────────────────────────────────────────────────────
 
 REGISTRY_YAML = """
@@ -43,6 +48,7 @@ models:
     name: DeepSeek V4 Flash
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: low
@@ -57,6 +63,7 @@ models:
     name: Gemini 2.5 Flash
     provider: gemini
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-flash
     group: low
@@ -69,6 +76,7 @@ models:
     name: GPT-OSS 120B
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: openai/gpt-oss-120b
     group: low
     group_role: fallback
@@ -80,6 +88,7 @@ models:
     name: Gemini 2.5 Pro
     provider: gemini
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-pro
     group: low
@@ -92,6 +101,7 @@ models:
     name: DeepSeek V4 Flash Max
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: med
@@ -106,6 +116,7 @@ models:
     name: DeepSeek V4 Flash (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-flash
     group: med
     group_role: fallback
@@ -118,6 +129,7 @@ models:
     name: DeepSeek V4 Pro
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: med
@@ -130,6 +142,7 @@ models:
     name: DeepSeek V4 Pro Max
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: high
@@ -143,6 +156,7 @@ models:
     name: DeepSeek V4 Pro (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-pro
     group: high
     group_role: fallback
@@ -155,6 +169,7 @@ models:
     name: Kimi K3
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: moonshotai/kimi-k3
     group: ultra
     group_role: fallback
@@ -166,6 +181,7 @@ models:
     name: GLM 5.2
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: zhipuai/glm-5.2
     group: ultra
     group_role: primary
@@ -516,6 +532,119 @@ class TestAnthropicDeploymentId:
 
 # ── _resolve_group_json ────────────────────────────────────────────────
 
+class TestLitellmProbeSpeaksTheDeclaredScheme:
+    """The health probe must speak the scheme its URL declares.
+
+    It was `HTTPConnection` unconditionally with a default port of 8980 —
+    correct for exactly one deployment, a loopback proxy on the box. The moment
+    the router got a TLS edge (model-router-policy §3.4a) the probe spoke plain
+    HTTP at a TLS listener, the handshake failed, and the path was reported
+    "not reachable" — indistinguishable from the router being down.
+
+    Measured live 2026-08-03: the router answered `/v1/models` with 23 models
+    over `https://router.nousergon.ai:8443` while this probe called it
+    unreachable, and resolution fell through to openrouter.ai.
+    """
+
+    class _Resp:
+        status = 401  # what an authenticating edge returns to an unauthenticated probe
+
+        def read(self):
+            return b""
+
+    def _capture(self, monkeypatch):
+        seen = {}
+
+        class _Conn:
+            def __init__(self, host, port, timeout=None):
+                seen.update(host=host, port=port, timeout=timeout,
+                            cls=type(self).__name__)
+
+            def request(self, *a, **kw):
+                pass
+
+            def getresponse(self):
+                return TestLitellmProbeSpeaksTheDeclaredScheme._Resp()
+
+            def close(self):
+                pass
+
+        class _Https(_Conn):
+            pass
+
+        class _Http(_Conn):
+            pass
+
+        monkeypatch.setattr(_router._http_client, "HTTPSConnection", _Https)
+        monkeypatch.setattr(_router._http_client, "HTTPConnection", _Http)
+        return seen
+
+    def test_https_url_uses_a_tls_connection_and_port_443(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                info = _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["cls"] == "_Https", (
+            "the probe used a plaintext connection for an https:// URL — the "
+            "TLS handshake fails and the router is reported unreachable"
+        )
+        assert seen["port"] == 443, (
+            f"an https:// URL with no explicit port probed {seen['port']}, not 443"
+        )
+        assert info["route"] == "litellm_proxy"
+
+    def test_explicit_port_is_honoured(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Https", 8443)
+
+    def test_http_url_still_uses_plaintext_and_8980(self, registry_file, monkeypatch):
+        """The loopback case must not regress — R27d permits it."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Http", 8980)
+
+    def test_probe_timeout_allows_for_a_tls_handshake(self, registry_file, monkeypatch):
+        """2s suited a loopback proxy. A cold Lambda's TLS handshake to an
+        internet edge does not reliably fit in it, and the failure is silent."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["timeout"] >= 5, (
+            f"probe timeout is {seen['timeout']}s — too tight for a TLS "
+            "handshake from a cold start"
+        )
+
+
 class TestResolveGroupDetailed:
     def test_med_returns_deepseek_egress(self, registry_file, monkeypatch):
         _router._router = None
@@ -609,19 +738,24 @@ class TestResolveGroupDetailed:
         finally:
             _router._router = None
 
-    def test_exclude_route_egress_proxy_skips_to_openrouter(self, registry_file, monkeypatch):
-        """Med group primary is egress_proxy - with exclude_route=egress_proxy
-        it should skip to the OpenRouter fallback (deepseek-v4-flash-openrouter-max)."""
+    def test_exclude_route_is_gone(self, registry_file, monkeypatch):
+        """`exclude_route` was removed in 0.29.0 (model-router-policy R19).
+
+        A consumer narrowing the fallback chain is holding a routing table at
+        layer 5. Both callers passed it to mean "this route is not reachable
+        from where I am running", which is `exec_context` plus the registry's
+        `reachable_from`. Asserting the TypeError rather than deleting the test
+        keeps the removal itself under test — a re-added parameter would
+        silently restore the ability to route around the LiteLLM proxy.
+        """
         _router._router = None
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router._resolve_group_json("med", exclude_route="egress_proxy")
-            assert info["route"] == "openrouter"
-            assert info["provider"] == "openrouter"
-            assert info["auth_token_type"] == "openrouter_key"
-            assert info["deployment_id"] == "deepseek/deepseek-v4-flash"
-            assert info["registry_id"] == "deepseek-v4-flash-openrouter-max"
+                with pytest.raises(TypeError):
+                    _router._resolve_group_json("med", exclude_route="egress_proxy")
+                with pytest.raises(TypeError):
+                    _router.resolve_group_structured("med", exclude_route="egress_proxy")
         finally:
             _router._router = None
 
@@ -670,6 +804,90 @@ class TestResolveLitellmMasterKey:
         with mock.patch.dict(os.environ, {}, clear=True):
             result = _router._resolve_litellm_master_key()
         assert result is None
+
+
+class TestLitellmMasterKeyFromSSM:
+    """The SSM leg must work wherever krepis runs, and say so when it does not.
+
+    This leg used to shell out to `aws ssm get-parameter --profile
+    ne-laptop-daemon`. Verified 2026-08-03 against the Director Lambda, it
+    could not have worked there for three independent reasons — the
+    `public.ecr.aws/lambda/python:3.12` image ships no `aws` binary, there is
+    no such profile in a Lambda, and `alpha-engine-evaluator-role` grants SSM
+    on `/alpha-engine/*` but the parameter is `/symposion/...`. Every one was
+    swallowed by `except Exception: pass`, so the LiteLLM route would simply
+    have been skipped as unauthenticated the first time the Director could
+    actually reach the router.
+    """
+
+    def test_uses_boto3_and_no_aws_profile(self, monkeypatch):
+        """The credential chain is the execution context's, not a named profile."""
+        calls = {}
+
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                calls.update(kw)
+                return {"Parameter": {"Value": "key-from-ssm"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.delenv("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", raising=False)
+
+        assert _original_litellm_master_key_from_ssm() == "key-from-ssm"
+        assert calls["Name"] == _router.LITELLM_MASTER_KEY_SSM_PARAM
+        assert calls["WithDecryption"] is True
+        # boto3.client("ssm", region_name=...) — never a profile/session name.
+        _, kwargs = fake_boto3.client.call_args
+        assert "profile_name" not in kwargs
+
+    def test_parameter_name_is_overridable(self, monkeypatch):
+        """A fleet-specific SSM path is a fact about our account, not routing.
+
+        This is what lets a per-consumer credential (R22) replace the shared
+        master key without a code change.
+        """
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                return {"Parameter": {"Value": f"key-for-{kw['Name']}"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.setenv(
+            "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", "/alpha-engine/director/LITELLM_KEY")
+
+        assert _original_litellm_master_key_from_ssm() == \
+            "key-for-/alpha-engine/director/LITELLM_KEY"
+
+    def test_failure_is_logged_with_its_reason(self, monkeypatch, caplog):
+        """Returns None — but "access denied" and "no such parameter" are
+        different fixes, and a bare swallow makes them the same event."""
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                raise RuntimeError("AccessDeniedException: not authorized")
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "AccessDenied" in caplog.text
+
+    def test_missing_boto3_is_reported_not_swallowed(self, monkeypatch, caplog):
+        real_import = __import__
+
+        def _no_boto3(name, *a, **kw):
+            if name == "boto3":
+                raise ImportError("No module named 'boto3'")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.delitem(sys.modules, "boto3", raising=False)
+        monkeypatch.setattr("builtins.__import__", _no_boto3)
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "boto3" in caplog.text
 
 
 # ── CLI resolve --json ──────────────────────────────────────────────────────
@@ -947,14 +1165,55 @@ class TestEntryReachableFrom:
         entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
         assert _router._entry_reachable_from(entry, "lambda") is False
 
-    def test_missing_field_is_permissive_during_migration(self, caplog):
-        """R19 additive-then-remove: krepis lands ahead of the registry edit,
-        but says so every time."""
+    def test_missing_field_is_unreachable_from_everywhere(self, caplog):
+        """An absent declaration is not permission (R20, fail closed).
+
+        This was permissive as the R19 migration position, to be removed once
+        the registry validator enforced the field. It does
+        (`validate_llm_model_registry.py`, `test_missing_reachable_from_fails`),
+        and the permissive branch had a live cost in the meantime: the
+        hand-published S3 copy of the registry the Director reads lagged the
+        repo, still carried no `reachable_from`, and the omission was read as
+        universal reachability — so a Lambda served `glm-5.2` at openrouter.ai
+        DLP-unscanned while logging a healthy route.
+        """
         entry = {"id": "legacy-row"}
-        with caplog.at_level("WARNING"):
-            assert _router._entry_reachable_from(entry, "lambda") is True
+        with caplog.at_level("ERROR"):
+            assert _router._entry_reachable_from(entry, "lambda") is False
+            assert _router._entry_reachable_from(entry, "laptop") is False
         assert "reachable_from" in caplog.text
         assert "legacy-row" in caplog.text
+
+    def test_undeclared_entry_is_skipped_with_a_diagnosable_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """Fail closed, but never fail mute — the skip names why."""
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(
+            "schema_version: 1\n"
+            "model_groups:\n"
+            "  ultra: [legacy-row]\n"
+            "models:\n"
+            "  - id: legacy-row\n"
+            "    model: some/model\n"
+            "    provider: openrouter\n"
+            "    route: openrouter\n"
+            "    endpoints:\n"
+            "      openai: https://openrouter.ai/api\n",
+            encoding="utf-8",
+        )
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1:1")
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="lambda", wire="openai")
+            assert "reachable_from" in str(exc.value)
+            assert "legacy-row" in str(exc.value)
+        finally:
+            _router._router = None
 
 
 class TestEntryEndpoint:
@@ -1075,17 +1334,23 @@ class TestResolveFiltersByExecutionContext:
                 _router._resolve_group_json("ultra", wire="grpc")
 
 
-class TestExcludeRouteIsDeprecated:
-    def test_emits_deprecation_warning(self, registry_file, monkeypatch):
-        """Narrowing the chain at the call site is holding a routing table
-        (model-router-policy §2). Both callers used it to mean 'not reachable
-        from here', which is now exec_context."""
+class TestExcludeRouteIsRemoved:
+    def test_the_litellm_route_cannot_be_excluded_by_a_caller(self, registry_file, monkeypatch):
+        """R27a.4 — the router route is offered in every context.
+
+        The proxy path is gated on its health probe and on nothing a consumer
+        can say. This is the load-bearing half of the removal: `exclude_route`
+        existed for exactly one production purpose — letting the Director
+        Lambda skip the LiteLLM proxy and egress direct to openrouter.ai while
+        the path to the proxy was down — and nothing failed for weeks because
+        of it.
+        """
         _router._router = None
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                with pytest.warns(DeprecationWarning, match="exclude_route is deprecated"):
-                    _router._resolve_group_json("med", exclude_route="egress_proxy")
+                with pytest.raises(TypeError):
+                    _router._resolve_group_json("med", exclude_route="litellm_proxy")
         finally:
             _router._router = None
 

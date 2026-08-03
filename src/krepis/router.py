@@ -32,6 +32,7 @@ Registry lookup
 
 from __future__ import annotations
 
+import http.client as _http_client
 import json
 import logging
 import os
@@ -211,24 +212,42 @@ def _resolve_exec_context(exec_context: str | None = None) -> str:
 def _entry_reachable_from(entry: dict, exec_context: str) -> bool:
     """Whether *entry* declares itself reachable from *exec_context* (R28).
 
-    An entry with no ``reachable_from`` key is treated as reachable from every
-    context, with a warning.  That is the migration position and not the
-    target: R28 makes the field required and the registry validator fails a
-    pull request without it, so the permissive branch here exists only so a
-    krepis release can land ahead of the registry edit (R19,
-    additive-then-remove).  Remove the branch — and this warning — once the
-    validator is enforcing.
+    An entry with no ``reachable_from`` key is **not** reachable from anywhere.
+
+    This branch used to be permissive — an undeclared entry was treated as
+    reachable from every context, with a warning — as the R19
+    additive-then-remove migration position, to be removed "once the validator
+    is enforcing."  The validator has been enforcing since #6203
+    (``scripts/validate_llm_model_registry.py`` fails a pull request on a
+    route-bearing row with no ``reachable_from``, asserted by
+    ``test_missing_reachable_from_fails``), so this is that removal.
+
+    It is not bookkeeping.  On 2026-08-03 the copy of the registry the Director
+    Lambda actually reads — an S3 object published by hand, one day behind the
+    repo — still had no ``reachable_from`` on the ``ultra`` chain.  The
+    permissive branch read that silence as universal reachability and served
+    ``glm-5.2`` at ``openrouter.ai`` from a Lambda, DLP-unscanned, while logging
+    a healthy route (alpha-engine-config-I6183, model-router-policy R26).  A
+    default that turns *absence of a declaration* into *permission* converts a
+    stale artifact into a policy breach, silently, which is what R20 (fail
+    closed) forbids.
+
+    A skipped entry is recorded in ``skipped_entries`` with the reason naming
+    the missing declaration, so this surfaces as a diagnosable resolution
+    failure rather than an unexplained one — and, per R20, resolution raises
+    only when nothing in the chain can serve.
     """
     declared = entry.get("reachable_from")
     if declared is None:
-        logger.warning(
-            "Registry entry %r declares no reachable_from; treating as "
-            "reachable from every context. This entry predates "
-            "model-router-policy R28 and needs migrating "
-            "(alpha-engine-config-I6184).",
+        logger.error(
+            "Registry entry %r declares no reachable_from and is therefore "
+            "UNREACHABLE from every context. model-router-policy R28 makes the "
+            "field required and the registry validator enforces it, so this "
+            "entry came from a registry copy that is stale or hand-written. "
+            "Fix the registry — do not read the omission as permission.",
             entry.get("id", "<unknown>"),
         )
-        return True
+        return False
     return exec_context in declared
 
 
@@ -374,8 +393,16 @@ def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
 # Same resolution order as the LiteLLM proxy shim and the clauder script:
 #   1. LITELLM_MASTER_KEY env var
 #   2. secrets.env file (LITELLM_MASTER_KEY=...)
-#   3. AWS SSM /symposion/LITELLM_MASTER_KEY
+#   3. AWS SSM, parameter named by KREPIS_LITELLM_MASTER_KEY_SSM_PARAM
 # Returns the key string, or None if unresolvable.
+LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
+
+# Health-probe timeout, seconds. Was 2, which suited a loopback proxy and
+# nothing else: a TLS handshake to an internet-facing edge from a cold Lambda
+# does not reliably complete in 2s, and the failure mode is silent — the route
+# is reported unreachable and resolution falls through to a direct provider.
+# Deliberately still short; this gates a routing decision, not a request.
+LITELLM_PROBE_TIMEOUT_S = float(os.environ.get("KREPIS_LITELLM_PROBE_TIMEOUT_S", "5"))
 
 def _resolve_litellm_master_key() -> Optional[str]:
     import os as _os
@@ -408,7 +435,7 @@ def _resolve_litellm_master_key() -> Optional[str]:
 
 
 def _litellm_master_key_from_ssm() -> Optional[str]:
-    """Last-resort lookup of the master key from SSM.
+    """Last-resort lookup of the master key from SSM, via boto3.
 
     Split out of ``_resolve_litellm_master_key`` so tests can neutralise the one
     leg that reaches outside the process. Until 2026-07-30 this ran inline and
@@ -416,25 +443,69 @@ def _litellm_master_key_from_ssm() -> Optional[str]:
     passed only because the call always failed — they were asserting the state
     of the machine, not the behaviour of the code. Giving the laptop a machine
     identity that actually works turned all six red at once.
-    """
-    try:
-        import subprocess as _sp
-        _result = _sp.run(
-            ["aws", "ssm", "get-parameter",
-             "--name", "/symposion/LITELLM_MASTER_KEY",
-             "--with-decryption", "--region", "us-east-1",
-             "--profile", "ne-laptop-daemon",
-             "--query", "Parameter.Value", "--output", "text"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if _result.returncode == 0:
-            _val = _result.stdout.strip()
-            if _val and _val != "None":
-                return _val
-    except Exception:
-        pass
 
-    return None
+    This used to shell out to the ``aws`` CLI with ``--profile
+    ne-laptop-daemon``, and it could only ever have worked on the laptop.
+    Verified 2026-08-03 against the Director Lambda, where it fails three
+    times over: ``public.ecr.aws/lambda/python:3.12`` ships no ``aws`` binary,
+    so the ``subprocess.run`` raises ``FileNotFoundError``; there is no
+    ``ne-laptop-daemon`` profile in a Lambda; and ``alpha-engine-evaluator-role``
+    grants SSM only on ``/alpha-engine/*``, not ``/symposion/*``.
+
+    All three failures were swallowed by a bare ``except Exception: pass``, so
+    the only symptom was the LiteLLM path being skipped with a generic
+    "not resolvable" — indistinguishable from the proxy being down. That would
+    have surfaced as a mysterious routing failure the first time the Director
+    could actually reach the router (alpha-engine-config-I6194), not before.
+
+    Three changes:
+
+    * **boto3, not a subprocess.** The credential chain is then whatever the
+      execution context provides — an instance profile, a task role, a Lambda
+      role, or the laptop's own — which is what "portable" means here. No
+      profile name in library code.
+    * **The parameter name is overridable** via
+      ``KREPIS_LITELLM_MASTER_KEY_SSM_PARAM``. A fleet-specific path baked into
+      an MIT library is a fact about our account, not about routing.
+    * **The failure is recorded, not swallowed.** The caller needs to tell
+      "no credentials", "no such parameter" and "access denied" apart; each is
+      a different fix. This still returns ``None`` rather than raising — the
+      SSM leg is one of three sources and an unresolvable key is a legitimate
+      skip — but it says why, at WARNING.
+    """
+    param = os.environ.get(
+        "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", LITELLM_MASTER_KEY_SSM_PARAM
+    )
+    try:
+        import boto3  # noqa: PLC0415 - optional, resolved at call time
+    except ImportError:
+        logger.warning(
+            "LiteLLM master key: boto3 is not installed, so SSM parameter %r "
+            "cannot be read. Install boto3 or set LITELLM_MASTER_KEY.", param,
+        )
+        return None
+
+    try:
+        _ssm = boto3.client("ssm", region_name=os.environ.get(
+            "AWS_REGION", "us-east-1"))
+        _val = _ssm.get_parameter(
+            Name=param, WithDecryption=True)["Parameter"]["Value"].strip()
+    except Exception as exc:  # noqa: BLE001 - reason is logged, see docstring
+        logger.warning(
+            "LiteLLM master key: SSM parameter %r could not be read (%s: %s). "
+            "This is one of three sources; resolution continues, but if the "
+            "LiteLLM route is then skipped as unauthenticated, this is why.",
+            param, type(exc).__name__, exc,
+        )
+        return None
+
+    if not _val or _val == "None":
+        logger.warning(
+            "LiteLLM master key: SSM parameter %r resolved to an empty value.",
+            param,
+        )
+        return None
+    return _val
 
 
 # ── LiteLLM config staleness check (RETIRED) ────────────────────────────
@@ -1025,7 +1096,6 @@ def _upstream_model(litellm_model: str) -> str:
 
 def _resolve_group_json(
     group: str,
-    exclude_route: str | None = None,
     *,
     exec_context: str | None = None,
     wire: str = DEFAULT_WIRE,
@@ -1043,15 +1113,6 @@ def _resolve_group_json(
     ----------
     group
         The model group name (``low``, ``med``, ``high``, ``ultra``).
-    exclude_route
-        **DEPRECATED — do not add call sites.** Narrowing the chain is
-        holding a routing table, and model-router-policy §2 forbids that at
-        layer 5 whatever the mechanism: an argument reads the same as a
-        hardcoded slug once the decision is at the consumer. Both existing
-        callers passed it to express *"this route is not reachable from
-        where I am running"*, which is now ``exec_context`` + the registry's
-        ``reachable_from`` (R28/R29). Emits a :exc:`DeprecationWarning`;
-        removed once both call sites are migrated (alpha-engine-config-I6184).
     exec_context
         The caller's execution context — one of :data:`EXEC_CONTEXTS`.
         Declared, never inferred (R29). Defaults to ``KREPIS_EXEC_CONTEXT``
@@ -1081,19 +1142,21 @@ def _resolve_group_json(
     """
     import yaml as _yaml
 
-    if exclude_route is not None:
-        import warnings as _warnings
-
-        _warnings.warn(
-            "exclude_route is deprecated: narrowing the fallback chain at the "
-            "call site is holding a routing table (model-router-policy §2). "
-            "Declare exec_context instead and let the registry's "
-            "reachable_from decide (R28/R29). "
-            "Tracked as alpha-engine-config-I6184.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
-
+    # `exclude_route` used to be accepted here. It let a caller narrow the
+    # fallback chain — which is holding a routing table at layer 5, whatever
+    # the mechanism (model-router-policy §2). Both callers that passed it were
+    # expressing "this route is not reachable from where I am running", which
+    # is `exec_context` plus the registry's `reachable_from` (R28/R29). It was
+    # deprecated in 0.27.0, both call sites migrated (crucible-evaluator #170;
+    # the clauder wrapper's degraded path), and this is the R19 removal.
+    #
+    # It is worth remembering WHY it is gone rather than merely deprecated: it
+    # was added to make the Director Lambda succeed while the path to the
+    # LiteLLM proxy was down, and it worked — resolution fell through to
+    # `glm-5.2` at openrouter.ai, DLP-unscanned, logging a healthy route for
+    # weeks. Nothing failed when the proxy path was never restored. An argument
+    # that lets a consumer route around an unreachable control is a control the
+    # consumer can turn off.
     exec_context = _resolve_exec_context(exec_context)
     if wire not in WIRE_FORMATS:
         raise ValueError(
@@ -1141,33 +1204,67 @@ def _resolve_group_json(
     # Any check failing → fall through to per-provider resolution.
     _litellm_url = _resolve_litellm_proxy_url()
     _litellm_reachable = False
+    _litellm_probe_error = ""
     try:
         from urllib.parse import urlparse as _urlparse
         _parsed = _urlparse(_litellm_url)
         _host = _parsed.hostname or "127.0.0.1"
-        _port = _parsed.port or 8980
-        import http.client as _http
-        conn = _http.HTTPConnection(_host, _port, timeout=2)
+        _scheme = (_parsed.scheme or "http").lower()
+
+        # The probe MUST speak the scheme the URL declares.
+        #
+        # This used to be `HTTPConnection` unconditionally, with a default port
+        # of 8980 — correct for exactly one deployment: a loopback proxy on the
+        # box. The moment the router got a TLS edge (model-router-policy §3.4a,
+        # alpha-engine-config-I6194) the probe spoke plain HTTP at a TLS
+        # listener, the handshake failed, and the whole path was reported as
+        # "LiteLLM proxy at https://... not reachable" — indistinguishable from
+        # the router being down. Measured live 2026-08-03: the router answered
+        # `/v1/models` with 23 models over that exact URL while this probe
+        # called it unreachable.
+        #
+        # R27f makes the URL, port and TLS posture part of the layer-4
+        # contract. A probe that can only speak one of them is a resolver
+        # holding a transport fact the contract already states.
+        if _scheme == "https":
+            _default_port = 443
+            _conn_cls = _http_client.HTTPSConnection
+        else:
+            _default_port = 8980
+            _conn_cls = _http_client.HTTPConnection
+        _port = _parsed.port or _default_port
+
+        conn = _conn_cls(_host, _port, timeout=LITELLM_PROBE_TIMEOUT_S)
         conn.request("GET", "/health")
         resp = conn.getresponse()
         resp.read()
         conn.close()
         # 200 = no master key set; 401 = master key required but proxy alive.
+        # 401 is the EXPECTED answer through an authenticating edge (R27c): the
+        # edge refuses the unauthenticated probe, which proves it is up and
+        # guarding, and is not a reason to route elsewhere.
         _litellm_reachable = resp.status in (200, 401)
-    except Exception:
+        if not _litellm_reachable:
+            _litellm_probe_error = f"unexpected status {resp.status}"
+    except Exception as exc:  # noqa: BLE001 - reason is surfaced in the skip
+        # The reason is kept and reported. A bare swallow made "TLS handshake
+        # failed against a plaintext probe" and "the router is down" the same
+        # log line for as long as the two could differ.
         _litellm_reachable = False
+        _litellm_probe_error = f"{type(exc).__name__}: {exc}"
 
     _litellm_ok = False
     _litellm_skip_reasons: list[str] = []
 
-    # When exclude_route is "litellm_proxy", skip the LiteLLM proxy path
-    # entirely and go straight to per-provider resolution.
-    if exclude_route == "litellm_proxy":
+    # There is deliberately no way for a caller to skip this path. The router
+    # route is offered in every execution context and gated only on its health
+    # probe (R27a.4) — a consumer that could exclude it would be making the
+    # router's reachability a property of its own network, which is the exact
+    # inversion §3.4a exists to forbid.
+    if not _litellm_reachable:
         _litellm_skip_reasons.append(
-            f"LiteLLM proxy excluded by exclude_route={exclude_route!r}")
-    elif not _litellm_reachable:
-        _litellm_skip_reasons.append(
-            f"LiteLLM proxy at {_litellm_url} not reachable")
+            f"LiteLLM proxy at {_litellm_url} not reachable"
+            + (f" ({_litellm_probe_error})" if _litellm_probe_error else ""))
     else:
         # ── Check 2: master key resolvable ───────────────────────────────
         _master_key = _resolve_litellm_master_key()
@@ -1278,19 +1375,7 @@ def _resolve_group_json(
         if entry is None:
             continue
 
-        # Skip entries whose route matches exclude_route. The clauder
-        # wrapper's degraded path re-calls with exclude_route="egress_proxy"
-        # when the DeepSeek egress proxy is unhealthy, so we skip directly-
-        # routed entries and fall through to OpenRouter without waiting for
-        # the egress proxy health probe timeout (alpha-engine-config-I4465).
         _entry_route = entry.get("route", "")
-        if exclude_route and _entry_route == exclude_route:
-            skips.append({
-                "registry_id": mid,
-                "provider": entry.get("provider", ""),
-                "reason": f"Excluded by route constraint (exclude_route={exclude_route!r})",
-            })
-            continue
 
         # R28/R29 — is this entry's endpoint reachable from where the caller
         # says it is running?  Recorded with the context named, so a caller
@@ -1298,14 +1383,23 @@ def _resolve_group_json(
         # from "unhealthy", which is the distinction the old resolution path
         # collapsed.
         if not _entry_reachable_from(entry, exec_context):
+            _declared = entry.get("reachable_from")
+            if _declared is None:
+                _reason = (
+                    "Registry entry declares no reachable_from, so it is "
+                    "unreachable from every context (model-router-policy R28). "
+                    "This registry copy is stale or hand-written — the "
+                    "validator rejects the field's absence."
+                )
+            else:
+                _reason = (
+                    f"Not reachable from execution context "
+                    f"{exec_context!r} (registry reachable_from={_declared!r})"
+                )
             skips.append({
                 "registry_id": mid,
                 "provider": entry.get("provider", ""),
-                "reason": (
-                    f"Not reachable from execution context "
-                    f"{exec_context!r} (registry reachable_from="
-                    f"{entry.get('reachable_from')!r})"
-                ),
+                "reason": _reason,
             })
             continue
 
@@ -1407,7 +1501,6 @@ def _resolve_group_json(
 
 def resolve_group_structured(
     group: str,
-    exclude_route: str | None = None,
     *,
     exec_context: str | None = None,
     wire: str = DEFAULT_WIRE,
@@ -1442,12 +1535,12 @@ def resolve_group_structured(
     Callers declare *where they are running* (``exec_context``) and *what wire
     format they speak* (``wire``), and nothing else about routing.  Which
     entries those two facts admit is a registry decision, resolved above the
-    consumer (model-router-policy §2 layer 5, R28/R29).  ``exclude_route`` is
-    deprecated and warns; see :func:`_resolve_group_json`.
+    consumer (model-router-policy §2 layer 5, R28/R29).  ``exclude_route`` was
+    removed in 0.30.0 after both call sites migrated; see
+    :func:`_resolve_group_json`.
     """
     return _resolve_group_json(
         group,
-        exclude_route=exclude_route,
         exec_context=exec_context,
         wire=wire,
     )
@@ -1468,19 +1561,22 @@ def _cli() -> None:
 
     if cmd == "resolve":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exec-context <ctx>] [--wire <fmt>] [--exclude-route <route>]", file=sys.stderr)
+            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exec-context <ctx>] [--wire <fmt>]", file=sys.stderr)
             print(f"  --exec-context  one of {list(EXEC_CONTEXTS)} (default: $KREPIS_EXEC_CONTEXT, else {DEFAULT_EXEC_CONTEXT})", file=sys.stderr)
             print(f"  --wire          one of {list(WIRE_FORMATS)} (default: {DEFAULT_WIRE})", file=sys.stderr)
-            print("  --exclude-route DEPRECATED — use --exec-context", file=sys.stderr)
             sys.exit(1)
         group = sys.argv[2]
         want_json = "--json" in sys.argv
-        exclude_route: str | None = None
         exec_context: str | None = None
         wire = DEFAULT_WIRE
         for i, arg in enumerate(sys.argv):
-            if arg == "--exclude-route" and i + 1 < len(sys.argv):
-                exclude_route = sys.argv[i + 1]
+            if arg == "--exclude-route":
+                # Removed in 0.30.0. Exiting beats silently ignoring it: a
+                # caller passing it believes it is narrowing the chain, and a
+                # flag that is accepted-and-dropped resolves to something the
+                # caller did not ask for.
+                print("--exclude-route was removed in krepis 0.30.0. Declare --exec-context instead and let the registry's reachable_from decide (model-router-policy R28/R29).", file=sys.stderr)
+                sys.exit(2)
             elif arg == "--exec-context" and i + 1 < len(sys.argv):
                 exec_context = sys.argv[i + 1]
             elif arg == "--wire" and i + 1 < len(sys.argv):
@@ -1488,7 +1584,6 @@ def _cli() -> None:
         if want_json:
             info = _resolve_group_json(
                 group,
-                exclude_route=exclude_route,
                 exec_context=exec_context,
                 wire=wire,
             )
