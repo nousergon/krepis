@@ -1546,6 +1546,179 @@ def resolve_group_structured(
     )
 
 
+# ── Group → ModelSpec (the consumer-facing adapter) ───────────────────────
+#
+# `resolve_group_structured` returns a routing DECISION; every consumer then
+# has to turn that decision into a `ModelSpec` before it can call anything.
+# That adaptation was being written out by hand at each call site — the
+# Director (`crucible-evaluator/director/agent.py`), the groom driver and
+# `groomer_krepis_adapter.py` all carry their own copy of the same
+# `auth_token_type` -> env-var-name table, and the Director's own comment
+# records that this is past `policy-shared-code`'s second-adoption trigger.
+#
+# The table belongs here because this module is the only PRODUCER of
+# `auth_token_type` values.  A consumer holding its own copy silently
+# mis-authenticates the day a new value is introduced: the unknown key is
+# absent from its dict, and the friendliest outcome is a KeyError at the call
+# site rather than a wrong credential sent to a real endpoint.
+
+#: ``auth_token_type`` -> the SECRET NAME holding that credential, or ``None``
+#: when the endpoint needs no client credential.
+#:
+#: ``placeholder`` means a local egress proxy holds the real key and the
+#: client sends a literal placeholder — ``None`` lets ``ModelSpec`` fall back
+#: to the provider registry default.  It is NOT the same as "credential
+#: missing", and collapsing the two breaks every direct route.
+_AUTH_TOKEN_SECRET: dict = {
+    "placeholder": None,
+    "openrouter_key": "OPENROUTER_API_KEY",
+    "litellm_master_key": "LITELLM_MASTER_KEY",
+    "direct_api_key": "ANTHROPIC_API_KEY",
+}
+
+#: Names the secret holding THIS consumer's router-edge credential.
+#:
+#: The authenticated router edge identifies each consumer by its own
+#: credential (`nous-ergon-ops` `bin/render-router-secrets.sh` maps credential
+#: -> consumer name, and nginx sets `X-Router-Consumer` from it).  Per-consumer
+#: identity therefore requires per-consumer VALUES, and `krepis.secrets`
+#: resolves SSM BEFORE `os.environ` — so two consumers both reading the secret
+#: name `LITELLM_MASTER_KEY` receive the same SSM value and collapse into one
+#: identity at the edge, however carefully their environments were set.
+#:
+#: Setting this env var to a distinct secret name (e.g.
+#: ``ROUTER_CONSUMER_THINKTANK``, resolving to ``/alpha-engine/
+#: ROUTER_CONSUMER_THINKTANK``) gives a consumer its own credential without a
+#: new lookup mechanism.  Unset, behaviour is exactly as before.
+ROUTER_CREDENTIAL_SECRET_ENV = "KREPIS_ROUTER_CREDENTIAL_SECRET"
+
+
+def router_credential_secret_name() -> str:
+    """The secret name holding this consumer's router-edge credential.
+
+    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` when set, else the historical
+    ``LITELLM_MASTER_KEY``.
+    """
+    return (
+        os.environ.get(ROUTER_CREDENTIAL_SECRET_ENV, "").strip()
+        or "LITELLM_MASTER_KEY"
+    )
+
+
+def route_is_degraded(route: dict) -> bool:
+    """Whether RESOLUTION already fell past the group's primary entry.
+
+    ``model-router-policy`` R12 makes serving from a fallback an ALERT rather
+    than a log line, so this is a supported predicate rather than something
+    each consumer re-derives from ``skipped_entries``.
+
+    **This answers a resolve-time question only.**  On the ``litellm_proxy``
+    route the chain is walked by the proxy, so which entry serves is not
+    knowable here — it arrives at call time as ``resp.model``, which is what
+    ``LLMClient`` compares against :func:`get_group_primary`.  Returning
+    "degraded" for that route would fire on every healthy router call:
+    ``registry_id`` is the synthetic ``litellm:group:<g>`` while
+    ``primary_registry_id`` is a real model id, so the two NEVER match there.
+    A detector whose output does not vary with the condition it names is not
+    a detector.
+    """
+    if route.get("route") == "litellm_proxy":
+        return False
+    primary = route.get("primary_registry_id") or route.get("primary_model")
+    serving = route.get("registry_id") or route.get("deployment_id")
+    if not primary or not serving:
+        # Absence is not health.  A per-provider route that cannot say which
+        # entry is primary cannot be asserted undegraded, so say so.
+        return True
+    return primary != serving
+
+
+def resolve_group_spec(
+    group: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+    max_tokens: int | None = None,
+    structured_outputs: bool | None = None,
+) -> tuple:
+    """Resolve *group* and adapt it to a ``(ModelSpec, route)`` pair.
+
+    The supported way for a consumer to go from "I want the ``med`` tier,
+    and I am running in a Lambda" to a client it can call.  The consumer
+    states its capability tier, where it runs and what wire format it speaks;
+    everything else — model, endpoint, credential, params — is a registry
+    decision resolved above it (model-router-policy §2 layer 5).
+
+    *max_tokens* and *structured_outputs* override the registry's params when
+    given.  Passing neither takes the registry values, which is what a caller
+    with no specific requirement should do.
+
+    Returns
+    -------
+    tuple
+        ``(ModelSpec, route)``.  The route dict is returned alongside because
+        it carries the degradation and cost fields a caller must not have to
+        re-resolve — see :func:`route_is_degraded`.
+
+    Raises
+    ------
+    RuntimeError
+        The resolver returned a schema version this function was not written
+        against, or an ``auth_token_type`` it does not know.  Both refuse
+        rather than guess: guessing a field meaning misroutes, and guessing a
+        credential sends a real key to an unintended endpoint.
+    """
+    from krepis.llm_config import ModelSpec
+
+    route = resolve_group_structured(
+        group,
+        exec_context=exec_context,
+        wire=wire,
+    )
+
+    if route.get("schema_version") != RESOLVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"krepis.router resolve schema_version "
+            f"{route.get('schema_version')!r} != expected "
+            f"{RESOLVE_SCHEMA_VERSION!r} — refusing to guess field meanings"
+        )
+
+    auth_type = route["auth_token_type"]
+    if auth_type not in _AUTH_TOKEN_SECRET:
+        raise RuntimeError(
+            f"unknown auth_token_type {auth_type!r} from krepis.router — "
+            "refusing to authenticate against an unintended endpoint"
+        )
+    api_key_env = _AUTH_TOKEN_SECRET[auth_type]
+    if auth_type == "litellm_master_key":
+        api_key_env = router_credential_secret_name()
+
+    params = route.get("params") or {}
+    spec = ModelSpec(
+        provider=route["provider"],
+        model=route["deployment_id"],
+        base_url=route["api_base_url"] or None,
+        api_key_env=api_key_env,
+        max_tokens=(
+            max_tokens if max_tokens is not None
+            else params.get("max_tokens", 4096)
+        ),
+        structured_outputs=(
+            structured_outputs if structured_outputs is not None
+            else params.get("structured_outputs", True)
+        ),
+        reasoning=params.get("reasoning"),
+    )
+    logger.info(
+        "resolved group=%s -> model=%s provider=%s route=%s exec_context=%s "
+        "wire=%s degraded=%s (primary=%s)",
+        group, route["deployment_id"], route["provider"], route.get("route"),
+        route.get("exec_context"), route.get("wire"), route_is_degraded(route),
+        route.get("primary_registry_id") or route.get("primary_model"),
+    )
+    return spec, route
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 def _cli() -> None:

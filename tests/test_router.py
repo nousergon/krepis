@@ -1471,3 +1471,168 @@ class TestRouterIsNeverContextFiltered:
             f"{offenders} name a network attachment, not a place code runs. "
             "Reaching the router may not depend on network position (R27a)."
         )
+
+
+# ── resolve_group_spec — the group -> ModelSpec adapter ──────────────────
+
+
+class TestResolveGroupSpec:
+    """`resolve_group_spec` is the supported way a consumer goes from a
+    capability tier to a client. Before it existed, three call sites each
+    carried their own copy of the `auth_token_type` -> credential-name table
+    (`director/agent.py`, `groom_driver.py`, `groomer_krepis_adapter.py`) —
+    and this module is the only producer of those values, so a consumer copy
+    silently mis-authenticates the day a new one is introduced."""
+
+    def _route(self, **over):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "med",
+            "display_name": "deepseek-v4-flash-max (med)",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "med",
+            "auth_token_type": "litellm_master_key",
+            "group": "med",
+            "registry_id": "litellm:group:med",
+            "primary_model": "deepseek-v4-flash",
+            "primary_registry_id": "deepseek-v4-flash-max",
+            "capabilities": {},
+            "params": {"max_tokens": 8192, "structured_outputs": True},
+        }
+        route.update(over)
+        return route
+
+    def _patch(self, monkeypatch, route):
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+
+    def test_builds_a_spec_from_the_route(self, monkeypatch):
+        self._patch(monkeypatch, self._route())
+        spec, route = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.provider == "litellm"
+        assert spec.model == "med"
+        assert spec.base_url == "https://router.example:8443"
+        assert spec.max_tokens == 8192
+        assert route["group"] == "med"
+
+    def test_explicit_max_tokens_overrides_the_registry(self, monkeypatch):
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec(
+            "med", exec_context="lambda", max_tokens=4000
+        )
+        assert spec.max_tokens == 4000
+
+    def test_structured_outputs_override_is_honoured(self, monkeypatch):
+        """A call site that has live-verified strict json_schema is unreliable
+        for the model serving its group must be able to say so — silently
+        taking the registry default would re-break that call site."""
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec(
+            "med", exec_context="lambda", structured_outputs=False
+        )
+        assert spec.structured_outputs is False
+
+    def test_unknown_schema_version_raises(self, monkeypatch):
+        self._patch(monkeypatch, self._route(schema_version=999))
+        with pytest.raises(RuntimeError, match="schema_version"):
+            _router.resolve_group_spec("med", exec_context="lambda")
+
+    def test_unknown_auth_token_type_raises(self, monkeypatch):
+        """Refusing beats guessing: a guessed credential is a real key sent to
+        an unintended endpoint."""
+        self._patch(monkeypatch, self._route(auth_token_type="new_thing"))
+        with pytest.raises(RuntimeError, match="auth_token_type"):
+            _router.resolve_group_spec("med", exec_context="lambda")
+
+    def test_placeholder_auth_maps_to_no_credential_name(self, monkeypatch):
+        """`placeholder` means the local egress proxy holds the real key. It
+        is not a missing credential, and collapsing the two would break every
+        direct route from a context that can reach one."""
+        self._patch(monkeypatch, self._route(
+            auth_token_type="placeholder",
+            provider="deepseek",
+            route="egress_proxy",
+            api_base_url="http://127.0.0.1:8990",
+            deployment_id="deepseek-v4-flash",
+            registry_id="deepseek-v4-flash-max",
+            primary_registry_id="deepseek-v4-flash-max",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env is None
+
+    # ── per-consumer router credential ───────────────────────────────────
+
+    def test_router_credential_defaults_to_the_historical_name(self, monkeypatch):
+        monkeypatch.delenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, raising=False)
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+
+    def test_per_consumer_credential_secret_is_honoured(self, monkeypatch):
+        """The edge identifies a consumer BY its credential value, and
+        `krepis.secrets` resolves SSM before os.environ — so two consumers
+        reading the same secret NAME collapse into one identity at the edge
+        no matter how their environments are set."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ROUTER_CONSUMER_THINKTANK"
+
+    def test_per_consumer_credential_does_not_leak_into_other_auth_types(
+        self, monkeypatch
+    ):
+        """It renames the ROUTER credential only. Applying it to a direct
+        provider route would point that route at a router credential."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        self._patch(monkeypatch, self._route(
+            auth_token_type="direct_api_key", provider="anthropic",
+            route="direct", api_base_url="",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ANTHROPIC_API_KEY"
+
+    def test_blank_env_falls_back_rather_than_naming_an_empty_secret(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, "   ")
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+
+    # ── route_is_degraded ────────────────────────────────────────────────
+
+    def test_litellm_proxy_route_is_never_degraded_at_resolve_time(self):
+        """The proxy walks the chain itself, so which entry serves is a
+        call-time fact. `registry_id` there is the synthetic
+        `litellm:group:<g>` and `primary_registry_id` a real model id, so a
+        naive comparison fires on EVERY healthy router call — a detector
+        whose output does not vary with the condition it names."""
+        assert _router.route_is_degraded(self._route()) is False
+
+    def test_per_provider_fallback_is_degraded(self):
+        assert _router.route_is_degraded(self._route(
+            route="egress_proxy",
+            registry_id="deepseek-v4-pro",
+            primary_registry_id="deepseek-v4-flash-max",
+        )) is True
+
+    def test_per_provider_primary_is_not_degraded(self):
+        assert _router.route_is_degraded(self._route(
+            route="egress_proxy",
+            registry_id="deepseek-v4-flash-max",
+            primary_registry_id="deepseek-v4-flash-max",
+        )) is False
+
+    def test_missing_primary_on_a_direct_route_reads_as_degraded(self):
+        """Absence is not health — principles §2.7."""
+        r = self._route(route="egress_proxy", registry_id="x")
+        r.pop("primary_registry_id")
+        r.pop("primary_model")
+        assert _router.route_is_degraded(r) is True
