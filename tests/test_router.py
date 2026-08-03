@@ -800,3 +800,318 @@ class TestResolveContract:
             assert isinstance(remove_after, int)
             assert remove_after > _router.RESOLVE_SCHEMA_VERSION - 1
             assert old != new
+
+
+# ── Execution-context reachability (model-router-policy R28/R29) ─────────
+#
+# These tests exist because of a live defect: the Director Lambda's weekly
+# `ultra` call resolved to openrouter.ai direct and egressed DLP-unscanned
+# (alpha-engine-config-I6183).  Nothing in the chain was unhealthy.  The two
+# entries ahead of it were dropped because krepis' own hardcoded endpoint
+# table had no row for `moonshot` or `zhipu` — a routing fact invented at
+# layer 3 — and the caller compensated with `exclude_route="litellm_proxy"`,
+# a routing fact asserted at layer 5.  The registry, which owns endpoints,
+# was not consulted about either.
+
+REACHABILITY_REGISTRY_YAML = """
+schema_version: 1
+
+model_groups:
+  ultra:
+    - kimi-direct
+    - glm-direct
+    - glm-openrouter
+
+models:
+  - id: kimi-direct
+    name: Kimi (direct Moonshot)
+    provider: moonshot
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    endpoints:
+      openai: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2_vpc]
+    model: kimi-k3
+    group: ultra
+    group_role: primary
+    params:
+      max_tokens: 16384
+    status: active
+
+  - id: glm-direct
+    name: GLM (direct Zhipu)
+    provider: zhipu
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    endpoints:
+      openai: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2_vpc]
+    model: glm-5.2
+    group: ultra
+    group_role: fallback
+    params:
+      max_tokens: 16384
+    status: active
+
+  - id: glm-openrouter
+    name: GLM (via OpenRouter)
+    provider: openrouter
+    route: openrouter
+    endpoints:
+      anthropic: https://openrouter.ai/api
+      openai: https://openrouter.ai/api
+    reachable_from: [laptop, ec2_vpc]
+    model: z-ai/glm-5.2
+    group: ultra
+    group_role: fallback
+    params:
+      max_tokens: 16384
+    status: active
+"""
+
+
+@pytest.fixture
+def reachability_registry():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(REACHABILITY_REGISTRY_YAML)
+    yield Path(f.name)
+    os.unlink(f.name)
+
+
+@pytest.fixture
+def _no_litellm():
+    """Force the per-provider resolution path deterministically.
+
+    An unresolvable master key is one of the documented LiteLLM skip reasons,
+    so this exercises the same branch a real key-less host would.
+    """
+    with mock.patch.object(_router, "_resolve_litellm_master_key", return_value=None):
+        yield
+
+
+class TestResolveExecContext:
+    def test_defaults_to_laptop(self, monkeypatch):
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
+
+    def test_env_var_is_read(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda_vpc")
+        assert _router._resolve_exec_context() == "lambda_vpc"
+
+    def test_explicit_argument_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda_vpc")
+        assert _router._resolve_exec_context("laptop") == "laptop"
+
+    def test_unknown_context_raises_rather_than_defaulting(self, monkeypatch):
+        """Falling back to the default on an unrecognised context would resolve
+        an endpoint chosen on a vocabulary mismatch (R29)."""
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        with pytest.raises(ValueError, match="Unknown execution context"):
+            _router._resolve_exec_context("fargate")
+
+    def test_context_is_never_inferred_from_lambda_env(self, monkeypatch):
+        """R29 — declared, not inferred. AWS_LAMBDA_FUNCTION_NAME being set
+        must not make krepis believe it is in a Lambda; a wrong guess makes a
+        mis-resolution look like a health failure."""
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "alpha-engine-evaluator-director")
+        assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
+
+
+class TestEntryReachableFrom:
+    def test_declared_context_matches(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2_vpc"]}
+        assert _router._entry_reachable_from(entry, "laptop") is True
+
+    def test_undeclared_context_is_filtered(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2_vpc"]}
+        assert _router._entry_reachable_from(entry, "lambda_vpc") is False
+
+    def test_missing_field_is_permissive_during_migration(self, caplog):
+        """R19 additive-then-remove: krepis lands ahead of the registry edit,
+        but says so every time."""
+        entry = {"id": "legacy-row"}
+        with caplog.at_level("WARNING"):
+            assert _router._entry_reachable_from(entry, "lambda_vpc") is True
+        assert "reachable_from" in caplog.text
+        assert "legacy-row" in caplog.text
+
+
+class TestEntryEndpoint:
+    def test_reads_declared_wire_endpoint_from_registry(self):
+        entry = {
+            "id": "x", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_provider_absent_from_krepis_tables_still_resolves(self):
+        """The I6183 regression. `moonshot` has no row in krepis' legacy table;
+        the registry declares its endpoint, so it must resolve anyway. A
+        resolver that drops it has invented a routing fact at layer 3 (R29)."""
+        entry = {
+            "id": "kimi-direct", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        assert ("egress_proxy", "moonshot") not in _router._LEGACY_CLI_ENDPOINTS
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_undeclared_wire_raises_naming_what_is_declared(self):
+        entry = {
+            "id": "x", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        with pytest.raises(ValueError, match="declares no 'anthropic'-wire endpoint"):
+            _router._entry_endpoint(entry, "anthropic")
+
+    def test_legacy_api_base_serves_the_openai_wire(self):
+        entry = {"id": "x", "route": "egress_proxy", "provider": "deepseek",
+                 "api_base": "http://127.0.0.1:8990"}
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_legacy_shim_warns_and_names_the_entry(self, caplog):
+        entry = {"id": "unmigrated", "route": "openrouter", "provider": "openrouter"}
+        with caplog.at_level("WARNING"):
+            url = _router._entry_endpoint(entry, "anthropic")
+        assert url == "https://openrouter.ai/api"
+        assert "unmigrated" in caplog.text
+        assert "R7" in caplog.text
+
+    def test_env_override_beats_the_declared_endpoint(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_OPENROUTER_API_URL", "http://localhost:9999")
+        entry = {"id": "x", "route": "openrouter", "provider": "openrouter",
+                 "endpoints": {"anthropic": "https://openrouter.ai/api"}}
+        assert _router._entry_endpoint(entry, "anthropic") == "http://localhost:9999"
+
+
+class TestResolveFiltersByExecutionContext:
+    def test_laptop_resolves_the_declared_primary(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="laptop", wire="openai")
+            assert info["registry_id"] == "kimi-direct"
+            assert info["exec_context"] == "laptop"
+            assert info["wire"] == "openai"
+        finally:
+            _router._router = None
+
+    def test_lambda_fails_closed_rather_than_reaching_openrouter(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """THE I6183 REGRESSION TEST.
+
+        From `lambda_vpc` no entry in this chain is reachable — the egress
+        proxies are on other hosts and openrouter.ai is off the private-subnet
+        route. Before R28/R29 the resolver walked past both direct entries
+        (no krepis table row for moonshot/zhipu) and served openrouter.ai
+        direct, unscanned. It must now raise.
+        """
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="lambda_vpc", wire="openai")
+            msg = str(exc.value)
+            assert "lambda_vpc" in msg
+            # Fail-closed diagnosis: the message carries WHY each entry went.
+            assert "kimi-direct" in msg
+            assert "glm-openrouter" in msg
+        finally:
+            _router._router = None
+
+    def test_skipped_entries_names_the_context_not_a_health_failure(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """R29 — 'unreachable from here' must be distinguishable from
+        'unhealthy'. Collapsing the two is what made the Director's fallback
+        log identically to a primary (I6185)."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                # Reachable only from ec2_vpc: the two direct entries survive,
+                # so resolution succeeds and the skips are observable.
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="ec2_vpc", wire="anthropic")
+            reasons = {s["registry_id"]: s["reason"] for s in info["skipped_entries"]}
+            assert "kimi-direct" in reasons
+            assert "anthropic" in reasons["kimi-direct"]
+            assert "not reachable" not in reasons["kimi-direct"].lower()
+            assert info["registry_id"] == "glm-openrouter"
+        finally:
+            _router._router = None
+
+    def test_unknown_wire_is_rejected(self, reachability_registry, monkeypatch):
+        with monkeypatch.context() as m:
+            m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+            with pytest.raises(ValueError, match="Unknown wire format"):
+                _router._resolve_group_json("ultra", wire="grpc")
+
+
+class TestExcludeRouteIsDeprecated:
+    def test_emits_deprecation_warning(self, registry_file, monkeypatch):
+        """Narrowing the chain at the call site is holding a routing table
+        (model-router-policy §2). Both callers used it to mean 'not reachable
+        from here', which is now exec_context."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with pytest.warns(DeprecationWarning, match="exclude_route is deprecated"):
+                    _router._resolve_group_json("med", exclude_route="egress_proxy")
+        finally:
+            _router._router = None
+
+    def test_no_warning_when_not_passed(self, registry_file, monkeypatch, recwarn):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                _router._resolve_group_json("med")
+            assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+        finally:
+            _router._router = None
+
+
+class TestResolveContractCarriesContext:
+    def test_exec_context_and_wire_are_emitted(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router.resolve_group_structured(
+                    "ultra", exec_context="laptop", wire="openai")
+            assert info["schema_version"] == _router.RESOLVE_SCHEMA_VERSION
+            assert info["exec_context"] == "laptop"
+            assert info["wire"] == "openai"
+        finally:
+            _router._router = None
+
+    def test_contract_still_validates_against_the_schema(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """Additive evolution (R19): new fields must not bump the version out
+        from under a consumer pinned to 2."""
+        import json as _json
+        jsonschema = pytest.importorskip("jsonschema")
+        schema_path = Path(_router.__file__).parent / "resolve_schema.json"
+        schema = _json.loads(schema_path.read_text())
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router.resolve_group_structured(
+                    "ultra", exec_context="laptop", wire="openai")
+            jsonschema.validate(info, schema)
+            assert info["schema_version"] == 2
+        finally:
+            _router._router = None

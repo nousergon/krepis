@@ -38,7 +38,12 @@
     },
     "route": {
       "type": "string",
-      "enum": ["litellm_proxy", "egress_proxy", "openrouter", "direct"],
+      "enum": [
+        "litellm_proxy",
+        "egress_proxy",
+        "openrouter",
+        "direct"
+      ],
       "description": "Which transport serves this group."
     },
     "api_base_url": {
@@ -56,7 +61,12 @@
     },
     "auth_token_type": {
       "type": "string",
-      "enum": ["placeholder", "openrouter_key", "litellm_master_key", "direct_api_key"],
+      "enum": [
+        "placeholder",
+        "openrouter_key",
+        "litellm_master_key",
+        "direct_api_key"
+      ],
       "description": "Which credential the caller must present. 'placeholder' means the egress proxy injects the real key."
     },
     "group": {
@@ -79,11 +89,21 @@
       "type": "object",
       "description": "Per-model feature flags as declared in the registry.",
       "properties": {
-        "web_search": {"type": "boolean"},
-        "tool_choice": {"type": "boolean"},
-        "prompt_caching": {"type": "boolean"},
-        "automatic_prefix_caching": {"type": "boolean"},
-        "batches": {"type": "boolean"}
+        "web_search": {
+          "type": "boolean"
+        },
+        "tool_choice": {
+          "type": "boolean"
+        },
+        "prompt_caching": {
+          "type": "boolean"
+        },
+        "automatic_prefix_caching": {
+          "type": "boolean"
+        },
+        "batches": {
+          "type": "boolean"
+        }
       }
     },
     "params": {
@@ -94,10 +114,18 @@
       "type": "object",
       "description": "Price card for the resolved entry, in USD per 1M tokens.",
       "properties": {
-        "cost_per_1m_input": {"type": "number"},
-        "cost_per_1m_output": {"type": "number"},
-        "cost_per_1m_cache_read": {"type": "number"},
-        "cost_per_1m_cache_write": {"type": "number"}
+        "cost_per_1m_input": {
+          "type": "number"
+        },
+        "cost_per_1m_output": {
+          "type": "number"
+        },
+        "cost_per_1m_cache_read": {
+          "type": "number"
+        },
+        "cost_per_1m_cache_write": {
+          "type": "number"
+        }
       }
     },
     "supports_prompt_caching": {
@@ -114,15 +142,38 @@
     },
     "skipped_entries": {
       "type": "array",
-      "description": "Registry entries skipped during resolution, with the reason.",
+      "description": "Registry entries skipped during resolution, with the reason. R12/R29: a consumer that discards this cannot tell a fallback from a primary, and a resolution that dropped the group's declared primary logs identically to one that did not. Reasons distinguish 'not reachable from execution context X', 'no <wire>-wire endpoint declared', 'egress proxy not reachable' and the deprecated exclude_route constraint.",
       "items": {
         "type": "object",
         "properties": {
-          "registry_id": {"type": "string"},
-          "provider": {"type": "string"},
-          "reason": {"type": "string"}
+          "registry_id": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
         }
       }
+    },
+    "exec_context": {
+      "type": "string",
+      "enum": [
+        "laptop",
+        "ec2_vpc",
+        "lambda_vpc"
+      ],
+      "description": "The execution context this resolution was performed for (model-router-policy R29). DECLARED by the caller, never inferred by the resolver. Entries the registry does not mark reachable_from this context are filtered out and recorded in skipped_entries. Added at schema_version 2 as an additive field; consumers predating it ignore it safely."
+    },
+    "wire": {
+      "type": "string",
+      "enum": [
+        "anthropic",
+        "openai"
+      ],
+      "description": "The wire format api_base_url speaks. 'anthropic' is the Claude CLI's Messages format (the default); 'openai' is the OpenAI-compatible format programmatic callers on the openai transport use. The same provider is often reachable at both on different ports, so a consumer MUST NOT assume api_base_url matches its own transport without checking this field. Added at schema_version 2 as an additive field."
     }
   }
 }
