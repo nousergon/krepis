@@ -1592,6 +1592,15 @@ _AUTH_TOKEN_SECRET: dict = {
 #: new lookup mechanism.  Unset, behaviour is exactly as before.
 ROUTER_CREDENTIAL_SECRET_ENV = "KREPIS_ROUTER_CREDENTIAL_SECRET"
 
+#: Provider name emitted for the router-edge route.
+#:
+#: Deliberately NOT ``"litellm"``: that name is bound in
+#: ``llm_config.PROVIDER_REGISTRY`` to ``TRANSPORT_LITELLM``, i.e. the
+#: in-process :func:`get_router`, which calls providers directly from the
+#: consumer.  This name is unknown to that registry, so ``ModelSpec`` treats
+#: it as a custom OpenAI-compatible endpoint — which is what the edge is.
+ROUTER_EDGE_PROVIDER = "litellm_proxy"
+
 
 def router_credential_secret_name() -> str:
     """The secret name holding this consumer's router-edge credential.
@@ -1693,9 +1702,33 @@ def resolve_group_spec(
     if auth_type == "litellm_master_key":
         api_key_env = router_credential_secret_name()
 
+    # The router route is the EDGE, not the in-process Router.
+    #
+    # `resolve_group_structured` reports `provider: "litellm"` for the proxy
+    # route, and ModelSpec maps that name to TRANSPORT_LITELLM — which is
+    # `get_router()`, an in-process LiteLLM Router built from the registry
+    # that calls each provider DIRECTLY from the consumer, reading
+    # OPENROUTER_API_KEY out of the environment as it goes.
+    #
+    # That is the opposite of what a consumer under alpha-engine-config-I6367
+    # needs.  It would (a) egress straight to openrouter.ai, unscanned, which
+    # is the linkage the ruling forbids; (b) bypass the authenticated edge,
+    # so per-consumer identity and rate limiting never apply; (c) require
+    # `litellm` and a readable registry inside every consumer.
+    #
+    # `api_base_url` on this route already IS the edge, and the edge speaks
+    # OpenAI-compatible chat completions with the group name as the model.
+    # So the proxy route is emitted as a CUSTOM OpenAI-compatible endpoint —
+    # ModelSpec's documented shape for exactly that (any provider name it
+    # does not know, plus base_url + api_key_env). The chain is then walked
+    # by the proxy, server-side, which is the whole point of having one.
+    provider = route["provider"]
+    if route.get("route") == "litellm_proxy":
+        provider = ROUTER_EDGE_PROVIDER
+
     params = route.get("params") or {}
     spec = ModelSpec(
-        provider=route["provider"],
+        provider=provider,
         model=route["deployment_id"],
         base_url=route["api_base_url"] or None,
         api_key_env=api_key_env,
