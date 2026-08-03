@@ -107,14 +107,59 @@ _ENV_OVERRIDE_MAP: dict[tuple[str, str | None], str] = {
     ("litellm_proxy", None):      "KREPIS_LITELLM_PROXY_URL",
 }
 
-# Mapping of (route, provider) tuples to CLI-compatible base URLs.
-# Only these combinations speak the wire format the Claude CLI expects.
-# Port 8971 strips the /anthropic upstream-prefix (DeepSeek supports the
-# CLI wire format natively); ports 8972-8976 serve OpenAI-format (for
-# LiteLLM, not CLI-compatible).  The LiteLLM proxy (port 8980) is the
-# preferred path and is checked first in _resolve_group_json before
-# falling through to these per-provider endpoints.
-_CLI_COMPATIBLE_ENDPOINTS: dict[tuple[str, str | None], str] = {
+# ── Execution context (model-router-policy R28/R29) ──────────────────────
+# A DIRECT PROVIDER endpoint is not a global fact.  `http://127.0.0.1:8990` is
+# true on the laptop and on the dashboard box and meaningless inside a Lambda
+# container.  `reachable_from` scopes those, and only those.
+#
+# It does NOT scope the litellm_proxy route.  model-router-policy §3.4a R27a is
+# categorical: the router is addressed by (url, credential) and reaching it may
+# not depend on host, VPC, subnet, security group or private IP.  So the proxy
+# path below is gated on its HEALTH PROBE and never on context — its
+# unavailability is an outage, never a reachability fact about the caller.
+#
+# The names say WHERE CODE RUNS, never how it is attached.  An earlier draft of
+# this constant read `lambda_vpc`, and a context name asserting a network
+# attachment is an invitation to the R27a violation that cost a 2h20m
+# fleet-wide SSM outage on 2026-08-03 (nous-ergon-ops-I417): the endpoint
+# created to give one VPC-attached Lambda a private path to SSM carried a
+# VPC-wide private-DNS override behind a security group that blocked the VPC.
+#
+# R29: the context is a DECLARED input, never inferred from hostname, the
+# metadata service, or the presence of an env var.  Inference is what makes a
+# mis-resolution look like a health failure.
+EXEC_CONTEXT_LAPTOP = "laptop"
+EXEC_CONTEXT_EC2 = "ec2"
+EXEC_CONTEXT_LAMBDA = "lambda"
+EXEC_CONTEXTS = (EXEC_CONTEXT_LAPTOP, EXEC_CONTEXT_EC2, EXEC_CONTEXT_LAMBDA)
+DEFAULT_EXEC_CONTEXT = EXEC_CONTEXT_LAPTOP
+
+# ── Wire formats ─────────────────────────────────────────────────────────
+# An endpoint speaks one wire format.  The Claude CLI speaks the Anthropic
+# Messages format; programmatic callers built on the openai transport speak
+# the OpenAI format.  The same provider is frequently reachable at BOTH, on
+# different ports (DeepSeek: 8971 Anthropic-wire, 8990 OpenAI-wire), which is
+# the fact the old (route, provider) -> URL table was encoding without saying
+# so — and the reason a caller could be handed an endpoint in the wrong format.
+WIRE_ANTHROPIC = "anthropic"
+WIRE_OPENAI = "openai"
+WIRE_FORMATS = (WIRE_ANTHROPIC, WIRE_OPENAI)
+DEFAULT_WIRE = WIRE_ANTHROPIC
+
+# LEGACY — remove once every registry entry declares an `endpoints` block.
+#
+# This is the table model-router-policy R7 forbids ("no hardcoded hosts or
+# ports anywhere in library code") and R29 names directly: a resolver that
+# drops an entry because its own code lacks a row for that provider has
+# invented a routing fact at layer 3.  It is retained ONLY as the migration
+# shim for registry entries that predate `endpoints`, is consulted only when
+# an entry carries no `endpoints` block, and warns on every use naming the
+# entry that still needs migrating.
+#
+# Removal condition: `LLM_MODEL_REGISTRY.yaml` declares `endpoints` on every
+# route-bearing row and the registry validator requires it.  Tracked as
+# alpha-engine-config-I6186.
+_LEGACY_CLI_ENDPOINTS: dict[tuple[str, str | None], str] = {
     ("egress_proxy", "deepseek"): "http://127.0.0.1:8971",
     ("openrouter", None):         "https://openrouter.ai/api",
     ("direct", "anthropic"):      "",
@@ -132,12 +177,136 @@ def _resolve_litellm_proxy_url() -> str:
     return os.environ.get("KREPIS_LITELLM_PROXY_URL", LITELLM_PROXY_URL)
 
 
+def _resolve_exec_context(exec_context: str | None = None) -> str:
+    """Return the caller's declared execution context (R29).
+
+    Resolution order: explicit argument → ``KREPIS_EXEC_CONTEXT`` env var →
+    :data:`DEFAULT_EXEC_CONTEXT`.
+
+    The value is DECLARED, never inferred.  krepis does not read the EC2
+    metadata service, the Lambda runtime env vars, or the hostname to guess
+    where it is running: a wrong guess produces a resolution that looks like a
+    health failure, which is the exact confusion R29 exists to prevent.
+
+    Raises :exc:`ValueError` on an unrecognised context rather than falling
+    back to the default — an unknown context means the caller believes it is
+    somewhere krepis has no reachability facts about, and resolving anyway
+    would hand it an endpoint chosen on a vocabulary mismatch.
+    """
+    ctx = exec_context or os.environ.get("KREPIS_EXEC_CONTEXT") or DEFAULT_EXEC_CONTEXT
+    ctx = ctx.strip()
+    if ctx not in EXEC_CONTEXTS:
+        raise ValueError(
+            f"Unknown execution context {ctx!r}. Declared contexts are "
+            f"{list(EXEC_CONTEXTS)} — they name where code runs, never how it "
+            "is attached (model-router-policy R28). Set KREPIS_EXEC_CONTEXT to "
+            "one of them, or add the new context to this constant AND to the "
+            "registry's reachable_from vocabulary. A context name encoding a "
+            "network posture (e.g. 'lambda_vpc') is a defect: reaching the "
+            "router may not depend on network position (§3.4a R27a)."
+        )
+    return ctx
+
+
+def _entry_reachable_from(entry: dict, exec_context: str) -> bool:
+    """Whether *entry* declares itself reachable from *exec_context* (R28).
+
+    An entry with no ``reachable_from`` key is treated as reachable from every
+    context, with a warning.  That is the migration position and not the
+    target: R28 makes the field required and the registry validator fails a
+    pull request without it, so the permissive branch here exists only so a
+    krepis release can land ahead of the registry edit (R19,
+    additive-then-remove).  Remove the branch — and this warning — once the
+    validator is enforcing.
+    """
+    declared = entry.get("reachable_from")
+    if declared is None:
+        logger.warning(
+            "Registry entry %r declares no reachable_from; treating as "
+            "reachable from every context. This entry predates "
+            "model-router-policy R28 and needs migrating "
+            "(alpha-engine-config-I6184).",
+            entry.get("id", "<unknown>"),
+        )
+        return True
+    return exec_context in declared
+
+
+def _entry_endpoint(entry: dict, wire: str) -> str:
+    """Return *entry*'s declared base URL for the *wire* format.
+
+    The registry owns endpoints (model-router-policy §2 layer 1), so this
+    reads them rather than deciding them:
+
+    1. Per-route env-var override (``_ENV_OVERRIDE_MAP``) — a box-level
+       bootstrap exporting its own port, which is a deployment fact rather
+       than a routing one.
+    2. ``entry["endpoints"][wire]`` — the declared endpoint for this format.
+    3. ``entry["api_base"]`` when *wire* is the OpenAI format — the pre-
+       ``endpoints`` spelling of the same fact.
+    4. :data:`_LEGACY_CLI_ENDPOINTS` — the migration shim, warned on.
+
+    Raises :exc:`ValueError` if the entry declares no endpoint for *wire*.
+    The caller records that in ``skipped_entries`` and moves on, so "this
+    provider does not speak your wire format" is a stated registry fact
+    rather than a silent absence from a dict.
+    """
+    route = entry.get("route", "")
+    provider = entry.get("provider", "")
+
+    # 1. Env override — deployment fact, wins over the declared default.
+    for key in ((route, provider), (route, None)):
+        env_var = _ENV_OVERRIDE_MAP.get(key)
+        if env_var:
+            override = os.environ.get(env_var)
+            if override:
+                return override
+
+    # 2. Declared per-wire endpoint.
+    endpoints = entry.get("endpoints")
+    if isinstance(endpoints, dict):
+        if wire in endpoints:
+            return endpoints[wire] or ""
+        raise ValueError(
+            f"registry entry {entry.get('id', '<unknown>')!r} declares no "
+            f"{wire!r}-wire endpoint (declared: {sorted(endpoints)})"
+        )
+
+    # 3. Pre-`endpoints` spelling: bare `api_base` is the OpenAI-wire endpoint.
+    if wire == WIRE_OPENAI and entry.get("api_base"):
+        return entry["api_base"]
+
+    # 4. Migration shim.
+    for key in ((route, provider), (route, None)):
+        if key in _LEGACY_CLI_ENDPOINTS:
+            logger.warning(
+                "Registry entry %r has no `endpoints` block; falling back to "
+                "krepis' legacy hardcoded endpoint table, which "
+                "model-router-policy R7 forbids. Declare "
+                "endpoints.{anthropic,openai} on this row "
+                "(alpha-engine-config-I6186).",
+                entry.get("id", "<unknown>"),
+            )
+            return _LEGACY_CLI_ENDPOINTS[key]
+
+    raise ValueError(
+        f"registry entry {entry.get('id', '<unknown>')!r} "
+        f"(route={route!r}, provider={provider!r}) declares no endpoint for "
+        f"the {wire!r} wire format, and no legacy default applies"
+    )
+
+
 def _resolve_cli_endpoint(route: str, provider: str | None) -> str:
     """Resolve a CLI-compatible endpoint for *(route, provider)* at call time.
 
+    DEPRECATED — superseded by :func:`_entry_endpoint`, which reads the
+    endpoint the registry declares instead of choosing one from a table in
+    library code.  Retained because the ``(route, provider)`` shape is what
+    the legacy shim is keyed on and existing tests bind to this name.
+
     Resolution order:
     1. Per-route env var (``_ENV_OVERRIDE_MAP`` → ``os.environ``)
-    2. Module-level ``_CLI_COMPATIBLE_ENDPOINTS`` default
+    2. Module-level :data:`_LEGACY_CLI_ENDPOINTS` default
 
     Returns the endpoint URL or ``""`` for provider-default routes (``direct``).
     Raises :exc:`ValueError` if the combination is not CLI-compatible.
@@ -157,12 +326,12 @@ def _resolve_cli_endpoint(route: str, provider: str | None) -> str:
             return override
 
     # 3. Check exact match in the default map
-    if precise_key in _CLI_COMPATIBLE_ENDPOINTS:
-        return _CLI_COMPATIBLE_ENDPOINTS[precise_key]
+    if precise_key in _LEGACY_CLI_ENDPOINTS:
+        return _LEGACY_CLI_ENDPOINTS[precise_key]
 
     # 4. Check catch-all by route
-    if catchall_key in _CLI_COMPATIBLE_ENDPOINTS:
-        return _CLI_COMPATIBLE_ENDPOINTS[catchall_key]
+    if catchall_key in _LEGACY_CLI_ENDPOINTS:
+        return _LEGACY_CLI_ENDPOINTS[catchall_key]
 
     raise ValueError(
         f"({route!r}, {provider!r}) is not a CLI-compatible endpoint "
@@ -531,7 +700,7 @@ def _cli_endpoint_for(entry: dict) -> str:
     """Return the CLI-compatible base URL for a registry model entry.
 
     Resolves the endpoint from env var overrides first (config#4923), then
-    falls back to the default ``_CLI_COMPATIBLE_ENDPOINTS`` literal.
+    falls back to the legacy ``_LEGACY_CLI_ENDPOINTS`` literal.
 
     For ``egress_proxy`` routes: probes the resolved proxy at
     ``/__proxy_health__`` before returning.  An unreachable proxy raises
@@ -854,7 +1023,13 @@ def _upstream_model(litellm_model: str) -> str:
 
 # ── group resolution (structured, for shell scripts) ────────────────────
 
-def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
+def _resolve_group_json(
+    group: str,
+    exclude_route: str | None = None,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+) -> dict:
     """Return full routing info for *group* as a JSON-ready dict.
 
     Reads the registry directly (bypasses the Router's cooldown state).
@@ -869,12 +1044,26 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
     group
         The model group name (``low``, ``med``, ``high``, ``ultra``).
     exclude_route
-        Optional route type to exclude. When set (e.g.
-        ``"egress_proxy"``), the resolver skips entries whose ``route``
-        field matches this value — both the LiteLLM proxy path and the
-        per-provider fallback loop. Used by the clauder wrapper's
-        degraded path to skip directly-routed entries and fall through
-        to OpenRouter (alpha-engine-config-I4465).
+        **DEPRECATED — do not add call sites.** Narrowing the chain is
+        holding a routing table, and model-router-policy §2 forbids that at
+        layer 5 whatever the mechanism: an argument reads the same as a
+        hardcoded slug once the decision is at the consumer. Both existing
+        callers passed it to express *"this route is not reachable from
+        where I am running"*, which is now ``exec_context`` + the registry's
+        ``reachable_from`` (R28/R29). Emits a :exc:`DeprecationWarning`;
+        removed once both call sites are migrated (alpha-engine-config-I6184).
+    exec_context
+        The caller's execution context — one of :data:`EXEC_CONTEXTS`.
+        Declared, never inferred (R29). Defaults to ``KREPIS_EXEC_CONTEXT``
+        and then to :data:`DEFAULT_EXEC_CONTEXT`. Entries the registry does
+        not declare ``reachable_from`` this context are skipped, and each
+        lands in ``skipped_entries`` naming the context — so "unreachable
+        from here" is never confused with "unhealthy".
+    wire
+        The wire format the caller speaks: :data:`WIRE_ANTHROPIC` (the
+        Claude CLI's Messages format, the default) or :data:`WIRE_OPENAI`.
+        An entry that declares no endpoint for this format is skipped with
+        that as the stated reason.
 
     Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
@@ -891,6 +1080,26 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
     Raises :exc:`ValueError` if NO model in the group is CLI-compatible.
     """
     import yaml as _yaml
+
+    if exclude_route is not None:
+        import warnings as _warnings
+
+        _warnings.warn(
+            "exclude_route is deprecated: narrowing the fallback chain at the "
+            "call site is holding a routing table (model-router-policy §2). "
+            "Declare exec_context instead and let the registry's "
+            "reachable_from decide (R28/R29). "
+            "Tracked as alpha-engine-config-I6184.",
+            DeprecationWarning,
+            stacklevel=3,
+        )
+
+    exec_context = _resolve_exec_context(exec_context)
+    if wire not in WIRE_FORMATS:
+        raise ValueError(
+            f"Unknown wire format {wire!r}; declared formats are "
+            f"{list(WIRE_FORMATS)}"
+        )
 
     reg_path = _find_registry()
     if not reg_path:
@@ -1049,6 +1258,8 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
             # the server side without client markers.
             "supports_prompt_caching": _group_pc,
             "automatic_prefix_caching": _group_apc,
+            "exec_context": exec_context,
+            "wire": wire,
             "skipped_entries": [],
         })
 
@@ -1081,19 +1292,50 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
             })
             continue
 
-        # Skip entries whose provider API doesn't speak the CLI wire format.
-        # Only DeepSeek (port 8971, natively CLI-compatible) and OpenRouter
-        # (server-side format translation) can serve the CLI directly.
-        # All other providers require the LiteLLM proxy for format translation.
-        try:
-            api_base_url = _cli_endpoint_for(entry)
-        except ValueError:
+        # R28/R29 — is this entry's endpoint reachable from where the caller
+        # says it is running?  Recorded with the context named, so a caller
+        # reading skipped_entries can tell "not reachable from here" apart
+        # from "unhealthy", which is the distinction the old resolution path
+        # collapsed.
+        if not _entry_reachable_from(entry, exec_context):
             skips.append({
                 "registry_id": mid,
                 "provider": entry.get("provider", ""),
-                "reason": "Provider-native format only — requires LiteLLM proxy for CLI access",
+                "reason": (
+                    f"Not reachable from execution context "
+                    f"{exec_context!r} (registry reachable_from="
+                    f"{entry.get('reachable_from')!r})"
+                ),
             })
             continue
+
+        # Skip entries that declare no endpoint for the caller's wire format.
+        # This used to be decided by absence from a hardcoded (route, provider)
+        # table in this module — so an entry was dropped because krepis had no
+        # row for its provider, which is a routing fact invented at layer 3
+        # (R7/R29).  It is now the registry's statement about itself.
+        try:
+            api_base_url = _entry_endpoint(entry, wire)
+        except ValueError as exc:
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": f"No {wire!r}-wire endpoint declared: {exc}",
+            })
+            continue
+
+        # An egress_proxy endpoint that does not answer its health probe is
+        # unusable; fail at resolve time rather than handing back a dead
+        # endpoint that surfaces later as an opaque ConnectionRefused
+        # (config#4923).
+        if _entry_route == "egress_proxy" and api_base_url:
+            if not _probe_egress_proxy(api_base_url):
+                skips.append({
+                    "registry_id": mid,
+                    "provider": entry.get("provider", ""),
+                    "reason": f"Egress proxy at {api_base_url!r} is not reachable",
+                })
+                continue
 
         model_str = entry.get("model", "")
         route = entry.get("route", "")
@@ -1141,18 +1383,35 @@ def _resolve_group_json(group: str, exclude_route: str | None = None) -> dict:
             "params": params,
             "cache_pricing": cache_pricing,
             "supports_prompt_caching": _entry_pc,
+            "exec_context": exec_context,
+            "wire": wire,
             "skipped_entries": skips if skips else [],
         })
 
+    # R29 — fail closed. No entry in the group is reachable from this
+    # context in this wire format, so there is nothing legitimate left to
+    # reach for. The skip reasons are carried into the message because this
+    # exception is frequently the only artifact a weekly unattended caller
+    # leaves behind, and "no model was CLI-compatible" without them sent
+    # operators looking at provider health for a reachability fault.
+    _detail = "; ".join(
+        f"{s_['registry_id']}: {s_['reason']}" for s_ in skips
+    ) or "no entries examined"
     raise ValueError(
-        f"No model in group {group!r} is CLI-compatible. "
-        f"Available models: {group_ids}.  "
-        "All provider-native-format entries require the LiteLLM proxy "
-        "for CLI access — ensure LiteLLM is running on port 8980."
+        f"No model in group {group!r} is reachable from execution context "
+        f"{exec_context!r} in the {wire!r} wire format. "
+        f"Chain: {group_ids}. Skipped — {_detail}. "
+        f"LiteLLM proxy skipped: {'; '.join(_litellm_skip_reasons) or 'no'}."
     )
 
 
-def resolve_group_structured(group: str, exclude_route: str | None = None) -> dict:
+def resolve_group_structured(
+    group: str,
+    exclude_route: str | None = None,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+) -> dict:
     """Resolve *group* to a full routing decision — the PUBLIC contract.
 
     This is the supported entry point for programmatic callers.  It returns
@@ -1179,8 +1438,19 @@ def resolve_group_structured(group: str, exclude_route: str | None = None) -> di
     path was dead code, and routing silently fell back to an endpoint exported
     by a bootstrap shell script (alpha-engine-config-I4454).  Consumers must
     bind to a supported public surface; a leading underscore is not one.
+
+    Callers declare *where they are running* (``exec_context``) and *what wire
+    format they speak* (``wire``), and nothing else about routing.  Which
+    entries those two facts admit is a registry decision, resolved above the
+    consumer (model-router-policy §2 layer 5, R28/R29).  ``exclude_route`` is
+    deprecated and warns; see :func:`_resolve_group_json`.
     """
-    return _resolve_group_json(group, exclude_route=exclude_route)
+    return _resolve_group_json(
+        group,
+        exclude_route=exclude_route,
+        exec_context=exec_context,
+        wire=wire,
+    )
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
@@ -1198,17 +1468,30 @@ def _cli() -> None:
 
     if cmd == "resolve":
         if len(sys.argv) < 3:
-            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exclude-route <route>]", file=sys.stderr)
+            print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exec-context <ctx>] [--wire <fmt>] [--exclude-route <route>]", file=sys.stderr)
+            print(f"  --exec-context  one of {list(EXEC_CONTEXTS)} (default: $KREPIS_EXEC_CONTEXT, else {DEFAULT_EXEC_CONTEXT})", file=sys.stderr)
+            print(f"  --wire          one of {list(WIRE_FORMATS)} (default: {DEFAULT_WIRE})", file=sys.stderr)
+            print("  --exclude-route DEPRECATED — use --exec-context", file=sys.stderr)
             sys.exit(1)
         group = sys.argv[2]
         want_json = "--json" in sys.argv
         exclude_route: str | None = None
+        exec_context: str | None = None
+        wire = DEFAULT_WIRE
         for i, arg in enumerate(sys.argv):
             if arg == "--exclude-route" and i + 1 < len(sys.argv):
                 exclude_route = sys.argv[i + 1]
-                break
+            elif arg == "--exec-context" and i + 1 < len(sys.argv):
+                exec_context = sys.argv[i + 1]
+            elif arg == "--wire" and i + 1 < len(sys.argv):
+                wire = sys.argv[i + 1]
         if want_json:
-            info = _resolve_group_json(group, exclude_route=exclude_route)
+            info = _resolve_group_json(
+                group,
+                exclude_route=exclude_route,
+                exec_context=exec_context,
+                wire=wire,
+            )
             print(json.dumps(info))
         else:
             model = resolve_group(group)
