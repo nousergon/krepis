@@ -162,8 +162,8 @@
       "type": "string",
       "enum": [
         "laptop",
-        "ec2_vpc",
-        "lambda_vpc"
+        "ec2",
+        "lambda"
       ],
       "description": "The execution context this resolution was performed for (model-router-policy R29). DECLARED by the caller, never inferred by the resolver. Entries the registry does not mark reachable_from this context are filtered out and recorded in skipped_entries. Added at schema_version 2 as an additive field; consumers predating it ignore it safely."
     },

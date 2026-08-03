@@ -830,7 +830,7 @@ models:
     api_base: http://127.0.0.1:8990
     endpoints:
       openai: http://127.0.0.1:8990
-    reachable_from: [laptop, ec2_vpc]
+    reachable_from: [laptop, ec2]
     model: kimi-k3
     group: ultra
     group_role: primary
@@ -845,7 +845,7 @@ models:
     api_base: http://127.0.0.1:8990
     endpoints:
       openai: http://127.0.0.1:8990
-    reachable_from: [laptop, ec2_vpc]
+    reachable_from: [laptop, ec2]
     model: glm-5.2
     group: ultra
     group_role: fallback
@@ -860,7 +860,7 @@ models:
     endpoints:
       anthropic: https://openrouter.ai/api
       openai: https://openrouter.ai/api
-    reachable_from: [laptop, ec2_vpc]
+    reachable_from: [laptop, ec2]
     model: z-ai/glm-5.2
     group: ultra
     group_role: fallback
@@ -895,11 +895,11 @@ class TestResolveExecContext:
         assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
 
     def test_env_var_is_read(self, monkeypatch):
-        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda_vpc")
-        assert _router._resolve_exec_context() == "lambda_vpc"
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda")
+        assert _router._resolve_exec_context() == "lambda"
 
     def test_explicit_argument_wins_over_env(self, monkeypatch):
-        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda_vpc")
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda")
         assert _router._resolve_exec_context("laptop") == "laptop"
 
     def test_unknown_context_raises_rather_than_defaulting(self, monkeypatch):
@@ -920,19 +920,19 @@ class TestResolveExecContext:
 
 class TestEntryReachableFrom:
     def test_declared_context_matches(self):
-        entry = {"id": "x", "reachable_from": ["laptop", "ec2_vpc"]}
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
         assert _router._entry_reachable_from(entry, "laptop") is True
 
     def test_undeclared_context_is_filtered(self):
-        entry = {"id": "x", "reachable_from": ["laptop", "ec2_vpc"]}
-        assert _router._entry_reachable_from(entry, "lambda_vpc") is False
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
+        assert _router._entry_reachable_from(entry, "lambda") is False
 
     def test_missing_field_is_permissive_during_migration(self, caplog):
         """R19 additive-then-remove: krepis lands ahead of the registry edit,
         but says so every time."""
         entry = {"id": "legacy-row"}
         with caplog.at_level("WARNING"):
-            assert _router._entry_reachable_from(entry, "lambda_vpc") is True
+            assert _router._entry_reachable_from(entry, "lambda") is True
         assert "reachable_from" in caplog.text
         assert "legacy-row" in caplog.text
 
@@ -1005,7 +1005,7 @@ class TestResolveFiltersByExecutionContext:
     ):
         """THE I6183 REGRESSION TEST.
 
-        From `lambda_vpc` no entry in this chain is reachable — the egress
+        From `lambda` no entry in this chain is reachable — the egress
         proxies are on other hosts and openrouter.ai is off the private-subnet
         route. Before R28/R29 the resolver walked past both direct entries
         (no krepis table row for moonshot/zhipu) and served openrouter.ai
@@ -1017,9 +1017,9 @@ class TestResolveFiltersByExecutionContext:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
                 with pytest.raises(ValueError) as exc:
                     _router._resolve_group_json(
-                        "ultra", exec_context="lambda_vpc", wire="openai")
+                        "ultra", exec_context="lambda", wire="openai")
             msg = str(exc.value)
-            assert "lambda_vpc" in msg
+            assert "lambda" in msg
             # Fail-closed diagnosis: the message carries WHY each entry went.
             assert "kimi-direct" in msg
             assert "glm-openrouter" in msg
@@ -1036,10 +1036,10 @@ class TestResolveFiltersByExecutionContext:
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
-                # Reachable only from ec2_vpc: the two direct entries survive,
+                # Reachable only from ec2: the two direct entries survive,
                 # so resolution succeeds and the skips are observable.
                 info = _router._resolve_group_json(
-                    "ultra", exec_context="ec2_vpc", wire="anthropic")
+                    "ultra", exec_context="ec2", wire="anthropic")
             reasons = {s["registry_id"]: s["reason"] for s in info["skipped_entries"]}
             assert "kimi-direct" in reasons
             assert "anthropic" in reasons["kimi-direct"]
@@ -1115,3 +1115,94 @@ class TestResolveContractCarriesContext:
             assert info["schema_version"] == 2
         finally:
             _router._router = None
+
+
+class TestRouterIsNeverContextFiltered:
+    """model-router-policy §3.4a R27a — the router is a service, not a location.
+
+    `reachable_from` scopes DIRECT PROVIDER entries only. Applying it to the
+    litellm_proxy route would make the router's availability a property of the
+    caller's network, which is the inversion §3.4a exists to forbid — and the
+    reasoning that produced a 2h20m fleet-wide SSM outage on 2026-08-03
+    (nous-ergon-ops-I417): "the Lambda cannot reach the router, so attach the
+    Lambda to the router's VPC".
+
+    The pairing is what needs a test. The health gate and the reachability
+    filter are each covered above; nothing asserted that the second does not
+    apply to the first, which is the shape where both halves pass and the
+    behaviour is still wrong.
+    """
+
+    def _healthy_litellm(self, monkeypatch):
+        """Make every LiteLLM gate pass without a live proxy."""
+        import http.client as _http
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b""
+
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return _Resp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(_http, "HTTPConnection", _Conn)
+        monkeypatch.setattr(_router, "_resolve_litellm_master_key",
+                            lambda: "test-master-key")
+
+    def test_router_serves_a_context_no_entry_declares(
+        self, reachability_registry, monkeypatch
+    ):
+        """No entry in this fixture declares `lambda`. The router must still
+        serve it — availability is a health question, never a reachability
+        fact about the caller."""
+        self._healthy_litellm(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="lambda", wire="openai")
+            assert info["route"] == "litellm_proxy"
+            assert info["exec_context"] == "lambda"
+        finally:
+            _router._router = None
+
+    def test_no_registry_entry_may_declare_reachability_for_the_router(
+        self, reachability_registry
+    ):
+        """A `route: litellm_proxy` row carrying `reachable_from` would be a
+        registry asserting the thing R27a forbids. The resolver never reads
+        such a row — the proxy path is synthesised, not looked up — so the
+        guard belongs at the registry validator, and this pins the invariant
+        the resolver relies on."""
+        import yaml as _yaml
+        doc = _yaml.safe_load(reachability_registry.read_text())
+        proxy_rows = [m for m in doc["models"]
+                      if m.get("route") == "litellm_proxy"]
+        assert proxy_rows == [], (
+            "the litellm_proxy route is synthesised by the resolver, not a "
+            "registry row; a row for it would be a second source of truth for "
+            "how the router is reached (§3.4a R27f)"
+        )
+
+    def test_context_vocabulary_encodes_no_network_posture(self):
+        """`lambda_vpc` was the original name and is exactly the invitation
+        R27a forbids: a context asserting an attachment makes "attach the
+        consumer" read as the natural fix."""
+        offenders = [c for c in _router.EXEC_CONTEXTS
+                     if "vpc" in c or "subnet" in c or "sg" in c]
+        assert offenders == [], (
+            f"{offenders} name a network attachment, not a place code runs. "
+            "Reaching the router may not depend on network position (R27a)."
+        )

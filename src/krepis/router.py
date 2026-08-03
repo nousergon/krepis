@@ -108,22 +108,30 @@ _ENV_OVERRIDE_MAP: dict[tuple[str, str | None], str] = {
 }
 
 # ── Execution context (model-router-policy R28/R29) ──────────────────────
-# An endpoint is not a global fact.  `http://127.0.0.1:8990` is true on the
-# laptop and on the dashboard box and meaningless inside a Lambda container,
-# and `https://openrouter.ai/api` is reachable from the laptop and NOT from a
-# VPC-attached Lambda on a private-subnet route with no IGW.
+# A DIRECT PROVIDER endpoint is not a global fact.  `http://127.0.0.1:8990` is
+# true on the laptop and on the dashboard box and meaningless inside a Lambda
+# container.  `reachable_from` scopes those, and only those.
 #
-# The vocabulary is the Environment column of llm-egress-proxy-policy.md
-# § "Enforcement mechanism per environment" — one shared list, so reachability
-# and egress compulsion cannot drift apart.
+# It does NOT scope the litellm_proxy route.  model-router-policy §3.4a R27a is
+# categorical: the router is addressed by (url, credential) and reaching it may
+# not depend on host, VPC, subnet, security group or private IP.  So the proxy
+# path below is gated on its HEALTH PROBE and never on context — its
+# unavailability is an outage, never a reachability fact about the caller.
+#
+# The names say WHERE CODE RUNS, never how it is attached.  An earlier draft of
+# this constant read `lambda_vpc`, and a context name asserting a network
+# attachment is an invitation to the R27a violation that cost a 2h20m
+# fleet-wide SSM outage on 2026-08-03 (nous-ergon-ops-I417): the endpoint
+# created to give one VPC-attached Lambda a private path to SSM carried a
+# VPC-wide private-DNS override behind a security group that blocked the VPC.
 #
 # R29: the context is a DECLARED input, never inferred from hostname, the
 # metadata service, or the presence of an env var.  Inference is what makes a
 # mis-resolution look like a health failure.
 EXEC_CONTEXT_LAPTOP = "laptop"
-EXEC_CONTEXT_EC2_VPC = "ec2_vpc"
-EXEC_CONTEXT_LAMBDA_VPC = "lambda_vpc"
-EXEC_CONTEXTS = (EXEC_CONTEXT_LAPTOP, EXEC_CONTEXT_EC2_VPC, EXEC_CONTEXT_LAMBDA_VPC)
+EXEC_CONTEXT_EC2 = "ec2"
+EXEC_CONTEXT_LAMBDA = "lambda"
+EXEC_CONTEXTS = (EXEC_CONTEXT_LAPTOP, EXEC_CONTEXT_EC2, EXEC_CONTEXT_LAMBDA)
 DEFAULT_EXEC_CONTEXT = EXEC_CONTEXT_LAPTOP
 
 # ── Wire formats ─────────────────────────────────────────────────────────
@@ -190,10 +198,12 @@ def _resolve_exec_context(exec_context: str | None = None) -> str:
     if ctx not in EXEC_CONTEXTS:
         raise ValueError(
             f"Unknown execution context {ctx!r}. Declared contexts are "
-            f"{list(EXEC_CONTEXTS)} (the Environment column of "
-            "llm-egress-proxy-policy.md § 'Enforcement mechanism per "
-            "environment'). Set KREPIS_EXEC_CONTEXT to one of them, or add "
-            "the new context to BOTH that table and EXEC_CONTEXTS."
+            f"{list(EXEC_CONTEXTS)} — they name where code runs, never how it "
+            "is attached (model-router-policy R28). Set KREPIS_EXEC_CONTEXT to "
+            "one of them, or add the new context to this constant AND to the "
+            "registry's reachable_from vocabulary. A context name encoding a "
+            "network posture (e.g. 'lambda_vpc') is a defect: reaching the "
+            "router may not depend on network position (§3.4a R27a)."
         )
     return ctx
 
