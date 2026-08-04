@@ -100,6 +100,18 @@ cards:
     output_per_1m: 0.28
     cache_read_per_1m: 0.028     # 10x the DIRECT rate — OpenRouter margin
     cache_create_per_1m: 0.14
+  # OpenRouter pinned the 2026-07-31 0731 revision as its own dated slug
+  # (deepseek/deepseek-v4-flash stays on the original snapshot). The registry
+  # routes to the dated slug, and the OpenRouter completion echoes it back as
+  # model_name, so this card keys on the dated form. The bare-slug card above
+  # is NOT a price change on the same string — it remains the price of the
+  # original snapshot the bare slug still serves.
+  - model_name: deepseek/deepseek-v4-flash-0731
+    effective_from: 2026-07-31
+    input_per_1m: 0.09
+    output_per_1m: 0.18
+    cache_read_per_1m: 0.018     # 20% of input, same discount shape as bare slug
+    cache_create_per_1m: 0.09
   - model_name: deepseek/deepseek-v4-pro
     effective_from: 2026-07-03
     input_per_1m: 0.435
