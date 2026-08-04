@@ -36,6 +36,7 @@ import http.client as _http_client
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -1691,16 +1692,41 @@ ROUTER_CREDENTIAL_SECRET_ENV = "KREPIS_ROUTER_CREDENTIAL_SECRET"
 ROUTER_EDGE_PROVIDER = "litellm_proxy"
 
 
+#: A credential NAME is an identifier, never a path. Enforced rather than
+#: assumed: this value is operator-supplied through the environment and is
+#: interpolated into an SSM parameter path
+#: (:func:`_litellm_master_key_from_ssm`), so an unvalidated one could name a
+#: parameter outside the fleet's prefix — ``../../elsewhere/PARAM`` reads as a
+#: traversal to the SSM API, not as a malformed name. It also reaches logs, and
+#: an identifier cannot carry a newline into a log record.
+_CREDENTIAL_NAME_RE = re.compile(r"\A[A-Za-z0-9_]{1,128}\Z")
+
+
 def router_credential_secret_name() -> str:
     """The secret name holding this consumer's router-edge credential.
 
-    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` when set, else the historical
-    ``LITELLM_MASTER_KEY``.
+    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` when set and well-formed, else the
+    historical ``LITELLM_MASTER_KEY``.
+
+    A malformed value falls back rather than raising: this runs inside route
+    admission, where the established contract is that an unusable credential
+    SKIPS the route with a reason. Raising here would take down every group
+    resolution in the process, including the per-provider routes that have
+    nothing to do with the router edge.
     """
-    return (
-        os.environ.get(ROUTER_CREDENTIAL_SECRET_ENV, "").strip()
-        or "LITELLM_MASTER_KEY"
-    )
+    raw = os.environ.get(ROUTER_CREDENTIAL_SECRET_ENV, "").strip()
+    if not raw:
+        return "LITELLM_MASTER_KEY"
+    if not _CREDENTIAL_NAME_RE.match(raw):
+        logger.warning(
+            "%s is set but is not a valid credential name (expected "
+            "[A-Za-z0-9_]{1,128}); falling back to LITELLM_MASTER_KEY. This "
+            "consumer will authenticate as whoever holds the shared key, so "
+            "fix the variable rather than relying on the fallback.",
+            ROUTER_CREDENTIAL_SECRET_ENV,
+        )
+        return "LITELLM_MASTER_KEY"
+    return raw
 
 
 def route_is_degraded(route: dict) -> bool:

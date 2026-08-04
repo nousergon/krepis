@@ -1767,6 +1767,51 @@ class TestPerConsumerCredentialIsAdmitted:
         _original_litellm_master_key_from_ssm("ROUTER_CONSUMER_THINKTANK")
         assert seen["param"] == "/custom/PARAM"
 
+    # ── the name is an identifier, not a path ────────────────────────────
+
+    @pytest.mark.parametrize("bad", [
+        "../../symposion/LITELLM_MASTER_KEY",   # traversal out of the prefix
+        "/alpha-engine/ROUTER_CONSUMER_X",      # absolute, would double-prefix
+        "ROUTER CONSUMER",                      # space
+        "ROUTER\nCONSUMER",                     # newline into a log record
+        "ROUTER-CONSUMER",                      # hyphen is not an env-var char
+        "x" * 129,                              # over the length bound
+    ])
+    def test_a_malformed_name_falls_back_rather_than_naming_a_path(
+        self, monkeypatch, bad
+    ):
+        """The value is operator-supplied and is interpolated into an SSM
+        parameter path, so `../../elsewhere/PARAM` reads as a traversal to the
+        SSM API rather than as a malformed name."""
+        monkeypatch.setenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, bad)
+        assert _router.router_credential_secret_name() == "LITELLM_MASTER_KEY"
+
+    def test_a_malformed_name_is_warned_not_swallowed(
+        self, monkeypatch, caplog
+    ):
+        """Falling back silently would authenticate this consumer as whoever
+        holds the shared key — the identity collapse distinct credentials exist
+        to prevent — and it would look like a working configuration."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "../../elsewhere/PARAM"
+        )
+        with caplog.at_level("WARNING"):
+            _router.router_credential_secret_name()
+        assert any(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV in r.message
+            or _router.ROUTER_CREDENTIAL_SECRET_ENV in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_well_formed_name_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        assert (
+            _router.router_credential_secret_name()
+            == "ROUTER_CONSUMER_THINKTANK"
+        )
+
 
 def _raise_oserror(*_args, **_kwargs):
     raise OSError("secrets.env neutralised for this test")
