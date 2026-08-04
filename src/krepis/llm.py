@@ -229,13 +229,15 @@ def _empty_content_diagnostics(resp: Any, choice: Any) -> str:
         reasoning = getattr(msg, "reasoning_content", None) or getattr(
             msg, "reasoning", None
         )
-        fields = sorted(
-            k
-            for k, v in (
-                vars(msg) if msg is not None and hasattr(msg, "__dict__") else {}
-            ).items()
-            if v not in (None, "", [], {})
-        )
+        # `vars()` alone is not enough: on a pydantic-modelled SDK response
+        # the provider's non-standard fields live in `__pydantic_extra__`, and
+        # `reasoning_content` — the single most diagnostic name here — is
+        # exactly one of those. Measured 2026-08-04 against the live edge:
+        # `vars()` reported `['role']` on a message carrying 29,877 chars of
+        # reasoning, i.e. it named none of what the operator needs.
+        attrs = dict(vars(msg)) if msg is not None and hasattr(msg, "__dict__") else {}
+        attrs.update(getattr(msg, "model_extra", None) or {})
+        fields = sorted(k for k, v in attrs.items() if v not in (None, "", [], {}))
         return (
             f"finish_reason={getattr(choice, 'finish_reason', None)!r} "
             f"native_finish_reason="

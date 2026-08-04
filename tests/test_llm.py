@@ -1124,6 +1124,29 @@ class TestEmptyContentIsVisible:
             "the populated sibling fields are what say WHERE the output went"
         )
 
+    def test_provider_extra_fields_are_named(self, caplog):
+        """The most diagnostic field lives in pydantic's extras, not `vars()`.
+
+        Measured 2026-08-04 against the live edge: `vars(message)` reported
+        `['role']` on a message carrying 29,877 chars of `reasoning_content`,
+        naming none of what an operator needs.
+        """
+        from krepis.llm import _empty_content_diagnostics
+
+        class _Msg:
+            def __init__(self):
+                self.role = "assistant"
+                self.content = ""
+
+            model_extra = {"reasoning_content": "x" * 100, "refusal": None}
+
+        choice = SimpleNamespace(message=_Msg(), finish_reason="length")
+        out = _empty_content_diagnostics(
+            SimpleNamespace(choices=[choice]), choice
+        )
+        assert "reasoning_content" in out
+        assert "refusal" not in out, "empty fields are noise, not signal"
+
     def test_non_empty_content_logs_nothing(self, caplog):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
         with caplog.at_level(logging.ERROR, logger="krepis.llm"):
