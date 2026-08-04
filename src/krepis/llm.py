@@ -573,6 +573,12 @@ class LLMClient:
         self._max_retries = max_retries
         self._cost_sink = cost_sink
         self._client: Any = None
+        if spec.supports_automatic_prefix_caching:
+            logger.info(
+                "LLMClient(%s/%s): automatic prefix caching is active for this model "
+                "(server-side, no client-side cache_control markers needed)",
+                spec.provider, spec.model,
+            )
         # Parameters the route could not honor and the caller allowed us to
         # drop. Surfaced on LLMResult so a degraded call is visible in the
         # artifact rather than only in a log line.
