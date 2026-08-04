@@ -88,6 +88,25 @@ class TestModelSpec:
         assert spec.resolved_base_url() == "https://openrouter.ai/api/v1"
         assert spec.resolved_api_key_env() == "OPENROUTER_API_KEY"
 
+    def test_supports_automatic_prefix_caching_defaults_false(self):
+        spec = ModelSpec("anthropic", "claude-haiku-4-5")
+        assert spec.supports_automatic_prefix_caching is False
+
+    def test_supports_automatic_prefix_caching_from_json(self):
+        spec = parse_model_spec(
+            '{"provider": "openrouter", "model": "deepseek/deepseek-v4-flash:floor", '
+            '"supports_automatic_prefix_caching": true}'
+        )
+        assert spec.supports_automatic_prefix_caching is True
+
+    def test_supports_automatic_prefix_caching_ssm_round_trip(self):
+        ssm = _FakeSSM({
+            "/p/llm": '{"provider": "openai", "model": "gpt-5", '
+                      '"supports_automatic_prefix_caching": true}'
+        })
+        spec = resolve_model_spec("/p/llm", default=ModelSpec("anthropic", "x"), ssm_client=ssm)
+        assert spec.supports_automatic_prefix_caching is True
+
     def test_custom_provider_requires_explicit_fields(self):
         bare = ModelSpec("vllm_spot", "my-model")
         assert bare.transport == "openai"

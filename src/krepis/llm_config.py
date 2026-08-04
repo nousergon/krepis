@@ -165,6 +165,18 @@ class ModelSpec:
         billed at all) while producing the longest content. Without this
         knob a reasoning model can silently produce a well-formed, fully
         billed, EMPTY response through this adapter.
+    supports_automatic_prefix_caching
+        Whether the provider/model supports server-side automatic prefix
+        caching (e.g. DeepSeek, Moonshot/Kimi, Zhipu/GLM). When ``True``,
+        the provider caches repeated prompt prefixes transparently with
+        no client-side ``cache_control`` markers needed. Defaults to
+        ``False`` (conservative) — set explicitly in the SSM JSON spec
+        or code default when the model is known to support it. Read by
+        :class:`krepis.llm.LLMClient` for cache-aware logging; no
+        client-side behavior change is required since the caching is
+        automatic. Contrast with ``prompt_caching`` (Anthropic-style
+        explicit ``cache_control`` breakpoints) which is transport-level
+        and needs no ModelSpec field.
     """
 
     provider: str
@@ -174,6 +186,7 @@ class ModelSpec:
     structured_outputs: bool = True
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
+    supports_automatic_prefix_caching: bool = False
 
     def _registry_defaults(self) -> Optional[ProviderDefaults]:
         return PROVIDER_REGISTRY.get(self.provider)
@@ -220,6 +233,7 @@ _SPEC_JSON_FIELDS = {
     "structured_outputs",
     "api_key_env",
     "reasoning",
+    "supports_automatic_prefix_caching",
 }
 
 
