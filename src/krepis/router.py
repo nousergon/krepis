@@ -407,29 +407,39 @@ LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
 # Deliberately still short; this gates a routing decision, not a request.
 LITELLM_PROBE_TIMEOUT_S = float(os.environ.get("KREPIS_LITELLM_PROBE_TIMEOUT_S", "5"))
 
-def _resolve_litellm_master_key() -> Optional[str]:
-    """Resolve THIS consumer's router-edge credential, by its own name.
+def resolve_router_credential(name: Optional[str] = None) -> Optional[str]:
+    """Resolve a router-edge credential VALUE, by credential *name*.
 
-    The name comes from :func:`router_credential_secret_name` — the same one
-    :func:`resolve_group_spec` puts in ``ModelSpec.api_key_env`` — so a single
-    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` declaration serves both the admission
-    check here and the call itself.
+    Three legs, in order: process environment → ``secrets.env`` → AWS SSM
+    (``krepis.secrets.SSM_PREFIX + name``, see
+    :func:`_litellm_master_key_from_ssm`). Returns the credential, or ``None``
+    when no leg answers.
 
-    Until alpha-engine-config-I6414 this leg hardcoded the literal
-    ``LITELLM_MASTER_KEY`` while the call path honoured the override, so the two
-    halves disagreed about which credential the consumer had. A consumer
-    configured exactly as I6373 intends was **rejected in ``_resolve_group_json``
-    before its credential was ever consulted** — measured 2026-08-04 on
-    ``alpha-engine-research-runner`` with ``KREPIS_ROUTER_CREDENTIAL_SECRET``
-    set correctly, and again on the Think Tank spot box, which it took down.
-    The two halves had been tested separately and each passed.
+    *name* defaults to :func:`router_credential_secret_name` — the same name
+    :func:`resolve_group_spec` puts in ``ModelSpec.api_key_env`` — so one
+    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` declaration serves both route
+    admission and the call itself. Callers holding an already-resolved
+    ``ModelSpec`` should pass ``spec.resolved_api_key_env()`` rather than
+    re-deriving it, so a spec built with an explicit ``api_key_env`` resolves
+    the credential it actually names.
 
-    Unset, behaviour is byte-identical to before: the name resolves to
-    ``LITELLM_MASTER_KEY`` and all three legs read exactly what they used to.
+    **Public because both halves of the contract need it** (I6373 / I6414).
+    Route admission calls it to decide whether the edge is offered;
+    :meth:`krepis.llm.LLMClient._resolve_api_key` calls it to authenticate the
+    request. While it was private, the call half could not reach it and read
+    ``os.environ`` alone: a consumer whose credential lived only in SSM — the
+    shape :func:`resolve_group_spec` is designed around, because an SSM-only
+    credential never enters an environment, a log, or an SSM command string —
+    passed admission and then died at the call with ``no API key for provider
+    'litellm_proxy'``. Measured 2026-08-04 on the Think Tank spot box
+    (``manifest_1d6e7a653137``, aborted after 5s with 0 theses written) and on
+    ``alpha-engine-research-runner``, both configured exactly as I6373 intends.
+    I6414 fixed the admission half only; the two halves still disagreed, one
+    layer further in.
     """
     import os as _os
 
-    _name = router_credential_secret_name()
+    _name = name or router_credential_secret_name()
 
     # 1. Env var, under this consumer's name.
     _key = _os.environ.get(_name, "").strip()
@@ -457,6 +467,16 @@ def _resolve_litellm_master_key() -> Optional[str]:
 
     # 3. AWS SSM
     return _litellm_master_key_from_ssm(_name)
+
+
+def _resolve_litellm_master_key() -> Optional[str]:
+    """Back-compat alias for :func:`resolve_router_credential` with no name.
+
+    Retained rather than renamed at every call site: this is the in-module
+    admission path, and keeping the private name means the I6414 change and
+    this one stay separable in ``git blame``.
+    """
+    return resolve_router_credential()
 
 
 def _litellm_master_key_from_ssm(name: str = "LITELLM_MASTER_KEY") -> Optional[str]:
@@ -1684,12 +1704,13 @@ ROUTER_CREDENTIAL_SECRET_ENV = "KREPIS_ROUTER_CREDENTIAL_SECRET"
 
 #: Provider name emitted for the router-edge route.
 #:
-#: Deliberately NOT ``"litellm"``: that name is bound in
-#: ``llm_config.PROVIDER_REGISTRY`` to ``TRANSPORT_LITELLM``, i.e. the
-#: in-process :func:`get_router`, which calls providers directly from the
-#: consumer.  This name is unknown to that registry, so ``ModelSpec`` treats
-#: it as a custom OpenAI-compatible endpoint — which is what the edge is.
-ROUTER_EDGE_PROVIDER = "litellm_proxy"
+#: Re-exported from :mod:`krepis.llm_config`, which is where it now lives:
+#: :mod:`krepis.llm` must recognise the same name to authenticate the edge on
+#: the router credential chain (alpha-engine-config-I6373), and a second
+#: literal in a second module is how the two halves drift apart. Imported at
+#: call depth rather than module top because this module deliberately has no
+#: top-level ``krepis`` imports.
+from krepis.llm_config import ROUTER_EDGE_PROVIDER  # noqa: E402
 
 
 #: A credential NAME is an identifier, never a path. Enforced rather than
