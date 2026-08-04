@@ -7,6 +7,7 @@ import pytest
 from pydantic import BaseModel, Field
 
 from krepis.llm import (
+    BudgetExhaustedError,
     LLMClient,
     LLMError,
     NullChoicesError,
@@ -1179,3 +1180,94 @@ class TestEmptyContentIsVisible:
 
         resp = SimpleNamespace(choices=[_Hostile()])
         assert _choice_text(resp) == ""
+
+
+class TestBudgetExhaustedIsNotRetried:
+    """An exhausted budget is a certainty about every remaining attempt.
+
+    `no JSON object found in response: ''` says *the model returned something
+    unparseable* — a prompt or model problem. The actual fault is *max_tokens
+    was too small for this ask*, a one-line registry change. Three wrong
+    hypotheses were chased against a live paid endpoint before anyone looked
+    at `finish_reason` (alpha-engine-config#6391).
+
+    Retrying does not merely fail to inform. Measured on the Director's weekly
+    call: two attempts, ~100s of generation each, both fully billed, and the
+    second was guaranteed to fail before the first returned.
+    """
+
+    def _length_capped_empty(self):
+        usage = _openai_usage()
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=7993)
+        return _openai_resp("", usage=usage, finish_reason="length")
+
+    def test_it_raises_on_the_first_occurrence(self):
+        fake = FakeOpenAI([self._length_capped_empty()] * 2)
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert len(fake.kwargs) == 1, (
+            "the second attempt re-issues the identical ask under the "
+            "identical ceiling — it can only fail again, and it bills again"
+        )
+        msg = str(exc.value)
+        assert "max_tokens=1024" in msg, "name the budget that was too small"
+        assert "reasoning_tokens=7993" in msg
+        assert "no JSON object" not in msg, (
+            "the old message points at the prompt; this fault is the budget"
+        )
+
+    def test_it_is_an_llm_error_so_callers_still_catch_it(self):
+        fake = FakeOpenAI([self._length_capped_empty()])
+        with pytest.raises(LLMError):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+
+    def test_it_carries_the_usage_of_the_billed_attempt(self):
+        fake = FakeOpenAI([self._length_capped_empty()])
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert exc.value.usage is not None
+        assert exc.value.usage.output_tokens > 0, (
+            "the attempt was billed — a failed call still has spend to record"
+        )
+
+    def test_empty_with_finish_reason_stop_keeps_the_retry(self):
+        """A DIFFERENT fault: a model that answered with nothing.
+
+        A retry can fix that one, so it must keep the corrective-retry path.
+        """
+        fake = FakeOpenAI([
+            _openai_resp("", finish_reason="stop"),
+            _openai_resp('{"name": "a", "score": 1}', finish_reason="stop"),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.name == "a"
+        assert len(fake.kwargs) == 2
+
+    def test_length_capped_WITH_content_is_ordinary_truncation(self):
+        """Truncation the caller may still parse — not this fault."""
+        fake = FakeOpenAI([
+            _openai_resp('{"name": "a", "score": 1}', finish_reason="length"),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.score == 1
+
+    def test_anthropic_max_tokens_before_the_tool_block(self):
+        msg = _anthropic_msg([_text_block("thinking...")])
+        msg.stop_reason = "max_tokens"
+        fake = FakeAnthropic([msg, msg])
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(ANTHROPIC_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert "stop_reason='max_tokens'" in str(exc.value)
+        assert len(fake.payloads) == 1

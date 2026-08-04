@@ -293,6 +293,82 @@ class LLMError(RuntimeError):
         self.usage = usage
 
 
+class BudgetExhaustedError(LLMError):
+    """The completion budget ran out before any content was produced.
+
+    A distinct type because it has a distinct fix. ``no JSON object found in
+    response: ''`` — what this used to surface as — says *the model returned
+    something unparseable*, which is a prompt or model problem. The actual
+    fault is *``max_tokens`` was too small for this ask*, a one-line change to
+    the registry row. Three wrong hypotheses were chased against a live paid
+    endpoint before anyone looked at ``finish_reason``
+    (alpha-engine-config#6391).
+
+    **Never retried.** The second attempt cannot succeed under the same
+    budget: it re-issues the identical ask against the identical ceiling.
+    Measured on the Director's weekly call — two attempts, ~100s of generation
+    each, both fully billed, both guaranteed to fail before the first one
+    returned. Retrying does not merely fail to inform, it doubles the cost of
+    a certain failure.
+
+    Empty content with ``finish_reason='stop'`` is a DIFFERENT fault and keeps
+    the ordinary corrective-retry path — that one really is a model returning
+    nothing useful, and a retry can fix it.
+    """
+
+
+def _budget_exhausted_error(
+    *,
+    spec: "ModelSpec",
+    max_tokens: int,
+    stop_signal: str,
+    reasoning_tokens: Any = None,
+    usage: "Optional[LLMUsage]" = None,
+) -> "BudgetExhaustedError":
+    """The one message, built the same way for every transport."""
+    return BudgetExhaustedError(
+        f"provider={spec.provider} model={spec.model}: the completion budget "
+        f"was exhausted before any content was produced — max_tokens="
+        f"{max_tokens}, {stop_signal}, reasoning_tokens={reasoning_tokens!r}. "
+        f"On a reasoning model max_tokens bounds reasoning AND content "
+        f"together, so the trace consumed the whole budget and nothing was "
+        f"left to answer with. Raise the budget for this ask — not the "
+        f"prompt, and not the schema.",
+        usage=usage,
+    )
+
+
+def _reject_budget_exhausted(
+    resp: Any,
+    text: str,
+    *,
+    spec: "ModelSpec",
+    max_tokens: int,
+    usage: "Optional[LLMUsage]" = None,
+) -> None:
+    """Raise :exc:`BudgetExhaustedError` for an empty, length-capped response.
+
+    No-op unless the content is empty AND the provider says it stopped because
+    it hit the ceiling. Both conditions matter: a length-capped response WITH
+    content is ordinary truncation the caller may still parse, and an empty
+    response that stopped naturally is a different fault entirely
+    (a model that answered with nothing, which a retry can fix).
+    """
+    if text:
+        return
+    choice = _first_choice(resp)
+    if getattr(choice, "finish_reason", None) != "length":
+        return
+    details = getattr(getattr(resp, "usage", None), "completion_tokens_details", None)
+    raise _budget_exhausted_error(
+        spec=spec,
+        max_tokens=max_tokens,
+        stop_signal="finish_reason='length'",
+        reasoning_tokens=getattr(details, "reasoning_tokens", None),
+        usage=usage,
+    )
+
+
 # ── Result types ──────────────────────────────────────────────────────────
 
 
@@ -1062,6 +1138,18 @@ class LLMClient:
             msg = client.messages.create(**payload)
             self._usage_from_anthropic(msg, into=usage)
             tool_input = self._extract_tool_input(msg, schema_name)
+            # Same fault, Anthropic's spelling of it: the forced tool never
+            # got emitted because the budget ran out first. Raised outside the
+            # retry classification for the same reason as the openai path —
+            # the next attempt re-issues the identical ask under the identical
+            # ceiling.
+            if tool_input is None and getattr(msg, "stop_reason", None) == "max_tokens":
+                raise _budget_exhausted_error(
+                    spec=self.spec,
+                    max_tokens=max_tokens,
+                    stop_signal="stop_reason='max_tokens'",
+                    usage=usage,
+                )
             try:
                 if tool_input is None:
                     raise ValueError(
@@ -1153,6 +1241,13 @@ class LLMClient:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 raw_text = _choice_text(resp)
+                # Deliberately OUTSIDE the retry classification below: a
+                # budget exhausted before any content is not an attempt
+                # failure, it is a certainty about every remaining attempt.
+                _reject_budget_exhausted(
+                    resp, raw_text, spec=self.spec,
+                    max_tokens=max_tokens, usage=usage,
+                )
             except (json.JSONDecodeError, NullChoicesError) as exc:
                 # Two body-level transport failures on what the SDK treated as
                 # a SUCCESSFUL transaction, both invisible to its own
@@ -1297,6 +1392,17 @@ class LLMClient:
                 # attempt goes to a DIFFERENT model, so sleeping first would
                 # delay a call that is not hitting the unhealthy endpoint.
                 raw_text = _choice_text(resp)
+                # Raised INSIDE the guarded block here, unlike the openai
+                # path: the Router's next attempt goes to a DIFFERENT model in
+                # the group, which may well answer within the same budget, so
+                # a budget exhaustion is a genuine attempt failure rather than
+                # a certainty about the rest. What it must not be is
+                # anonymous — caught below, its message becomes ``last_error``
+                # and names the budget in the final LLMError.
+                _reject_budget_exhausted(
+                    resp, raw_text, spec=self.spec,
+                    max_tokens=max_tokens, usage=usage,
+                )
                 parsed = self._extract_json(raw_text)
                 validated = parse_and_validate(parsed)
             except Exception as exc:
