@@ -58,6 +58,22 @@ TRANSPORT_ANTHROPIC = "anthropic"
 TRANSPORT_OPENAI = "openai"
 TRANSPORT_LITELLM = "litellm"
 
+#: Provider name emitted for the router-edge route by
+#: :func:`krepis.router.resolve_group_spec`.
+#:
+#: Deliberately NOT ``"litellm"``: that name is bound in
+#: :data:`PROVIDER_REGISTRY` below to :data:`TRANSPORT_LITELLM`, i.e. the
+#: in-process ``krepis.router.get_router``, which calls providers directly from
+#: the consumer.  This name is absent from that registry, so :class:`ModelSpec`
+#: treats it as a custom OpenAI-compatible endpoint — which is what the edge is.
+#:
+#: Defined HERE, in the module both :mod:`krepis.router` (which stamps it onto
+#: the spec) and :mod:`krepis.llm` (which must recognise it to authenticate on
+#: the router credential chain) already import, rather than in either of them.
+#: ``krepis.router.ROUTER_EDGE_PROVIDER`` re-exports it, so the name keeps
+#: working where it is already used.
+ROUTER_EDGE_PROVIDER = "litellm_proxy"
+
 
 @dataclass(frozen=True)
 class ProviderDefaults:
