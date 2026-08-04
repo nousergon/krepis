@@ -1690,3 +1690,80 @@ class TestResolveGroupSpec:
         r.pop("primary_registry_id")
         r.pop("primary_model")
         assert _router.route_is_degraded(r) is True
+
+
+class TestAppConfigFailureIsObservable:
+    """`krepis.logging.setup_logging` pins the root logger at INFO with no env
+    override, so anything logged below INFO is unobservable in every deployed
+    environment that uses it. AppConfig resolution used to log its failure at
+    DEBUG — measured 2026-08-04 on alpha-engine-research-runner, where it
+    failed on every invocation and the only visible symptom was a
+    FileNotFoundError naming LLM_MODEL_REGISTRY_PATH, which is not the cause.
+    """
+
+    def _optin(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_APPCONFIG_APPLICATION", "alpha-engine")
+        monkeypatch.setenv("KREPIS_APPCONFIG_CONFIG_PROFILE", "llm-model-registry")
+        monkeypatch.setenv("KREPIS_APPCONFIG_ENVIRONMENT", "production")
+        _router._appconfig_cached_path = None
+        _router._appconfig_next_poll_s = 0.0
+
+    def test_a_failed_poll_logs_at_warning(self, monkeypatch, caplog):
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+
+        def _boom(*a, **k):
+            raise RuntimeError("AccessDenied: simulated")
+
+        monkeypatch.setattr(_b3, "client", _boom)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert any(r.levelname == "WARNING" for r in caplog.records), (
+            "the failure is invisible at INFO, which is where every consumer "
+            "of krepis.logging.setup_logging is pinned"
+        )
+        assert "AppConfig registry resolution FAILED" in caplog.text
+
+    def test_the_warning_says_the_fallback_cannot_help(self, monkeypatch, caplog):
+        """\"Falling through to the filesystem walk\" reads as recovery. In a
+        Lambda or on a fresh spot box that walk finds nothing, so the message
+        has to say so — otherwise the next reader treats the raise that
+        follows as the real fault."""
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+        monkeypatch.setattr(_b3, "client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            _router._find_registry_from_appconfig()
+        assert "finds nothing" in caplog.text
+        assert "LLM_MODEL_REGISTRY_PATH" in caplog.text
+
+    def test_an_empty_configuration_also_warns(self, monkeypatch, caplog):
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+
+        class _Body:
+            def read(self):
+                return b""
+
+        class _Client:
+            def start_configuration_session(self, **k):
+                return {"InitialConfigurationToken": "t"}
+
+            def get_latest_configuration(self, **k):
+                return {"Configuration": _Body()}
+
+        monkeypatch.setattr(_b3, "client", lambda *a, **k: _Client())
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert "EMPTY configuration" in caplog.text
+
+    def test_no_warning_when_appconfig_was_never_opted_into(self, monkeypatch, caplog):
+        """Environments with a local checkout never set the opt-in and must
+        stay quiet — this branch is not reachable for them."""
+        monkeypatch.delenv("KREPIS_APPCONFIG_APPLICATION", raising=False)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert caplog.text == ""
