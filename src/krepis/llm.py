@@ -192,9 +192,90 @@ def _first_choice(resp: Any) -> Any:
     return choices[0]
 
 
+def _empty_content_diagnostics(resp: Any, choice: Any) -> str:
+    """Why ``message.content`` came back empty, in one line.
+
+    An empty content on an otherwise successful response has several causes
+    that look identical from the outside, and the SDK surfaces none of them:
+
+    - a **reasoning model that spent the whole output budget on its trace**.
+      ``max_tokens`` bounds reasoning + content together, so the response is
+      large, ``choices`` is present, and ``content`` is ``''``. This is what
+      the Director hit on 2026-08-04 (alpha-engine-config#6396): two ~100s
+      completions, both fully billed, nginx logging 30 KB responses, and the
+      only signal was ``no JSON object found in response: ''``;
+    - a refusal or a content filter, which lands in a sibling field;
+    - a genuinely truncated body (``finish_reason='length'``);
+    - a provider whose content sits somewhere other than ``message.content``.
+
+    ``finish_reason`` alone does not separate them — a budget consumed by
+    reasoning reports ``length`` on some routes and ``stop`` on others. The
+    reasoning-token count and the sibling field names do.
+    """
+    # The ONE swallow in this module's fail-loud contract, and it is bounded to
+    # instrumentation: (a) the failure mode swallowed is this function's own
+    # introspection raising — an SDK response object whose attribute access
+    # has side effects, which `getattr(x, y, None)` does NOT protect against,
+    # because a raising `__getattr__` propagates past the default; (b) the
+    # primary deliverable survives untouched — the caller still receives the
+    # content it read and classifies it exactly as before, since a diagnostic
+    # that can break the call it describes is worse than no diagnostic;
+    # (c) the recording surface is the same ERROR line, which still emits and
+    # names the introspection failure instead of the fields.
+    try:
+        msg = getattr(choice, "message", None)
+        usage = getattr(resp, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(msg, "reasoning_content", None) or getattr(
+            msg, "reasoning", None
+        )
+        fields = sorted(
+            k
+            for k, v in (
+                vars(msg) if msg is not None and hasattr(msg, "__dict__") else {}
+            ).items()
+            if v not in (None, "", [], {})
+        )
+        return (
+            f"finish_reason={getattr(choice, 'finish_reason', None)!r} "
+            f"native_finish_reason="
+            f"{getattr(choice, 'native_finish_reason', None)!r} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)!r} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)!r} "
+            f"reasoning_chars="
+            f"{len(reasoning) if isinstance(reasoning, str) else None} "
+            f"populated_message_fields={fields} "
+            f"response_type={type(resp).__name__} "
+            f"id={getattr(resp, 'id', None)!r} "
+            f"model={getattr(resp, 'model', None)!r}"
+        )
+    except Exception as exc:  # noqa: BLE001 — see the three-part rationale above
+        return (
+            f"diagnostics unavailable: introspecting the response raised "
+            f"{exc.__class__.__name__}: {exc} "
+            f"(response_type={type(resp).__name__})"
+        )
+
+
 def _choice_text(resp: Any) -> str:
-    """First choice's message content, stripped. Raises on null choices."""
-    return (_first_choice(resp).message.content or "").strip()
+    """First choice's message content, stripped. Raises on null choices.
+
+    Logs at ERROR when the content is empty. The emptiness itself is not an
+    error here — callers classify it — but it is invisible without this line,
+    and the caller-facing symptom actively misdirects: a structured caller
+    reports ``no JSON object found in response: ''``, which reads as a model
+    that answered in prose. Instrumented at THIS chokepoint rather than at the
+    structured paths, for the same reason ``_first_choice`` is: a guard
+    applied at four of five call sites is not a guard.
+    """
+    choice = _first_choice(resp)
+    text = (getattr(choice.message, "content", None) or "").strip()
+    if not text:
+        logger.error(
+            "llm: EMPTY message.content on a successful response — %s",
+            _empty_content_diagnostics(resp, choice),
+        )
+    return text
 
 
 class LLMError(RuntimeError):
@@ -654,6 +735,41 @@ class LLMClient:
             usage.provider_cost_usd = (usage.provider_cost_usd or 0.0) + float(cost)
         return usage
 
+    def _effective_max_tokens(self, max_tokens: Optional[int]) -> int:
+        """The budget actually sent, warning when a caller shrinks the row's.
+
+        ``max_tokens`` is a registry-owned parameter, and a caller-supplied
+        value wins over :attr:`ModelSpec.max_tokens` outright. Raising it is
+        ordinary — a caller that knows its own ask is larger than the row's
+        default. LOWERING it silently reverses the registry, and on a
+        reasoning model that is not a smaller answer, it is NO answer:
+        ``max_tokens`` bounds reasoning + content together, so the trace
+        consumes the budget and ``content`` comes back ``''``.
+
+        Live 2026-08-04 (alpha-engine-config#6396): the Director passed a
+        literal 8000 against a row carrying 65536. Two ~100s completions, both
+        fully billed, both empty — and raising the ROW from 16384 to 65536 as
+        the remediation changed nothing, because the literal was what the
+        request carried. Nothing anywhere logged the number on the wire.
+
+        This is a warning rather than a refusal: shrinking the budget is a
+        legitimate cost control, and this library does not get to overrule a
+        caller. It only has to stop the override being invisible.
+        """
+        if max_tokens is None:
+            return self.spec.max_tokens
+        if max_tokens < self.spec.max_tokens:
+            logger.warning(
+                "llm: caller max_tokens=%d OVERRIDES the registry's %d for "
+                "provider=%s model=%s — the wire carries %d. A registry-side "
+                "budget change cannot reach this call while the override "
+                "stands, and on a reasoning model max_tokens bounds reasoning "
+                "+ content together (alpha-engine-config#6396).",
+                max_tokens, self.spec.max_tokens, self.spec.provider,
+                self.spec.model, max_tokens,
+            )
+        return max_tokens
+
     def _openai_extra_body(self) -> Optional[dict]:
         body: dict = {}
         if self._is_openrouter():
@@ -714,7 +830,7 @@ class LLMClient:
         — there is nothing to forward and nothing is lost.
         """
         self._reject_reasoning_on_anthropic()
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             payload = build_messages_payload(
@@ -856,7 +972,7 @@ class LLMClient:
 
         is_pydantic = hasattr(schema, "model_json_schema")
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         def _parse_and_validate(raw_data: Any):
             if is_pydantic:
@@ -1285,7 +1401,7 @@ class LLMClient:
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             extra: dict = {

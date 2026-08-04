@@ -1,5 +1,6 @@
 """Tests for ``krepis.llm.LLMClient`` — both transports via fake clients."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -1018,3 +1019,140 @@ class TestRetryBackoff:
         finally:
             _mod._time.sleep = real_sleep
         assert all(0.0 <= d <= _RETRY_DELAY_CAP_S for d in seen), seen
+
+
+# ── budget ownership + empty-content visibility (alpha-engine-config#6396) ──
+
+
+class TestEffectiveMaxTokens:
+    """`max_tokens` is registry-owned. A caller literal wins — say so.
+
+    `structured`/`complete`/`structured_with_search` all resolve the budget as
+    "the caller's if given, else the row's". Raising it is ordinary. LOWERING
+    it silently reverses the registry, and on a reasoning model that is not a
+    smaller answer — `max_tokens` bounds reasoning + content together, so the
+    trace consumes the budget and `content` comes back `''`.
+
+    Live 2026-08-04: the Director passed a literal 8000 against a row carrying
+    65536. Two ~100s completions, both fully billed, both empty. Raising the
+    ROW 16384 -> 65536 as the remediation changed nothing, because the literal
+    was what the request carried, and nothing logged the wire value.
+    """
+
+    def test_none_uses_the_registry_budget(self):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert fake.kwargs[0]["max_tokens"] == 1024
+
+    def test_a_lower_caller_value_reaches_the_wire_and_warns(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+                max_tokens=8,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 8, (
+            "the caller's value is what the request carries — the library "
+            "does not overrule it, it only refuses to hide it"
+        )
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warned, "a caller shrinking the registry budget logged nothing"
+        assert "1024" in warned[0].getMessage(), (
+            "the warning must name the registry value being overridden, or an "
+            "operator cannot tell a registry change is inert"
+        )
+
+    def test_a_higher_caller_value_does_not_warn(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+                max_tokens=4096,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 4096
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_complete_resolves_the_budget_the_same_way(self, caplog):
+        fake = FakeOpenAI([_openai_resp("hello")])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u", max_tokens=8,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 8
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "the override is invisible on `complete` too — every budget site "
+            "goes through the same resolver, or the guard covers some of them"
+        )
+
+
+class TestEmptyContentIsVisible:
+    """An empty `message.content` on a 200 must not pass silently.
+
+    The caller-facing symptom actively misdirects: a structured caller reports
+    `no JSON object found in response: ''`, which reads as a model that
+    answered in prose. Three diagnostic cycles were spent on that reading
+    while the response was 30 KB of reasoning trace.
+    """
+
+    def _empty_reasoning_resp(self):
+        usage = _openai_usage()
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=7998)
+        resp = _openai_resp("", usage=usage, finish_reason="stop")
+        resp.choices[0].message.reasoning_content = "x" * 30000
+        return resp
+
+    def test_empty_content_logs_the_reasoning_budget(self, caplog):
+        fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
+        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        errors = [r.getMessage() for r in caplog.records
+                  if r.levelno == logging.ERROR]
+        assert errors, "an empty content produced no ERROR line"
+        msg = errors[0]
+        assert "reasoning_tokens=7998" in msg, (
+            "without the reasoning-token count, an exhausted budget and a lost "
+            "response body are the same log line"
+        )
+        assert "finish_reason='stop'" in msg
+        assert "reasoning_content" in msg, (
+            "the populated sibling fields are what say WHERE the output went"
+        )
+
+    def test_non_empty_content_logs_nothing(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_whitespace_only_content_counts_as_empty(self, caplog):
+        fake = FakeOpenAI([_openai_resp("   \n  ")] * 2)
+        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    def test_diagnostics_never_mask_the_fault(self):
+        """A response the diagnostic cannot introspect must still return ''."""
+        from krepis.llm import _choice_text
+
+        class _Hostile:
+            @property
+            def message(self):
+                return SimpleNamespace(content="")
+
+            def __getattr__(self, name):
+                raise RuntimeError("this response resists introspection")
+
+        resp = SimpleNamespace(choices=[_Hostile()])
+        assert _choice_text(resp) == ""
