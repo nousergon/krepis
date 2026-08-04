@@ -1532,11 +1532,45 @@ class TestResolveGroupSpec:
     def test_builds_a_spec_from_the_route(self, monkeypatch):
         self._patch(monkeypatch, self._route())
         spec, route = _router.resolve_group_spec("med", exec_context="lambda")
-        assert spec.provider == "litellm"
         assert spec.model == "med"
         assert spec.base_url == "https://router.example:8443"
         assert spec.max_tokens == 8192
         assert route["group"] == "med"
+
+    def test_proxy_route_is_an_openai_endpoint_not_the_in_process_router(
+        self, monkeypatch
+    ):
+        """`resolve_group_structured` reports provider `litellm` for the proxy
+        route, and ModelSpec binds that name to TRANSPORT_LITELLM — the
+        in-process `get_router()`, which calls each provider DIRECTLY from
+        the consumer and reads OPENROUTER_API_KEY from the environment as it
+        goes. Emitting it verbatim would egress unscanned to openrouter.ai,
+        bypass the authenticated edge entirely, and require litellm plus a
+        readable registry inside every consumer — the constraint that
+        reverted crucible-evaluator-PR157 (alpha-engine-config-I6059)."""
+        from krepis.llm_config import PROVIDER_REGISTRY, TRANSPORT_OPENAI
+
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+
+        assert spec.provider == _router.ROUTER_EDGE_PROVIDER == "litellm_proxy"
+        assert spec.provider not in PROVIDER_REGISTRY, (
+            "a name known to PROVIDER_REGISTRY takes that provider's "
+            "transport; the edge must resolve as a custom OpenAI-compatible "
+            "endpoint"
+        )
+        assert spec.transport == TRANSPORT_OPENAI
+        # base_url + api_key_env are what make a custom endpoint valid.
+        assert spec.base_url and spec.api_key_env
+
+    def test_non_proxy_routes_keep_their_provider(self, monkeypatch):
+        self._patch(monkeypatch, self._route(
+            provider="deepseek", route="egress_proxy",
+            auth_token_type="placeholder",
+            api_base_url="http://127.0.0.1:8990",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.provider == "deepseek"
 
     def test_explicit_max_tokens_overrides_the_registry(self, monkeypatch):
         self._patch(monkeypatch, self._route())
