@@ -660,8 +660,15 @@ def _find_registry_from_appconfig() -> Optional[Path]:
             )
             content = response["Configuration"].read()
             if not content:
-                logger.debug(
-                    "AppConfig returned empty configuration for %s/%s/%s",
+                # Same reasoning as the exception branch below: the caller
+                # opted in, so "AppConfig answered with nothing deployed" is
+                # a configuration fault it needs to see, not a debug detail.
+                logger.warning(
+                    "AppConfig returned an EMPTY configuration for %s/%s/%s "
+                    "— nothing is deployed to that profile/environment. "
+                    "Falling through to the filesystem walk, which finds "
+                    "nothing in an environment with no alpha-engine-config "
+                    "checkout.",
                     app_id, config_profile, environment,
                 )
                 return None
@@ -691,9 +698,37 @@ def _find_registry_from_appconfig() -> Optional[Path]:
             return cache_file
 
         except Exception:
-            logger.debug(
-                "AppConfig registry resolution failed — "
-                "falling through to filesystem walk",
+            # WARNING, not debug.  This branch is only reachable when the
+            # caller explicitly OPTED IN by setting
+            # KREPIS_APPCONFIG_APPLICATION — it asked for AppConfig, so
+            # AppConfig failing is news, not noise.
+            #
+            # It was debug, and that made the failure unobservable in every
+            # deployed environment: `krepis.logging.setup_logging` pins the
+            # root logger at INFO with no env override, so nothing below INFO
+            # can ever be emitted by a consumer that uses it. Measured
+            # 2026-08-04 on alpha-engine-research-runner — AppConfig resolution
+            # failed on every invocation and the only visible symptom was
+            # `FileNotFoundError: LLM_MODEL_REGISTRY.yaml not found — set
+            # LLM_MODEL_REGISTRY_PATH ...` raised much later from
+            # `_resolve_group_json`, naming neither AppConfig nor the cause.
+            # Enabling Lambda's own DEBUG log level does not help, because
+            # setup_logging clears the root handlers and re-pins the level.
+            #
+            # The message must also say what the fallback WILL do, because in
+            # a Lambda or on a stock-AMI box the filesystem walk cannot
+            # succeed — "falling through" reads as recovery when it is
+            # actually the last step before a confusing raise.
+            logger.warning(
+                "AppConfig registry resolution FAILED for %s/%s/%s — falling "
+                "through to the filesystem walk, which finds nothing in an "
+                "environment with no alpha-engine-config checkout (a Lambda, "
+                "a fresh spot box). If no registry is found the caller raises "
+                "FileNotFoundError naming LLM_MODEL_REGISTRY_PATH, which is "
+                "not the cause. Check the role's appconfigdata: "
+                "StartConfigurationSession / GetLatestConfiguration grants "
+                "and that a configuration is deployed.",
+                app_id, config_profile, environment,
                 exc_info=True,
             )
             # If we had a previously cached file that still exists, keep
