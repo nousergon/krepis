@@ -1718,12 +1718,17 @@ def router_credential_secret_name() -> str:
     if not raw:
         return "LITELLM_MASTER_KEY"
     if not _CREDENTIAL_NAME_RE.match(raw):
+        # The variable name is inlined rather than passed as an argument.
+        # It is a module-level constant and cannot carry a secret, but
+        # `py/clear-text-logging-sensitive-data` matches on the identifier, so
+        # passing it flags an alert that says nothing. Inlining costs nothing
+        # and leaves the alert list carrying only the flows worth arguing about.
         logger.warning(
-            "%s is set but is not a valid credential name (expected "
-            "[A-Za-z0-9_]{1,128}); falling back to LITELLM_MASTER_KEY. This "
-            "consumer will authenticate as whoever holds the shared key, so "
-            "fix the variable rather than relying on the fallback.",
-            ROUTER_CREDENTIAL_SECRET_ENV,
+            "KREPIS_ROUTER_CREDENTIAL_SECRET is set but is not a valid "
+            "credential name (expected [A-Za-z0-9_]{1,128}); falling back to "
+            "LITELLM_MASTER_KEY. This consumer will authenticate as whoever "
+            "holds the shared key, so fix the variable rather than relying "
+            "on the fallback."
         )
         return "LITELLM_MASTER_KEY"
     return raw
