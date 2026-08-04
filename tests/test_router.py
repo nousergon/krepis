@@ -15,6 +15,11 @@ from krepis import router as _router
 # patches it (so TestProbeEgressProxy can call through to the real function).
 _original_probe_egress_proxy = _router._probe_egress_proxy
 
+# Same trick for the SSM leg: conftest's autouse `_no_ssm_master_key_lookup_from_tests`
+# stubs it for the whole suite, so TestLitellmMasterKeyFromSSM — the one class
+# that tests the leg itself — has to hold the real function.
+_original_litellm_master_key_from_ssm = _router._litellm_master_key_from_ssm
+
 # ── _parse_registry ──────────────────────────────────────────────────────
 
 REGISTRY_YAML = """
@@ -43,6 +48,7 @@ models:
     name: DeepSeek V4 Flash
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: low
@@ -57,6 +63,7 @@ models:
     name: Gemini 2.5 Flash
     provider: gemini
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-flash
     group: low
@@ -69,6 +76,7 @@ models:
     name: GPT-OSS 120B
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: openai/gpt-oss-120b
     group: low
     group_role: fallback
@@ -80,6 +88,7 @@ models:
     name: Gemini 2.5 Pro
     provider: gemini
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-pro
     group: low
@@ -92,6 +101,7 @@ models:
     name: DeepSeek V4 Flash Max
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
     group: med
@@ -106,6 +116,7 @@ models:
     name: DeepSeek V4 Flash (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-flash
     group: med
     group_role: fallback
@@ -118,6 +129,7 @@ models:
     name: DeepSeek V4 Pro
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: med
@@ -130,6 +142,7 @@ models:
     name: DeepSeek V4 Pro Max
     provider: deepseek
     route: egress_proxy
+    reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
     group: high
@@ -143,6 +156,7 @@ models:
     name: DeepSeek V4 Pro (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-pro
     group: high
     group_role: fallback
@@ -155,6 +169,7 @@ models:
     name: Kimi K3
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: moonshotai/kimi-k3
     group: ultra
     group_role: fallback
@@ -166,6 +181,7 @@ models:
     name: GLM 5.2
     provider: openrouter
     route: openrouter
+    reachable_from: [laptop, ec2]
     model: zhipuai/glm-5.2
     group: ultra
     group_role: primary
@@ -513,6 +529,119 @@ class TestAnthropicDeploymentId:
 
 # ── _resolve_group_json ────────────────────────────────────────────────
 
+class TestLitellmProbeSpeaksTheDeclaredScheme:
+    """The health probe must speak the scheme its URL declares.
+
+    It was `HTTPConnection` unconditionally with a default port of 8980 —
+    correct for exactly one deployment, a loopback proxy on the box. The moment
+    the router got a TLS edge (model-router-policy §3.4a) the probe spoke plain
+    HTTP at a TLS listener, the handshake failed, and the path was reported
+    "not reachable" — indistinguishable from the router being down.
+
+    Measured live 2026-08-03: the router answered `/v1/models` with 23 models
+    over `https://router.nousergon.ai:8443` while this probe called it
+    unreachable, and resolution fell through to openrouter.ai.
+    """
+
+    class _Resp:
+        status = 401  # what an authenticating edge returns to an unauthenticated probe
+
+        def read(self):
+            return b""
+
+    def _capture(self, monkeypatch):
+        seen = {}
+
+        class _Conn:
+            def __init__(self, host, port, timeout=None):
+                seen.update(host=host, port=port, timeout=timeout,
+                            cls=type(self).__name__)
+
+            def request(self, *a, **kw):
+                pass
+
+            def getresponse(self):
+                return TestLitellmProbeSpeaksTheDeclaredScheme._Resp()
+
+            def close(self):
+                pass
+
+        class _Https(_Conn):
+            pass
+
+        class _Http(_Conn):
+            pass
+
+        monkeypatch.setattr(_router._http_client, "HTTPSConnection", _Https)
+        monkeypatch.setattr(_router._http_client, "HTTPConnection", _Http)
+        return seen
+
+    def test_https_url_uses_a_tls_connection_and_port_443(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                info = _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["cls"] == "_Https", (
+            "the probe used a plaintext connection for an https:// URL — the "
+            "TLS handshake fails and the router is reported unreachable"
+        )
+        assert seen["port"] == 443, (
+            f"an https:// URL with no explicit port probed {seen['port']}, not 443"
+        )
+        assert info["route"] == "litellm_proxy"
+
+    def test_explicit_port_is_honoured(self, registry_file, monkeypatch):
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Https", 8443)
+
+    def test_http_url_still_uses_plaintext_and_8980(self, registry_file, monkeypatch):
+        """The loopback case must not regress — R27d permits it."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert (seen["cls"], seen["port"]) == ("_Http", 8980)
+
+    def test_probe_timeout_allows_for_a_tls_handshake(self, registry_file, monkeypatch):
+        """2s suited a loopback proxy. A cold Lambda's TLS handshake to an
+        internet edge does not reliably fit in it, and the failure is silent."""
+        seen = self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai:8443")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                _router._resolve_group_json("ultra")
+        finally:
+            _router._router = None
+        assert seen["timeout"] >= 5, (
+            f"probe timeout is {seen['timeout']}s — too tight for a TLS "
+            "handshake from a cold start"
+        )
+
+
 class TestResolveGroupDetailed:
     def test_med_returns_deepseek_egress(self, registry_file, monkeypatch):
         _router._router = None
@@ -600,19 +729,24 @@ class TestResolveGroupDetailed:
         finally:
             _router._router = None
 
-    def test_exclude_route_egress_proxy_skips_to_openrouter(self, registry_file, monkeypatch):
-        """Med group primary is egress_proxy - with exclude_route=egress_proxy
-        it should skip to the OpenRouter fallback (deepseek-v4-flash-openrouter-max)."""
+    def test_exclude_route_is_gone(self, registry_file, monkeypatch):
+        """`exclude_route` was removed in 0.29.0 (model-router-policy R19).
+
+        A consumer narrowing the fallback chain is holding a routing table at
+        layer 5. Both callers passed it to mean "this route is not reachable
+        from where I am running", which is `exec_context` plus the registry's
+        `reachable_from`. Asserting the TypeError rather than deleting the test
+        keeps the removal itself under test — a re-added parameter would
+        silently restore the ability to route around the LiteLLM proxy.
+        """
         _router._router = None
         try:
             with monkeypatch.context() as m:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
-                info = _router._resolve_group_json("med", exclude_route="egress_proxy")
-            assert info["route"] == "openrouter"
-            assert info["provider"] == "openrouter"
-            assert info["auth_token_type"] == "openrouter_key"
-            assert info["deployment_id"] == "deepseek/deepseek-v4-flash"
-            assert info["registry_id"] == "deepseek-v4-flash-openrouter-max"
+                with pytest.raises(TypeError):
+                    _router._resolve_group_json("med", exclude_route="egress_proxy")
+                with pytest.raises(TypeError):
+                    _router.resolve_group_structured("med", exclude_route="egress_proxy")
         finally:
             _router._router = None
 
@@ -657,6 +791,90 @@ class TestResolveLitellmMasterKey:
         with mock.patch.dict(os.environ, {}, clear=True):
             result = _router._resolve_litellm_master_key()
         assert result is None
+
+
+class TestLitellmMasterKeyFromSSM:
+    """The SSM leg must work wherever krepis runs, and say so when it does not.
+
+    This leg used to shell out to `aws ssm get-parameter --profile
+    ne-laptop-daemon`. Verified 2026-08-03 against the Director Lambda, it
+    could not have worked there for three independent reasons — the
+    `public.ecr.aws/lambda/python:3.12` image ships no `aws` binary, there is
+    no such profile in a Lambda, and `alpha-engine-evaluator-role` grants SSM
+    on `/alpha-engine/*` but the parameter is `/symposion/...`. Every one was
+    swallowed by `except Exception: pass`, so the LiteLLM route would simply
+    have been skipped as unauthenticated the first time the Director could
+    actually reach the router.
+    """
+
+    def test_uses_boto3_and_no_aws_profile(self, monkeypatch):
+        """The credential chain is the execution context's, not a named profile."""
+        calls = {}
+
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                calls.update(kw)
+                return {"Parameter": {"Value": "key-from-ssm"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.delenv("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", raising=False)
+
+        assert _original_litellm_master_key_from_ssm() == "key-from-ssm"
+        assert calls["Name"] == _router.LITELLM_MASTER_KEY_SSM_PARAM
+        assert calls["WithDecryption"] is True
+        # boto3.client("ssm", region_name=...) — never a profile/session name.
+        _, kwargs = fake_boto3.client.call_args
+        assert "profile_name" not in kwargs
+
+    def test_parameter_name_is_overridable(self, monkeypatch):
+        """A fleet-specific SSM path is a fact about our account, not routing.
+
+        This is what lets a per-consumer credential (R22) replace the shared
+        master key without a code change.
+        """
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                return {"Parameter": {"Value": f"key-for-{kw['Name']}"}}
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+        monkeypatch.setenv(
+            "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", "/alpha-engine/director/LITELLM_KEY")
+
+        assert _original_litellm_master_key_from_ssm() == \
+            "key-for-/alpha-engine/director/LITELLM_KEY"
+
+    def test_failure_is_logged_with_its_reason(self, monkeypatch, caplog):
+        """Returns None — but "access denied" and "no such parameter" are
+        different fixes, and a bare swallow makes them the same event."""
+        class _FakeSSM:
+            def get_parameter(self, **kw):
+                raise RuntimeError("AccessDeniedException: not authorized")
+
+        fake_boto3 = mock.Mock()
+        fake_boto3.client.return_value = _FakeSSM()
+        monkeypatch.setitem(sys.modules, "boto3", fake_boto3)
+
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "AccessDenied" in caplog.text
+
+    def test_missing_boto3_is_reported_not_swallowed(self, monkeypatch, caplog):
+        real_import = __import__
+
+        def _no_boto3(name, *a, **kw):
+            if name == "boto3":
+                raise ImportError("No module named 'boto3'")
+            return real_import(name, *a, **kw)
+
+        monkeypatch.delitem(sys.modules, "boto3", raising=False)
+        monkeypatch.setattr("builtins.__import__", _no_boto3)
+        with caplog.at_level("WARNING"):
+            assert _original_litellm_master_key_from_ssm() is None
+        assert "boto3" in caplog.text
 
 
 # ── CLI resolve --json ──────────────────────────────────────────────────────
@@ -800,3 +1018,732 @@ class TestResolveContract:
             assert isinstance(remove_after, int)
             assert remove_after > _router.RESOLVE_SCHEMA_VERSION - 1
             assert old != new
+
+
+# ── Execution-context reachability (model-router-policy R28/R29) ─────────
+#
+# These tests exist because of a live defect: the Director Lambda's weekly
+# `ultra` call resolved to openrouter.ai direct and egressed DLP-unscanned
+# (alpha-engine-config-I6183).  Nothing in the chain was unhealthy.  The two
+# entries ahead of it were dropped because krepis' own hardcoded endpoint
+# table had no row for `moonshot` or `zhipu` — a routing fact invented at
+# layer 3 — and the caller compensated with `exclude_route="litellm_proxy"`,
+# a routing fact asserted at layer 5.  The registry, which owns endpoints,
+# was not consulted about either.
+
+REACHABILITY_REGISTRY_YAML = """
+schema_version: 1
+
+model_groups:
+  ultra:
+    - kimi-direct
+    - glm-direct
+    - glm-openrouter
+
+models:
+  - id: kimi-direct
+    name: Kimi (direct Moonshot)
+    provider: moonshot
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    endpoints:
+      openai: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    model: kimi-k3
+    group: ultra
+    group_role: primary
+    params:
+      max_tokens: 16384
+    status: active
+
+  - id: glm-direct
+    name: GLM (direct Zhipu)
+    provider: zhipu
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    endpoints:
+      openai: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    model: glm-5.2
+    group: ultra
+    group_role: fallback
+    params:
+      max_tokens: 16384
+    status: active
+
+  - id: glm-openrouter
+    name: GLM (via OpenRouter)
+    provider: openrouter
+    route: openrouter
+    endpoints:
+      anthropic: https://openrouter.ai/api
+      openai: https://openrouter.ai/api
+    reachable_from: [laptop, ec2]
+    model: z-ai/glm-5.2
+    group: ultra
+    group_role: fallback
+    params:
+      max_tokens: 16384
+    status: active
+"""
+
+
+@pytest.fixture
+def reachability_registry():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(REACHABILITY_REGISTRY_YAML)
+    yield Path(f.name)
+    os.unlink(f.name)
+
+
+@pytest.fixture
+def _no_litellm():
+    """Force the per-provider resolution path deterministically.
+
+    An unresolvable master key is one of the documented LiteLLM skip reasons,
+    so this exercises the same branch a real key-less host would.
+    """
+    with mock.patch.object(_router, "_resolve_litellm_master_key", return_value=None):
+        yield
+
+
+class TestResolveExecContext:
+    def test_defaults_to_laptop(self, monkeypatch):
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
+
+    def test_env_var_is_read(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda")
+        assert _router._resolve_exec_context() == "lambda"
+
+    def test_explicit_argument_wins_over_env(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "lambda")
+        assert _router._resolve_exec_context("laptop") == "laptop"
+
+    def test_unknown_context_raises_rather_than_defaulting(self, monkeypatch):
+        """Falling back to the default on an unrecognised context would resolve
+        an endpoint chosen on a vocabulary mismatch (R29)."""
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        with pytest.raises(ValueError, match="Unknown execution context"):
+            _router._resolve_exec_context("fargate")
+
+    def test_context_is_never_inferred_from_lambda_env(self, monkeypatch):
+        """R29 — declared, not inferred. AWS_LAMBDA_FUNCTION_NAME being set
+        must not make krepis believe it is in a Lambda; a wrong guess makes a
+        mis-resolution look like a health failure."""
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "alpha-engine-evaluator-director")
+        assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
+
+
+class TestEntryReachableFrom:
+    def test_declared_context_matches(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
+        assert _router._entry_reachable_from(entry, "laptop") is True
+
+    def test_undeclared_context_is_filtered(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
+        assert _router._entry_reachable_from(entry, "lambda") is False
+
+    def test_missing_field_is_unreachable_from_everywhere(self, caplog):
+        """An absent declaration is not permission (R20, fail closed).
+
+        This was permissive as the R19 migration position, to be removed once
+        the registry validator enforced the field. It does
+        (`validate_llm_model_registry.py`, `test_missing_reachable_from_fails`),
+        and the permissive branch had a live cost in the meantime: the
+        hand-published S3 copy of the registry the Director reads lagged the
+        repo, still carried no `reachable_from`, and the omission was read as
+        universal reachability — so a Lambda served `glm-5.2` at openrouter.ai
+        DLP-unscanned while logging a healthy route.
+        """
+        entry = {"id": "legacy-row"}
+        with caplog.at_level("ERROR"):
+            assert _router._entry_reachable_from(entry, "lambda") is False
+            assert _router._entry_reachable_from(entry, "laptop") is False
+        assert "reachable_from" in caplog.text
+        assert "legacy-row" in caplog.text
+
+    def test_undeclared_entry_is_skipped_with_a_diagnosable_reason(
+        self, tmp_path, monkeypatch
+    ):
+        """Fail closed, but never fail mute — the skip names why."""
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(
+            "schema_version: 1\n"
+            "model_groups:\n"
+            "  ultra: [legacy-row]\n"
+            "models:\n"
+            "  - id: legacy-row\n"
+            "    model: some/model\n"
+            "    provider: openrouter\n"
+            "    route: openrouter\n"
+            "    endpoints:\n"
+            "      openai: https://openrouter.ai/api\n",
+            encoding="utf-8",
+        )
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1:1")
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="lambda", wire="openai")
+            assert "reachable_from" in str(exc.value)
+            assert "legacy-row" in str(exc.value)
+        finally:
+            _router._router = None
+
+
+class TestEntryEndpoint:
+    def test_reads_declared_wire_endpoint_from_registry(self):
+        entry = {
+            "id": "x", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_provider_absent_from_krepis_tables_still_resolves(self):
+        """The I6183 regression. `moonshot` has no row in krepis' legacy table;
+        the registry declares its endpoint, so it must resolve anyway. A
+        resolver that drops it has invented a routing fact at layer 3 (R29)."""
+        entry = {
+            "id": "kimi-direct", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        assert ("egress_proxy", "moonshot") not in _router._LEGACY_CLI_ENDPOINTS
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_undeclared_wire_raises_naming_what_is_declared(self):
+        entry = {
+            "id": "x", "route": "egress_proxy", "provider": "moonshot",
+            "endpoints": {"openai": "http://127.0.0.1:8990"},
+        }
+        with pytest.raises(ValueError, match="declares no 'anthropic'-wire endpoint"):
+            _router._entry_endpoint(entry, "anthropic")
+
+    def test_legacy_api_base_serves_the_openai_wire(self):
+        entry = {"id": "x", "route": "egress_proxy", "provider": "deepseek",
+                 "api_base": "http://127.0.0.1:8990"}
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
+
+    def test_legacy_shim_warns_and_names_the_entry(self, caplog):
+        entry = {"id": "unmigrated", "route": "openrouter", "provider": "openrouter"}
+        with caplog.at_level("WARNING"):
+            url = _router._entry_endpoint(entry, "anthropic")
+        assert url == "https://openrouter.ai/api"
+        assert "unmigrated" in caplog.text
+        assert "R7" in caplog.text
+
+    def test_env_override_beats_the_declared_endpoint(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_OPENROUTER_API_URL", "http://localhost:9999")
+        entry = {"id": "x", "route": "openrouter", "provider": "openrouter",
+                 "endpoints": {"anthropic": "https://openrouter.ai/api"}}
+        assert _router._entry_endpoint(entry, "anthropic") == "http://localhost:9999"
+
+
+class TestResolveFiltersByExecutionContext:
+    def test_laptop_resolves_the_declared_primary(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="laptop", wire="openai")
+            assert info["registry_id"] == "kimi-direct"
+            assert info["exec_context"] == "laptop"
+            assert info["wire"] == "openai"
+        finally:
+            _router._router = None
+
+    def test_lambda_fails_closed_rather_than_reaching_openrouter(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """THE I6183 REGRESSION TEST.
+
+        From `lambda` no entry in this chain is reachable — the egress
+        proxies are on other hosts and openrouter.ai is off the private-subnet
+        route. Before R28/R29 the resolver walked past both direct entries
+        (no krepis table row for moonshot/zhipu) and served openrouter.ai
+        direct, unscanned. It must now raise.
+        """
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="lambda", wire="openai")
+            msg = str(exc.value)
+            assert "lambda" in msg
+            # Fail-closed diagnosis: the message carries WHY each entry went.
+            assert "kimi-direct" in msg
+            assert "glm-openrouter" in msg
+        finally:
+            _router._router = None
+
+    def test_skipped_entries_names_the_context_not_a_health_failure(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """R29 — 'unreachable from here' must be distinguishable from
+        'unhealthy'. Collapsing the two is what made the Director's fallback
+        log identically to a primary (I6185)."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                # Reachable only from ec2: the two direct entries survive,
+                # so resolution succeeds and the skips are observable.
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="ec2", wire="anthropic")
+            reasons = {s["registry_id"]: s["reason"] for s in info["skipped_entries"]}
+            assert "kimi-direct" in reasons
+            assert "anthropic" in reasons["kimi-direct"]
+            assert "not reachable" not in reasons["kimi-direct"].lower()
+            assert info["registry_id"] == "glm-openrouter"
+        finally:
+            _router._router = None
+
+    def test_unknown_wire_is_rejected(self, reachability_registry, monkeypatch):
+        with monkeypatch.context() as m:
+            m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+            with pytest.raises(ValueError, match="Unknown wire format"):
+                _router._resolve_group_json("ultra", wire="grpc")
+
+
+class TestExcludeRouteIsRemoved:
+    def test_the_litellm_route_cannot_be_excluded_by_a_caller(self, registry_file, monkeypatch):
+        """R27a.4 — the router route is offered in every context.
+
+        The proxy path is gated on its health probe and on nothing a consumer
+        can say. This is the load-bearing half of the removal: `exclude_route`
+        existed for exactly one production purpose — letting the Director
+        Lambda skip the LiteLLM proxy and egress direct to openrouter.ai while
+        the path to the proxy was down — and nothing failed for weeks because
+        of it.
+        """
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with pytest.raises(TypeError):
+                    _router._resolve_group_json("med", exclude_route="litellm_proxy")
+        finally:
+            _router._router = None
+
+    def test_no_warning_when_not_passed(self, registry_file, monkeypatch, recwarn):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                _router._resolve_group_json("med")
+            assert not [w for w in recwarn if issubclass(w.category, DeprecationWarning)]
+        finally:
+            _router._router = None
+
+
+class TestResolveContractCarriesContext:
+    def test_exec_context_and_wire_are_emitted(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router.resolve_group_structured(
+                    "ultra", exec_context="laptop", wire="openai")
+            assert info["schema_version"] == _router.RESOLVE_SCHEMA_VERSION
+            assert info["exec_context"] == "laptop"
+            assert info["wire"] == "openai"
+        finally:
+            _router._router = None
+
+    def test_contract_still_validates_against_the_schema(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """Additive evolution (R19): new fields must not bump the version out
+        from under a consumer pinned to 2."""
+        import json as _json
+        jsonschema = pytest.importorskip("jsonschema")
+        schema_path = Path(_router.__file__).parent / "resolve_schema.json"
+        schema = _json.loads(schema_path.read_text())
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router.resolve_group_structured(
+                    "ultra", exec_context="laptop", wire="openai")
+            jsonschema.validate(info, schema)
+            assert info["schema_version"] == 2
+        finally:
+            _router._router = None
+
+
+class TestRouterIsNeverContextFiltered:
+    """model-router-policy §3.4a R27a — the router is a service, not a location.
+
+    `reachable_from` scopes DIRECT PROVIDER entries only. Applying it to the
+    litellm_proxy route would make the router's availability a property of the
+    caller's network, which is the inversion §3.4a exists to forbid — and the
+    reasoning that produced a 2h20m fleet-wide SSM outage on 2026-08-03
+    (nous-ergon-ops-I417): "the Lambda cannot reach the router, so attach the
+    Lambda to the router's VPC".
+
+    The pairing is what needs a test. The health gate and the reachability
+    filter are each covered above; nothing asserted that the second does not
+    apply to the first, which is the shape where both halves pass and the
+    behaviour is still wrong.
+    """
+
+    def _healthy_litellm(self, monkeypatch):
+        """Make every LiteLLM gate pass without a live proxy."""
+        import http.client as _http
+
+        class _Resp:
+            status = 200
+
+            def read(self):
+                return b""
+
+        class _Conn:
+            def __init__(self, *a, **k):
+                pass
+
+            def request(self, *a, **k):
+                pass
+
+            def getresponse(self):
+                return _Resp()
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(_http, "HTTPConnection", _Conn)
+        monkeypatch.setattr(_router, "_resolve_litellm_master_key",
+                            lambda: "test-master-key")
+
+    def test_router_serves_a_context_no_entry_declares(
+        self, reachability_registry, monkeypatch
+    ):
+        """No entry in this fixture declares `lambda`. The router must still
+        serve it — availability is a health question, never a reachability
+        fact about the caller."""
+        self._healthy_litellm(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="lambda", wire="openai")
+            assert info["route"] == "litellm_proxy"
+            assert info["exec_context"] == "lambda"
+        finally:
+            _router._router = None
+
+    def test_no_registry_entry_may_declare_reachability_for_the_router(
+        self, reachability_registry
+    ):
+        """A `route: litellm_proxy` row carrying `reachable_from` would be a
+        registry asserting the thing R27a forbids. The resolver never reads
+        such a row — the proxy path is synthesised, not looked up — so the
+        guard belongs at the registry validator, and this pins the invariant
+        the resolver relies on."""
+        import yaml as _yaml
+        doc = _yaml.safe_load(reachability_registry.read_text())
+        proxy_rows = [m for m in doc["models"]
+                      if m.get("route") == "litellm_proxy"]
+        assert proxy_rows == [], (
+            "the litellm_proxy route is synthesised by the resolver, not a "
+            "registry row; a row for it would be a second source of truth for "
+            "how the router is reached (§3.4a R27f)"
+        )
+
+    def test_context_vocabulary_encodes_no_network_posture(self):
+        """`lambda_vpc` was the original name and is exactly the invitation
+        R27a forbids: a context asserting an attachment makes "attach the
+        consumer" read as the natural fix."""
+        offenders = [c for c in _router.EXEC_CONTEXTS
+                     if "vpc" in c or "subnet" in c or "sg" in c]
+        assert offenders == [], (
+            f"{offenders} name a network attachment, not a place code runs. "
+            "Reaching the router may not depend on network position (R27a)."
+        )
+
+
+# ── resolve_group_spec — the group -> ModelSpec adapter ──────────────────
+
+
+class TestResolveGroupSpec:
+    """`resolve_group_spec` is the supported way a consumer goes from a
+    capability tier to a client. Before it existed, three call sites each
+    carried their own copy of the `auth_token_type` -> credential-name table
+    (`director/agent.py`, `groom_driver.py`, `groomer_krepis_adapter.py`) —
+    and this module is the only producer of those values, so a consumer copy
+    silently mis-authenticates the day a new one is introduced."""
+
+    def _route(self, **over):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "med",
+            "display_name": "deepseek-v4-flash-max (med)",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "med",
+            "auth_token_type": "litellm_master_key",
+            "group": "med",
+            "registry_id": "litellm:group:med",
+            "primary_model": "deepseek-v4-flash",
+            "primary_registry_id": "deepseek-v4-flash-max",
+            "capabilities": {},
+            "params": {"max_tokens": 8192, "structured_outputs": True},
+        }
+        route.update(over)
+        return route
+
+    def _patch(self, monkeypatch, route):
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+
+    def test_builds_a_spec_from_the_route(self, monkeypatch):
+        self._patch(monkeypatch, self._route())
+        spec, route = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.model == "med"
+        assert spec.base_url == "https://router.example:8443"
+        assert spec.max_tokens == 8192
+        assert route["group"] == "med"
+
+    def test_proxy_route_is_an_openai_endpoint_not_the_in_process_router(
+        self, monkeypatch
+    ):
+        """`resolve_group_structured` reports provider `litellm` for the proxy
+        route, and ModelSpec binds that name to TRANSPORT_LITELLM — the
+        in-process `get_router()`, which calls each provider DIRECTLY from
+        the consumer and reads OPENROUTER_API_KEY from the environment as it
+        goes. Emitting it verbatim would egress unscanned to openrouter.ai,
+        bypass the authenticated edge entirely, and require litellm plus a
+        readable registry inside every consumer — the constraint that
+        reverted crucible-evaluator-PR157 (alpha-engine-config-I6059)."""
+        from krepis.llm_config import PROVIDER_REGISTRY, TRANSPORT_OPENAI
+
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+
+        assert spec.provider == _router.ROUTER_EDGE_PROVIDER == "litellm_proxy"
+        assert spec.provider not in PROVIDER_REGISTRY, (
+            "a name known to PROVIDER_REGISTRY takes that provider's "
+            "transport; the edge must resolve as a custom OpenAI-compatible "
+            "endpoint"
+        )
+        assert spec.transport == TRANSPORT_OPENAI
+        # base_url + api_key_env are what make a custom endpoint valid.
+        assert spec.base_url and spec.api_key_env
+
+    def test_non_proxy_routes_keep_their_provider(self, monkeypatch):
+        self._patch(monkeypatch, self._route(
+            provider="deepseek", route="egress_proxy",
+            auth_token_type="placeholder",
+            api_base_url="http://127.0.0.1:8990",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.provider == "deepseek"
+
+    def test_explicit_max_tokens_overrides_the_registry(self, monkeypatch):
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec(
+            "med", exec_context="lambda", max_tokens=4000
+        )
+        assert spec.max_tokens == 4000
+
+    def test_structured_outputs_override_is_honoured(self, monkeypatch):
+        """A call site that has live-verified strict json_schema is unreliable
+        for the model serving its group must be able to say so — silently
+        taking the registry default would re-break that call site."""
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec(
+            "med", exec_context="lambda", structured_outputs=False
+        )
+        assert spec.structured_outputs is False
+
+    def test_unknown_schema_version_raises(self, monkeypatch):
+        self._patch(monkeypatch, self._route(schema_version=999))
+        with pytest.raises(RuntimeError, match="schema_version"):
+            _router.resolve_group_spec("med", exec_context="lambda")
+
+    def test_unknown_auth_token_type_raises(self, monkeypatch):
+        """Refusing beats guessing: a guessed credential is a real key sent to
+        an unintended endpoint."""
+        self._patch(monkeypatch, self._route(auth_token_type="new_thing"))
+        with pytest.raises(RuntimeError, match="auth_token_type"):
+            _router.resolve_group_spec("med", exec_context="lambda")
+
+    def test_placeholder_auth_maps_to_no_credential_name(self, monkeypatch):
+        """`placeholder` means the local egress proxy holds the real key. It
+        is not a missing credential, and collapsing the two would break every
+        direct route from a context that can reach one."""
+        self._patch(monkeypatch, self._route(
+            auth_token_type="placeholder",
+            provider="deepseek",
+            route="egress_proxy",
+            api_base_url="http://127.0.0.1:8990",
+            deployment_id="deepseek-v4-flash",
+            registry_id="deepseek-v4-flash-max",
+            primary_registry_id="deepseek-v4-flash-max",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env is None
+
+    # ── per-consumer router credential ───────────────────────────────────
+
+    def test_router_credential_defaults_to_the_historical_name(self, monkeypatch):
+        monkeypatch.delenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, raising=False)
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+
+    def test_per_consumer_credential_secret_is_honoured(self, monkeypatch):
+        """The edge identifies a consumer BY its credential value, and
+        `krepis.secrets` resolves SSM before os.environ — so two consumers
+        reading the same secret NAME collapse into one identity at the edge
+        no matter how their environments are set."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ROUTER_CONSUMER_THINKTANK"
+
+    def test_per_consumer_credential_does_not_leak_into_other_auth_types(
+        self, monkeypatch
+    ):
+        """It renames the ROUTER credential only. Applying it to a direct
+        provider route would point that route at a router credential."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        self._patch(monkeypatch, self._route(
+            auth_token_type="direct_api_key", provider="anthropic",
+            route="direct", api_base_url="",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ANTHROPIC_API_KEY"
+
+    def test_blank_env_falls_back_rather_than_naming_an_empty_secret(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, "   ")
+        self._patch(monkeypatch, self._route())
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+
+    # ── route_is_degraded ────────────────────────────────────────────────
+
+    def test_litellm_proxy_route_is_never_degraded_at_resolve_time(self):
+        """The proxy walks the chain itself, so which entry serves is a
+        call-time fact. `registry_id` there is the synthetic
+        `litellm:group:<g>` and `primary_registry_id` a real model id, so a
+        naive comparison fires on EVERY healthy router call — a detector
+        whose output does not vary with the condition it names."""
+        assert _router.route_is_degraded(self._route()) is False
+
+    def test_per_provider_fallback_is_degraded(self):
+        assert _router.route_is_degraded(self._route(
+            route="egress_proxy",
+            registry_id="deepseek-v4-pro",
+            primary_registry_id="deepseek-v4-flash-max",
+        )) is True
+
+    def test_per_provider_primary_is_not_degraded(self):
+        assert _router.route_is_degraded(self._route(
+            route="egress_proxy",
+            registry_id="deepseek-v4-flash-max",
+            primary_registry_id="deepseek-v4-flash-max",
+        )) is False
+
+    def test_missing_primary_on_a_direct_route_reads_as_degraded(self):
+        """Absence is not health — principles §2.7."""
+        r = self._route(route="egress_proxy", registry_id="x")
+        r.pop("primary_registry_id")
+        r.pop("primary_model")
+        assert _router.route_is_degraded(r) is True
+
+
+class TestAppConfigFailureIsObservable:
+    """`krepis.logging.setup_logging` pins the root logger at INFO with no env
+    override, so anything logged below INFO is unobservable in every deployed
+    environment that uses it. AppConfig resolution used to log its failure at
+    DEBUG — measured 2026-08-04 on alpha-engine-research-runner, where it
+    failed on every invocation and the only visible symptom was a
+    FileNotFoundError naming LLM_MODEL_REGISTRY_PATH, which is not the cause.
+    """
+
+    def _optin(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_APPCONFIG_APPLICATION", "alpha-engine")
+        monkeypatch.setenv("KREPIS_APPCONFIG_CONFIG_PROFILE", "llm-model-registry")
+        monkeypatch.setenv("KREPIS_APPCONFIG_ENVIRONMENT", "production")
+        _router._appconfig_cached_path = None
+        _router._appconfig_next_poll_s = 0.0
+
+    def test_a_failed_poll_logs_at_warning(self, monkeypatch, caplog):
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+
+        def _boom(*a, **k):
+            raise RuntimeError("AccessDenied: simulated")
+
+        monkeypatch.setattr(_b3, "client", _boom)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert any(r.levelname == "WARNING" for r in caplog.records), (
+            "the failure is invisible at INFO, which is where every consumer "
+            "of krepis.logging.setup_logging is pinned"
+        )
+        assert "AppConfig registry resolution FAILED" in caplog.text
+
+    def test_the_warning_says_the_fallback_cannot_help(self, monkeypatch, caplog):
+        """\"Falling through to the filesystem walk\" reads as recovery. In a
+        Lambda or on a fresh spot box that walk finds nothing, so the message
+        has to say so — otherwise the next reader treats the raise that
+        follows as the real fault."""
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+        monkeypatch.setattr(_b3, "client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            _router._find_registry_from_appconfig()
+        assert "finds nothing" in caplog.text
+        assert "LLM_MODEL_REGISTRY_PATH" in caplog.text
+
+    def test_an_empty_configuration_also_warns(self, monkeypatch, caplog):
+        import boto3 as _b3
+
+        self._optin(monkeypatch)
+
+        class _Body:
+            def read(self):
+                return b""
+
+        class _Client:
+            def start_configuration_session(self, **k):
+                return {"InitialConfigurationToken": "t"}
+
+            def get_latest_configuration(self, **k):
+                return {"Configuration": _Body()}
+
+        monkeypatch.setattr(_b3, "client", lambda *a, **k: _Client())
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert "EMPTY configuration" in caplog.text
+
+    def test_no_warning_when_appconfig_was_never_opted_into(self, monkeypatch, caplog):
+        """Environments with a local checkout never set the opt-in and must
+        stay quiet — this branch is not reachable for them."""
+        monkeypatch.delenv("KREPIS_APPCONFIG_APPLICATION", raising=False)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            assert _router._find_registry_from_appconfig() is None
+        assert caplog.text == ""
