@@ -36,6 +36,7 @@ import http.client as _http_client
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Optional
@@ -389,11 +390,13 @@ def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
         return False
 
 
-# ── LiteLLM master key resolution ────────────────────────────────────────
-# Same resolution order as the LiteLLM proxy shim and the clauder script:
-#   1. LITELLM_MASTER_KEY env var
-#   2. secrets.env file (LITELLM_MASTER_KEY=...)
-#   3. AWS SSM, parameter named by KREPIS_LITELLM_MASTER_KEY_SSM_PARAM
+# ── Router-edge credential resolution ────────────────────────────────────
+# Same resolution order as the LiteLLM proxy shim and the clauder script,
+# except that the NAME is this consumer's own — `router_credential_secret_name()`
+# — rather than the literal `LITELLM_MASTER_KEY`:
+#   1. <name> env var
+#   2. secrets.env file (<name>=...)
+#   3. AWS SSM, parameter derived from <name> (see _litellm_master_key_from_ssm)
 # Returns the key string, or None if unresolvable.
 LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
 
@@ -405,14 +408,36 @@ LITELLM_MASTER_KEY_SSM_PARAM = "/symposion/LITELLM_MASTER_KEY"
 LITELLM_PROBE_TIMEOUT_S = float(os.environ.get("KREPIS_LITELLM_PROBE_TIMEOUT_S", "5"))
 
 def _resolve_litellm_master_key() -> Optional[str]:
+    """Resolve THIS consumer's router-edge credential, by its own name.
+
+    The name comes from :func:`router_credential_secret_name` — the same one
+    :func:`resolve_group_spec` puts in ``ModelSpec.api_key_env`` — so a single
+    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` declaration serves both the admission
+    check here and the call itself.
+
+    Until alpha-engine-config-I6414 this leg hardcoded the literal
+    ``LITELLM_MASTER_KEY`` while the call path honoured the override, so the two
+    halves disagreed about which credential the consumer had. A consumer
+    configured exactly as I6373 intends was **rejected in ``_resolve_group_json``
+    before its credential was ever consulted** — measured 2026-08-04 on
+    ``alpha-engine-research-runner`` with ``KREPIS_ROUTER_CREDENTIAL_SECRET``
+    set correctly, and again on the Think Tank spot box, which it took down.
+    The two halves had been tested separately and each passed.
+
+    Unset, behaviour is byte-identical to before: the name resolves to
+    ``LITELLM_MASTER_KEY`` and all three legs read exactly what they used to.
+    """
     import os as _os
 
-    # 1. Env var
-    _key = _os.environ.get("LITELLM_MASTER_KEY", "").strip()
+    _name = router_credential_secret_name()
+
+    # 1. Env var, under this consumer's name.
+    _key = _os.environ.get(_name, "").strip()
     if _key:
         return _key
 
     # 2. secrets.env (same path conventions as the shim)
+    _prefix = f"{_name}="
     _secrets_paths = [
         _os.path.expanduser("~/Development/.llm-routing/secrets.env"),
         _os.path.expanduser("~/.llm-routing/secrets.env"),
@@ -422,7 +447,7 @@ def _resolve_litellm_master_key() -> Optional[str]:
             with open(_sp) as _sf:
                 for _line in _sf:
                     _line = _line.strip()
-                    if _line.startswith("LITELLM_MASTER_KEY="):
+                    if _line.startswith(_prefix):
                         _val = _line.split("=", 1)[1].strip().strip('"').strip("'")
                         if _val:
                             return _val
@@ -431,11 +456,31 @@ def _resolve_litellm_master_key() -> Optional[str]:
             continue
 
     # 3. AWS SSM
-    return _litellm_master_key_from_ssm()
+    return _litellm_master_key_from_ssm(_name)
 
 
-def _litellm_master_key_from_ssm() -> Optional[str]:
-    """Last-resort lookup of the master key from SSM, via boto3.
+def _litellm_master_key_from_ssm(name: str = "LITELLM_MASTER_KEY") -> Optional[str]:
+    """Last-resort lookup of the router-edge credential from SSM, via boto3.
+
+    ``name`` is the consumer's credential name (alpha-engine-config-I6414).
+    Which SSM parameter that maps to, in precedence order:
+
+    1. ``$KREPIS_LITELLM_MASTER_KEY_SSM_PARAM`` when set — an explicit operator
+       override always wins, and callers already setting it keep working.
+    2. The historical ``/symposion/LITELLM_MASTER_KEY`` when ``name`` is the
+       default, so the shared-key path is byte-identical to before.
+    3. Otherwise ``krepis.secrets.SSM_PREFIX + name`` — the same convention
+       every other secret in the fleet resolves under, rather than a second
+       naming scheme invented here. The prefix is imported rather than written
+       out so there is one definition of it.
+
+    Deliberately NOT ``krepis.secrets.get_secret(name)``, despite that being the
+    obvious reuse: it resolves SSM **before** ``os.environ`` and caches
+    per-process, both of which are wrong for this leg. Leg 1 of the caller has
+    already checked the environment and found nothing, so an env-consulting
+    resolver here would re-answer a question that was just answered; and the
+    cache would make a credential rotation invisible until the process restarts,
+    on the one code path whose failure takes a consumer entirely off the router.
 
     Split out of ``_resolve_litellm_master_key`` so tests can neutralise the one
     leg that reaches outside the process. Until 2026-07-30 this ran inline and
@@ -473,9 +518,14 @@ def _litellm_master_key_from_ssm() -> Optional[str]:
       SSM leg is one of three sources and an unresolvable key is a legitimate
       skip — but it says why, at WARNING.
     """
-    param = os.environ.get(
-        "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", LITELLM_MASTER_KEY_SSM_PARAM
-    )
+    param = os.environ.get("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", "").strip()
+    if not param:
+        if name == "LITELLM_MASTER_KEY":
+            param = LITELLM_MASTER_KEY_SSM_PARAM
+        else:
+            from krepis.secrets import SSM_PREFIX  # noqa: PLC0415 - avoid cycle
+            param = f"{SSM_PREFIX.rstrip('/')}/{name}"
+
     try:
         import boto3  # noqa: PLC0415 - optional, resolved at call time
     except ImportError:
@@ -1304,8 +1354,13 @@ def _resolve_group_json(
         # ── Check 2: master key resolvable ───────────────────────────────
         _master_key = _resolve_litellm_master_key()
         if _master_key is None:
+            # Name the credential this consumer actually looked for. The
+            # message used to say "LITELLM_MASTER_KEY" unconditionally, which
+            # sent an operator to the wrong parameter on the one path where
+            # the route is skipped and the reason is all they have.
             _litellm_skip_reasons.append(
-                "LITELLM_MASTER_KEY not resolvable (env → secrets.env → SSM)")
+                f"{router_credential_secret_name()} not resolvable "
+                "(env → secrets.env → SSM)")
         else:
             # ── Check 3: config staleness (RETIRED — externalized) ──────
             # The mtime-glob heuristic (_litellm_config_is_stale) has been
@@ -1637,16 +1692,46 @@ ROUTER_CREDENTIAL_SECRET_ENV = "KREPIS_ROUTER_CREDENTIAL_SECRET"
 ROUTER_EDGE_PROVIDER = "litellm_proxy"
 
 
+#: A credential NAME is an identifier, never a path. Enforced rather than
+#: assumed: this value is operator-supplied through the environment and is
+#: interpolated into an SSM parameter path
+#: (:func:`_litellm_master_key_from_ssm`), so an unvalidated one could name a
+#: parameter outside the fleet's prefix — ``../../elsewhere/PARAM`` reads as a
+#: traversal to the SSM API, not as a malformed name. It also reaches logs, and
+#: an identifier cannot carry a newline into a log record.
+_CREDENTIAL_NAME_RE = re.compile(r"\A[A-Za-z0-9_]{1,128}\Z")
+
+
 def router_credential_secret_name() -> str:
     """The secret name holding this consumer's router-edge credential.
 
-    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` when set, else the historical
-    ``LITELLM_MASTER_KEY``.
+    ``$KREPIS_ROUTER_CREDENTIAL_SECRET`` when set and well-formed, else the
+    historical ``LITELLM_MASTER_KEY``.
+
+    A malformed value falls back rather than raising: this runs inside route
+    admission, where the established contract is that an unusable credential
+    SKIPS the route with a reason. Raising here would take down every group
+    resolution in the process, including the per-provider routes that have
+    nothing to do with the router edge.
     """
-    return (
-        os.environ.get(ROUTER_CREDENTIAL_SECRET_ENV, "").strip()
-        or "LITELLM_MASTER_KEY"
-    )
+    raw = os.environ.get(ROUTER_CREDENTIAL_SECRET_ENV, "").strip()
+    if not raw:
+        return "LITELLM_MASTER_KEY"
+    if not _CREDENTIAL_NAME_RE.match(raw):
+        # The variable name is inlined rather than passed as an argument.
+        # It is a module-level constant and cannot carry a secret, but
+        # `py/clear-text-logging-sensitive-data` matches on the identifier, so
+        # passing it flags an alert that says nothing. Inlining costs nothing
+        # and leaves the alert list carrying only the flows worth arguing about.
+        logger.warning(
+            "KREPIS_ROUTER_CREDENTIAL_SECRET is set but is not a valid "
+            "credential name (expected [A-Za-z0-9_]{1,128}); falling back to "
+            "LITELLM_MASTER_KEY. This consumer will authenticate as whoever "
+            "holds the shared key, so fix the variable rather than relying "
+            "on the fallback."
+        )
+        return "LITELLM_MASTER_KEY"
+    return raw
 
 
 def route_is_degraded(route: dict) -> bool:
