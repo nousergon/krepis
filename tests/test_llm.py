@@ -1271,3 +1271,138 @@ class TestBudgetExhaustedIsNotRetried:
             )
         assert "stop_reason='max_tokens'" in str(exc.value)
         assert len(fake.payloads) == 1
+
+
+# ── Router-edge credential resolution at CALL time (config-I6373) ─────────
+
+
+class TestRouterEdgeCredentialAtCallTime:
+    """The edge credential resolves on the full chain, not the environment.
+
+    ``resolve_group_spec`` names a per-consumer credential and the supported
+    home for its value is SSM — precisely so the secret never enters an
+    environment, a Lambda config, a CloudWatch log, or an SSM command string.
+    Route admission resolved it that way; this leg read ``os.environ`` alone.
+    A consumer configured exactly as alpha-engine-config-I6373 intends was
+    therefore ADMITTED to the route and then failed the call it had just been
+    admitted for.
+
+    Measured 2026-08-04: the Think Tank spot box aborted 5s into its daily run
+    with 0 theses written and ``challenger_selection`` unwritten, and
+    ``alpha-engine-research-runner`` failed identically — both with all six
+    ``KREPIS_*`` variables set and ``/alpha-engine/ROUTER_CONSUMER_*`` present
+    and readable. Both halves had tests; neither test could see the other half,
+    which is why the class-level test below exercises the SEAM rather than
+    either side of it.
+    """
+
+    ROUTER_SPEC = ModelSpec(
+        provider="litellm_proxy",
+        model="med",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    def test_credential_only_in_ssm_resolves(self, monkeypatch):
+        """The live failure, reproduced: nothing in the environment, value in SSM."""
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": (
+                "sk-from-ssm" if name == "ROUTER_CONSUMER_THINKTANK" else None
+            ),
+        )
+        client = LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-ssm"
+
+    def test_ssm_lookup_uses_this_consumers_name_not_the_shared_key(self, monkeypatch):
+        """The edge identifies a consumer BY its credential value, so resolving
+        the shared name would collapse this consumer into the director."""
+        seen = []
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": seen.append(name) or "sk",
+        )
+        LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")._resolve_api_key()
+        assert seen == ["ROUTER_CONSUMER_THINKTANK"]
+        assert "LITELLM_MASTER_KEY" not in seen
+
+    def test_environment_still_wins_when_set(self, monkeypatch):
+        monkeypatch.setenv("ROUTER_CONSUMER_THINKTANK", "sk-from-env")
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": "sk-from-ssm",
+        )
+        client = LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-env"
+
+    def test_unresolvable_edge_credential_names_the_ssm_parameter(self, monkeypatch):
+        """Naming only the env var sends an operator to the wrong place on the
+        one path whose supported source is SSM."""
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        with pytest.raises(LLMConfigError) as exc:
+            LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")._resolve_api_key()
+        message = str(exc.value)
+        # All three sources, so the message matches the chain that was walked.
+        # The pre-I6373 message named the environment variable ALONE, which is
+        # the one source a correctly-configured consumer deliberately does not
+        # use — it read as "you forgot to set it" to an operator who had not.
+        assert "/alpha-engine/ROUTER_CONSUMER_THINKTANK" in message
+        assert "environment variable" in message
+        assert "api_key=" in message
+
+    def test_non_router_providers_stay_environment_only(self, monkeypatch):
+        """Every other provider authenticates from a key that is deliberately in
+        the environment. This change must not quietly give them an SSM read."""
+        called = []
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": called.append(name) or "sk",
+        )
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        spec = ModelSpec(provider="openrouter", model="m")
+        with pytest.raises(LLMConfigError) as exc:
+            LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+        assert called == []
+        assert "OPENROUTER_API_KEY environment variable" in str(exc.value)
+
+    def test_explicit_api_key_still_short_circuits(self, monkeypatch):
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        client = LLMClient(
+            spec=self.ROUTER_SPEC, callsite_id="t", api_key="sk-explicit"
+        )
+        assert client._resolve_api_key() == "sk-explicit"
+
+    def test_the_two_halves_agree_on_the_credential_name(self, monkeypatch):
+        """THE SEAM. Route admission and the call must look up the same name.
+
+        Both halves passed their own tests while disagreeing about which
+        credential the consumer had — first about the NAME (I6414), then about
+        where its VALUE may live (this change). Asserting them separately is
+        what let that happen twice, so this walks the whole path: the name the
+        admission check resolves is the name the client authenticates with.
+        """
+        import krepis.router as _router
+
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        seen = []
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": seen.append(name) or "sk-shared",
+        )
+
+        admission = _router._resolve_litellm_master_key()
+        spec = ModelSpec(
+            provider=_router.ROUTER_EDGE_PROVIDER,
+            model="med",
+            base_url="https://router.example.invalid:8443",
+            api_key_env=_router.router_credential_secret_name(),
+        )
+        call = LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+
+        assert admission == call == "sk-shared"
+        assert seen == ["ROUTER_CONSUMER_THINKTANK", "ROUTER_CONSUMER_THINKTANK"]
