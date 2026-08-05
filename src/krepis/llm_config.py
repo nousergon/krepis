@@ -58,6 +58,22 @@ TRANSPORT_ANTHROPIC = "anthropic"
 TRANSPORT_OPENAI = "openai"
 TRANSPORT_LITELLM = "litellm"
 
+#: Provider name emitted for the router-edge route by
+#: :func:`krepis.router.resolve_group_spec`.
+#:
+#: Deliberately NOT ``"litellm"``: that name is bound in
+#: :data:`PROVIDER_REGISTRY` below to :data:`TRANSPORT_LITELLM`, i.e. the
+#: in-process ``krepis.router.get_router``, which calls providers directly from
+#: the consumer.  This name is absent from that registry, so :class:`ModelSpec`
+#: treats it as a custom OpenAI-compatible endpoint — which is what the edge is.
+#:
+#: Defined HERE, in the module both :mod:`krepis.router` (which stamps it onto
+#: the spec) and :mod:`krepis.llm` (which must recognise it to authenticate on
+#: the router credential chain) already import, rather than in either of them.
+#: ``krepis.router.ROUTER_EDGE_PROVIDER`` re-exports it, so the name keeps
+#: working where it is already used.
+ROUTER_EDGE_PROVIDER = "litellm_proxy"
+
 
 @dataclass(frozen=True)
 class ProviderDefaults:
@@ -149,6 +165,18 @@ class ModelSpec:
         billed at all) while producing the longest content. Without this
         knob a reasoning model can silently produce a well-formed, fully
         billed, EMPTY response through this adapter.
+    supports_automatic_prefix_caching
+        Whether the provider/model supports server-side automatic prefix
+        caching (e.g. DeepSeek, Moonshot/Kimi, Zhipu/GLM). When ``True``,
+        the provider caches repeated prompt prefixes transparently with
+        no client-side ``cache_control`` markers needed. Defaults to
+        ``False`` (conservative) — set explicitly in the SSM JSON spec
+        or code default when the model is known to support it. Read by
+        :class:`krepis.llm.LLMClient` for cache-aware logging; no
+        client-side behavior change is required since the caching is
+        automatic. Contrast with ``prompt_caching`` (Anthropic-style
+        explicit ``cache_control`` breakpoints) which is transport-level
+        and needs no ModelSpec field.
     """
 
     provider: str
@@ -158,6 +186,7 @@ class ModelSpec:
     structured_outputs: bool = True
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
+    supports_automatic_prefix_caching: bool = False
 
     def _registry_defaults(self) -> Optional[ProviderDefaults]:
         return PROVIDER_REGISTRY.get(self.provider)
@@ -204,6 +233,7 @@ _SPEC_JSON_FIELDS = {
     "structured_outputs",
     "api_key_env",
     "reasoning",
+    "supports_automatic_prefix_caching",
 }
 
 

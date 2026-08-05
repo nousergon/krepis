@@ -1640,6 +1640,213 @@ class TestResolveGroupSpec:
         spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
         assert spec.api_key_env == "LITELLM_MASTER_KEY"
 
+
+class TestPerConsumerCredentialIsAdmitted:
+    """The ADMISSION half of the per-consumer credential
+    (alpha-engine-config-I6414).
+
+    ``KREPIS_ROUTER_CREDENTIAL_SECRET`` was honoured only at call time, in
+    ``resolve_group_spec``'s ``api_key_env``. The ``litellm_proxy`` candidate is
+    admitted or skipped much earlier, in ``_resolve_group_json``, and that check
+    called ``_resolve_litellm_master_key`` which looked only for the literal
+    ``LITELLM_MASTER_KEY``. So a consumer configured exactly as I6373 intends was
+    rejected before its credential was ever consulted.
+
+    The gap is precisely that the two halves were tested separately and each
+    passed — the class above covers the call half. These cover the admission
+    half and the equivalence between them.
+    """
+
+    @staticmethod
+    def _no_secrets_env(monkeypatch):
+        """Neutralise leg 2 so the test asserts code, not this machine.
+
+        A real ``~/Development/.llm-routing/secrets.env`` exists on the laptop
+        and carries ``LITELLM_MASTER_KEY``; without this the default-name cases
+        would pass from the filesystem regardless of what the code does.
+        """
+        monkeypatch.setattr("builtins.open", _raise_oserror)
+
+    def test_only_the_per_consumer_env_var_is_set_and_it_is_admitted(
+        self, monkeypatch
+    ):
+        """The exact I6373 configuration: the per-consumer name declared, the
+        credential present under THAT name, and `LITELLM_MASTER_KEY` absent."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        monkeypatch.setenv("ROUTER_CONSUMER_THINKTANK", "sk-thinktank-value")
+        monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+        self._no_secrets_env(monkeypatch)
+        monkeypatch.setattr(
+            _router, "_litellm_master_key_from_ssm", _fail_if_called
+        )
+
+        assert _router._resolve_litellm_master_key() == "sk-thinktank-value"
+
+    def test_the_shared_key_does_not_satisfy_a_per_consumer_declaration(
+        self, monkeypatch
+    ):
+        """Falling back to `LITELLM_MASTER_KEY` would collapse this consumer
+        into the director's identity at the edge — one `X-Router-Consumer`, one
+        rate-limit bucket, and revoking one revokes all. That is what
+        nous-ergon-ops-PR474 established distinct credentials to prevent, so the
+        fallback must NOT exist."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-the-shared-director-key")
+        self._no_secrets_env(monkeypatch)
+        monkeypatch.setattr(
+            _router, "_litellm_master_key_from_ssm", lambda name=None: None
+        )
+
+        assert _router._resolve_litellm_master_key() is None
+
+    def test_unset_override_resolves_exactly_as_before(self, monkeypatch):
+        """The regression guard on every existing consumer."""
+        monkeypatch.delenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, raising=False)
+        monkeypatch.setenv("LITELLM_MASTER_KEY", "sk-historical")
+        self._no_secrets_env(monkeypatch)
+        monkeypatch.setattr(
+            _router, "_litellm_master_key_from_ssm", _fail_if_called
+        )
+
+        assert _router._resolve_litellm_master_key() == "sk-historical"
+
+    def test_ssm_leg_receives_the_consumer_name(self, monkeypatch):
+        """Leg 3 must look up THIS consumer's parameter. Passing the default
+        name through would read the director's parameter and admit the route on
+        a credential the consumer cannot present at call time — an admission
+        that then 401s, which is worse than a clean skip."""
+        seen = {}
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_RESEARCH"
+        )
+        monkeypatch.delenv("ROUTER_CONSUMER_RESEARCH", raising=False)
+        monkeypatch.delenv("LITELLM_MASTER_KEY", raising=False)
+        self._no_secrets_env(monkeypatch)
+        monkeypatch.setattr(
+            _router, "_litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": seen.setdefault("name", name),
+        )
+
+        _router._resolve_litellm_master_key()
+        assert seen["name"] == "ROUTER_CONSUMER_RESEARCH"
+
+    # ── which SSM parameter the name maps to ─────────────────────────────
+
+    def test_ssm_param_for_the_default_name_is_unchanged(self, monkeypatch):
+        monkeypatch.delenv("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", raising=False)
+        seen = _capture_ssm_param(monkeypatch)
+
+        _original_litellm_master_key_from_ssm("LITELLM_MASTER_KEY")
+        assert seen["param"] == _router.LITELLM_MASTER_KEY_SSM_PARAM
+
+    def test_ssm_param_for_a_consumer_name_uses_the_fleet_prefix(
+        self, monkeypatch
+    ):
+        from krepis.secrets import SSM_PREFIX
+
+        monkeypatch.delenv("KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", raising=False)
+        seen = _capture_ssm_param(monkeypatch)
+
+        _original_litellm_master_key_from_ssm("ROUTER_CONSUMER_THINKTANK")
+        assert seen["param"] == (
+            f"{SSM_PREFIX.rstrip('/')}/ROUTER_CONSUMER_THINKTANK"
+        )
+
+    def test_explicit_ssm_param_override_still_wins(self, monkeypatch):
+        """Callers already setting it keep working, whatever their name is."""
+        monkeypatch.setenv(
+            "KREPIS_LITELLM_MASTER_KEY_SSM_PARAM", "/custom/PARAM"
+        )
+        seen = _capture_ssm_param(monkeypatch)
+
+        _original_litellm_master_key_from_ssm("ROUTER_CONSUMER_THINKTANK")
+        assert seen["param"] == "/custom/PARAM"
+
+    # ── the name is an identifier, not a path ────────────────────────────
+
+    @pytest.mark.parametrize("bad", [
+        "../../symposion/LITELLM_MASTER_KEY",   # traversal out of the prefix
+        "/alpha-engine/ROUTER_CONSUMER_X",      # absolute, would double-prefix
+        "ROUTER CONSUMER",                      # space
+        "ROUTER\nCONSUMER",                     # newline into a log record
+        "ROUTER-CONSUMER",                      # hyphen is not an env-var char
+        "x" * 129,                              # over the length bound
+    ])
+    def test_a_malformed_name_falls_back_rather_than_naming_a_path(
+        self, monkeypatch, bad
+    ):
+        """The value is operator-supplied and is interpolated into an SSM
+        parameter path, so `../../elsewhere/PARAM` reads as a traversal to the
+        SSM API rather than as a malformed name."""
+        monkeypatch.setenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, bad)
+        assert _router.router_credential_secret_name() == "LITELLM_MASTER_KEY"
+
+    def test_a_malformed_name_is_warned_not_swallowed(
+        self, monkeypatch, caplog
+    ):
+        """Falling back silently would authenticate this consumer as whoever
+        holds the shared key — the identity collapse distinct credentials exist
+        to prevent — and it would look like a working configuration."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "../../elsewhere/PARAM"
+        )
+        with caplog.at_level("WARNING"):
+            _router.router_credential_secret_name()
+        assert any(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV in r.message
+            or _router.ROUTER_CREDENTIAL_SECRET_ENV in r.getMessage()
+            for r in caplog.records
+        )
+
+    def test_a_well_formed_name_is_unchanged(self, monkeypatch):
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        assert (
+            _router.router_credential_secret_name()
+            == "ROUTER_CONSUMER_THINKTANK"
+        )
+
+
+def _raise_oserror(*_args, **_kwargs):
+    raise OSError("secrets.env neutralised for this test")
+
+
+def _fail_if_called(*_args, **_kwargs):
+    raise AssertionError(
+        "resolution should have returned before reaching this leg"
+    )
+
+
+def _capture_ssm_param(monkeypatch) -> dict:
+    """Record the parameter name `_litellm_master_key_from_ssm` asks SSM for,
+    without reaching AWS. Returns the dict the name lands in.
+
+    Callers use `_original_litellm_master_key_from_ssm`, not the module
+    attribute: conftest's autouse `_no_ssm_master_key_lookup_from_tests` stubs
+    the attribute for the whole suite, so calling it here would exercise the
+    stub and assert nothing."""
+    seen: dict = {}
+
+    class _FakeSSM:
+        @staticmethod
+        def get_parameter(Name, WithDecryption):  # noqa: N803 - boto3 kwarg
+            seen["param"] = Name
+            return {"Parameter": {"Value": "sk-fake"}}
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(_service, region_name=None):
+            return _FakeSSM()
+
+    monkeypatch.setitem(sys.modules, "boto3", _FakeBoto3)
+    return seen
+
     # ── route_is_degraded ────────────────────────────────────────────────
 
     def test_litellm_proxy_route_is_never_degraded_at_resolve_time(self):

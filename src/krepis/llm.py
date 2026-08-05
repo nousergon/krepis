@@ -45,11 +45,16 @@ from krepis.anthropic_payload import (
     build_web_search_tool,
 )
 from krepis.llm_config import (
+    ROUTER_EDGE_PROVIDER,
     TRANSPORT_ANTHROPIC,
     TRANSPORT_LITELLM,
     LLMConfigError,
     ModelSpec,
 )
+# Only the prefix constant, so the router-edge failure message can name the
+# SSM parameter an operator has to look at. `krepis.secrets` imports boto3
+# lazily, so this costs nothing at import time.
+from krepis.secrets import SSM_PREFIX as _SSM_PREFIX
 from krepis.llm_search import (
     Citation,
     SearchEvent,
@@ -568,6 +573,12 @@ class LLMClient:
         self._max_retries = max_retries
         self._cost_sink = cost_sink
         self._client: Any = None
+        if spec.supports_automatic_prefix_caching:
+            logger.info(
+                "LLMClient(%s/%s): automatic prefix caching is active for this model "
+                "(server-side, no client-side cache_control markers needed)",
+                spec.provider, spec.model,
+            )
         # Parameters the route could not honor and the caller allowed us to
         # drop. Surfaced on LLMResult so a degraded call is visible in the
         # artifact rather than only in a log line.
@@ -625,7 +636,46 @@ class LLMClient:
             return self._api_key
         env_name = self.spec.resolved_api_key_env()
         key = os.environ.get(env_name)
+        if not key and self.spec.provider == ROUTER_EDGE_PROVIDER:
+            # The ROUTER EDGE resolves on the full credential chain, not the
+            # environment alone (alpha-engine-config-I6373).
+            #
+            # Every other provider here authenticates from a key that is
+            # deliberately in the environment, and that stays true. The edge is
+            # different in kind: `resolve_group_spec` names a PER-CONSUMER
+            # credential (`$KREPIS_ROUTER_CREDENTIAL_SECRET`), the edge
+            # identifies the consumer BY that credential's value, and the
+            # supported home for it is SSM under `/alpha-engine/<name>` —
+            # precisely so the secret never enters an environment, a Lambda
+            # config, a CloudWatch log, or an SSM command string on the way to
+            # the box.
+            #
+            # Route admission already resolved it that way. This leg did not,
+            # so a consumer configured exactly as intended passed admission and
+            # then failed the call it had just been admitted for. Measured
+            # 2026-08-04: the Think Tank spot box aborted 5s into its daily run
+            # having written 0 theses, with all six KREPIS_* variables set and
+            # the SSM parameter present and readable; `alpha-engine-research-
+            # runner` failed identically. Both halves had tests; neither test
+            # could see the other half.
+            #
+            # Lazy import: `krepis.router` imports `krepis.llm_config` and is
+            # the heavier module, so it is reached the same way every other
+            # router call in this file is.
+            from krepis.router import resolve_router_credential
+
+            key = resolve_router_credential(env_name)
         if not key:
+            if self.spec.provider == ROUTER_EDGE_PROVIDER:
+                # Naming only the environment variable sends an operator to the
+                # wrong place on the path whose supported source is SSM.
+                raise LLMConfigError(
+                    f"no router-edge credential {env_name!r}: pass api_key=, "
+                    f"set the {env_name} environment variable, or put the "
+                    f"value in SSM at {_SSM_PREFIX}{env_name} "
+                    "(this consumer's identity at the edge is its credential "
+                    "VALUE — do not point it at a shared key)"
+                )
             raise LLMConfigError(
                 f"no API key for provider {self.spec.provider!r}: pass "
                 f"api_key= or set the {env_name} environment variable"
