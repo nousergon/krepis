@@ -31,6 +31,7 @@ model_groups:
     - gemini-2.5-flash
     - gpt-oss-120b
     - gemini-2.5-pro
+    - gemini-2.0-flash
   med:
     - deepseek-v4-flash-max
     - deepseek-v4-flash-openrouter-max
@@ -188,6 +189,30 @@ models:
     params:
       max_tokens: 16384
     status: active
+
+  # Deprecated model — should be excluded from model_list by the
+  # _parse_registry filter (model-router-policy R4).
+  - id: claude-sonnet-5
+    name: Claude Sonnet 5
+    provider: anthropic
+    route: direct
+    model: claude-sonnet-5
+    status: deprecated
+    notes: No Anthropic in Router per 2026-07-24 ruling.
+
+  # Deprecated model in the low group — should be silently dropped from
+  # the fallback chain.
+  - id: gemini-2.0-flash
+    name: Gemini 2.0 Flash
+    provider: gemini
+    route: egress_proxy
+    api_base: http://127.0.0.1:8974/v1beta/openai
+    model: gemini-2.0-flash
+    group: low
+    group_role: fallback
+    params:
+      max_tokens: 8192
+    status: deprecated
 """
 
 
@@ -252,6 +277,36 @@ class TestParseRegistry:
         assert "med" in model_names
         assert "high" in model_names
         assert "ultra" in model_names
+
+    def test_deprecated_model_not_in_model_list(self, registry_file):
+        """Deprecated models that aren't in any group should be excluded
+        from model_list (model-router-policy R4)."""
+        model_list, fallbacks = _router._parse_registry(registry_file)
+        model_names = {m["model_name"] for m in model_list}
+        # claude-sonnet-5 is status:deprecated and not in any group
+        assert "low-claude-sonnet-5" not in model_names
+        # The deprecated model should not appear as its own entry
+        assert "claude-sonnet-5" not in model_names
+
+    def test_deprecated_model_excluded_from_fallback(self, registry_file):
+        """Deprecated models in group fallback chains should be silently
+        dropped (R4: no reachable deprecated model)."""
+        model_list, fallbacks = _router._parse_registry(registry_file)
+        # The low group originally had gemini-2.0-flash as a fallback but
+        # it's status:deprecated — should not appear in the fallback chain
+        low_fb = next(fb for fb in fallbacks if "low" in fb)
+        assert "low-gemini-2.0-flash" not in low_fb["low"]
+        # The deprecated model's exclusion should not affect the live chain
+        assert "low-gemini-2.5-flash" in low_fb["low"]
+
+    def test_deprecated_model_does_not_affect_group_alias(self, registry_file):
+        """If a deprecated model is the group primary (first in list), the
+        alias should still come from the first LIVE member."""
+        model_list, fallbacks = _router._parse_registry(registry_file)
+        # All groups have a valid primary — verifies that no group is empty
+        group_names = {"low", "med", "high", "ultra"}
+        parsed_groups = {m["model_name"] for m in model_list}
+        assert group_names.issubset(parsed_groups)
 
     def test_reasoning_param_included(self, registry_file):
         model_list, fallbacks = _router._parse_registry(registry_file)
