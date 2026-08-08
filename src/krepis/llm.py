@@ -124,6 +124,40 @@ def _check_fallback_transition(group: str, fallback_used: bool, served_model: st
     _fallback_state[group] = fallback_used
 
 
+def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
+    """Return the real model that served a group-addressed call, or raise.
+
+    ``spec.model`` on a group-addressed spec is a synthetic alias ("low" /
+    "med" / "high" / "ultra") that never appears in ``krepis.cost``'s price
+    cards and is never itself a billable model. When the router response's
+    ``model`` field comes back empty, or (for reasons not yet root-caused —
+    alpha-engine-config-I6543) equal to the alias itself, the previous code
+    silently substituted the alias as the served model. That value then
+    flowed into ``krepis.cost.load_default_pricing().get(served_model, ...)``
+    and, for THIS consumer, failed there — but the defect is here: an alias
+    is not a served model, in a Lambda whose cost lookup happens to succeed
+    to find a coincidentally-matching card, or logged to a manifest as the
+    served model, either would be silently wrong rather than loudly wrong.
+
+    Raising here surfaces the failure at its source with the diagnostic
+    payload (``_hidden_params``, when the transport is litellm's own Router
+    object) needed to root-cause why the field was unusable, instead of at
+    a downstream consumer with none of that context.
+    """
+    served_model = getattr(resp, "model", "") or ""
+    if served_model and served_model != spec.model:
+        return served_model
+    hidden = getattr(resp, "_hidden_params", None)
+    raise LLMConfigError(
+        f"provider={spec.provider!r} group={spec.model!r}: the router "
+        f"response did not report a served model distinct from the group "
+        f"alias (model field was {served_model!r}). Refusing to bill or "
+        f"record the call under the alias — it is not a real model and "
+        f"carries no price card (alpha-engine-config-I6543). "
+        f"resp._hidden_params={hidden!r}"
+    )
+
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 # Special/control-token leakage: some open-weight models (confirmed live
@@ -1011,14 +1045,14 @@ class LLMClient:
                 ],
                 max_tokens=limit,
             )
-            served_model = getattr(resp, "model", "")
+            served_model = _resolve_group_served_model(resp, spec=self.spec)
             primary = _get_primary(self.spec.model)
-            fallback_used = bool(primary and served_model and served_model != primary)
+            fallback_used = bool(primary and served_model != primary)
             _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
             text = self._choice_text_or_llm_error(resp)
             return LLMResult(
                 text=text,
-                model=served_model or self.spec.model,
+                model=served_model,
                 provider=self.spec.provider,
                 served_provider=getattr(resp, "_hidden_params", {}).get("model_id", None),
                 usage=self._usage_from_openai(resp),
@@ -1044,9 +1078,14 @@ class LLMClient:
             kwargs.update(extra)
         resp = self._transport_client().chat.completions.create(**kwargs)
         text = self._choice_text_or_llm_error(resp)
+        served_model = (
+            _resolve_group_served_model(resp, spec=self.spec)
+            if self.spec.provider == ROUTER_EDGE_PROVIDER
+            else getattr(resp, "model", self.spec.model)
+        )
         return LLMResult(
             text=text,
-            model=getattr(resp, "model", self.spec.model),
+            model=served_model,
             provider=self.spec.provider,
             served_provider=getattr(resp, "provider", None),
             usage=self._usage_from_openai(resp),
@@ -1298,6 +1337,18 @@ class LLMClient:
                     resp, raw_text, spec=self.spec,
                     max_tokens=max_tokens, usage=usage,
                 )
+                # Also outside the retry classification, and computed before
+                # JSON validation: an unresolvable served model is a router/
+                # transport data-integrity problem, not a validation failure,
+                # and cannot be fixed by a corrective retry against the same
+                # response. Letting it fall into the validation except below
+                # would burn `attempts` retries on an unrecoverable condition
+                # and report it as "failed validation" (alpha-engine-config-I6543).
+                served_model = (
+                    _resolve_group_served_model(resp, spec=self.spec)
+                    if self.spec.provider == ROUTER_EDGE_PROVIDER
+                    else getattr(resp, "model", self.spec.model)
+                )
             except (json.JSONDecodeError, NullChoicesError) as exc:
                 # Two body-level transport failures on what the SDK treated as
                 # a SUCCESSFUL transaction, both invisible to its own
@@ -1338,7 +1389,7 @@ class LLMClient:
                 parsed = parse_and_validate(_extract_json(raw_text))
                 return StructuredResult(
                     text=raw_text,
-                    model=getattr(resp, "model", self.spec.model),
+                    model=served_model,
                     provider=self.spec.provider,
                     served_provider=getattr(resp, "provider", None),
                     usage=usage,
@@ -1427,9 +1478,9 @@ class LLMClient:
                     ) from exc
                 continue
 
-            served_model = getattr(resp, "model", "")
+            served_model = _resolve_group_served_model(resp, spec=self.spec)
             primary = _get_primary(self.spec.model)
-            if primary and served_model and served_model != primary:
+            if primary and served_model != primary:
                 fallback_used = True
             _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
 
@@ -1462,7 +1513,7 @@ class LLMClient:
                 text=raw_text,
                 parsed=validated if is_pydantic else None,
                 data=validated if not is_pydantic else None,
-                model=served_model or self.spec.model,
+                model=served_model,
                 provider=self.spec.provider,
                 usage=usage,
                 raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
