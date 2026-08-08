@@ -28,11 +28,13 @@ import pytest
 
 from krepis.anthropic_payload import (
     DEFAULT_WEB_SEARCH_MAX_USES,
+    MAX_CACHE_BREAKPOINTS,
     SERVER_TOOL_PREFIXES,
     PayloadInvariantError,
     build_batches_request_params,
     build_messages_payload,
     build_web_search_tool,
+    ensure_message_breakpoint_spacing,
     validate_payload,
 )
 
@@ -388,3 +390,229 @@ def test_build_batches_request_params_extra_merges_into_params():
         extra={"metadata": {"user_id": "judge-v3"}},
     )
     assert req["params"]["metadata"] == {"user_id": "judge-v3"}
+
+
+# ── 4-breakpoint ceiling (G3, §3.7) ──────────────────────────────────────────
+
+
+class TestCountCacheBreakpoints:
+    """``_count_cache_breakpoints`` — count ``cache_control`` markers
+    across system blocks and message content blocks."""
+
+    def test_zero_breakpoints_empty_payload(self):
+        from krepis.anthropic_payload import _count_cache_breakpoints
+        assert _count_cache_breakpoints({}) == 0
+        assert _count_cache_breakpoints({"system": [], "messages": []}) == 0
+
+    def test_zero_breakpoints_no_cache_control(self):
+        from krepis.anthropic_payload import _count_cache_breakpoints
+        payload = {
+            "system": [{"type": "text", "text": "hello"}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        assert _count_cache_breakpoints(payload) == 0
+
+    def test_one_system_breakpoint(self):
+        from krepis.anthropic_payload import _count_cache_breakpoints
+        payload = {
+            "system": [{"type": "text", "text": "prompt",
+                         "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        assert _count_cache_breakpoints(payload) == 1
+
+    def test_breakpoints_in_message_content_blocks(self):
+        from krepis.anthropic_payload import _count_cache_breakpoints
+        payload = {
+            "system": [{"type": "text", "text": "prompt",
+                         "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "part a",
+                     "cache_control": {"type": "ephemeral"}},
+                    {"type": "text", "text": "part b"},
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "response",
+                     "cache_control": {"type": "ephemeral"}},
+                ]},
+            ],
+        }
+        # system block (1) + user content block (1) + assistant content block (1) = 3
+        assert _count_cache_breakpoints(payload) == 3
+
+
+class TestValidate4BreakpointCeiling:
+    """``validate_payload`` MUST reject payloads exceeding 4 breakpoints."""
+
+    def test_allows_four_breakpoints(self):
+        """Boundary: exactly 4 breakpoints is valid."""
+        payload = {
+            "system": [
+                {"type": "text", "text": "s1",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s2",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s3",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s4",
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        validate_payload(payload)
+
+    def test_rejects_five_breakpoints(self):
+        payload = {
+            "system": [
+                {"type": "text", "text": "s1",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s2",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s3",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s4",
+                 "cache_control": {"type": "ephemeral"}},
+                {"type": "text", "text": "s5",
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        with pytest.raises(PayloadInvariantError, match="4-breakpoint|4 cache_control|MAX_CACHE_BREAKPOINTS"):
+            validate_payload(payload)
+
+    def test_rejects_breakpoints_across_system_and_messages(self):
+        """Breakpoints in both system AND message content blocks
+        count toward the same ceiling — the API limit is per-request."""
+        five_system_blocks = [
+            {"type": "text", "text": f"s{i}",
+             "cache_control": {"type": "ephemeral"}}
+            for i in range(4)
+        ]
+        payload = {
+            "system": five_system_blocks,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "extra",
+                 "cache_control": {"type": "ephemeral"}},
+            ]}],
+        }
+        with pytest.raises(PayloadInvariantError):
+            validate_payload(payload)
+
+    def test_existing_server_tool_check_still_fires(self):
+        """Adding the breakpoint ceiling must not break the existing
+        server-tool ⊥ assistant-prefill invariant; both checks coexist."""
+        payload = {
+            "system": [{"type": "text", "text": "p",
+                         "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"type": "web_search_20250305", "name": "w"}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "Y"},
+            ],
+        }
+        with pytest.raises(PayloadInvariantError, match="server-side tools"):
+            validate_payload(payload)
+
+    def test_max_breakpoints_constant_exported(self):
+        """The constant is public so consumers can reference it."""
+        assert MAX_CACHE_BREAKPOINTS == 4
+
+
+# ── 20-block lookback (G3, §3.7) ──────────────────────────────────────────────
+
+
+class TestEnsureMessageBreakpointSpacing:
+    """``ensure_message_breakpoint_spacing`` — intermediate breakpoint
+    placement in multi-turn messages.
+
+    Both unenforced G3 rules are M1-only, and the fleet currently runs
+    zero active M1 models. These tests verify the logic is correct so
+    it fires when needed, and that the no-op path (M2/M4) is inert.
+    """
+
+    def test_noop_when_supports_explicit_breakpoints_false(self):
+        """M2/M4 path: markers are never placed."""
+        messages = [
+            {"role": "user", "content": [{"type": "text", "text": "a"}]},
+        ]
+        result = ensure_message_breakpoint_spacing(
+            messages, supports_explicit_breakpoints=False,
+        )
+        assert result is messages
+        assert "cache_control" not in result[0]["content"][0]
+
+    def test_noop_for_short_conversation(self):
+        """Below the 20-block lookback window: no markers needed."""
+        blocks = [{"type": "text", "text": str(i)} for i in range(19)]
+        messages = [{"role": "user", "content": blocks}]
+        ensure_message_breakpoint_spacing(messages)
+        assert all("cache_control" not in b for b in messages[0]["content"])
+
+    def test_places_first_intermediate_at_20_blocks(self):
+        """At exactly 20 consecutive blocks without a breakpoint,
+        the next block gets one (blocks are 0-indexed: block 19 is
+        the 20th)."""
+        blocks = [{"type": "text", "text": str(i)} for i in range(21)]
+        messages = [{"role": "user", "content": blocks}]
+        ensure_message_breakpoint_spacing(messages)
+        # block 0-18: no breakpoint (18 blocks)
+        # block 19: 20th block, gets breakpoint
+        for i in range(19):
+            assert "cache_control" not in blocks[i], f"block {i} should not have cache_control"
+        assert "cache_control" in blocks[19], "block 19 (20th block) should have intermediate breakpoint"
+        # After placing one, the counter resets; block 20 is the first
+        # block after the breakpoint (at offset 1, < 15 → no marker).
+        assert "cache_control" not in blocks[20]
+
+    def test_respects_existing_breakpoint_in_messages(self):
+        """An existing ``cache_control`` marker resets the counter
+        — blocks after it don't count toward the 20-block window."""
+        blocks = [{"type": "text", "text": str(i)} for i in range(25)]
+        # Place an existing breakpoint at block 10
+        blocks[10]["cache_control"] = {"type": "ephemeral"}
+        messages = [{"role": "user", "content": blocks}]
+        ensure_message_breakpoint_spacing(messages)
+        # After the breakpoint at block 10, counters reset.
+        # Blocks 11-29 (19 more) have no new breakpoint.
+        for i in range(11, 25):
+            assert "cache_control" not in blocks[i], f"block {i} should not have new cache_control"
+
+    def test_places_repeated_intermediates_at_15_block_interval(self):
+        """After the 20-block lookback window triggers the first
+        intermediate, further breakpoints are placed ~15 blocks
+        apart (counter values 20, 35, 50, ... = (N-20)%15==0).
+        The counter is NOT reset on placement so intervals stay
+        approximately 15 rather than reverting to 20 each time."""
+        blocks = [{"type": "text", "text": str(i)} for i in range(70)]
+        messages = [{"role": "user", "content": blocks}]
+        ensure_message_breakpoint_spacing(messages)
+        # Block 19 = 20th block (0-indexed) → first intermediate
+        assert "cache_control" in blocks[19]
+        # After first placement, counter continues (not reset).
+        # Counter=35 → (35-20)%15==0 → block 34 (15 blocks later)
+        assert "cache_control" in blocks[34]
+        # Counter=50 → (50-20)%15==0 → block 49 (15 blocks later)
+        assert "cache_control" in blocks[49]
+        # Blocks beyond: counter < 20 before next trigger (65) → none
+        assert "cache_control" not in blocks[60]
+        assert "cache_control" not in blocks[69]
+
+    def test_single_string_content_no_markers_placed(self):
+        """String content is a single content block; no intermediate
+        breakpoints are needed since content is indivisible."""
+        messages = [
+            {"role": "user", "content": "a long string content"},
+        ]
+        ensure_message_breakpoint_spacing(messages)
+        assert isinstance(messages[0]["content"], str)
+
+    def test_mixed_string_and_list_messages(self):
+        """A multi-turn conversation with mixed message shapes."""
+        messages = [
+            {"role": "user", "content": "short text"},
+            {"role": "assistant",
+             "content": [{"type": "text", "text": "response"}]},
+        ]
+        result = ensure_message_breakpoint_spacing(messages)
+        assert result is messages
