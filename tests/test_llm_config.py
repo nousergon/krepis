@@ -259,3 +259,42 @@ class TestInProcessLitellmProviderIsRefused:
     def test_named_providers_are_unaffected(self):
         for provider in ("anthropic", "openai", "openrouter"):
             assert ModelSpec(provider, "some-model").provider == provider
+
+
+class TestInProcessLitellmTransportIsRetired:
+    """The transport `provider="litellm"` used to select is gone
+    (alpha-engine-config-I6665). These assert it cannot come back quietly —
+    a re-added registry entry or transport branch would restore consumer-side
+    direct egress, which is the condition I6367 rules out, and would do it
+    without anyone naming the decision.
+    """
+
+    def test_litellm_is_not_in_the_provider_registry(self):
+        from krepis.llm_config import PROVIDER_REGISTRY
+
+        assert "litellm" not in PROVIDER_REGISTRY
+
+    def test_only_two_transports_exist(self):
+        from krepis.llm_config import PROVIDER_REGISTRY
+
+        assert {d.transport for d in PROVIDER_REGISTRY.values()} == {
+            "anthropic",
+            "openai",
+        }
+
+    def test_the_llm_module_has_no_in_process_router(self):
+        import krepis.llm as _llm
+
+        assert not hasattr(_llm, "_get_router")
+        assert not hasattr(_llm.LLMClient, "_structured_litellm")
+
+    def test_the_alias_still_resolves_for_older_importers(self):
+        """`TRANSPORT_LITELLM` was importable; keep the name resolving so a
+        consumer pinned to an older krepis does not fail at IMPORT time, which
+        would be a worse error than the one the guard gives it."""
+        from krepis.llm_config import (
+            REFUSED_IN_PROCESS_PROVIDER,
+            TRANSPORT_LITELLM,
+        )
+
+        assert TRANSPORT_LITELLM == REFUSED_IN_PROCESS_PROVIDER == "litellm"

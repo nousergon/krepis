@@ -47,7 +47,6 @@ from krepis.anthropic_payload import (
 from krepis.llm_config import (
     ROUTER_EDGE_PROVIDER,
     TRANSPORT_ANTHROPIC,
-    TRANSPORT_LITELLM,
     LLMConfigError,
     ModelSpec,
 )
@@ -65,38 +64,6 @@ from krepis.llm_search import (
 )
 
 logger = logging.getLogger(__name__)
-
-# ── LiteLLM Router (lazy singleton) ────────────────────────────────────────
-# When provider=litellm, calls route through a litellm.Router configured with
-# the model groups defined in LLM_MODEL_REGISTRY.yaml. The Router handles
-# fallback chains transparently — a call to model "low" tries the primary
-# in the low group, then falls back through the ordered chain on failure.
-#
-# The Router config is the SINGLE source of truth, derived from
-# LLM_MODEL_REGISTRY.yaml at init time (with a hardcoded fallback if the
-# registry file can't be found). See krepis.router for the registry loader
-# and CLI (python3 -m krepis.router resolve <group>).
-#
-# Model groups (no Anthropic — per Brian's 2026-07-24 ruling):
-#   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
-#   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
-#   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
-#   ultra: glm-5.2 → kimi-k3 → deepseek-v4-pro (reasoning=max)
-#
-# Initialized on first use so importing krepis.llm doesn't pay the Router
-# construction cost until a caller actually uses the litellm transport.
-
-
-def _get_router() -> Any:
-    """Return the module-level LiteLLM Router singleton.
-
-    Delegates to :func:`krepis.router.get_router` which builds from
-    LLM_MODEL_REGISTRY.yaml (preferred) or a hardcoded fallback.
-    """
-    from krepis.router import get_router as _router_get
-
-    return _router_get()
-
 
 # Per-group fallback-state tracker so callers can detect sign-on / sign-off
 # transitions.  Keyed by group name ("low", "med", "high", "ultra"); True
@@ -1018,51 +985,6 @@ class LLMClient:
                 raw_response=msg,
             )
 
-        if self.spec.transport == TRANSPORT_LITELLM:
-            # LiteLLM Router handles fallback chains — model is the group name.
-            from krepis.router import get_group_primary as _get_primary
-            from krepis.router import group_supports_explicit_cache_breakpoints as _grp_pc
-
-            # cache_system asks for EXPLICIT cache_control breakpoints. Whether
-            # the served model honors them is a per-model fact resolved from
-            # the registry via the group's primary — never assumed, and never
-            # silently dropped, which is what this branch used to do.
-            if cache_system:
-                self._capability_gate(
-                    "cache_system",
-                    _grp_pc(self.spec.model),
-                    on_unsupported=on_unsupported,
-                    detail="the model serving this group uses automatic prefix "
-                           "caching (or none), which takes no client markers",
-                )
-
-            router = _get_router()
-            resp = router.completion(
-                model=self.spec.model,  # "low", "med", "high", "ultra"
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=limit,
-            )
-            served_model = _resolve_group_served_model(resp, spec=self.spec)
-            primary = _get_primary(self.spec.model)
-            fallback_used = bool(primary and served_model != primary)
-            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
-            text = self._choice_text_or_llm_error(resp)
-            return LLMResult(
-                text=text,
-                model=served_model,
-                provider=self.spec.provider,
-                served_provider=getattr(resp, "_hidden_params", {}).get("model_id", None),
-                usage=self._usage_from_openai(resp),
-                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
-                raw_response=resp,
-                fallback_used=fallback_used,
-                model_requested=self.spec.model,
-                dropped_params=list(self.dropped_params),
-            )
-
         kwargs: dict = {
             "model": self.spec.model,
             "max_tokens": limit,
@@ -1157,17 +1079,6 @@ class LLMClient:
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             return self._structured_anthropic(
-                system=system,
-                user_content=user_content,
-                schema_dict=schema_dict,
-                schema_name=schema_name,
-                parse_and_validate=_parse_and_validate,
-                is_pydantic=is_pydantic,
-                attempts=attempts,
-                max_tokens=limit,
-            )
-        if self.spec.transport == TRANSPORT_LITELLM:
-            return self._structured_litellm(
                 system=system,
                 user_content=user_content,
                 schema_dict=schema_dict,
@@ -1421,108 +1332,6 @@ class LLMClient:
 
         raise LLMError(
             f"provider={self.spec.provider} model={self.spec.model}: "
-            f"structured output failed validation after {attempts} "
-            f"attempt(s): {last_error}",
-            usage=usage,
-        )
-
-    def _structured_litellm(
-        self,
-        *,
-        system: str,
-        user_content: str,
-        schema_dict: dict,
-        schema_name: str,
-        parse_and_validate: Callable[[Any], Any],
-        is_pydantic: bool,
-        attempts: int,
-        max_tokens: int,
-    ) -> StructuredResult:
-        """Structured completion via LiteLLM Router with fallback chains."""
-        from krepis.router import get_group_primary as _get_primary
-
-        json_instruction = _JSON_INSTRUCTION.format(
-            schema=json.dumps(schema_dict, indent=2)
-        )
-        usage = LLMUsage()
-        last_error: Optional[str] = None
-        fallback_used = False
-
-        for attempt in range(1, attempts + 1):
-            router = _get_router()
-            prompt = (
-                user_content + json_instruction
-                if attempt == 1
-                else user_content
-                + f"\n\nPrevious attempt failed: {last_error}\n"
-                + json_instruction
-            )
-            try:
-                resp = router.completion(
-                    model=self.spec.model,  # "low", "med", "high", "ultra"
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt == attempts:
-                    raise LLMError(
-                        f"litellm Router call failed after {attempts} "
-                        f"attempt(s) — all models in group "
-                        f"{self.spec.model!r} exhausted (primary → "
-                        f"fallbacks all failed): {last_error}",
-                        usage=usage,
-                    ) from exc
-                continue
-
-            served_model = _resolve_group_served_model(resp, spec=self.spec)
-            primary = _get_primary(self.spec.model)
-            if primary and served_model != primary:
-                fallback_used = True
-            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
-
-            self._usage_from_openai(resp, into=usage)
-            try:
-                # _choice_text is inside the guarded block: a null/empty
-                # ``choices`` body is a retryable provider failure here too,
-                # not a bare TypeError escaping the loop. No explicit backoff
-                # on this branch — the Router's fallback chain means the next
-                # attempt goes to a DIFFERENT model, so sleeping first would
-                # delay a call that is not hitting the unhealthy endpoint.
-                raw_text = _choice_text(resp)
-                # Raised INSIDE the guarded block here, unlike the openai
-                # path: the Router's next attempt goes to a DIFFERENT model in
-                # the group, which may well answer within the same budget, so
-                # a budget exhaustion is a genuine attempt failure rather than
-                # a certainty about the rest. What it must not be is
-                # anonymous — caught below, its message becomes ``last_error``
-                # and names the budget in the final LLMError.
-                _reject_budget_exhausted(
-                    resp, raw_text, spec=self.spec,
-                    max_tokens=max_tokens, usage=usage,
-                )
-                parsed = self._extract_json(raw_text)
-                validated = parse_and_validate(parsed)
-            except Exception as exc:
-                last_error = str(exc)
-                continue
-            return StructuredResult(
-                text=raw_text,
-                parsed=validated if is_pydantic else None,
-                data=validated if not is_pydantic else None,
-                model=served_model,
-                provider=self.spec.provider,
-                usage=usage,
-                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
-                raw_response=resp,
-                fallback_used=fallback_used,
-                model_requested=self.spec.model,
-            )
-
-        raise LLMError(
             f"structured output failed validation after {attempts} "
             f"attempt(s): {last_error}",
             usage=usage,

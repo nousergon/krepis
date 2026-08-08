@@ -56,16 +56,30 @@ class LLMConfigError(RuntimeError):
 
 TRANSPORT_ANTHROPIC = "anthropic"
 TRANSPORT_OPENAI = "openai"
-TRANSPORT_LITELLM = "litellm"
+
+#: The provider name :class:`ModelSpec` REFUSES to construct.
+#:
+#: It used to name a third transport — an in-process LiteLLM Router built
+#: inside the consumer, calling each upstream provider directly from it. That
+#: transport is gone (alpha-engine-config-I6665); the name survives only as
+#: the thing the guard in ``ModelSpec.__post_init__`` recognises, because
+#: consumers and stored configs still say it and must get a pointer rather
+#: than a confusing "unknown provider needs a base_url".
+#:
+#: `krepis.router.get_router` still builds a Router — for `resolve_group`,
+#: `get_group_primary` and the CLI, none of which issue completions.
+REFUSED_IN_PROCESS_PROVIDER = "litellm"
+
+#: Backwards-compatible alias. It no longer names a transport.
+TRANSPORT_LITELLM = REFUSED_IN_PROCESS_PROVIDER
 
 #: Provider name emitted for the router-edge route by
 #: :func:`krepis.router.resolve_group_spec`.
 #:
-#: Deliberately NOT ``"litellm"``: that name is bound in
-#: :data:`PROVIDER_REGISTRY` below to :data:`TRANSPORT_LITELLM`, i.e. the
-#: in-process ``krepis.router.get_router``, which calls providers directly from
-#: the consumer.  This name is absent from that registry, so :class:`ModelSpec`
-#: treats it as a custom OpenAI-compatible endpoint — which is what the edge is.
+#: Deliberately NOT ``"litellm"``: :class:`ModelSpec` refuses that name
+#: outright (see :data:`REFUSED_IN_PROCESS_PROVIDER`).  This name is absent
+#: from :data:`PROVIDER_REGISTRY`, so :class:`ModelSpec` treats it as a custom
+#: OpenAI-compatible endpoint — which is what the edge is.
 #:
 #: Defined HERE, in the module both :mod:`krepis.router` (which stamps it onto
 #: the spec) and :mod:`krepis.llm` (which must recognise it to authenticate on
@@ -102,11 +116,6 @@ PROVIDER_REGISTRY: dict = {
         transport=TRANSPORT_OPENAI,
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
-    ),
-    "litellm": ProviderDefaults(
-        transport=TRANSPORT_LITELLM,
-        base_url=None,
-        api_key_env="LITELLM_MASTER_KEY",
     ),
 }
 
@@ -189,11 +198,18 @@ class ModelSpec:
     supports_automatic_prefix_caching: bool = False
 
     def __post_init__(self) -> None:
-        # `provider="litellm"` binds to TRANSPORT_LITELLM — the IN-PROCESS
-        # LiteLLM Router, which builds a router inside the consumer and calls
-        # each upstream provider directly from it. A consumer naming it is
-        # always making the same mistake: it means "the `high` group", and it
-        # gets "be your own router".
+        # `provider="litellm"` used to select an IN-PROCESS LiteLLM Router,
+        # built inside the consumer and calling each upstream provider directly
+        # from it. That transport is gone (alpha-engine-config-I6665), but the
+        # NAME survives in stored configs and in people's fingers, and a
+        # consumer typing it is always making the same mistake: it means "the
+        # `high` group", and it used to get "be your own router".
+        #
+        # Refusing by name rather than letting it fall through to the
+        # unknown-provider path is deliberate. Unknown providers are treated as
+        # custom OpenAI-compatible endpoints, so without this the failure would
+        # be "provider 'litellm' is not a built-in and no base_url was
+        # supplied" — true, useless, and pointing at the wrong fix.
         #
         # The objection is stated in full above `krepis.router.
         # resolve_group_spec`. In short, that path (a) egresses straight to the
@@ -213,7 +229,7 @@ class ModelSpec:
         # Raising at CONSTRUCTION rather than at first call is the point: a
         # spec that cannot work should not survive resolution. Deferring it to
         # call time is what let six days pass.
-        if self.provider == TRANSPORT_LITELLM:
+        if self.provider == REFUSED_IN_PROCESS_PROVIDER:
             raise LLMConfigError(
                 "ModelSpec(provider='litellm') selects the IN-PROCESS LiteLLM "
                 "Router, which calls upstream providers directly from this "
