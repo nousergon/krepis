@@ -188,6 +188,47 @@ class ModelSpec:
     reasoning: Optional[dict] = None
     supports_automatic_prefix_caching: bool = False
 
+    def __post_init__(self) -> None:
+        # `provider="litellm"` binds to TRANSPORT_LITELLM — the IN-PROCESS
+        # LiteLLM Router, which builds a router inside the consumer and calls
+        # each upstream provider directly from it. A consumer naming it is
+        # always making the same mistake: it means "the `high` group", and it
+        # gets "be your own router".
+        #
+        # The objection is stated in full above `krepis.router.
+        # resolve_group_spec`. In short, that path (a) egresses straight to the
+        # upstream provider, unscanned by the egress proxy; (b) bypasses the
+        # authenticated edge, so per-consumer identity, rate limiting and spend
+        # attribution never apply; (c) requires `litellm` and a readable model
+        # registry inside every consumer.
+        #
+        # It failed all three ways in production before this guard existed.
+        # morning-signal set this provider on 2026-08-02 and every episode for
+        # the next six days aborted its primary on `ModuleNotFoundError: No
+        # module named 'litellm'` and silently aired on a direct-provider
+        # fallback. The package was never installed, so the transport this name
+        # selects had never once run — and nothing said so, because the failure
+        # was indistinguishable from a provider being down.
+        #
+        # Raising at CONSTRUCTION rather than at first call is the point: a
+        # spec that cannot work should not survive resolution. Deferring it to
+        # call time is what let six days pass.
+        if self.provider == TRANSPORT_LITELLM:
+            raise LLMConfigError(
+                "ModelSpec(provider='litellm') selects the IN-PROCESS LiteLLM "
+                "Router, which calls upstream providers directly from this "
+                "consumer — bypassing the egress proxy, the authenticated "
+                "router edge, and per-consumer attribution.\n\n"
+                "To address a model GROUP, resolve it instead:\n"
+                "    from krepis.router import resolve_group_spec\n"
+                "    spec, route = resolve_group_spec("
+                f"{self.model!r}, exec_context=..., wire='openai')\n\n"
+                "That returns a spec pointing at the router edge, with the "
+                "model, endpoint and credential decided by the registry. To "
+                "call one provider directly and deliberately, name that "
+                "provider."
+            )
+
     def _registry_defaults(self) -> Optional[ProviderDefaults]:
         return PROVIDER_REGISTRY.get(self.provider)
 
