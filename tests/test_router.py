@@ -310,6 +310,7 @@ class TestGetRouter:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 router = _router.get_router()
             assert router is not None
@@ -335,6 +336,7 @@ class TestGetRouter:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 router = _router.get_router()
             for m in router.model_list:
@@ -346,6 +348,7 @@ class TestGetRouter:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 router = _router.get_router()
             groups = {list(fb.keys())[0] for fb in router.fallbacks}
@@ -647,6 +650,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("med")
             assert info["model"] == "deepseek-v4-flash"
@@ -663,6 +667,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("high")
             assert info["model"] == "deepseek-v4-pro"
@@ -679,6 +684,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("ultra")
             assert info["model"] == "zhipuai/glm-5.2"
@@ -696,6 +702,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("low")
             # Should skip gemini-2.5-flash (not Anthropic-compat) → deepseek-v4-flash
@@ -711,6 +718,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 with pytest.raises(ValueError, match="not found in registry"):
                     _router._resolve_group_json("nonexistent")
@@ -721,6 +729,7 @@ class TestResolveGroupDetailed:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router._resolve_group_json("med")
             for key in ("model", "provider", "route", "api_base_url",
@@ -763,9 +772,13 @@ class TestResolveLitellmMasterKey:
     def test_env_var_empty_ignored(self):
         """An empty or whitespace-only LITELLM_MASTER_KEY is treated as unset."""
         with mock.patch.dict(os.environ, {"LITELLM_MASTER_KEY": "  "}):
-            result = _router._resolve_litellm_master_key()
-        # Should fall through to None since no secrets file or SSM is available
-        assert result is None
+            # Prevent falling through to real secrets.env on disk (I5224)
+            with mock.patch("os.path.expanduser", return_value="/nonexistent"):
+                result = _router._resolve_litellm_master_key()
+        # Should fall through to None since no secrets file or SSM is available.
+        # Use boolean capture to avoid rendering the key value on failure.
+        is_none = result is None
+        assert is_none
 
     def test_secrets_file_found(self, tmp_path):
         """A secrets.env file with LITELLM_MASTER_KEY=... is read."""
@@ -884,6 +897,7 @@ class TestCLIResolveGroup:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "med", "--json"]):
                     _router._cli()
@@ -900,6 +914,7 @@ class TestCLIResolveGroup:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 with mock.patch.object(sys, "argv", ["krepis.router", "resolve", "high"]):
                     _router._cli()
@@ -948,6 +963,7 @@ class TestResolveContract:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router.resolve_group_structured(group)
             jsonschema.validate(instance=info, schema=schema)
@@ -963,6 +979,7 @@ class TestResolveContract:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router.resolve_group_structured(group)
         finally:
@@ -974,6 +991,7 @@ class TestResolveContract:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router.resolve_group_structured("med")
         finally:
@@ -989,6 +1007,7 @@ class TestResolveContract:
         _router._router = None
         try:
             with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 info = _router.resolve_group_structured("med")
         finally:
@@ -1003,6 +1022,7 @@ class TestResolveContract:
             _router._router = None
             try:
                 with monkeypatch.context() as m:
+                    m.delenv("LITELLM_MASTER_KEY", raising=False)
                     m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                     info = _router.resolve_group_structured(group)
             finally:
