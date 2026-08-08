@@ -15,7 +15,7 @@ from krepis.llm import (
     _extract_json,
     _first_choice,
 )
-from krepis.llm_config import LLMConfigError, ModelSpec
+from krepis.llm_config import ROUTER_EDGE_PROVIDER, LLMConfigError, ModelSpec
 
 
 # ── fixtures / fakes ──────────────────────────────────────────────────────
@@ -1406,3 +1406,91 @@ class TestRouterEdgeCredentialAtCallTime:
 
         assert admission == call == "sk-shared"
         assert seen == ["ROUTER_CONSUMER_THINKTANK", "ROUTER_CONSUMER_THINKTANK"]
+
+
+# ── Group alias must never masquerade as a served model (config-I6543) ────
+
+
+class TestGroupServedModelNeverAliasesToTheGroupName:
+    """A group-addressed spec's ``model`` is a synthetic name ("low" / "med"
+    / "high" / "ultra") that is never itself a billable model and carries no
+    price card. When the router response's ``model`` field comes back empty
+    or equal to the alias, the client must raise rather than report the
+    alias as the served model — the prior behavior let "low" flow all the
+    way into ``thinktank/client.py::_cost_for``, which correctly found no
+    price card for it and aborted the run with 0 theses written (live
+    2026-08-04, alpha-engine-config-I6543).
+    """
+
+    ROUTER_SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="low",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    @staticmethod
+    def _router_client(fake):
+        # The router edge resolves its credential on the full SSM chain
+        # (I6373); an explicit api_key short-circuits that so these tests
+        # exercise served-model resolution, not credential resolution.
+        return LLMClient(
+            TestGroupServedModelNeverAliasesToTheGroupName.ROUTER_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+        )
+
+    def test_structured_raises_when_response_model_is_the_alias(self):
+        fake = FakeOpenAI([_openai_resp('{"anything": 1}', model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).structured(
+                system="s", user_content="u",
+                schema={"type": "object"}, schema_name="blob",
+            )
+        # Not retried: an alias echo is a data-integrity problem, not a
+        # transient validation failure a corrective retry could fix.
+        assert len(fake.kwargs) == 1
+
+    def test_structured_raises_when_response_model_is_empty(self):
+        fake = FakeOpenAI([_openai_resp('{"anything": 1}', model="")])
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            self._router_client(fake).structured(
+                system="s", user_content="u",
+                schema={"type": "object"}, schema_name="blob",
+            )
+
+    def test_structured_accepts_a_real_served_model(self):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="deepseek/deepseek-v4-flash")
+        ])
+        result = self._router_client(fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "deepseek/deepseek-v4-flash"
+
+    def test_complete_raises_when_response_model_is_the_alias(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
+    def test_complete_accepts_a_real_served_model(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="deepseek/deepseek-v4-flash")])
+        result = self._router_client(fake).complete(
+            system="s", user_content="u"
+        )
+        assert result.model == "deepseek/deepseek-v4-flash"
+
+    def test_non_router_provider_is_unaffected_by_alias_matching_model(self):
+        """A pinned (non-group-addressed) spec legitimately requests and
+        receives the SAME model name back — that must never raise. The
+        strict check is scoped to ``ROUTER_EDGE_PROVIDER`` only."""
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="moonshotai/kimi-k2.6")
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "moonshotai/kimi-k2.6"
