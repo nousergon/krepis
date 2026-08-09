@@ -205,3 +205,96 @@ class TestResolve:
             "/p/llm", default=DEFAULT, ssm_client=ssm, max_tokens=1500
         )
         assert spec.max_tokens == 1500
+
+
+class TestInProcessLitellmProviderIsRefused:
+    """`provider="litellm"` selects the in-process LiteLLM Router, which calls
+    upstream providers directly from the consumer. A consumer naming it always
+    means "the model group", so the name is refused with a pointer rather than
+    honoured.
+
+    Live cost of not doing this (2026-08-08): morning-signal set the provider
+    on 2026-08-02 and every episode for six days aborted its primary on
+    `ModuleNotFoundError: No module named 'litellm'`, then silently aired on a
+    direct-provider fallback. The transport that name selects had never run
+    once, and nothing distinguished that from a provider outage.
+    """
+
+    def test_construction_raises(self):
+        with pytest.raises(LLMConfigError) as exc:
+            ModelSpec("litellm", "high")
+        assert "resolve_group_spec" in str(exc.value), (
+            "the error must name the supported alternative — an error that "
+            "only says no leaves the caller to guess, and the guess is what "
+            "produced this provider name in the first place"
+        )
+
+    def test_the_error_names_the_group_that_was_asked_for(self):
+        with pytest.raises(LLMConfigError) as exc:
+            ModelSpec("litellm", "ultra")
+        assert "'ultra'" in str(exc.value)
+
+    def test_parse_from_json_is_refused_too(self):
+        """The production instance came from a JSON config value, not a
+        literal — so the guard has to hold on the parse path."""
+        with pytest.raises(LLMConfigError):
+            parse_model_spec('{"provider": "litellm", "model": "high"}')
+
+    def test_parse_from_colon_form_is_refused_too(self):
+        with pytest.raises(LLMConfigError):
+            parse_model_spec("litellm:high")
+
+    def test_the_router_edge_provider_is_unaffected(self):
+        """`litellm_proxy` is what `resolve_group_spec` emits for the edge —
+        a custom OpenAI-compatible endpoint, and the whole point of the guard.
+        Refusing it too would block the supported path."""
+        spec = ModelSpec(
+            "litellm_proxy", "high",
+            base_url="https://router.example:8443",
+            api_key_env="ROUTER_CONSUMER_TEST",
+        )
+        assert spec.provider == "litellm_proxy"
+        assert spec.resolved_base_url() == "https://router.example:8443"
+
+    def test_named_providers_are_unaffected(self):
+        for provider in ("anthropic", "openai", "openrouter"):
+            assert ModelSpec(provider, "some-model").provider == provider
+
+
+class TestInProcessLitellmTransportIsRetired:
+    """The transport `provider="litellm"` used to select is gone
+    (alpha-engine-config-I6665). These assert it cannot come back quietly —
+    a re-added registry entry or transport branch would restore consumer-side
+    direct egress, which is the condition I6367 rules out, and would do it
+    without anyone naming the decision.
+    """
+
+    def test_litellm_is_not_in_the_provider_registry(self):
+        from krepis.llm_config import PROVIDER_REGISTRY
+
+        assert "litellm" not in PROVIDER_REGISTRY
+
+    def test_only_two_transports_exist(self):
+        from krepis.llm_config import PROVIDER_REGISTRY
+
+        assert {d.transport for d in PROVIDER_REGISTRY.values()} == {
+            "anthropic",
+            "openai",
+        }
+
+    def test_the_llm_module_has_no_in_process_router(self):
+        import krepis.llm as _llm
+
+        assert not hasattr(_llm, "_get_router")
+        assert not hasattr(_llm.LLMClient, "_structured_litellm")
+
+    def test_the_alias_still_resolves_for_older_importers(self):
+        """`TRANSPORT_LITELLM` was importable; keep the name resolving so a
+        consumer pinned to an older krepis does not fail at IMPORT time, which
+        would be a worse error than the one the guard gives it."""
+        from krepis.llm_config import (
+            REFUSED_IN_PROCESS_PROVIDER,
+            TRANSPORT_LITELLM,
+        )
+
+        assert TRANSPORT_LITELLM == REFUSED_IN_PROCESS_PROVIDER == "litellm"
