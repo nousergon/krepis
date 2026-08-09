@@ -936,10 +936,33 @@ def _cli_deployment_id(entry: dict) -> str:
 
 # ── registry → Router config ─────────────────────────────────────────────
 
-def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], list[dict]]:
-    """Parse LLM_MODEL_REGISTRY.yaml into litellm Router model_list + fallbacks.
+def _parse_registry(
+    path: Path, openrouter_key: str = ""
+) -> tuple[list[dict], list[dict], dict[str, str]]:
+    """Parse LLM_MODEL_REGISTRY.yaml into litellm Router config.
 
-    Returns (model_list, fallbacks) tuples ready for litellm.Router().
+    Returns ``(model_list, fallbacks, group_aliases)`` ready for
+    ``litellm.Router(model_list=…, fallbacks=…, model_group_alias=…)``.
+
+    EVERY deployment — the primary included — is named with the qualified
+    ``{group}-{mid}`` form; the bare group name ("low", "med", …) is
+    registered only as a ``model_group_alias`` onto the primary's qualified
+    name. Naming the primary deployment with the bare group name (the
+    pre-0.39.0 shape) made LiteLLM report the group ALIAS as
+    ``response.model`` on every healthy primary-served call, which is
+    exactly the masquerade the served-model guard in ``krepis.llm`` rejects
+    (alpha-engine-config-I6543, 2026-08-09 comment). A group alias is an
+    addressing convenience, never a served-model identity.
+
+    ``fallbacks`` carries each group's chain under TWO keys: the bare group
+    name and the primary's qualified name. Measured against litellm 1.93.0:
+    the fallback lookup key is the model name AS ADDRESSED BY THE CALLER
+    (``kwargs["model"]``) — alias resolution does not rewrite it — so the
+    alias-keyed entry serves alias-addressed calls and the qualified-keyed
+    entry serves callers that address the primary deployment directly.
+    Every consumer of these tuples (in-process Router construction, any
+    proxy-yaml render) gets the alias map from this one function — one
+    derivation implementation (model-router-policy R6).
     """
     import yaml as _yaml
 
@@ -948,6 +971,7 @@ def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], l
 
     model_list: list[dict] = []
     fallbacks: list[dict] = []
+    group_aliases: dict[str, str] = {}
     seen_models: set[str] = set()
 
     groups = doc.get("model_groups", {})
@@ -955,29 +979,35 @@ def _parse_registry(path: Path, openrouter_key: str = "") -> tuple[list[dict], l
 
     for group_name, group_ids in groups.items():
         fallback_chain: list[str] = []
-        for i, mid in enumerate(group_ids):
+        primary_name: str | None = None
+        for mid in group_ids:
             entry = models.get(mid)
             if entry is None:
                 logger.warning("model %r referenced in group %r not found in models list", mid, group_name)
                 continue
 
-            # Primary is named after the GROUP ("low", "med", …) so
-            # router.completion(model="low") resolves to the first entry.
-            # Fallbacks get qualified: "low-gemini-2.5-flash", etc.
-            model_name = group_name if i == 0 else f"{group_name}-{mid}"
+            # All deployments get the qualified name — "low-deepseek-v4-flash",
+            # "low-gemini-2.5-flash", … The FIRST resolvable entry is the
+            # primary; the bare group name aliases to it below.
+            model_name = f"{group_name}-{mid}"
             litellm_params = _model_to_litellm_params(entry, openrouter_key)
 
             if model_name not in seen_models:
                 model_list.append({"model_name": model_name, "litellm_params": litellm_params})
                 seen_models.add(model_name)
 
-            if i > 0:
+            if primary_name is None:
+                primary_name = model_name
+            else:
                 fallback_chain.append(model_name)
 
-        if fallback_chain:
+        if primary_name is not None:
+            group_aliases[group_name] = primary_name
+        if fallback_chain and primary_name is not None:
             fallbacks.append({group_name: fallback_chain})
+            fallbacks.append({primary_name: fallback_chain})
 
-    return model_list, fallbacks
+    return model_list, fallbacks, group_aliases
 
 
 def _model_to_litellm_params(entry: dict, openrouter_key: str) -> dict:
@@ -1082,10 +1112,17 @@ def get_router() -> Any:
             )
 
         logger.info("building Router from %s", reg_path)
-        model_list, fallbacks = _parse_registry(reg_path, openrouter_key)
+        model_list, fallbacks, group_aliases = _parse_registry(reg_path, openrouter_key)
 
-        _router = _Router(model_list=model_list, fallbacks=fallbacks)
-        logger.info("Router initialized: %d models, %d fallback groups", len(model_list), len(fallbacks))
+        _router = _Router(
+            model_list=model_list,
+            fallbacks=fallbacks,
+            model_group_alias=group_aliases,
+        )
+        logger.info(
+            "Router initialized: %d models, %d fallback entries, %d group aliases",
+            len(model_list), len(fallbacks), len(group_aliases),
+        )
         return _router
 
 
@@ -1099,15 +1136,20 @@ def resolve_group(group: str) -> str:
     """
     router = get_router()
 
+    # The bare group name is an ALIAS onto the primary's qualified
+    # deployment name ("low" → "low-{mid}"); resolve it before any
+    # model_list lookup — no deployment is named with the bare group name.
+    primary_name = _alias_target(router, group) or group
+
     # Find the primary model's upstream identifier
-    primary_model = _upstream_model_for(router, group)
+    primary_model = _upstream_model_for(router, primary_name)
     if not primary_model:
         # Group not found in model list — return the group name as-is
         return group
 
     # Check if primary is in cooldown
     deployments = getattr(router, "cooldown_deployments", {})
-    primary_key = _deployment_key_for(router, group)
+    primary_key = _deployment_key_for(router, primary_name)
     if primary_key and primary_key in deployments:
         # Primary is in cooldown — try fallbacks
         for fb in router.fallbacks:
@@ -1168,9 +1210,72 @@ def get_group_primary(group: str) -> Optional[str]:
         fallback_used = (resp.model != primary)
     """
     router = get_router()
+    # The primary deployment is named "{group}-{mid}", never the bare group
+    # name; the group name is a model_group_alias onto it.
+    primary_name = _alias_target(router, group)
+    if primary_name is None:
+        return None
     for m in router.model_list:
-        if m["model_name"] == group:
+        if m["model_name"] == primary_name:
             return m["litellm_params"]["model"]
+    return None
+
+
+def _alias_target(router: Any, name: str) -> Optional[str]:
+    """Resolve a ``model_group_alias`` key to its target deployment name.
+
+    Returns ``None`` when *name* is not a registered alias. Handles both
+    litellm alias value shapes (plain string and ``{"model": …}`` dict).
+    """
+    aliases = getattr(router, "model_group_alias", None) or {}
+    target = aliases.get(name)
+    if isinstance(target, dict):
+        return target.get("model")
+    return target
+
+
+def served_model_for_deployment(deployment_name: str) -> Optional[str]:
+    """Map a derived deployment name ``{group}-{mid}`` to its registry
+    entry's upstream model identifier — the ``(model, route)`` key that
+    ``krepis.cost`` price cards are written against.
+
+    A LiteLLM response served by a named deployment can report the
+    deployment's ``model_name`` (the qualified ``{group}-{mid}`` form)
+    rather than the upstream model. That name embeds the registry model id,
+    so it is honestly resolvable: strip the group prefix, look the id up in
+    the registry, return the entry's ``model`` field verbatim. The field is
+    returned unmodified because it is already route-correct for pricing —
+    an OpenRouter entry carries the slug card key
+    (e.g. ``moonshotai/kimi-k3``), a direct entry the bare key
+    (e.g. ``deepseek-v4-flash``) — and price cards are per (model, ROUTE),
+    never shared between the two.
+
+    Returns ``None`` when *deployment_name* is not a derived deployment
+    name for any group in the registry. Raises ``FileNotFoundError`` when
+    no registry can be found — a caller holding a ``{group}-{mid}``-shaped
+    name resolved it through this registry in the first place, so an
+    unreadable registry here is a real defect, not a soft miss.
+    """
+    reg_path = _find_registry()
+    if not reg_path:
+        raise FileNotFoundError(
+            "LLM_MODEL_REGISTRY.yaml not found — cannot resolve deployment "
+            f"name {deployment_name!r} to its upstream model. Set "
+            "LLM_MODEL_REGISTRY_PATH or run from within a repo whose "
+            "private-docs/ directory contains the file."
+        )
+    import yaml as _yaml
+    with open(reg_path) as f:
+        doc = _yaml.safe_load(f)
+    groups = doc.get("model_groups", {}) or {}
+    models = {m["id"]: m for m in doc.get("models", [])}
+    for group_name, group_ids in groups.items():
+        prefix = f"{group_name}-"
+        if not deployment_name.startswith(prefix):
+            continue
+        mid = deployment_name[len(prefix):]
+        if mid in group_ids and mid in models:
+            return models[mid].get("model") or None
     return None
 
 
@@ -1941,9 +2046,11 @@ def _cli() -> None:
             print(model)
 
     elif cmd == "groups":
+        # Groups are the model_group_alias keys — the fallbacks structure is
+        # dual-keyed (group name + qualified primary name) and omits groups
+        # without a fallback chain, so it is the wrong source for this list.
         router = get_router()
-        for fb in router.fallbacks:
-            group_name = list(fb.keys())[0]
+        for group_name in getattr(router, "model_group_alias", None) or {}:
             print(group_name)
 
     elif cmd == "models":

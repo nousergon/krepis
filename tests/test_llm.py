@@ -1494,3 +1494,64 @@ class TestGroupServedModelNeverAliasesToTheGroupName:
             schema={"type": "object"}, schema_name="blob",
         )
         assert result.model == "moonshotai/kimi-k2.6"
+
+    # ── qualified {group}-{mid} deployment names (0.39.0 derivation) ──
+
+    _STRIP_REGISTRY = """
+model_groups:
+  low:
+    - deepseek-v4-flash
+    - gpt-oss-120b
+
+models:
+  - id: deepseek-v4-flash
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
+    model: deepseek-v4-flash
+    status: active
+  - id: gpt-oss-120b
+    provider: openrouter
+    route: openrouter
+    model: openai/gpt-oss-120b
+    status: active
+"""
+
+    @pytest.fixture
+    def strip_registry(self, tmp_path, monkeypatch):
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(self._STRIP_REGISTRY)
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+
+    def test_qualified_primary_name_passes_the_guard_and_resolves(
+        self, strip_registry
+    ):
+        """A wire response whose ``model`` is the qualified primary
+        deployment name ``{group}-{mid}`` — what the 0.39.0 derivation
+        names every deployment, primary included — must pass the guard and
+        come back as the registry entry's upstream model, the identifier
+        the price cards are keyed on (alpha-engine-config-I6543,
+        2026-08-09 comment)."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-deepseek-v4-flash")])
+        result = self._router_client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash"
+
+    def test_qualified_fallback_name_resolves_to_its_route_correct_slug(
+        self, strip_registry
+    ):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="low-gpt-oss-120b")
+        ])
+        result = self._router_client(fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "openai/gpt-oss-120b"
+
+    def test_unresolvable_group_prefixed_name_raises(self, strip_registry):
+        """A ``{group}-``-prefixed served model the local registry cannot
+        resolve means the router and this consumer read different
+        registries — fail loud, not at the price-card lookup downstream."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
+        with pytest.raises(LLMConfigError, match="does not resolve through"):
+            self._router_client(fake).complete(system="s", user_content="u")

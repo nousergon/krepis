@@ -209,59 +209,96 @@ def _patch_egress_probe():
 
 class TestParseRegistry:
     def test_parses_four_groups(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        assert len(fallbacks) == 4  # low, med, high, ultra all have fallbacks
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        # Chains are dual-keyed (group name + qualified primary name); the
+        # GROUP list is the alias map.
+        assert set(aliases) == {"low", "med", "high", "ultra"}
+        group_keyed = {k for fb in fallbacks for k in fb if k in aliases}
+        assert group_keyed == {"low", "med", "high", "ultra"}
 
     def test_low_group_primary(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        low_primary = next(m for m in model_list if m["model_name"] == "low")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        low_primary = next(
+            m for m in model_list if m["model_name"] == "low-deepseek-v4-flash"
+        )
         assert "openai/deepseek-v4-flash" in low_primary["litellm_params"]["model"]
         assert "8972/v1" in low_primary["litellm_params"]["api_base"]
 
     def test_low_group_has_fallback_chain(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
         low_fb = next(fb for fb in fallbacks if "low" in fb)
         assert len(low_fb["low"]) == 3
         assert "low-gemini-2.5-flash" in low_fb["low"]
 
     def test_gemini_routes_to_port_8974(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
         gemini = next(m for m in model_list if m["model_name"] == "low-gemini-2.5-flash")
         assert "8974/v1beta/openai" in gemini["litellm_params"]["api_base"]
         assert "openai/gemini-2.5-flash" == gemini["litellm_params"]["model"]
 
     def test_openrouter_model_has_openrouter_prefix(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        ultra = next(m for m in model_list if m["model_name"] == "ultra")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        ultra = next(m for m in model_list if m["model_name"] == "ultra-glm-5.2")
         assert "openrouter/zhipuai/glm-5.2" == ultra["litellm_params"]["model"]
 
     def test_openrouter_model_uses_openrouter_key(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file, openrouter_key="test-openrouter-key")
-        ultra = next(m for m in model_list if m["model_name"] == "ultra")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file, openrouter_key="test-openrouter-key")
+        ultra = next(m for m in model_list if m["model_name"] == "ultra-glm-5.2")
         assert ultra["litellm_params"]["api_key"] == "test-openrouter-key"
 
     def test_egress_proxy_model_uses_placeholder_key(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        low = next(m for m in model_list if m["model_name"] == "low")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        low = next(m for m in model_list if m["model_name"] == "low-deepseek-v4-flash")
         assert "placeholder" in low["litellm_params"]["api_key"]
 
-    def test_primary_model_named_as_group_name(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
+    def test_groups_addressable_via_alias_map(self, registry_file):
+        """Every group stays addressable by its bare name — through the
+        ``model_group_alias`` map onto the primary's qualified deployment
+        name, never through a deployment NAMED with the bare group name
+        (the property test_primary_model_named_as_group_name asserted
+        before 0.39.0)."""
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        assert aliases == {
+            "low": "low-deepseek-v4-flash",
+            "med": "med-deepseek-v4-flash-max",
+            "high": "high-deepseek-v4-pro-max",
+            "ultra": "ultra-glm-5.2",
+        }
         model_names = {m["model_name"] for m in model_list}
-        assert "low" in model_names
-        assert "med" in model_names
-        assert "high" in model_names
-        assert "ultra" in model_names
+        for alias, target in aliases.items():
+            assert target in model_names
+
+    def test_no_deployment_is_named_with_a_bare_group_name(self, registry_file):
+        """Regression, alpha-engine-config-I6543 (2026-08-09): naming the
+        primary deployment with the bare group name made LiteLLM report the
+        group ALIAS as ``response.model`` on every healthy primary-served
+        call, tripping the served-model guard on wire transports."""
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        model_names = {m["model_name"] for m in model_list}
+        assert model_names.isdisjoint(aliases.keys())
+
+    def test_fallback_chains_are_dual_keyed(self, registry_file):
+        """Measured on litellm 1.93.0: the fallback lookup key is the model
+        name AS ADDRESSED BY THE CALLER — alias resolution never rewrites
+        it. The group-name key serves alias-addressed calls; the
+        qualified-primary key serves callers addressing the primary
+        deployment directly."""
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        by_key = {k: v for fb in fallbacks for k, v in fb.items()}
+        for alias, target in aliases.items():
+            assert by_key[alias] == by_key[target]
 
     def test_reasoning_param_included(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        med_primary = next(m for m in model_list if m["model_name"] == "med")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        med_primary = next(
+            m for m in model_list if m["model_name"] == "med-deepseek-v4-flash-max"
+        )
         extra = med_primary["litellm_params"].get("extra_body", {})
         assert extra.get("reasoning") == {"effort": "max"}
 
     def test_reasoning_exclude_included(self, registry_file):
-        model_list, fallbacks = _router._parse_registry(registry_file)
-        low = next(m for m in model_list if m["model_name"] == "low")
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        low = next(m for m in model_list if m["model_name"] == "low-deepseek-v4-flash")
         extra = low["litellm_params"].get("extra_body", {})
         assert extra.get("reasoning") == {"exclude": True}
 
@@ -314,11 +351,14 @@ class TestGetRouter:
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 router = _router.get_router()
             assert router is not None
+            # Groups are addressable through the Router's model_group_alias,
+            # never through a deployment named with the bare group name.
+            aliases = dict(router.model_group_alias)
+            assert set(aliases) == {"low", "med", "high", "ultra"}
             model_names = {m["model_name"] for m in router.model_list}
-            assert "low" in model_names
-            assert "med" in model_names
-            assert "high" in model_names
-            assert "ultra" in model_names
+            assert model_names.isdisjoint(aliases.keys())
+            for target in aliases.values():
+                assert target in model_names
         finally:
             _router._router = None
 
@@ -351,12 +391,122 @@ class TestGetRouter:
                 m.delenv("LITELLM_MASTER_KEY", raising=False)
                 m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
                 router = _router.get_router()
-            groups = {list(fb.keys())[0] for fb in router.fallbacks}
-            assert groups == {"low", "med", "high", "ultra"}
+            keys = {k for fb in router.fallbacks for k in fb}
+            # Dual-keyed: every group's chain is reachable both by the bare
+            # group name (alias-addressed calls) and by the primary's
+            # qualified deployment name (qualified-addressed calls).
+            assert {"low", "med", "high", "ultra"} <= keys
+            assert "low-deepseek-v4-flash" in keys
             low_fb = next(fb for fb in router.fallbacks if "low" in fb)
             assert len(low_fb["low"]) == 3
         finally:
             _router._router = None
+
+    def test_alias_addressed_call_engages_group_keyed_fallbacks(
+        self, registry_file, monkeypatch
+    ):
+        """End-to-end against a REAL litellm Router: an alias-addressed call
+        whose primary deployment fails must engage the group's fallback
+        chain. This pins the measured litellm behavior the dual-keying
+        relies on — the fallback lookup key is the name the caller
+        addressed (the alias), not the alias-resolved deployment name."""
+        from litellm import Router
+
+        model_list, fallbacks, aliases = _router._parse_registry(registry_file)
+        by_name = {m["model_name"]: m for m in model_list}
+        by_name["low-deepseek-v4-flash"]["litellm_params"]["mock_response"] = (
+            "litellm.InternalServerError"
+        )
+        by_name["low-gemini-2.5-flash"]["litellm_params"]["mock_response"] = (
+            "served-by-fallback"
+        )
+        router = Router(
+            model_list=model_list,
+            fallbacks=fallbacks,
+            model_group_alias=aliases,
+            num_retries=0,
+        )
+        resp = router.completion(
+            model="low", messages=[{"role": "user", "content": "hi"}]
+        )
+        assert resp.choices[0].message.content == "served-by-fallback"
+
+
+# ── group resolution through the alias map ───────────────────────────────
+
+class TestGroupResolutionThroughAlias:
+    """The internal lookups that assumed the primary deployment was NAMED
+    with the bare group name (``m["model_name"] == group``) must resolve
+    through the model_group_alias instead (alpha-engine-config-I6543)."""
+
+    @pytest.fixture(autouse=True)
+    def _fresh_router(self, registry_file, monkeypatch):
+        _router._router = None
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+        yield
+        _router._router = None
+
+    def test_get_group_primary_resolves_through_alias(self):
+        assert _router.get_group_primary("low") == "openai/deepseek-v4-flash"
+        assert _router.get_group_primary("ultra") == "openrouter/zhipuai/glm-5.2"
+
+    def test_get_group_primary_unknown_group_returns_none(self):
+        assert _router.get_group_primary("nonexistent") is None
+
+    def test_resolve_group_returns_primary_upstream_model(self):
+        assert _router.resolve_group("low") == "deepseek-v4-flash"
+
+    def test_cli_groups_lists_all_groups(self, capsys):
+        with mock.patch.object(sys, "argv", ["krepis.router", "groups"]):
+            _router._cli()
+        out = capsys.readouterr().out.split()
+        assert set(out) == {"low", "med", "high", "ultra"}
+
+
+# ── served_model_for_deployment ──────────────────────────────────────────
+
+class TestServedModelForDeployment:
+    """A response reporting the qualified ``{group}-{mid}`` deployment name
+    must be resolvable to the registry entry's upstream model — the
+    (model, route) identifier price cards are keyed on."""
+
+    @pytest.fixture(autouse=True)
+    def _registry_env(self, registry_file, monkeypatch):
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+
+    def test_qualified_primary_resolves_to_upstream_model(self):
+        assert (
+            _router.served_model_for_deployment("low-deepseek-v4-flash")
+            == "deepseek-v4-flash"
+        )
+
+    def test_qualified_fallback_resolves_to_upstream_model(self):
+        assert (
+            _router.served_model_for_deployment("low-gemini-2.5-flash")
+            == "gemini-2.5-flash"
+        )
+
+    def test_openrouter_entry_keeps_its_route_correct_slug(self):
+        # Cards are per (model, ROUTE): the OpenRouter entry's slug is the
+        # pricing key and must come back verbatim, not stripped.
+        assert (
+            _router.served_model_for_deployment("ultra-kimi-k3")
+            == "moonshotai/kimi-k3"
+        )
+
+    def test_non_deployment_name_returns_none(self):
+        assert _router.served_model_for_deployment("deepseek-v4-flash") is None
+        assert _router.served_model_for_deployment("low") is None
+
+    def test_mid_not_in_the_named_group_returns_none(self):
+        # "kimi-k3" is an ultra member, not a low member.
+        assert _router.served_model_for_deployment("low-kimi-k3") is None
+
+    def test_missing_registry_raises(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError, match="cannot resolve deployment"):
+            _router.served_model_for_deployment("low-deepseek-v4-flash")
 
 
 # ── CLI ──────────────────────────────────────────────────────────────────
