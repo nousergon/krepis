@@ -33,6 +33,18 @@ CLI convention.
   branches). Exit code is ``0`` if *either* channel succeeded, ``1`` if
   *both* failed.
 
+**Dry-run** (``--dry-run`` CLI flag / ``dry_run=True`` kwarg, config-I6759).
+Runs argument parsing + ``_format_message`` and reports a synthetic
+``ok=True, detail="dry-run: would send"`` :class:`ChannelResult` per
+channel — no SNS publish, no Telegram call, no dedup marker write, no
+Overseer intake event, and no boto3 client construction. The
+short-circuit fires before the dedup check and before the
+``PYTEST_CURRENT_TEST`` guard, so it is deterministic in every caller
+environment. Use it to verify a delivery call site's argument shape
+without paging the operator (PR165 paged Brian with a synthetic ERROR
+because ``publish()`` previously only suppressed fan-out under
+``PYTEST_CURRENT_TEST``).
+
 **Severity tiering.** ``severity`` is a free-form string that is
 prepended to the message (``[ERROR] ...`` / ``[WARNING] ...``) for both
 channels. Telegram pushes (``disable_notification=False``) for
@@ -238,6 +250,7 @@ def publish(
     dedup_key: str | None = None,
     dedup_window_min: int | None = DEFAULT_DEDUP_WINDOW_MIN,
     dedup_bucket: str | None = None,
+    dry_run: bool = False,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -292,6 +305,15 @@ def publish(
         ``dedup_key`` for the lifetime of the marker bucket).
     :param dedup_bucket: S3 bucket holding the markers. Defaults to
         ``alpha-engine-research`` (the shared corpus bucket).
+    :param dry_run: When ``True``, short-circuits before the dedup
+        check and before any boto3 client construction. Argument
+        parsing, ``_format_message``, and (if ``sns`` and an explicit
+        ``sns_topic_arn`` were given) topic-ARN echoing still run; no
+        SNS publish, no Telegram call, no dedup marker write, and no
+        Overseer intake event fire. Returns a :class:`PublishResult`
+        with ``ok=True, detail="dry-run: would send"`` per attempted
+        channel so callers verifying a delivery call site's shape exit
+        ``0`` without paging the operator (config-I6759).
     :returns: :class:`PublishResult` — caller can inspect per-channel
         outcomes. :attr:`PublishResult.any_ok` is the typical success
         gate; :attr:`PublishResult.all_ok` is the strict variant.
@@ -300,6 +322,28 @@ def publish(
     """
     result = PublishResult()
     formatted = _format_message(message, severity, source)
+
+    # ── Dry-run short-circuit (config-I6759) ─────────────────────────────
+    # Fires before the dedup check and before any boto3 client construction
+    # (SNS ARN resolution's ``sts.get_caller_identity`` call included) so a
+    # caller verifying a delivery call site's argument shape never pages
+    # the operator and never depends on AWS credentials being present.
+    # Deliberately does NOT attempt live SNS topic-ARN resolution — only an
+    # already-explicit ``sns_topic_arn`` is echoed — so this path never
+    # imports boto3. No dedup marker write, no Overseer intake event
+    # (full suppression; no ``dry_run`` field added to the event schema).
+    if dry_run:
+        detail = "dry-run: would send"
+        if sns:
+            sns_detail = f"{detail} to {sns_topic_arn}" if sns_topic_arn else detail
+            result.sns = ChannelResult(ok=True, detail=sns_detail)
+        else:
+            result.sns = ChannelResult(ok=True, detail="dry-run: sns disabled (sns=False)")
+        if telegram:
+            result.telegram = ChannelResult(ok=True, detail=detail)
+        else:
+            result.telegram = ChannelResult(ok=True, detail="dry-run: telegram disabled (telegram=False)")
+        return result
 
     # ── Test-environment guard (defense-in-depth) ────────────────────────
     # NEVER fan out a real SNS / Telegram alert from inside a test process.
@@ -429,6 +473,18 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Verify the delivery call site's argument shape without "
+            "sending anything: runs arg parsing + message formatting, "
+            "attempts no SNS publish, no Telegram call, writes no dedup "
+            "marker, and never constructs a boto3 client. Exits 0. "
+            "Use this to smoke-test a call site's flags instead of "
+            "issuing a real (or synthetic-ERROR) alert (config-I6759)."
+        ),
+    )
+    pub.add_argument(
         "--sns-topic-arn",
         default=None,
         help=(
@@ -491,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
         dedup_key=args.dedup_key,
         dedup_window_min=window_min,
         dedup_bucket=args.dedup_bucket,
+        dry_run=args.dry_run,
     )
 
     # One-line status to stderr (stdout reserved for structured output if

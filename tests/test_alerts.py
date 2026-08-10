@@ -759,3 +759,104 @@ class TestTestEnvGuard:
                 result = alerts.publish("boom", source="x")
         # Guard did NOT short-circuit — the mocked transports ran.
         assert result.any_ok is True
+
+
+class TestDryRun:
+    """``dry_run=True`` (config-I6759) — verify a call site's argument
+    shape without sending anything. Motivated by PR165: a delivery
+    verification call site paged Brian with a synthetic ERROR because
+    ``publish()`` previously only suppressed fan-out under
+    ``PYTEST_CURRENT_TEST``."""
+
+    def test_never_constructs_boto3_client(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        boom = MagicMock(side_effect=AssertionError("boto3.client() reached in dry-run!"))
+        fake_boto3_module = MagicMock()
+        fake_boto3_module.client = boom
+        with patch.dict("sys.modules", {"boto3": fake_boto3_module}):
+            result = alerts.publish("boom", source="x", dry_run=True)
+        boom.assert_not_called()
+        assert result.sns.ok is True
+        assert result.telegram.ok is True
+
+    def test_never_touches_telegram_transport(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_publish_telegram",
+            side_effect=AssertionError("_publish_telegram reached in dry-run!"),
+        ) as tg:
+            result = alerts.publish("boom", source="x", dry_run=True)
+        tg.assert_not_called()
+        assert result.telegram.ok is True
+        assert result.telegram.detail == "dry-run: would send"
+
+    def test_never_calls_publish_sns(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_publish_sns",
+            side_effect=AssertionError("_publish_sns reached in dry-run!"),
+        ) as sns_fn:
+            result = alerts.publish("boom", source="x", dry_run=True)
+        sns_fn.assert_not_called()
+        assert result.sns.ok is True
+        assert result.sns.detail == "dry-run: would send"
+
+    def test_writes_no_dedup_marker(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_write_dedup_marker",
+            side_effect=AssertionError("_write_dedup_marker reached in dry-run!"),
+        ) as write_marker:
+            result = alerts.publish(
+                "boom", source="x", dedup_key="dry-run-key", dry_run=True,
+            )
+        write_marker.assert_not_called()
+        assert result.dedup_skipped is False
+        assert result.sns.ok is True
+        assert result.telegram.ok is True
+
+    def test_emits_no_overseer_intake_event(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        from krepis import fleet_events
+
+        with patch.object(
+            fleet_events, "emit_alert_event",
+            side_effect=AssertionError("emit_alert_event reached in dry-run!"),
+        ) as emit:
+            alerts.publish("boom", source="x", dry_run=True)
+        emit.assert_not_called()
+
+    def test_dry_run_result_shape(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        result = alerts.publish("boom", severity="error", source="x", dry_run=True)
+        assert isinstance(result, alerts.PublishResult)
+        assert result.sns == alerts.ChannelResult(ok=True, detail="dry-run: would send")
+        assert result.telegram == alerts.ChannelResult(ok=True, detail="dry-run: would send")
+        assert result.any_ok is True
+        assert result.all_ok is True
+        assert result.dedup_skipped is False
+
+    def test_dry_run_respects_channel_disable(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        result = alerts.publish("boom", source="x", sns=False, telegram=False, dry_run=True)
+        assert result.sns.ok is True
+        assert "sns disabled" in result.sns.detail
+        assert result.telegram.ok is True
+        assert "telegram disabled" in result.telegram.detail
+
+    def test_cli_dry_run_flag_returns_0(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        boom = MagicMock(side_effect=AssertionError("boto3.client() reached in dry-run!"))
+        fake_boto3_module = MagicMock()
+        fake_boto3_module.client = boom
+        with patch.dict("sys.modules", {"boto3": fake_boto3_module}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                side_effect=AssertionError("_publish_telegram reached in dry-run!"),
+            ):
+                rc = alerts.main([
+                    "publish", "--dry-run",
+                    "--message", "x", "--severity", "error", "--source", "y",
+                ])
+        assert rc == 0
+        boom.assert_not_called()
