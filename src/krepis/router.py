@@ -1543,14 +1543,26 @@ def _resolve_group_json(
 
         _display_name = f"{_primary_model} ({group})"
 
+        # config-I6727 deliverable 2: the model to ADDRESS on the wire is the
+        # QUALIFIED primary deployment name ({group}-{mid}, the #118 naming),
+        # never the bare group alias. litellm's proxy stamps the CLIENT-
+        # REQUESTED model back onto every non-fallback response
+        # (_override_openai_response_model), so a bare-alias-addressed healthy
+        # call reports the alias as resp.model regardless of server-side
+        # deployment naming — the masquerade the #115 guard rejects. Dual-keyed
+        # fallbacks (#118) keep the chain engaged under the qualified key; the
+        # bare group remains a server-side model_group_alias for callers krepis
+        # does not own. Resolver-owned: consumers address what this dict says.
+        _qualified_primary = f"{group}-{_primary_registry_id}"
+
         return _with_compat_aliases({
             "schema_version": RESOLVE_SCHEMA_VERSION,
-            "model": group,
+            "model": _qualified_primary,
             "display_name": _display_name,
             "provider": "litellm",
             "route": "litellm_proxy",
             "api_base_url": _litellm_url,
-            "deployment_id": group,
+            "deployment_id": _qualified_primary,
             "auth_token_type": "litellm_master_key",
             "group": group,
             "registry_id": f"litellm:group:{group}",
@@ -1964,7 +1976,10 @@ def resolve_group_spec(
     # constraint that reverted crucible-evaluator-PR157.
     #
     # `api_base_url` on this route already IS the edge, and the edge speaks
-    # OpenAI-compatible chat completions with the group name as the model.
+    # OpenAI-compatible chat completions with the QUALIFIED primary
+    # deployment name ({group}-{mid}) as the model (config-I6727: addressing
+    # the bare group alias makes litellm's requested-model stamping report
+    # the alias as resp.model on every healthy call).
     # So the proxy route is emitted as a CUSTOM OpenAI-compatible endpoint —
     # ModelSpec's documented shape for exactly that (any provider name it
     # does not know, plus base_url + api_key_env). The chain is then walked
