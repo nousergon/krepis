@@ -120,8 +120,38 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
     it means the router served a deployment this consumer's registry does
     not know (registry drift), and letting it flow would only move the
     failure into the price-card lookup with less context.
+
+    **A response echoing a QUALIFIED DEPLOYMENT name is not masquerade.**
+    Since ``router.py``'s litellm_proxy route began emitting
+    ``deployment_id = _qualified_primary`` (config-I6543), a proxy-routed
+    consumer addresses ``med-deepseek-v4-flash-max`` on the wire, not the
+    bare group — and LiteLLM stamps the model AS ADDRESSED back onto the
+    response, so ``served_model == spec.model`` on every healthy call. The
+    addressing half of that fix shipped without the accounting half: this
+    function still assumed ``spec.model`` was always a bare group, so it
+    rejected every successful call. Measured cost: the Think Tank
+    challenger arm aborted with ``theses_written: 0`` and wrote no
+    challenger selection (2026-08-10 run ``b150c317eeef``; the arm's last
+    valid selection is 2026-07-31).
+
+    So when the echoed name resolves through the registry as a derived
+    deployment, this returns its upstream model — a real, priceable id, and
+    exactly what the caller asked to be served. Genuine masquerade still
+    raises: a bare group name ("med") is not a derived deployment name, so
+    it does not resolve and falls through to the error below.
     """
     served_model = getattr(resp, "model", "") or ""
+    if served_model and served_model == spec.model:
+        # Deployment-addressed call: the caller named a concrete deployment
+        # and the router served it. Resolve to the billable upstream id.
+        # Guarded by the registry, never by the string's shape — an echoed
+        # name that does NOT resolve is indistinguishable from the alias
+        # masquerade this function exists to reject. An unreadable registry
+        # propagates its FileNotFoundError, exactly as the != branch below
+        # already lets it: that is a real defect, not a soft miss.
+        upstream = served_model_for_deployment(served_model)
+        if upstream:
+            return upstream
     if served_model and served_model != spec.model:
         if served_model.startswith(f"{spec.model}-"):
             upstream = served_model_for_deployment(served_model)

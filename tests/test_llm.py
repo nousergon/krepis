@@ -1548,6 +1548,87 @@ models:
         )
         assert result.model == "openai/gpt-oss-120b"
 
+    # ── deployment-ADDRESSED calls (the wire shape since router.py emits
+    # deployment_id = _qualified_primary on the litellm_proxy route) ──
+
+    _DEPLOYMENT_SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="low-deepseek-v4-flash",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    def _deployment_client(self, fake):
+        return LLMClient(
+            self._DEPLOYMENT_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+        )
+
+    def test_echoed_qualified_deployment_name_is_not_masquerade(
+        self, strip_registry
+    ):
+        """The consumer addressed a concrete deployment; LiteLLM stamps the
+        model AS ADDRESSED back, so served == spec.model on every HEALTHY
+        call. Rejecting that rejected every successful call: the Think Tank
+        challenger arm aborted with 0 theses written and wrote no challenger
+        selection between 2026-08-01 and 2026-08-10 (run b150c317eeef,
+        `group='med-deepseek-v4-flash-max'`)."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-deepseek-v4-flash")])
+        result = self._deployment_client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash"
+
+    def test_echoed_deployment_name_resolves_in_structured_too(
+        self, strip_registry
+    ):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="low-gpt-oss-120b")
+        ])
+        spec = ModelSpec(
+            provider=ROUTER_EDGE_PROVIDER,
+            model="low-gpt-oss-120b",
+            base_url="https://router.example.invalid:8443",
+            api_key_env="ROUTER_CONSUMER_THINKTANK",
+        )
+        client = LLMClient(
+            spec, callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake, api_key="sk-router-test",
+        )
+        result = client.structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "openai/gpt-oss-120b"
+
+    def test_echoed_bare_group_still_raises(self, strip_registry):
+        """The masquerade this guard exists for is UNCHANGED: a bare group
+        name is not a derived deployment name, does not resolve through the
+        registry, and must never be billed or recorded."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
+    def test_echoed_unresolvable_deployment_name_still_raises(
+        self, strip_registry
+    ):
+        """An echoed name the registry cannot resolve is indistinguishable
+        from masquerade — the registry, never the string's shape, is what
+        licenses the pass."""
+        spec = ModelSpec(
+            provider=ROUTER_EDGE_PROVIDER,
+            model="low-model-we-never-heard-of",
+            base_url="https://router.example.invalid:8443",
+            api_key_env="ROUTER_CONSUMER_THINKTANK",
+        )
+        fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
+        client = LLMClient(
+            spec, callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake, api_key="sk-router-test",
+        )
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            client.complete(system="s", user_content="u")
+
     def test_unresolvable_group_prefixed_name_raises(self, strip_registry):
         """A ``{group}-``-prefixed served model the local registry cannot
         resolve means the router and this consumer read different
