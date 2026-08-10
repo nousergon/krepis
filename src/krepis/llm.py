@@ -50,6 +50,7 @@ from krepis.llm_config import (
     LLMConfigError,
     ModelSpec,
 )
+from krepis.router import served_model_for_deployment
 # Only the prefix constant, so the router-edge failure message can name the
 # SSM parameter an operator has to look at. `krepis.secrets` imports boto3
 # lazily, so this costs nothing at import time.
@@ -110,9 +111,30 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
     payload (``_hidden_params``, when the transport is litellm's own Router
     object) needed to root-cause why the field was unusable, instead of at
     a downstream consumer with none of that context.
+
+    A served model of the qualified ``{group}-{mid}`` form — the deployment
+    naming the registry derivation produces as of 0.39.0 — is resolved
+    through the registry to the entry's upstream model identifier, so what
+    this returns is always a real, priceable model id, never a derived
+    deployment name. An unresolvable ``{group}-``-prefixed name raises:
+    it means the router served a deployment this consumer's registry does
+    not know (registry drift), and letting it flow would only move the
+    failure into the price-card lookup with less context.
     """
     served_model = getattr(resp, "model", "") or ""
     if served_model and served_model != spec.model:
+        if served_model.startswith(f"{spec.model}-"):
+            upstream = served_model_for_deployment(served_model)
+            if upstream:
+                return upstream
+            raise LLMConfigError(
+                f"provider={spec.provider!r} group={spec.model!r}: the router "
+                f"reported served model {served_model!r}, which is shaped like "
+                f"a derived deployment name for this group but does not "
+                f"resolve through the local LLM_MODEL_REGISTRY.yaml. The "
+                f"router and this consumer are reading different registries "
+                f"(alpha-engine-config-I6543)."
+            )
         return served_model
     hidden = getattr(resp, "_hidden_params", None)
     raise LLMConfigError(
