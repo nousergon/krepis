@@ -1601,6 +1601,15 @@ models:
         )
         assert result.model == "openai/gpt-oss-120b"
 
+    def test_echoed_bare_group_raises_without_touching_the_registry(self):
+        """No ``strip_registry`` fixture on purpose: a bare group echo must
+        produce the precise masquerade error even where no registry exists
+        on disk (this repo's own CI). Asking the registry about "low" turned
+        that into a FileNotFoundError."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
     def test_echoed_bare_group_still_raises(self, strip_registry):
         """The masquerade this guard exists for is UNCHANGED: a bare group
         name is not a derived deployment name, does not resolve through the

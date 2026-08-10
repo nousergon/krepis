@@ -141,14 +141,20 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
     it does not resolve and falls through to the error below.
     """
     served_model = getattr(resp, "model", "") or ""
-    if served_model and served_model == spec.model:
+    if served_model and served_model == spec.model and "-" in served_model:
         # Deployment-addressed call: the caller named a concrete deployment
         # and the router served it. Resolve to the billable upstream id.
-        # Guarded by the registry, never by the string's shape — an echoed
-        # name that does NOT resolve is indistinguishable from the alias
-        # masquerade this function exists to reject. An unreadable registry
-        # propagates its FileNotFoundError, exactly as the != branch below
-        # already lets it: that is a real defect, not a soft miss.
+        # The REGISTRY licenses the pass — an echoed name that does not
+        # resolve is indistinguishable from the alias masquerade this
+        # function exists to reject, and still falls through to the raise.
+        # The ``"-" in`` precondition is what keeps a bare group name off
+        # the registry path entirely: groups are "low"/"med"/"high"/"ultra",
+        # and asking the registry about one turned the precise masquerade
+        # error into a FileNotFoundError wherever no registry is on disk
+        # (caught by this repo's own CI, which has none). An unreadable
+        # registry still propagates for a ``{group}-{mid}``-shaped name,
+        # exactly as the != branch below already lets it: a consumer
+        # holding such a name resolved it through a registry to begin with.
         upstream = served_model_for_deployment(served_model)
         if upstream:
             return upstream
