@@ -749,6 +749,32 @@ class TestLitellmProbeSpeaksTheDeclaredScheme:
         )
         assert info["route"] == "litellm_proxy"
 
+    def test_proxy_route_addresses_the_qualified_primary_not_the_alias(
+        self, registry_file, monkeypatch
+    ):
+        """config-I6727 deliverable 2: on the litellm_proxy route the model to
+        ADDRESS is the qualified primary deployment name ({group}-{mid}, the
+        #118 naming), never the bare group alias — litellm's proxy stamps the
+        client-requested model back onto every non-fallback response, so a
+        bare-alias-addressed healthy call reports the alias as resp.model and
+        trips the #115 masquerade guard."""
+        self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                info = _router.resolve_group_structured("ultra")
+        finally:
+            _router._router = None
+        assert info["route"] == "litellm_proxy"
+        assert info["model"] == "ultra-glm-5.2"
+        assert info["deployment_id"] == "ultra-glm-5.2"
+        assert info["model"] != info["group"] == "ultra"
+        # the resolve-time primary facts survive unchanged
+        assert info["primary_registry_id"] == "glm-5.2"
+
     def test_explicit_port_is_honoured(self, registry_file, monkeypatch):
         seen = self._capture(monkeypatch)
         _router._router = None
@@ -1657,12 +1683,14 @@ class TestResolveGroupSpec:
     def _route(self, **over):
         route = {
             "schema_version": _router.RESOLVE_SCHEMA_VERSION,
-            "model": "med",
+            # config-I6727: the wire route resolves to the QUALIFIED primary
+            # deployment name; the bare group survives only in "group".
+            "model": "med-deepseek-v4-flash-max",
             "display_name": "deepseek-v4-flash-max (med)",
             "provider": "litellm",
             "route": "litellm_proxy",
             "api_base_url": "https://router.example:8443",
-            "deployment_id": "med",
+            "deployment_id": "med-deepseek-v4-flash-max",
             "auth_token_type": "litellm_master_key",
             "group": "med",
             "registry_id": "litellm:group:med",
@@ -1682,7 +1710,7 @@ class TestResolveGroupSpec:
     def test_builds_a_spec_from_the_route(self, monkeypatch):
         self._patch(monkeypatch, self._route())
         spec, route = _router.resolve_group_spec("med", exec_context="lambda")
-        assert spec.model == "med"
+        assert spec.model == "med-deepseek-v4-flash-max"
         assert spec.base_url == "https://router.example:8443"
         assert spec.max_tokens == 8192
         assert route["group"] == "med"
