@@ -44,7 +44,7 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # so the dependency is declared here — a consumer wires flow-doctor with
 # `krepis[flow_doctor]` + `from krepis.logging import setup_logging`, no AGPL
 # nousergon-lib required.
-flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.9"]
+flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.10"]
 # krepis.llm transports. Both SDKs are lazy-imported at call time, so a
 # consumer installs only the transport(s) its ModelSpec can resolve to:
 # `krepis[anthropic]` for the native Anthropic transport, `krepis[openai]`
