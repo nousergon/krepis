@@ -82,13 +82,20 @@ class FakeAnthropic:
 
 def _openai_usage(
     prompt=100, completion=50, cached=0, cost=None, searches=None,
-    nested_searches=None, nested_searches_obj=None,
+    nested_searches=None, nested_searches_obj=None, reasoning=None,
 ):
     u = SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
         prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
     )
+    if reasoning is not None:
+        # `reasoning` may be an int (typed SDK shape) or a dict, because a
+        # proxied provider delivers this as raw decoded JSON — both must read.
+        u.completion_tokens_details = (
+            reasoning if isinstance(reasoning, dict)
+            else SimpleNamespace(reasoning_tokens=reasoning)
+        )
     if cost is not None:
         u.cost = cost
     if searches is not None:
@@ -840,7 +847,7 @@ class TestCallsiteIdAndCostEmission:
         # metric is computed from downstream.
         for field_name in (
             "input_tokens", "output_tokens", "cache_read_tokens",
-            "prompt_cache_miss_tokens", "cost_usd",
+            "prompt_cache_miss_tokens", "reasoning_tokens", "cost_usd",
         ):
             assert field_name in rec, f"{field_name} missing from cost record"
         assert result.cost_emission_error is None
@@ -1039,6 +1046,33 @@ class TestEffectiveMaxTokens:
     ROW 16384 -> 65536 as the remediation changed nothing, because the literal
     was what the request carried, and nothing logged the wire value.
     """
+
+    def test_the_reasoning_share_is_recorded_on_a_SUCCESSFUL_call(self):
+        """Until now the draw was observable only when a call came back EMPTY
+        (`_budget_exhausted_error`), i.e. once per outage. A budget floor
+        cannot be derived from a quantity recorded only on failure — which is
+        why all three instances of this class were remediated by a guess.
+        """
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning=108))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+        assert result.usage.output_tokens == 111, (
+            "reasoning is a SUBSET of output tokens, not an addition"
+        )
+
+    def test_the_reasoning_share_reads_from_a_raw_dict_too(self):
+        """`getattr` on a dict silently returns the default — how
+        `server_tool_use_details` read 0 for weeks (config#1659)."""
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning={"reasoning_tokens": 108}))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+
+    def test_a_non_reasoning_response_records_zero_not_an_error(self):
+        fake = FakeOpenAI([_openai_resp("OK")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 0
 
     def test_none_uses_the_registry_budget(self):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
