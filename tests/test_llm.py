@@ -1167,17 +1167,21 @@ class TestEmptyContentIsVisible:
         return resp
 
     def test_empty_content_logs_the_reasoning_budget(self, caplog):
+        """WARNING, not ERROR, on the structured path — the caller raises with
+        the same diagnostics, so an ERROR here is a second report of one event
+        (see `_choice_text`). The DIAGNOSTICS are what this test is about and
+        they are unchanged; only the level moved."""
         fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             with pytest.raises(LLMError):
                 _client(OPENROUTER_SPEC, fake).structured(
                     system="s", user_content="u", schema=Spec,
                     schema_name="Spec",
                 )
-        errors = [r.getMessage() for r in caplog.records
-                  if r.levelno == logging.ERROR]
-        assert errors, "an empty content produced no ERROR line"
-        msg = errors[0]
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert warnings, "an empty content produced no diagnostic line"
+        msg = warnings[0]
         assert "reasoning_tokens=7998" in msg, (
             "without the reasoning-token count, an exhausted budget and a lost "
             "response body are the same log line"
@@ -1212,21 +1216,61 @@ class TestEmptyContentIsVisible:
 
     def test_non_empty_content_logs_nothing(self, caplog):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             _client(OPENROUTER_SPEC, fake).structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
             )
-        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING]
 
     def test_whitespace_only_content_counts_as_empty(self, caplog):
         fake = FakeOpenAI([_openai_resp("   \n  ")] * 2)
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             with pytest.raises(LLMError):
                 _client(OPENROUTER_SPEC, fake).structured(
                     system="s", user_content="u", schema=Spec,
                     schema_name="Spec",
                 )
-        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_structured_path_does_not_double_report_at_ERROR(self, caplog):
+        """One failed call must produce ONE alert-level record.
+
+        Alert handlers attach at ERROR (`krepis.logging.setup_logging`), so an
+        ERROR here plus the caller's own report of the raised exception is two
+        dispatches for one event. A single Think Tank abort on 2026-08-11
+        produced three separate ERROR dispatches this way
+        (alpha-engine-config-I6921 D3).
+        """
+        fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        empties = [r for r in caplog.records
+                   if "EMPTY message.content" in r.getMessage()]
+        assert empties, "the diagnostic must still be emitted"
+        assert not [r for r in empties if r.levelno >= logging.ERROR], (
+            "the structured path raises with these same diagnostics — logging "
+            "them at ERROR too is a duplicate alert, not extra coverage"
+        )
+
+    def test_plain_completion_still_logs_at_ERROR(self, caplog):
+        """The default stays ERROR and this is why: `complete()` RETURNS the
+        empty string and nothing raises, so this line is the only signal that
+        anything happened. Demoting it fleet-wide to buy quiet on the
+        structured path would trade a duplicate alert for a missing one."""
+        fake = FakeOpenAI([_openai_resp("")])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            result = _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u",
+            )
+        assert result.text == ""
+        assert [r for r in caplog.records
+                if "EMPTY message.content" in r.getMessage()
+                and r.levelno == logging.ERROR]
 
     def test_diagnostics_never_mask_the_fault(self):
         """A response the diagnostic cannot introspect must still return ''."""
