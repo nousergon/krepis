@@ -1252,6 +1252,30 @@ def test_openai_metadata_without_reasoning_details_is_zero_not_error():
     assert md.reasoning_tokens == 0
 
 
+def test_the_addressed_registry_entry_reaches_the_persisted_record():
+    """In-memory is not measurement. Measured 2026-08-11: two Think Tank tiers
+    on `med` recorded `deepseek-v4-flash` and read as a misroute to `low` for an
+    hour, because the record could not name the entry that was addressed.
+    alpha-engine-config-I6908.
+    """
+    from krepis.llm import LLMResult, LLMUsage
+
+    result = LLMResult(
+        text="hi",
+        model="deepseek-v4-flash",
+        provider="openrouter",
+        registry_id="deepseek-v4-flash-max",
+        usage=LLMUsage(input_tokens=10, output_tokens=5, provider_cost_usd=0.001),
+        raw_request={},
+    )
+    rec = record_llm_call(result)
+    assert rec["model"] == "deepseek-v4-flash", "the provider's own name"
+    assert rec["addressed_registry_id"] == "deepseek-v4-flash-max", "the entry addressed"
+    assert rec["model"] != rec["addressed_registry_id"], (
+        "the whole point is that these differ"
+    )
+
+
 def test_record_llm_call_persists_the_reasoning_share():
     """In-memory normalization is not measurement. The field has to reach the
     persisted record, or a budget floor still cannot be derived from it —

@@ -1741,6 +1741,39 @@ class TestResolveGroupSpec:
         # base_url + api_key_env are what make a custom endpoint valid.
         assert spec.base_url and spec.api_key_env
 
+    def test_the_proxy_route_carries_the_PRIMARY_registry_id(self, monkeypatch):
+        """A cost record has to be able to name the entry that was addressed.
+
+        `model` is the upstream name the provider reports, and three registry
+        entries (`deepseek-v4-flash`, `-low`, `-max`) share one such string
+        while declaring three different reasoning configs — so `model` alone
+        collapses them. On the proxy route `registry_id` is the synthetic
+        `litellm:group:{group}`, which names no entry; `primary_registry_id` is
+        the closest honest answer — what THIS process addressed, not a claim
+        about what the proxy walked to server-side.
+        alpha-engine-config-I6908.
+        """
+        self._patch(monkeypatch, self._route(
+            registry_id="litellm:group:med",
+            primary_registry_id="deepseek-v4-flash-max",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="lambda")
+        assert spec.registry_id == "deepseek-v4-flash-max"
+        assert not str(spec.registry_id).startswith("litellm:group:"), (
+            "the synthetic group id names no registry entry — recording it "
+            "would look like attribution while carrying none"
+        )
+
+    def test_a_direct_route_carries_its_own_registry_id(self, monkeypatch):
+        self._patch(monkeypatch, self._route(
+            provider="deepseek", route="egress_proxy",
+            auth_token_type="placeholder",
+            api_base_url="http://127.0.0.1:8990",
+            registry_id="deepseek-v4-flash-max",
+        ))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.registry_id == "deepseek-v4-flash-max"
+
     def test_non_proxy_routes_keep_their_provider(self, monkeypatch):
         self._patch(monkeypatch, self._route(
             provider="deepseek", route="egress_proxy",

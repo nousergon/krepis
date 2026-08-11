@@ -508,6 +508,13 @@ class LLMResult:
     # Consumers needing jurisdiction/compliance checks (config#3006) read
     # this instead of parsing ``raw_response`` themselves.
     served_provider: Optional[str] = None
+    # The registry entry this call ADDRESSED, carried through from
+    # :attr:`ModelSpec.registry_id`. Distinct from ``model``, which is the
+    # upstream name the provider reports: three registry entries can share one
+    # upstream model string while declaring three different reasoning configs,
+    # so ``model`` alone cannot say which was addressed
+    # (alpha-engine-config-I6908). ``None`` for a hand-built spec.
+    registry_id: Optional[str] = None
     # True when a fallback model in the group's chain served this request
     # (the primary failed and LiteLLM's Router transparently tried the
     # next model).  Always False on non-litellm transports.
@@ -1084,6 +1091,7 @@ class LLMClient:
                 text=text,
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,
@@ -1113,6 +1121,7 @@ class LLMClient:
             text=text,
             model=served_model,
             provider=self.spec.provider,
+            registry_id=self.spec.registry_id,
             served_provider=getattr(resp, "provider", None),
             usage=self._usage_from_openai(resp),
             raw_request=kwargs,
@@ -1264,6 +1273,7 @@ class LLMClient:
                     text="",
                     model=getattr(msg, "model", self.spec.model),
                     provider=self.spec.provider,
+                    registry_id=self.spec.registry_id,
                     usage=usage,
                     raw_request=payload,
                     raw_response=msg,
@@ -1544,6 +1554,7 @@ class LLMClient:
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,

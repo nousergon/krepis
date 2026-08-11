@@ -1047,6 +1047,34 @@ class TestEffectiveMaxTokens:
     was what the request carried, and nothing logged the wire value.
     """
 
+    def test_the_ADDRESSED_registry_entry_survives_onto_the_result(self):
+        """`model` is the upstream name the provider reports; `registry_id` is
+        the entry we addressed. They are NOT interchangeable: three registry
+        entries (`deepseek-v4-flash`, `-low`, `-max`) share one upstream model
+        string while declaring `{exclude: true}`, `{effort: low}` and
+        `{effort: max}`. Without this, three configurations collapse into one
+        row and cost cannot be attributed. alpha-engine-config-I6908.
+        """
+        spec = ModelSpec(
+            "openrouter", "deepseek-v4-flash", max_tokens=1024,
+            reasoning={"effort": "max"}, registry_id="deepseek-v4-flash-max",
+        )
+        fake = FakeOpenAI([_openai_resp("hi", model="deepseek-v4-flash")])
+        result = _client(spec, fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash", "the provider's own name"
+        assert result.registry_id == "deepseek-v4-flash-max", "the entry addressed"
+        assert result.model != result.registry_id, (
+            "the whole point is that these differ — a test asserting them equal "
+            "would pass on a spec where the distinction does not exist"
+        )
+
+    def test_a_hand_built_spec_records_no_registry_entry(self):
+        """`None` means 'not resolved from the registry', which is a different
+        statement from 'resolved and unknown'."""
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.registry_id is None
+
     def test_the_reasoning_share_is_recorded_on_a_SUCCESSFUL_call(self):
         """Until now the draw was observable only when a call came back EMPTY
         (`_budget_exhausted_error`), i.e. once per outage. A budget floor
