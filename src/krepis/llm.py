@@ -323,21 +323,38 @@ def _empty_content_diagnostics(resp: Any, choice: Any) -> str:
         )
 
 
-def _choice_text(resp: Any) -> str:
+def _choice_text(resp: Any, *, caller_raises_on_empty: bool = False) -> str:
     """First choice's message content, stripped. Raises on null choices.
 
-    Logs at ERROR when the content is empty. The emptiness itself is not an
-    error here — callers classify it — but it is invisible without this line,
-    and the caller-facing symptom actively misdirects: a structured caller
-    reports ``no JSON object found in response: ''``, which reads as a model
-    that answered in prose. Instrumented at THIS chokepoint rather than at the
-    structured paths, for the same reason ``_first_choice`` is: a guard
+    Logs the diagnostics when the content is empty. The emptiness itself is not
+    an error here — callers classify it — but it is invisible without this
+    line, and the caller-facing symptom actively misdirects: a structured
+    caller reports ``no JSON object found in response: ''``, which reads as a
+    model that answered in prose. Instrumented at THIS chokepoint rather than
+    at the structured paths, for the same reason ``_first_choice`` is: a guard
     applied at four of five call sites is not a guard.
+
+    ``caller_raises_on_empty`` sets the LEVEL, and only the level — the line is
+    emitted either way. This function's own docstring says the emptiness is not
+    an error and that callers classify it, so logging it at ERROR
+    unconditionally contradicts that: on the structured path the caller raises
+    with the SAME diagnostics microseconds later, so an ERROR here is a second
+    report of one event. Alert handlers attach at ERROR
+    (``krepis.logging.setup_logging``), so that duplication reached the on-call
+    human: one Think Tank abort on 2026-08-11 produced three separate ERROR
+    dispatches for a single failed call (alpha-engine-config-I6921 D3).
+
+    The default stays ERROR, deliberately. On the plain-completion path
+    (:meth:`LLMClient.complete`) an empty string is RETURNED to the caller and
+    nothing raises — there this line is the only signal that anything happened,
+    and demoting it fleet-wide to buy quiet on the structured path would trade
+    a duplicate alert for a missing one.
     """
     choice = _first_choice(resp)
     text = (getattr(choice.message, "content", None) or "").strip()
     if not text:
-        logger.error(
+        logger.log(
+            logging.WARNING if caller_raises_on_empty else logging.ERROR,
             "llm: EMPTY message.content on a successful response — %s",
             _empty_content_diagnostics(resp, choice),
         )
@@ -1354,7 +1371,7 @@ class LLMClient:
             try:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
-                raw_text = _choice_text(resp)
+                raw_text = _choice_text(resp, caller_raises_on_empty=True)
                 # Deliberately OUTSIDE the retry classification below: a
                 # budget exhausted before any content is not an attempt
                 # failure, it is a certainty about every remaining attempt.
