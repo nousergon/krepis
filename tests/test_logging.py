@@ -158,8 +158,10 @@ def test_flow_doctor_enabled_happy_path(monkeypatch, tmp_path):
     assert get_flow_doctor() is fake_instance
     # 0.58.0: from_config receives strict= (True here — FLOW_DOCTOR_ENABLED=1 is
     # an explicit opt-in, so a misconfig should fail loud).
+    # flow_name is passed explicitly as None when the caller did not set it:
+    # load_config drops None kwargs, so the yaml's own flow_name stands.
     fake_module.FlowDoctor.from_config.assert_called_once_with(
-        config_path=str(yaml_path), strict=True
+        config_path=str(yaml_path), strict=True, flow_name=None
     )
     # No exclude_patterns passed → kwarg must be absent so we don't
     # silently override the FlowDoctorHandler default.
@@ -401,7 +403,7 @@ def test_seed_runs_before_flow_doctor_init(
 
     env_at_init: dict[str, str] = {}
 
-    def capturing_from_config(*, config_path, strict=True):
+    def capturing_from_config(*, config_path, strict=True, flow_name=None):
         env_at_init.update({v: os.environ.get(v) for v in _FD_VARS})
         return mock.Mock()
 
@@ -415,6 +417,79 @@ def test_seed_runs_before_flow_doctor_init(
 
     for var in _FD_VARS:
         assert env_at_init[var] == f"resolved-{var}"
+
+
+# ── flow_name: the alert names the COMPONENT, not the repo ───────────────
+
+
+def _fake_flow_doctor_module():
+    fake_module = mock.Mock()
+    fake_module.FlowDoctor.from_config = mock.Mock(return_value=mock.Mock())
+    fake_module.FlowDoctorHandler = mock.Mock(return_value=logging.NullHandler())
+    return fake_module
+
+
+def test_flow_name_overrides_the_yaml(monkeypatch, tmp_path):
+    """A `flow-doctor.yaml` is owned per REPO; an alert is about a COMPONENT.
+
+    Live cost of conflating them: `crucible-research`'s yaml declares
+    `flow_name: research-lambda`, so every Think Tank alert arrived labelled
+    as a Lambda for the twelve days after the Think Tank moved to an EC2 spot
+    box — and the operator went looking at Lambda logs for a failure that had
+    none. `load_config` merges inline kwargs over the file, so the override
+    is a pass-through, not a re-implementation.
+    """
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text("flow_name: research-lambda\n")
+
+    fake_module = _fake_flow_doctor_module()
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake_module}):
+        setup_logging(
+            "thinktank",
+            flow_doctor_yaml=str(yaml_path),
+            flow_name="thinktank-spot",
+        )
+
+    fake_module.FlowDoctor.from_config.assert_called_once_with(
+        config_path=str(yaml_path), strict=True, flow_name="thinktank-spot"
+    )
+
+
+def test_flow_name_unset_leaves_the_yaml_authoritative(monkeypatch, tmp_path):
+    """Every existing caller must be unaffected. None is forwarded rather
+    than omitted because `load_config` already drops None kwargs — asserting
+    the explicit None pins that contract instead of leaving it implied."""
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text("flow_name: research-lambda\n")
+
+    fake_module = _fake_flow_doctor_module()
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake_module}):
+        setup_logging("thinktank", flow_doctor_yaml=str(yaml_path))
+
+    _, kwargs = fake_module.FlowDoctor.from_config.call_args
+    assert kwargs["flow_name"] is None
+
+
+def test_flow_name_does_not_change_the_log_prefix(monkeypatch, tmp_path, capsys):
+    """`name` and `flow_name` are separate knobs: one is the stdout prefix,
+    the other is what the alert is filed under. Coupling them would make a
+    caller unable to fix its alert label without also rewriting its logs."""
+    monkeypatch.setenv("FLOW_DOCTOR_ENABLED", "1")
+    yaml_path = tmp_path / "flow-doctor.yaml"
+    yaml_path.write_text("flow_name: research-lambda\n")
+
+    fake_module = _fake_flow_doctor_module()
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake_module}):
+        setup_logging(
+            "thinktank",
+            flow_doctor_yaml=str(yaml_path),
+            flow_name="thinktank-spot",
+        )
+    logging.getLogger().warning("hello")
+
+    assert "[thinktank]" in capsys.readouterr().err
 
 
 # ── SecretsRedactingFilter ────────────────────────────────────────────────
