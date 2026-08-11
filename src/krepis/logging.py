@@ -347,6 +347,7 @@ def _attach_flow_doctor(
     yaml_path: str,
     exclude_patterns: list[str] | None = None,
     strict: bool = True,
+    flow_name: str | None = None,
 ) -> None:
     """Initialize the shared flow-doctor instance and attach a log handler.
 
@@ -355,6 +356,12 @@ def _attach_flow_doctor(
     rendered message matches any pattern are dropped before entering
     the flow-doctor dispatch pipeline (email / GitHub issue). Use for
     benign ERROR-level noise that would otherwise dedup-spam on-call.
+
+    ``flow_name`` overrides the yaml's ``flow_name`` for this process only —
+    ``load_config`` merges inline kwargs over the file. A ``flow-doctor.yaml``
+    is per-REPO, but an alert is about a COMPONENT, and the two are not the
+    same thing in any repo that ships more than one entry point. Left unset,
+    the yaml's value stands and nothing changes for existing callers.
 
     ``strict`` (deployed runtimes) re-raises a missing-install / missing-yaml
     / missing-secret as a hard failure — a silently-degraded error monitor
@@ -397,7 +404,7 @@ def _attach_flow_doctor(
     # = False) with a stderr WARN instead of crashing the developer's run.
     try:
         _fd_instance = flow_doctor.FlowDoctor.from_config(
-            config_path=yaml_path, strict=strict
+            config_path=yaml_path, strict=strict, flow_name=flow_name
         )
     except Exception as exc:  # noqa: BLE001 - strict re-raise below
         if strict:
@@ -416,6 +423,7 @@ def setup_logging(
     name: str,
     flow_doctor_yaml: str | None = None,
     exclude_patterns: list[str] | None = None,
+    flow_name: str | None = None,
 ) -> None:
     """Configure the root logger for an Alpha Engine entrypoint.
 
@@ -434,6 +442,16 @@ def setup_logging(
         routing is suppressed. Example: the executor passes
         ``[r"Error 10197"]`` to suppress benign IB Gateway noise when
         the iOS app steals the live-data session.
+    :param flow_name: Overrides the yaml's ``flow_name`` for this process.
+        A ``flow-doctor.yaml`` is owned per REPO, but an alert is about a
+        COMPONENT — and a repo that ships more than one entry point has more
+        than one component behind a single file. Where they differ, the file's
+        name is the one that reaches the on-call human, and it can be actively
+        WRONG: ``crucible-research``'s yaml declares ``research-lambda``, so
+        every Think Tank alert arrived labelled as a Lambda for the twelve days
+        after the Think Tank moved to an EC2 spot box (ARCHITECTURE §47) — and
+        the operator, reasonably, went looking at Lambdas. Left unset the yaml
+        value stands, so no existing caller changes behaviour.
 
     Env vars consulted:
 
@@ -484,4 +502,5 @@ def setup_logging(
             flow_doctor_yaml,
             exclude_patterns=exclude_patterns,
             strict=strict,
+            flow_name=flow_name,
         )
