@@ -869,6 +869,7 @@ def record_anthropic_call(
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
         "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
+        "reasoning_tokens": metadata.reasoning_tokens,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
@@ -1021,6 +1022,9 @@ def metadata_from_openai_completion(
     """
     u = getattr(resp, "usage", None)
     details = getattr(u, "prompt_tokens_details", None) if u is not None else None
+    completion_details = (
+        getattr(u, "completion_tokens_details", None) if u is not None else None
+    )
     reported_cost = getattr(u, "cost", None) if u is not None else None
     return ModelMetadata(
         model_name=model_name if model_name is not None else resp.model,
@@ -1045,6 +1049,18 @@ def metadata_from_openai_completion(
         # ``ModelMetadata.prompt_cache_miss_tokens``.
         prompt_cache_miss_tokens=int(getattr(u, "prompt_cache_miss_tokens", 0) or 0)
             if u else 0,
+        # The reasoning share of ``output_tokens`` — a SUBSET of it, never an
+        # addition, so recompute_cost must not price the two separately.
+        # Mirrors ``krepis.llm._usage_from_openai``, including the dict shape:
+        # a proxied provider can deliver this as raw JSON, and ``getattr`` on a
+        # dict silently returns the default (config#1659's failure mode).
+        reasoning_tokens=(
+            int(completion_details.get("reasoning_tokens", 0) or 0)
+            if isinstance(completion_details, dict)
+            else int(getattr(completion_details, "reasoning_tokens", 0) or 0)
+            if completion_details is not None
+            else 0
+        ),
         web_search_requests=int(getattr(u, "web_search_requests", 0) or 0)
             if u else 0,
         provider_reported_cost_usd=float(reported_cost)
@@ -1071,6 +1087,7 @@ def _metadata_from_llm_result(result: Any, *, model_name: str | None) -> ModelMe
         cache_create_tokens=u.cache_create_tokens,
         cache_create_1h_tokens=u.cache_create_1h_tokens,
         prompt_cache_miss_tokens=u.prompt_cache_miss_tokens,
+        reasoning_tokens=getattr(u, "reasoning_tokens", 0) or 0,
         web_search_requests=u.web_search_requests,
         web_fetch_requests=u.web_fetch_requests,
         provider_reported_cost_usd=u.provider_cost_usd,
@@ -1148,6 +1165,7 @@ def record_llm_call(
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
         "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
+        "reasoning_tokens": metadata.reasoning_tokens,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
