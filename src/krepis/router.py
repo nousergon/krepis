@@ -2003,6 +2003,17 @@ def resolve_group_spec(
             else params.get("structured_outputs", True)
         ),
         reasoning=params.get("reasoning"),
+        # The route already knows which registry entry it picked; discarding it
+        # here is what made a cost record unable to name it. For a proxy route
+        # `registry_id` is `litellm:group:{group}` and the entry actually
+        # walked to is server-side, so `primary_registry_id` is the closest
+        # honest answer — what THIS process addressed, not a claim about what
+        # served. alpha-engine-config-I6908.
+        registry_id=(
+            route.get("primary_registry_id")
+            if route.get("route") == "litellm_proxy"
+            else route.get("registry_id")
+        ),
     )
     logger.info(
         "resolved group=%s -> model=%s provider=%s route=%s exec_context=%s "
