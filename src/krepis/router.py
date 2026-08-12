@@ -25,9 +25,18 @@ Registry lookup
     By default reads ``$LLM_MODEL_REGISTRY_PATH`` (env var).  If unset,
     walks up from *cwd* looking for
     ``private-docs/LLM_MODEL_REGISTRY.yaml`` (alpha-engine-config path).
-    Failing that, falls back to the hardcoded model list in
-    :func:`_builtin_model_list` — the same list that was previously
-    embedded in :func:`krepis.llm._get_router`.
+    Failing that it FAILS CLOSED — there is exactly one source of truth
+    (model-router-policy R1), so a built-in model list would be a
+    per-consumer copy of the registry and is deliberately absent. This
+    paragraph documented a ``_builtin_model_list`` fallback for some time
+    after the function was removed; a docstring promising a hardcoded model
+    list is an R1 violation to everyone who reads it.
+
+Derivation
+    This module does not parse the registry. :mod:`krepis.model_registry` is
+    the single derivation (model-router-policy R6/R6a) and is shared with the
+    proxy-config generator in ``alpha-engine-config``; what lives here is the
+    in-process naming topology only.
 """
 
 from __future__ import annotations
@@ -968,37 +977,48 @@ def _parse_registry(
     (``kwargs["model"]``) — alias resolution does not rewrite it — so the
     alias-keyed entry serves alias-addressed calls and the qualified-keyed
     entry serves callers that address the primary deployment directly.
-    Every consumer of these tuples (in-process Router construction, any
-    proxy-yaml render) gets the alias map from this one function — one
-    derivation implementation (model-router-policy R6).
+    This function performs NO parsing of its own. Every registry fact it uses —
+    discovery, YAML load, the status filter, per-group live membership and each
+    deployment's litellm params — comes from :mod:`krepis.model_registry`, which
+    is the single derivation model-router-policy R6 requires. What stays here is
+    the one thing that is genuinely this consumer's: the in-process naming
+    topology (qualified names, dual-keyed fallbacks, the alias map). See that
+    module's header for the three divergences that accumulated while a second
+    derivation existed, all three of which this path was on the wrong side of.
     """
-    import yaml as _yaml
+    from . import model_registry as _mr
 
-    with open(path) as f:
-        doc = _yaml.safe_load(f)
+    registry = _mr.load_registry(path)
 
     model_list: list[dict] = []
     fallbacks: list[dict] = []
     group_aliases: dict[str, str] = {}
     seen_models: set[str] = set()
 
-    groups = doc.get("model_groups", {})
-    models = {m["id"]: m for m in doc.get("models", [])}
+    overrides = {"OPENROUTER_API_KEY": openrouter_key} if openrouter_key else None
 
-    for group_name, group_ids in groups.items():
+    for group_name, live_ids in registry.iter_live_groups():
         fallback_chain: list[str] = []
         primary_name: str | None = None
-        for mid in group_ids:
-            entry = models.get(mid)
-            if entry is None:
-                logger.warning("model %r referenced in group %r not found in models list", mid, group_name)
-                continue
+        for mid in live_ids:
+            entry = registry.models[mid]
 
             # All deployments get the qualified name — "low-deepseek-v4-flash",
-            # "low-gemini-2.5-flash", … The FIRST resolvable entry is the
-            # primary; the bare group name aliases to it below.
+            # "low-gemini-2.5-flash", … The FIRST live entry is the primary;
+            # the bare group name aliases to it below.
             model_name = f"{group_name}-{mid}"
-            litellm_params = _model_to_litellm_params(entry, openrouter_key)
+            litellm_params = _mr.deployment_params(
+                entry, api_key_style="value", api_key_overrides=overrides
+            )
+            # rpm/tpm are per-surface rendering, not registry facts, so
+            # deployment_params leaves them out. The in-process Router honours
+            # whatever the registry declares, with tpm held at the admissible
+            # floor for the reason declared_tpm documents.
+            if "rpm" in entry:
+                litellm_params["rpm"] = entry["rpm"]
+            tpm = _mr.declared_tpm(entry, _mr.MIN_ADMISSIBLE_TPM)
+            if tpm is not None:
+                litellm_params["tpm"] = tpm
 
             if model_name not in seen_models:
                 model_list.append({"model_name": model_name, "litellm_params": litellm_params})
@@ -1016,68 +1036,6 @@ def _parse_registry(
             fallbacks.append({primary_name: fallback_chain})
 
     return model_list, fallbacks, group_aliases
-
-
-def _model_to_litellm_params(entry: dict, openrouter_key: str) -> dict:
-    """Convert a registry model entry to litellm params."""
-    provider = entry.get("provider", "")
-    route = entry.get("route", "")
-    model_id = entry.get("model", "")
-    params = entry.get("params", {})
-
-    litellm_params: dict = {}
-
-    # Build the litellm model prefix
-    if provider == "anthropic":
-        litellm_params["model"] = f"anthropic/{model_id}"
-        litellm_params["api_key"] = os.environ.get("ANTHROPIC_API_KEY", "")
-    elif provider == "openrouter":
-        litellm_params["model"] = f"openrouter/{model_id}"
-        litellm_params["api_key"] = openrouter_key
-    elif route == "egress_proxy":
-        litellm_params["model"] = f"openai/{model_id}"
-        litellm_params["api_key"] = _egress_placeholder
-        # api_base is driven by the registry — no hardcoded provider→port map.
-        # Every egress_proxy entry MUST carry an api_base field pointing at its
-        # local proxy instance (e.g. "http://127.0.0.1:8972/v1").
-        api_base = entry.get("api_base")
-        if api_base:
-            litellm_params["api_base"] = api_base
-        else:
-            entry_id = entry.get("id", model_id)
-            logger.warning(
-                "egress_proxy entry %r missing api_base — "
-                "requests will fail without a base URL", entry_id
-            )
-    else:
-        # Unknown route — treat as generic OpenAI-compatible, no proxy.
-        litellm_params["model"] = f"openai/{model_id}"
-        litellm_params["api_key"] = _egress_placeholder
-
-    # Apply params from registry
-    if "max_tokens" in params:
-        litellm_params["max_tokens"] = params["max_tokens"]
-    reasoning = params.get("reasoning")
-    if reasoning:
-        if "extra_body" not in litellm_params:
-            litellm_params["extra_body"] = {}
-        litellm_params["extra_body"]["reasoning"] = reasoning
-
-    # Multi-tenant egress proxy: set X-Upstream-Host header so the single
-    # proxy on port 8990 routes to the correct upstream provider.
-    upstream_host = entry.get("upstream_host")
-    if upstream_host:
-        if "extra_headers" not in litellm_params:
-            litellm_params["extra_headers"] = {}
-        litellm_params["extra_headers"]["X-Upstream-Host"] = upstream_host
-
-    # Apply RPM/TPM from registry if present
-    if "rpm" in entry:
-        litellm_params["rpm"] = entry["rpm"]
-    if "tpm" in entry:
-        litellm_params["tpm"] = entry["tpm"]
-
-    return litellm_params
 
 
 # ── Router singleton ─────────────────────────────────────────────────────
@@ -1187,17 +1145,19 @@ def group_supports_explicit_cache_breakpoints(group: str) -> bool:
     markers sent to a provider that may reject them.
     """
     try:
+        from . import model_registry as _mr
+
         reg_path = _find_registry()
         if not reg_path:
             return False
-        import yaml as _yaml
-        with open(reg_path) as f:
-            doc = _yaml.safe_load(f)
-        group_ids = (doc.get("model_groups") or {}).get(group) or []
-        if not group_ids:
+        registry = _mr.load_registry(reg_path)
+        # LIVE members only: the primary that will serve the request is the
+        # first live one, so asking a dead entry about its caching support
+        # answers for a model that cannot be reached.
+        live_ids = registry.live_group_ids(group)
+        if not live_ids:
             return False
-        models_by_id = {m["id"]: m for m in doc.get("models", [])}
-        explicit, _automatic = _caching_flags(models_by_id.get(group_ids[0], {}))
+        explicit, _automatic = _caching_flags(registry.models.get(live_ids[0], {}))
         return explicit
     except Exception:
         logger.warning(
@@ -1272,11 +1232,11 @@ def served_model_for_deployment(deployment_name: str) -> Optional[str]:
             "LLM_MODEL_REGISTRY_PATH or run from within a repo whose "
             "private-docs/ directory contains the file."
         )
-    import yaml as _yaml
-    with open(reg_path) as f:
-        doc = _yaml.safe_load(f)
-    groups = doc.get("model_groups", {}) or {}
-    models = {m["id"]: m for m in doc.get("models", [])}
+    from . import model_registry as _mr
+
+    registry = _mr.load_registry(reg_path)
+    groups = registry.groups
+    models = registry.models
     for group_name, group_ids in groups.items():
         prefix = f"{group_name}-"
         if not deployment_name.startswith(prefix):
@@ -1390,16 +1350,16 @@ def _resolve_group_json(
             "whose private-docs/ directory contains the file."
         )
 
-    with open(reg_path) as f:
-        doc = _yaml.safe_load(f)
+    from . import model_registry as _mr
 
-    models_by_id: dict[str, dict] = {m["id"]: m for m in doc.get("models", [])}
-    group_ids: list[str] = doc.get("model_groups", {}).get(group, [])
+    registry = _mr.load_registry(reg_path)
+    models_by_id: dict[str, dict] = registry.models
+    group_ids: list[str] = registry.groups.get(group, [])
 
     if not group_ids:
         raise ValueError(
             f"Model group {group!r} not found in registry. "
-            f"Available groups: {list(doc.get('model_groups', {}).keys())}"
+            f"Available groups: {list(registry.groups)}"
         )
 
     # ── Prefer LiteLLM proxy (format-translating central router) ──────────
@@ -1608,6 +1568,29 @@ def _resolve_group_json(
     for mid in group_ids:
         entry = models_by_id.get(mid)
         if entry is None:
+            continue
+
+        # R4 — a deprecated or unavailable entry MUST NOT be reachable at
+        # runtime: "not in a group and not callable by name". This path
+        # filtered on reachability and wire format but never on status, so a
+        # dead entry ahead of a live one in the chain was resolved and handed
+        # to the caller as its route. Recorded as a skip rather than dropped
+        # silently, per R29's first obligation: "unreachable from here",
+        # "unhealthy" and "excluded by status" are three different answers and
+        # a consumer reading skipped_entries must be able to tell them apart.
+        _status = entry.get("status")
+        if _status in _mr.EXCLUDED_STATUSES:
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": (
+                    f"Registry status is {_status!r} — excluded from every "
+                    "generated surface (model-router-policy R4). Deprecated is "
+                    "the permanent exit; unavailable means the entry exists but "
+                    "cannot serve, and emitting it would report depth the group "
+                    "does not have."
+                ),
+            })
             continue
 
         _entry_route = entry.get("route", "")

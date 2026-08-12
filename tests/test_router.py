@@ -2303,3 +2303,90 @@ class TestUnauthenticatablePairIsRefused:
     )
     def test_plaintext_loopback_detection(self, url, loopback):
         assert _router._is_plaintext_loopback(url) is loopback
+
+
+# ── R4 on the resolution path (model-router-policy §3.1) ─────────────────
+#
+# _resolve_group_json filtered on execution-context reachability and on wire
+# format, but never on `status`. A dead entry standing AHEAD of a live one in
+# a group's chain was therefore resolved and handed to the caller as its route
+# — R4 ("not in a group and not callable by name") violated on the resolution
+# contract, which is the one surface every consumer applies verbatim.
+#
+# Today's registry happens to declare every dead member AFTER a live one, so
+# this changes nothing about what resolves right now. That is exactly why it
+# needs a test: the guard's whole value is for the ordering nobody has written
+# yet, and a fixture built from today's registry would pass without it.
+
+_DEAD_FIRST_REGISTRY = """
+schema_version: 1
+
+model_groups:
+  low:
+    - dead-leader
+    - live-follower
+
+models:
+  - id: dead-leader
+    provider: zhipu
+    route: egress_proxy
+    model: qwen3-max
+    api_base: http://127.0.0.1:8974/v1
+    reachable_from: [laptop, ec2]
+    status: unavailable
+  - id: live-follower
+    provider: deepseek
+    route: egress_proxy
+    model: deepseek-v4-flash
+    api_base: http://127.0.0.1:8971/v1
+    reachable_from: [laptop, ec2]
+    status: active
+"""
+
+
+@pytest.fixture()
+def dead_first_registry(tmp_path):
+    p = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+    p.write_text(_DEAD_FIRST_REGISTRY)
+    return p
+
+
+class TestStatusFilterOnResolution:
+    def _resolve(self, monkeypatch, registry_path):
+        """Resolve with the router route probed as DOWN, so the chain is walked.
+
+        Degraded mode is the only path that reaches the direct entries, and it
+        is where a dead leader would be handed out.
+        """
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(_router, "_probe_egress_proxy", lambda *a, **k: True)
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1:1")
+                return _router.resolve_group_structured("low", exec_context="laptop")
+        finally:
+            _router._router = None
+
+    def test_a_dead_leader_is_skipped_and_the_live_follower_serves(
+        self, monkeypatch, dead_first_registry
+    ):
+        info = self._resolve(monkeypatch, dead_first_registry)
+        assert info["registry_id"] == "live-follower"
+        assert info["model"] == "deepseek-v4-flash"
+
+    def test_the_skip_names_status_so_it_is_not_read_as_unreachable(
+        self, monkeypatch, dead_first_registry
+    ):
+        """R29's first obligation: the three reasons must stay distinguishable.
+
+        "excluded by status", "not reachable from this context" and "unhealthy"
+        are three different answers, and a consumer reading skipped_entries has
+        to be able to tell which one it got.
+        """
+        info = self._resolve(monkeypatch, dead_first_registry)
+        skips = {s["registry_id"]: s["reason"] for s in info["skipped_entries"]}
+        assert "dead-leader" in skips
+        assert "unavailable" in skips["dead-leader"]
+        assert "R4" in skips["dead-leader"]
+        assert "reachable_from" not in skips["dead-leader"]
