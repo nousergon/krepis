@@ -2185,3 +2185,121 @@ class TestAppConfigFailureIsObservable:
         with caplog.at_level("WARNING", logger="krepis.router"):
             assert _router._find_registry_from_appconfig() is None
         assert caplog.text == ""
+
+
+# ── the (url, credential) pair must be able to authenticate ────────────────
+
+
+class TestUnauthenticatablePairIsRefused:
+    """A per-consumer credential paired with the plaintext loopback URL cannot
+    authenticate, and `resolve_group_spec` used to return it as a SUCCESSFUL
+    resolution — `route == "litellm_proxy"`, `degraded == False`.
+
+    The credential is meaningful only AT the authenticated edge, which
+    exchanges it for the router's own key. The process behind that edge knows
+    the master key and nothing else, and has no database in which to resolve a
+    virtual key, so every call comes back
+    `400 {"error":{"message":"No connected db."}}`.
+
+    Measured (alpha-engine-config-I6965): morning-signal declared
+    KREPIS_ROUTER_CREDENTIAL_SECRET and not KREPIS_LITELLM_PROXY_URL, took the
+    loopback default, and aborted its configured primary on that 400 on EVERY
+    scheduled run from 2026-08-09 to 2026-08-12 — airing each episode from a
+    fallback that is direct-OpenRouter linkage, which
+    alpha-engine-config-I6367 forbids.
+
+    model-router-policy R20: a failed resolution fails CLOSED.
+    """
+
+    def _route(self, **over):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "med-deepseek-v4-flash-max",
+            "display_name": "deepseek-v4-flash-max (med)",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": _router.LITELLM_PROXY_URL,
+            "deployment_id": "med-deepseek-v4-flash-max",
+            "auth_token_type": "litellm_master_key",
+            "group": "med",
+            "registry_id": "litellm:group:med",
+            "primary_model": "deepseek-v4-flash",
+            "primary_registry_id": "deepseek-v4-flash-max",
+            "capabilities": {},
+            "params": {"max_tokens": 8192, "structured_outputs": True},
+        }
+        route.update(over)
+        return route
+
+    def _patch(self, monkeypatch, route):
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+
+    def test_consumer_credential_on_the_loopback_process_raises(self, monkeypatch):
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(monkeypatch, self._route())
+        with pytest.raises(RuntimeError) as exc:
+            _router.resolve_group_spec("med", exec_context="ec2")
+        msg = str(exc.value)
+        assert "cannot authenticate" in msg
+        # The message must carry BOTH halves and the remedy — a consumer author
+        # reading only "authentication failed" learns nothing about which of
+        # the two independently-resolved values to change.
+        assert _router.LITELLM_PROXY_URL in msg
+        assert "ROUTER_CONSUMER_MORNINGSIGNAL" in msg
+        assert _router.LITELLM_PROXY_URL_ENV in msg
+
+    def test_master_key_on_the_loopback_process_still_resolves(self, monkeypatch):
+        """R27d: a co-tenant consumer may address loopback. The master key is
+        what that process can actually validate, so this arrangement is
+        legitimate and must not be swept up."""
+        monkeypatch.delenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, raising=False)
+        self._patch(monkeypatch, self._route())
+        spec, route = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+        assert route["route"] == "litellm_proxy"
+
+    def test_consumer_credential_on_the_edge_resolves(self, monkeypatch):
+        """The whole point of a per-consumer credential — addressed to the edge
+        it is meaningful at."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(
+            monkeypatch,
+            self._route(api_base_url="https://router.nousergon.ai:8443"),
+        )
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ROUTER_CONSUMER_MORNINGSIGNAL"
+        assert spec.base_url == "https://router.nousergon.ai:8443"
+
+    def test_the_edge_may_itself_be_on_loopback_over_tls(self, monkeypatch):
+        """Scheme is half the predicate. An edge terminating TLS on loopback is
+        a legitimate deployment; refusing it would make the guard a rule about
+        WHERE the consumer runs, which is exactly what R27a forbids."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(monkeypatch, self._route(api_base_url="https://127.0.0.1:8443"))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.base_url == "https://127.0.0.1:8443"
+
+    @pytest.mark.parametrize(
+        "url,loopback",
+        [
+            ("http://127.0.0.1:8980", True),
+            ("http://localhost:8980", True),
+            ("http://[::1]:8980", True),
+            ("http://127.1.2.3:8980", True),
+            ("https://127.0.0.1:8443", False),
+            ("https://router.nousergon.ai:8443", False),
+            ("http://router.nousergon.ai:8443", False),
+            ("", False),
+            ("not a url", False),
+        ],
+    )
+    def test_plaintext_loopback_detection(self, url, loopback):
+        assert _router._is_plaintext_loopback(url) is loopback
