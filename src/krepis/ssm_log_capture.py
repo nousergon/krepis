@@ -119,6 +119,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -220,19 +221,58 @@ def _ship_log_to_s3(
         return False, f"{type(exc).__name__}: {exc}"
 
 
+#: Lines worth leading a failure message with. Deliberately broad: a false
+#: positive costs a slightly-off first line, where a miss costs the reader a
+#: manual S3 fetch of the whole log. Anchored loosely because these come from
+#: Python logging, bare tracebacks, shell `set -e` output and Go binaries, and
+#: no single format spans them.
+_CAUSE_RE = re.compile(
+    r"(Traceback \(most recent call last\)|^\s*raise\b|\bERROR\b|\bCRITICAL\b"
+    r"|\bphase failed\b|\bstatus=error\b|\b[A-Za-z_]*Error\b|\b[A-Za-z_]*Exception\b"
+    r"|^\s*assert\b|\bFAILED\b|\bfatal:)"
+)
+
+#: Cap on either line rendered into a failure message. The whole point is to
+#: fit inside a downstream window (SSM's 24KB StandardErrorContent, a Telegram
+#: message); a single unbounded line would evict the pair it is part of.
+_FAILURE_LINE_CLIP = 400
+
+
+def _clip(line: str | None) -> str:
+    if not line:
+        return "no output captured"
+    line = line.strip()
+    if len(line) <= _FAILURE_LINE_CLIP:
+        return line
+    return line[:_FAILURE_LINE_CLIP] + f"… (+{len(line) - _FAILURE_LINE_CLIP} chars)"
+
+
 def format_subprocess_failure(
     step_name: str,
     *,
     returncode: int,
     last_output_line: str | None = None,
+    cause_line: str | None = None,
 ) -> str:
-    """Format a terminal-failure message naming the failing step + last output line.
+    """Format a terminal-failure message naming the failing step + its cause.
 
     The §116 rule 4 ("no naked rc") chokepoint: callers that use this
     function on their exit path never surface a bare ``exit status 1``
-    without context.  The message includes the step name, numeric return
-    code, and — when available — the last non-empty line the failing
-    subprocess emitted.
+    without context.
+
+    The LAST line of a failing run is usually the exit path, not the cause.
+    On 2026-08-11 the weekly SF's DataPhase1 died on
+
+        ERROR [data-collector] historical_constituents phase failed: No
+        'Selected changes to the list' table found ...
+
+    at 22:05, then ran on for fifteen more minutes before exiting; the last
+    line was ``failed to run commands: exit status 1``. What reached the
+    Telegram alert and the Step Functions ``cause`` field was a git-fetch
+    banner, and diagnosing it took a manual ``aws s3 cp`` of the full log
+    (alpha-engine-config-I6945). ``cause_line`` — the last CAUSE-SHAPED line
+    seen, per :data:`_CAUSE_RE` — is preferred when the two differ, and the
+    last line is kept alongside it rather than dropped.
 
     Args:
         step_name: human-readable label for the failing step
@@ -241,6 +281,10 @@ def format_subprocess_failure(
         last_output_line: the last non-empty line of merged stdout/stderr
             captured from the failing subprocess, or ``None`` when no
             output was captured (setup failure, empty output).
+        cause_line: the last line matching :data:`_CAUSE_RE`, or ``None``.
+            Leads the message when it differs from ``last_output_line``;
+            both are rendered so nothing that was previously surfaced is
+            lost.
 
     Returns:
         A single-line string suitable for ``stderr``. New callers should
@@ -251,15 +295,16 @@ def format_subprocess_failure(
 
         ssm_log_capture: ERROR: [spot-train] failed (rc=1) — AssertionError: validation failed
     """
-    if last_output_line:
-        return (
-            f"ssm_log_capture: ERROR: [{step_name}] failed "
-            f"(rc={returncode}) — {last_output_line}"
-        )
-    return (
-        f"ssm_log_capture: ERROR: [{step_name}] failed "
-        f"(rc={returncode}) — no output captured"
-    )
+    head = f"ssm_log_capture: ERROR: [{step_name}] failed (rc={returncode})"
+    if cause_line and cause_line != last_output_line:
+        # Both, in this order: the cause is what the reader needs, the last
+        # line is what they would otherwise have had and occasionally adds
+        # the exit path. Truncated so one runaway line cannot push the pair
+        # back out of whatever window renders this.
+        return f"{head} — {_clip(cause_line)} (last output: {_clip(last_output_line)})"
+    if cause_line or last_output_line:
+        return f"{head} — {_clip(cause_line or last_output_line)}"
+    return f"{head} — no output captured"
 
 
 def _resolve_correlation_id(cli_arg: str | None) -> str | None:
@@ -373,6 +418,10 @@ def run(
     step = step_name or slug
 
     last_output_line: Optional[str] = None
+    # The last CAUSE-SHAPED line, which is rarely the last line: a failing
+    # phase logs its error and the run continues to a generic exit
+    # (config-I6945).
+    last_cause_line: Optional[str] = None
     exit_code = 1
     try:
         with open(log_path, "wb") as logf:
@@ -403,6 +452,8 @@ def run(
                     stripped = line.strip()
                     if stripped:
                         last_output_line = stripped
+                        if _CAUSE_RE.search(stripped):
+                            last_cause_line = stripped
             proc.wait()
             exit_code = proc.returncode
     except FileNotFoundError as exc:
@@ -423,6 +474,7 @@ def run(
                 step,
                 returncode=exit_code,
                 last_output_line=last_output_line,
+                cause_line=last_cause_line,
             )
             print(failure_msg, file=sys.stderr)
             _append_log(log_path, failure_msg + "\n")
