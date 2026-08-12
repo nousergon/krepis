@@ -376,8 +376,14 @@ def _attach_flow_doctor(
         import flow_doctor
     except ImportError as exc:
         msg = (
+            # HYPHENATED deliberately (alpha-engine-config-I6963). This message
+            # is the one an operator copies, and pip <23.3 — which is what
+            # Amazon Linux 2023 ships (23.2.1) — does not normalise `_` to `-`
+            # in a REQUESTED extra, so `nousergon-lib[flow_doctor]` silently
+            # resolves to nothing and exits 0. Following the old wording
+            # reproduced the very failure this message is reporting.
             "flow-doctor is not installed but a flow_doctor_yaml was provided. "
-            "Install via nousergon-lib[flow_doctor] or add flow-doctor[diagnosis] "
+            "Install via nousergon-lib[flow-doctor] or add flow-doctor[diagnosis] "
             f"to requirements: {exc}"
         )
         if strict:
