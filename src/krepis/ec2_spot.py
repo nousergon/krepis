@@ -125,10 +125,36 @@ CAPACITY_EXIT_CODE: Final[int] = 64
 # closed account-wide" (quota) instead of both collapsing into the same code.
 QUOTA_EXIT_CODE: Final[int] = 65
 
-# relaunch-decision CLI: exit 0 = RELAUNCH, this = HOLD (do not relaunch, fail
-# loud). Distinct from 64 (capacity) and 1 (generic) so a bash caller can branch
-# on it unambiguously: `python -m ... relaunch-decision ...; case $? in 0) exec
-# ...;; 75) exit "$orig";; esac`.
+# relaunch-decision CLI, LEGACY exit-code contract: exit 0 = RELAUNCH, this =
+# HOLD (do not relaunch, fail loud). Distinct from 64 (capacity) and 1 (generic)
+# so a bash caller can branch on it unambiguously: `python -m ...
+# relaunch-decision ...; case $? in 0) exec ...;; 75) exit "$orig";; esac`.
+#
+# DEPRECATED AS THE DEFAULT ANSWER SHAPE — prefer `--json` (see below).
+#
+# Why: "hold" is not an error. It is the ordinary, expected verdict for every
+# failure that is not an AWS reclaim, i.e. the large majority of calls. Encoding
+# it as a NON-ZERO EXIT put the API's normal answer into the one channel that
+# `set -e` treats as fatal, and every bash adopter wrote the natural
+# `VAR="$(cmd)"` — a simple command whose status IS the substitution's. Errexit
+# then fired ON THE NORMAL ANSWER, inside the EXIT trap that was calling it, so
+# `terminate-instances` was never reached and the spot instance leaked. The
+# abort was silent because `set -e` does not re-enter a trap it is running.
+#
+# Measured 2026-08-12 across the fleet: SIX call sites in FIVE repos, all
+# written the same way, none of them guarded. Three were live leaks
+# (crucible-predictor, crucible-backtester ×2 — the second reached by ten
+# per-stage launchers — and crucible-dashboard); two more (nousergon-data ×2,
+# crucible-research) escaped only because their single caller happened to write
+# `|| reason=""`, which suppresses errexit through the whole call. Six of six
+# adopters made the same mistake, which makes it an API defect, not six user
+# errors: an interface whose normal answer is indistinguishable from a failure
+# will be misused by every correct-looking caller.
+#
+# The exit code is retained verbatim for the callers already handling it — a
+# change here would break them silently — but new callers should ask for
+# `--json`, where the verdict is a FIELD and the exit status means only whether
+# the CLI could answer at all.
 NO_RELAUNCH_EXIT_CODE: Final[int] = 75
 
 # ── Spot-reclaim classification ──────────────────────────────────────────────
@@ -705,10 +731,24 @@ def main(argv: list[str] | None = None) -> int:
         help=(
             "Classify a terminated spot AND decide whether the launcher should "
             "relaunch a fresh spot (bounded by --max-attempts, optionally gated "
-            "on the outer SF executionTimeout). Exits 0 = RELAUNCH, "
-            f"{NO_RELAUNCH_EXIT_CODE} = DO NOT relaunch (fail loud). Prints "
+            "on the outer SF executionTimeout). PREFER --json: the verdict is a "
+            "field and the exit status means only whether the CLI could answer. "
+            "Without --json the legacy contract applies — exits 0 = RELAUNCH, "
+            f"{NO_RELAUNCH_EXIT_CODE} = DO NOT relaunch, printing "
             "'relaunch|hold<TAB>reason<TAB>classification<TAB>attempts_remaining' "
-            "on stdout for bash callers."
+            "— which makes the ordinary 'hold' answer fatal under `set -e`."
+        ),
+    )
+    decide_p.add_argument(
+        "--json",
+        action="store_true",
+        dest="as_json",
+        help=(
+            "Emit the decision as a JSON object and exit 0 whenever a decision "
+            "was reached, INCLUDING 'hold'. Fields: relaunch (bool), verdict "
+            "('relaunch'|'hold'), reason, classification, attempts_remaining. "
+            "A non-zero exit then means the CLI could not answer at all (bad "
+            "input, AWS error) — never a verdict. Recommended for all callers."
         ),
     )
     decide_p.add_argument("--instance-id", required=True, help="EC2 instance ID.")
@@ -762,10 +802,36 @@ def main(argv: list[str] | None = None) -> int:
             sf_execution_timeout=args.sf_execution_timeout,
             per_attempt_seconds=args.per_attempt_seconds,
         )
+        verdict = "relaunch" if decision["relaunch"] else "hold"
+
+        if args.as_json:
+            # The RECOMMENDED contract: the verdict is DATA, and the exit
+            # status carries exactly one bit of meaning — could the CLI answer
+            # at all. "hold" is the ordinary answer for every non-reclaim
+            # failure, so putting it in the exit status made the normal path
+            # fatal under `set -e` for six of six bash adopters (see
+            # NO_RELAUNCH_EXIT_CODE). Reaching a decision is a SUCCESS whatever
+            # the decision is.
+            print(
+                json.dumps(
+                    {
+                        "relaunch": bool(decision["relaunch"]),
+                        "verdict": verdict,
+                        "reason": str(decision["reason"]),
+                        "classification": classified["classification"],
+                        "attempts_remaining": decision["attempts_remaining"],
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 0
+
+        # LEGACY contract, retained byte-for-byte. Changing it would silently
+        # invert the branch in every caller that currently tests for 75.
         print(
             "\t".join(
                 (
-                    "relaunch" if decision["relaunch"] else "hold",
+                    verdict,
                     str(decision["reason"]),
                     classified["classification"],
                     str(decision["attempts_remaining"]),
