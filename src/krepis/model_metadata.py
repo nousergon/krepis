@@ -81,6 +81,38 @@ class ModelMetadata(BaseModel):
     # consumers must treat a zero denominator as unknown rather than as
     # a 100% hit rate.
     prompt_cache_miss_tokens: int = Field(default=0, ge=0)
+    # The share of ``output_tokens`` spent on chain-of-thought, where the
+    # provider reports it (OpenAI-shape
+    # ``completion_tokens_details.reasoning_tokens``). NOT additional to
+    # ``output_tokens`` — a subset of it, so pricing must never add the two.
+    #
+    # It is the quantity a reasoning model's ``max_tokens`` must clear before
+    # any content is produced, and until now it was recorded nowhere on a
+    # SUCCESSFUL call — visible only in ``krepis.llm._budget_exhausted_error``,
+    # i.e. once per outage. Three budget-starvation outages in eight days
+    # (alpha-engine-config#6396, I6893, I6858) were each remediated by a guess
+    # for exactly that reason. Zero means "not reported by this provider",
+    # which on a non-reasoning model is also the true value — consumers must
+    # not read zero as evidence a reasoning model spent nothing.
+    # Zero-defaulted and additive within the schema.
+    reasoning_tokens: int = Field(default=0, ge=0)
+    # The registry entry the call ADDRESSED, when it was resolved from the
+    # model registry. Distinct from ``model_name``, which is the upstream name
+    # the provider reports.
+    #
+    # Three registry entries — `deepseek-v4-flash`, `-low`, `-max` — carry the
+    # same upstream model string while declaring `{exclude: true}`,
+    # `{effort: low}` and `{effort: max}` respectively. Without this field,
+    # spend across three distinct configurations collapses into one row and
+    # `{exclude: true}` is indistinguishable from `{effort: max}` downstream —
+    # the exact distinction the reasoning-budget class turns on. Measured
+    # 2026-08-11: two Think Tank tiers on `med` recorded `deepseek-v4-flash`
+    # and read as a misroute to `low` for an hour before the registry explained
+    # it. alpha-engine-config-I6908.
+    #
+    # ``None`` = not resolved from the registry (a hand-built spec), which is a
+    # different statement from "resolved and unknown". Additive within schema.
+    addressed_registry_id: str | None = None
     # Server-tool request counts (Anthropic ``Message.usage.server_tool_use``).
     # Distinct from token classes — these are flat per-request fees billed
     # via :class:`krepis.cost.ToolFee`, not the per-1M-token rate on the

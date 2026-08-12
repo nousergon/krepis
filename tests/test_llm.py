@@ -82,13 +82,20 @@ class FakeAnthropic:
 
 def _openai_usage(
     prompt=100, completion=50, cached=0, cost=None, searches=None,
-    nested_searches=None, nested_searches_obj=None,
+    nested_searches=None, nested_searches_obj=None, reasoning=None,
 ):
     u = SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
         prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
     )
+    if reasoning is not None:
+        # `reasoning` may be an int (typed SDK shape) or a dict, because a
+        # proxied provider delivers this as raw decoded JSON — both must read.
+        u.completion_tokens_details = (
+            reasoning if isinstance(reasoning, dict)
+            else SimpleNamespace(reasoning_tokens=reasoning)
+        )
     if cost is not None:
         u.cost = cost
     if searches is not None:
@@ -840,7 +847,7 @@ class TestCallsiteIdAndCostEmission:
         # metric is computed from downstream.
         for field_name in (
             "input_tokens", "output_tokens", "cache_read_tokens",
-            "prompt_cache_miss_tokens", "cost_usd",
+            "prompt_cache_miss_tokens", "reasoning_tokens", "cost_usd",
         ):
             assert field_name in rec, f"{field_name} missing from cost record"
         assert result.cost_emission_error is None
@@ -1040,6 +1047,61 @@ class TestEffectiveMaxTokens:
     was what the request carried, and nothing logged the wire value.
     """
 
+    def test_the_ADDRESSED_registry_entry_survives_onto_the_result(self):
+        """`model` is the upstream name the provider reports; `registry_id` is
+        the entry we addressed. They are NOT interchangeable: three registry
+        entries (`deepseek-v4-flash`, `-low`, `-max`) share one upstream model
+        string while declaring `{exclude: true}`, `{effort: low}` and
+        `{effort: max}`. Without this, three configurations collapse into one
+        row and cost cannot be attributed. alpha-engine-config-I6908.
+        """
+        spec = ModelSpec(
+            "openrouter", "deepseek-v4-flash", max_tokens=1024,
+            reasoning={"effort": "max"}, registry_id="deepseek-v4-flash-max",
+        )
+        fake = FakeOpenAI([_openai_resp("hi", model="deepseek-v4-flash")])
+        result = _client(spec, fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash", "the provider's own name"
+        assert result.registry_id == "deepseek-v4-flash-max", "the entry addressed"
+        assert result.model != result.registry_id, (
+            "the whole point is that these differ — a test asserting them equal "
+            "would pass on a spec where the distinction does not exist"
+        )
+
+    def test_a_hand_built_spec_records_no_registry_entry(self):
+        """`None` means 'not resolved from the registry', which is a different
+        statement from 'resolved and unknown'."""
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.registry_id is None
+
+    def test_the_reasoning_share_is_recorded_on_a_SUCCESSFUL_call(self):
+        """Until now the draw was observable only when a call came back EMPTY
+        (`_budget_exhausted_error`), i.e. once per outage. A budget floor
+        cannot be derived from a quantity recorded only on failure — which is
+        why all three instances of this class were remediated by a guess.
+        """
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning=108))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+        assert result.usage.output_tokens == 111, (
+            "reasoning is a SUBSET of output tokens, not an addition"
+        )
+
+    def test_the_reasoning_share_reads_from_a_raw_dict_too(self):
+        """`getattr` on a dict silently returns the default — how
+        `server_tool_use_details` read 0 for weeks (config#1659)."""
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning={"reasoning_tokens": 108}))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+
+    def test_a_non_reasoning_response_records_zero_not_an_error(self):
+        fake = FakeOpenAI([_openai_resp("OK")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 0
+
     def test_none_uses_the_registry_budget(self):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
         _client(OPENROUTER_SPEC, fake).structured(
@@ -1105,17 +1167,21 @@ class TestEmptyContentIsVisible:
         return resp
 
     def test_empty_content_logs_the_reasoning_budget(self, caplog):
+        """WARNING, not ERROR, on the structured path — the caller raises with
+        the same diagnostics, so an ERROR here is a second report of one event
+        (see `_choice_text`). The DIAGNOSTICS are what this test is about and
+        they are unchanged; only the level moved."""
         fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             with pytest.raises(LLMError):
                 _client(OPENROUTER_SPEC, fake).structured(
                     system="s", user_content="u", schema=Spec,
                     schema_name="Spec",
                 )
-        errors = [r.getMessage() for r in caplog.records
-                  if r.levelno == logging.ERROR]
-        assert errors, "an empty content produced no ERROR line"
-        msg = errors[0]
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert warnings, "an empty content produced no diagnostic line"
+        msg = warnings[0]
         assert "reasoning_tokens=7998" in msg, (
             "without the reasoning-token count, an exhausted budget and a lost "
             "response body are the same log line"
@@ -1150,21 +1216,61 @@ class TestEmptyContentIsVisible:
 
     def test_non_empty_content_logs_nothing(self, caplog):
         fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             _client(OPENROUTER_SPEC, fake).structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
             )
-        assert not [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING]
 
     def test_whitespace_only_content_counts_as_empty(self, caplog):
         fake = FakeOpenAI([_openai_resp("   \n  ")] * 2)
-        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
             with pytest.raises(LLMError):
                 _client(OPENROUTER_SPEC, fake).structured(
                     system="s", user_content="u", schema=Spec,
                     schema_name="Spec",
                 )
-        assert [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_structured_path_does_not_double_report_at_ERROR(self, caplog):
+        """One failed call must produce ONE alert-level record.
+
+        Alert handlers attach at ERROR (`krepis.logging.setup_logging`), so an
+        ERROR here plus the caller's own report of the raised exception is two
+        dispatches for one event. A single Think Tank abort on 2026-08-11
+        produced three separate ERROR dispatches this way
+        (alpha-engine-config-I6921 D3).
+        """
+        fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        empties = [r for r in caplog.records
+                   if "EMPTY message.content" in r.getMessage()]
+        assert empties, "the diagnostic must still be emitted"
+        assert not [r for r in empties if r.levelno >= logging.ERROR], (
+            "the structured path raises with these same diagnostics — logging "
+            "them at ERROR too is a duplicate alert, not extra coverage"
+        )
+
+    def test_plain_completion_still_logs_at_ERROR(self, caplog):
+        """The default stays ERROR and this is why: `complete()` RETURNS the
+        empty string and nothing raises, so this line is the only signal that
+        anything happened. Demoting it fleet-wide to buy quiet on the
+        structured path would trade a duplicate alert for a missing one."""
+        fake = FakeOpenAI([_openai_resp("")])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            result = _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u",
+            )
+        assert result.text == ""
+        assert [r for r in caplog.records
+                if "EMPTY message.content" in r.getMessage()
+                and r.levelno == logging.ERROR]
 
     def test_diagnostics_never_mask_the_fault(self):
         """A response the diagnostic cannot introspect must still return ''."""

@@ -323,21 +323,38 @@ def _empty_content_diagnostics(resp: Any, choice: Any) -> str:
         )
 
 
-def _choice_text(resp: Any) -> str:
+def _choice_text(resp: Any, *, caller_raises_on_empty: bool = False) -> str:
     """First choice's message content, stripped. Raises on null choices.
 
-    Logs at ERROR when the content is empty. The emptiness itself is not an
-    error here — callers classify it — but it is invisible without this line,
-    and the caller-facing symptom actively misdirects: a structured caller
-    reports ``no JSON object found in response: ''``, which reads as a model
-    that answered in prose. Instrumented at THIS chokepoint rather than at the
-    structured paths, for the same reason ``_first_choice`` is: a guard
+    Logs the diagnostics when the content is empty. The emptiness itself is not
+    an error here — callers classify it — but it is invisible without this
+    line, and the caller-facing symptom actively misdirects: a structured
+    caller reports ``no JSON object found in response: ''``, which reads as a
+    model that answered in prose. Instrumented at THIS chokepoint rather than
+    at the structured paths, for the same reason ``_first_choice`` is: a guard
     applied at four of five call sites is not a guard.
+
+    ``caller_raises_on_empty`` sets the LEVEL, and only the level — the line is
+    emitted either way. This function's own docstring says the emptiness is not
+    an error and that callers classify it, so logging it at ERROR
+    unconditionally contradicts that: on the structured path the caller raises
+    with the SAME diagnostics microseconds later, so an ERROR here is a second
+    report of one event. Alert handlers attach at ERROR
+    (``krepis.logging.setup_logging``), so that duplication reached the on-call
+    human: one Think Tank abort on 2026-08-11 produced three separate ERROR
+    dispatches for a single failed call (alpha-engine-config-I6921 D3).
+
+    The default stays ERROR, deliberately. On the plain-completion path
+    (:meth:`LLMClient.complete`) an empty string is RETURNED to the caller and
+    nothing raises — there this line is the only signal that anything happened,
+    and demoting it fleet-wide to buy quiet on the structured path would trade
+    a duplicate alert for a missing one.
     """
     choice = _first_choice(resp)
     text = (getattr(choice.message, "content", None) or "").strip()
     if not text:
-        logger.error(
+        logger.log(
+            logging.WARNING if caller_raises_on_empty else logging.ERROR,
             "llm: EMPTY message.content on a successful response — %s",
             _empty_content_diagnostics(resp, choice),
         )
@@ -451,6 +468,29 @@ class LLMUsage:
     #   hit_rate = cache_read / (cache_read + prompt_cache_miss)
     # when both fields are populated (0 = provider didn't report it).
     prompt_cache_miss_tokens: int = 0
+    # reasoning_tokens — the share of ``output_tokens`` the model spent on its
+    # chain of thought, where the provider reports it (0 = not reported, which
+    # on a non-reasoning model is also the true value).
+    #
+    # WHY THIS FIELD EXISTS. On a reasoning model ``max_tokens`` bounds
+    # reasoning AND content together, so a budget sized to the expected ANSWER
+    # yields no answer at all — a fully-billed response with
+    # ``finish_reason=length`` and ``content=''``. That failure has now
+    # occurred three times in eight days (alpha-engine-config#6396 the
+    # Director, I6893 Think Tank's ``pillar`` tier aborting a daily run with
+    # zero theses, I6858 ``router-canary`` paging intermittently), and every
+    # remediation so far has been a GUESS, because the quantity a budget must
+    # clear was recorded nowhere.
+    #
+    # It was visible only in the error path: ``_budget_exhausted_error`` reads
+    # ``reasoning_tokens`` off the response when a call comes back empty. So
+    # the draw was observable exactly once per outage and never on a healthy
+    # call — an unobserved quantity, not a healthy one (principles.md §2.7).
+    # Recording it on every call is what makes a measured floor possible at
+    # all; sizing rules are alpha-engine-config-I6901 and are deliberately NOT
+    # in this change, because the two candidate rules both fail against
+    # measurement today (see that issue).
+    reasoning_tokens: int = 0
     web_search_requests: int = 0
     web_fetch_requests: int = 0
     # Provider-reported USD cost when available (OpenRouter returns it in
@@ -485,6 +525,13 @@ class LLMResult:
     # Consumers needing jurisdiction/compliance checks (config#3006) read
     # this instead of parsing ``raw_response`` themselves.
     served_provider: Optional[str] = None
+    # The registry entry this call ADDRESSED, carried through from
+    # :attr:`ModelSpec.registry_id`. Distinct from ``model``, which is the
+    # upstream name the provider reports: three registry entries can share one
+    # upstream model string while declaring three different reasoning configs,
+    # so ``model`` alone cannot say which was addressed
+    # (alpha-engine-config-I6908). ``None`` for a hand-built spec.
+    registry_id: Optional[str] = None
     # True when a fallback model in the group's chain served this request
     # (the primary failed and LiteLLM's Router transparently tried the
     # next model).  Always False on non-litellm transports.
@@ -870,6 +917,13 @@ class LLMClient:
             usage.web_fetch_requests += int(
                 getattr(stu, "web_fetch_requests", 0) or 0
             )
+        # Anthropic's own API does NOT break out a reasoning share — extended
+        # thinking is counted inside ``output_tokens``, so this stays 0 on the
+        # real Anthropic transport and that zero is truthful. Read anyway,
+        # because DeepSeek's Anthropic-compatible endpoint already returns
+        # OpenAI-shaped extras here (see the cache fields above) and a
+        # provider that does report it should not be silently dropped.
+        usage.reasoning_tokens += int(getattr(u, "reasoning_tokens", None) or 0)
         return usage
 
     @staticmethod
@@ -880,6 +934,22 @@ class LLMClient:
             return usage
         usage.input_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
         usage.output_tokens += int(getattr(u, "completion_tokens", 0) or 0)
+        # OpenAI-shape providers report the reasoning share under
+        # completion_tokens_details.reasoning_tokens. Absent on non-reasoning
+        # models and on providers that do not break it out.
+        # Handle both shapes deliberately: the openai SDK types this field, but
+        # a proxied or non-conforming provider can deliver it as a raw dict,
+        # and ``getattr`` on a dict silently returns the default — the exact
+        # way ``server_tool_use_details`` read 0 for weeks below (config#1659).
+        completion_details = getattr(u, "completion_tokens_details", None)
+        if isinstance(completion_details, dict):
+            usage.reasoning_tokens += int(
+                completion_details.get("reasoning_tokens", 0) or 0
+            )
+        elif completion_details is not None:
+            usage.reasoning_tokens += int(
+                getattr(completion_details, "reasoning_tokens", 0) or 0
+            )
         details = getattr(u, "prompt_tokens_details", None)
         if details is not None:
             usage.cache_read_tokens += int(getattr(details, "cached_tokens", 0) or 0)
@@ -1038,6 +1108,7 @@ class LLMClient:
                 text=text,
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,
@@ -1067,6 +1138,7 @@ class LLMClient:
             text=text,
             model=served_model,
             provider=self.spec.provider,
+            registry_id=self.spec.registry_id,
             served_provider=getattr(resp, "provider", None),
             usage=self._usage_from_openai(resp),
             raw_request=kwargs,
@@ -1218,6 +1290,7 @@ class LLMClient:
                     text="",
                     model=getattr(msg, "model", self.spec.model),
                     provider=self.spec.provider,
+                    registry_id=self.spec.registry_id,
                     usage=usage,
                     raw_request=payload,
                     raw_response=msg,
@@ -1298,7 +1371,7 @@ class LLMClient:
             try:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
-                raw_text = _choice_text(resp)
+                raw_text = _choice_text(resp, caller_raises_on_empty=True)
                 # Deliberately OUTSIDE the retry classification below: a
                 # budget exhausted before any content is not an attempt
                 # failure, it is a certainty about every remaining attempt.
@@ -1498,6 +1571,7 @@ class LLMClient:
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,

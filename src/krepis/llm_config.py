@@ -196,6 +196,19 @@ class ModelSpec:
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
     supports_automatic_prefix_caching: bool = False
+    # The registry entry this spec was resolved FROM, when it came from the
+    # model registry (``route["registry_id"]``). ``None`` for a hand-built spec.
+    #
+    # It is not cosmetic and it is not the same as ``model``. Three registry
+    # entries — `deepseek-v4-flash`, `-low`, `-max` — all carry the upstream
+    # model string `deepseek-v4-flash` while declaring THREE DIFFERENT reasoning
+    # configs (`{exclude: true}`, `{effort: low}`, `{effort: max}`). The
+    # provider reports the upstream name, so without this field a cost record
+    # cannot say which entry was addressed: spend across three distinct
+    # configurations collapses into one row, and `{exclude: true}` is
+    # indistinguishable from `{effort: max}` downstream — the exact distinction
+    # the reasoning-budget class turns on (alpha-engine-config-I6901, I6908).
+    registry_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         # `provider="litellm"` used to select an IN-PROCESS LiteLLM Router,

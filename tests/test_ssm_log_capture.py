@@ -715,3 +715,82 @@ class TestChildEnvUnit:
         caller = {"BASE": "yes"}
         ssm_log_capture._child_env(caller, "abc-123")
         assert caller == {"BASE": "yes"}, "caller's env dict was mutated"
+
+
+class TestFailureMessageNamesTheCause:
+    """The last line of a failing run is the exit path, not the cause.
+
+    2026-08-11, weekly SF `ed3c8b3d`: DataPhase1 logged
+
+        ERROR [data-collector] historical_constituents phase failed: No
+        'Selected changes to the list' table found ...
+
+    at 22:05, ran on for fifteen more minutes, and exited with `failed to
+    run commands: exit status 1` as its last line. That last line is what
+    the failure message carried, and what reached the Telegram alert and the
+    SF `cause` field was a git-fetch banner. Diagnosing it took a manual
+    `aws s3 cp` of the whole log (alpha-engine-config-I6945).
+    """
+
+    _CAUSE = (
+        "ERROR [data-collector] historical_constituents phase failed: "
+        "No 'Selected changes to the list' table found"
+    )
+    _LAST = "failed to run commands: exit status 1"
+
+    def test_the_cause_leads_and_the_last_line_is_kept(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "data-weekly", returncode=1,
+            last_output_line=self._LAST, cause_line=self._CAUSE,
+        )
+        assert msg.index(self._CAUSE) < msg.index(self._LAST), (
+            "the cause must lead — a reader who only sees the first clause "
+            "is the case this exists for"
+        )
+
+    def test_it_is_not_rendered_twice_when_they_are_the_same_line(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line=self._CAUSE, cause_line=self._CAUSE,
+        )
+        assert msg.count(self._CAUSE) == 1
+
+    def test_the_old_shape_is_unchanged_when_no_cause_was_seen(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=2, last_output_line="boom",
+        )
+        assert msg == "ssm_log_capture: ERROR: [x] failed (rc=2) — boom"
+
+    def test_no_output_at_all_still_says_so(self):
+        msg = ssm_log_capture.format_subprocess_failure("x", returncode=3)
+        assert "no output captured" in msg
+
+    def test_a_runaway_line_is_clipped_so_it_cannot_evict_the_pair(self):
+        # An unbounded line defeats the purpose: the message exists to fit
+        # inside SSM's 24KB StandardErrorContent and a Telegram message.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line="z" * 50_000,
+            cause_line="y" * 50_000,
+        )
+        assert len(msg) < 1200
+        assert "chars)" in msg
+
+    @pytest.mark.parametrize("line", [
+        "Traceback (most recent call last):",
+        "ERROR [data-collector] phase failed: nope",
+        "RuntimeError: flow-doctor is not installed",
+        "ModuleNotFoundError: No module named 'flow_doctor'",
+        "PHASE_END name=historical_constituents status=error",
+        "fatal: repository '' does not exist",
+        "    assert 0 == 1",
+        "tests/test_x.py::test_y FAILED",
+    ])
+    def test_real_failure_lines_from_this_fleet_are_recognised(self, line):
+        assert ssm_log_capture._CAUSE_RE.search(line), line
+
+    @pytest.mark.parametrize("line", [
+        "Batch 12/19 — 600 refreshed so far (65%)",
+        "INFO [data-collector] Applied daily delta: 932 tickers updated",
+        "==> Terminating spot instance i-0b1bd59ff7ad9e2b0...",
+    ])
+    def test_routine_progress_lines_are_not_mistaken_for_causes(self, line):
+        assert not ssm_log_capture._CAUSE_RE.search(line), line
