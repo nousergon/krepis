@@ -373,3 +373,38 @@ def test_install_deps_surfaces_a_dropped_extra_and_runs_pip_check():
     deps = render_install_deps(_spec())
     assert "does not provide the extra" in deps
     assert "pip check" in deps
+
+
+def test_install_deps_FAILS_on_a_dropped_extra_rather_than_only_reporting_it():
+    """Surfacing a dropped extra in the log is not enough — the step must exit
+    non-zero.
+
+    pip emits `WARNING: ... does not provide the extra` on a SUCCESSFUL exit,
+    so a step that only greps it passes, and the failure lands later as an
+    ImportError in a different process with the install log gone. That is
+    exactly how config#6963 reached production (`ModuleNotFoundError: No module
+    named 'flow_doctor'` out of krepis.logging.setup_logging).
+
+    The predictor's `_spot_common.sh` already carried this hard-fail; this
+    renderer did not, which made the fleet copy WEAKER than the consumer it is
+    meant to replace. config-I6922: a consumer cannot be migrated onto a shared
+    implementation that drops behaviour it already has.
+    """
+    deps = render_install_deps(_spec())
+    extra_guard = deps.split("does not provide the extra", 1)[1]
+    # The guard must be a failing branch, not a bare grep: an `exit 1` has to
+    # appear after the match and before `pip check`, which is deliberately
+    # non-fatal and would otherwise be the next thing to run.
+    before_pip_check = extra_guard.split("pip check", 1)[0]
+    assert "exit 1" in before_pip_check
+    assert "the environment is incomplete" in before_pip_check
+
+
+def test_install_deps_keeps_pip_check_non_fatal():
+    """`pip check` stays advisory — the failure it would raise is a
+    pre-existing AMI-baked conflict unrelated to this checkout, which would
+    otherwise fail every lane on every run. Guards the hard-fail added above
+    from being widened onto it by a later edit."""
+    deps = render_install_deps(_spec())
+    tail = deps.split("pip check", 1)[1]
+    assert "||" in tail.splitlines()[0] or "WARNING" in tail
