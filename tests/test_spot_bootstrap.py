@@ -344,3 +344,32 @@ def test_cli_json_mode_emits_a_parseable_envelope(capsys):
     payload = _json.loads(capsys.readouterr().out)
     assert rc == 0
     assert "Type=simple" in payload["script"]
+
+
+# ── Run 12: the deps step that discarded the evidence (config-I6949) ─────
+
+
+def test_install_deps_does_not_pipe_the_install_through_tail():
+    """`pip install ... 2>&1 | tail -1` left one line of pip's run-as-root
+    warning as the entire record of a resolution that had quietly skipped a
+    strict-mode dependency. The predictor spot smoke then died on a missing
+    `flow_doctor` with nothing upstream to read."""
+    deps = render_install_deps(_spec())
+    assert "| tail -1" not in deps
+
+
+def test_install_deps_dumps_the_log_when_pip_fails():
+    deps = render_install_deps(_spec())
+    assert "_pip_log" in deps
+    # The failure branch must print the captured log, or preserving it buys
+    # nothing — the SSM step output is the only surface anyone reads.
+    assert 'tail -80 "$_pip_log" >&2' in deps
+    assert "exit 1" in deps
+
+
+def test_install_deps_surfaces_a_dropped_extra_and_runs_pip_check():
+    """A silently-dropped extra is the exact shape of the failure this
+    step is meant to make legible, and it is a pip WARNING on a zero exit."""
+    deps = render_install_deps(_spec())
+    assert "does not provide the extra" in deps
+    assert "pip check" in deps

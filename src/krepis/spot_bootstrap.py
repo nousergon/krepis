@@ -269,11 +269,34 @@ def render_install_deps(spec: SpotBootstrapSpec) -> str:
     No system-python fallback: :func:`render_bootstrap` guarantees the
     interpreter, so falling back here would silently resolve wheels against a
     different version than ``requirements.txt`` was compiled for.
+
+    The install log is kept, not piped through ``tail -1``. A pip run that
+    exits 0 having quietly skipped an extra looks identical to a clean one
+    through a one-line window, and that window is all a failure downstream
+    leaves behind: on 2026-08-11 the predictor's spot smoke died on a missing
+    ``flow_doctor`` — a strict-mode dependency named in ``requirements.txt`` —
+    and the deps step's only surviving output was pip's run-as-root warning
+    (config-I6949). ``pip check`` after the install names an environment whose
+    dependencies do not actually resolve, which is the shape that failure
+    takes when it is a resolution problem rather than a missing line.
     """
     return f"""set -eo pipefail
 export HOME=/home/ec2-user XDG_CACHE_HOME=/tmp AWS_REGION={spec.region} AWS_DEFAULT_REGION={spec.region}
 cd {_quote(spec.checkout)}
-{PYTHON} -m pip install --quiet --no-warn-script-location -r requirements.txt 2>&1 | tail -1
+_pip_log=/tmp/pip-install-deps.log
+if ! {PYTHON} -m pip install --no-warn-script-location -r requirements.txt > "$_pip_log" 2>&1; then
+  echo "ERROR: pip install -r requirements.txt failed" >&2
+  tail -80 "$_pip_log" >&2
+  exit 1
+fi
+grep -E "^(Successfully installed|WARNING: .*does not provide the extra)" "$_pip_log" || true
+# Non-fatal on purpose: an inconsistent environment is reported, not raised.
+# (a) The failure mode left unraised is a pre-existing AMI-baked conflict
+# unrelated to this checkout, which would otherwise fail every lane on every
+# run. (b) It is recorded on stdout of this SSM step, captured with the rest
+# of the deps output. A resolution defect in requirements.txt still surfaces
+# here in full, one step before the import that would have failed on it.
+{PYTHON} -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
 """
 
 
