@@ -88,6 +88,20 @@ is appended before ``.log`` for traceability.
   would mask it. Matches :mod:`krepis.alerts`' fail-safe
   posture.
 
+**The capture ends with the inner command, not with the pipe
+(alpha-engine-config-I6948):**
+
+EOF on the child's stdout arrives when the LAST holder of the write end closes
+it, which a leaked background descendant never does. :func:`run` therefore ends
+the capture on the DIRECT child's exit plus a short silence budget
+(:data:`ORPHAN_DRAIN_SECONDS`), reports the holdover loudly into the log, and
+kills the orphaned process group. Before this, one leaked
+``krepis.heartbeat emit ... &`` turned a PredictorTraining run that failed after
+142 seconds into a 5400-second SSM ``executionTimeout`` — SIGKILL at the budget,
+`ResponseCode 137`, and no log shipped at all, because the S3 ship happens after
+the read loop. The blind timeout was read as "the workload is too slow"; the
+workload had in fact failed almost immediately.
+
 **Correlation-id chokepoint (§116 rule 6):**
 
 The ``--correlation-id`` CLI argument (or ``$RUN_TOKEN`` env var) is the
@@ -120,9 +134,12 @@ import argparse
 import logging
 import os
 import re
+import select
+import signal
 import socket
 import subprocess
 import sys
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -146,6 +163,104 @@ CORRELATION_ID_ENV_VAR: Final[str] = "RUN_TOKEN"
 # $RUN_TOKEN are both absent, a command dispatched through SSM still gets a
 # stable, execution-scoped id from this rather than a throwaway uuid4.
 SSM_COMMAND_ID_ENV_VAR: Final[str] = "SSM_COMMAND_ID"
+
+# ── Orphan-holdover breaker (alpha-engine-config-I6948) ──────────────────────
+#
+# :func:`run` tees the inner command's output by reading its stdout pipe until
+# EOF. EOF arrives when the LAST holder of the pipe's write end closes it — not
+# when the inner command exits. A launcher that leaves a background process
+# running (the classic `python -m krepis.heartbeat emit ... &` with no matching
+# kill on the failure path) therefore holds that write end open indefinitely,
+# and the read loop blocks forever on a command that finished minutes ago.
+#
+# Measured 2026-08-11, ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9:
+# `PredictorTraining` entered at 15:22:14 PT; its smoke step FAILED at 15:24:36
+# (142 seconds in, on a flow-doctor ImportError — alpha-engine-config-I6963).
+# `crucible-predictor/infrastructure/spot_predictor_training.sh` had started a
+# background heartbeat and stops it only on the success path, so the leaked
+# heartbeat kept this pipe open. The SSM command ran on to its full 5400s
+# `executionTimeout` and was SIGKILLed at 16:52:14 — `ResponseCode 137`,
+# `ExecutionTimedOut` — and because the S3 ship happens AFTER this read loop,
+# the run's entire diagnostic record died with it. The outcome an operator saw
+# ("the workload exceeds its 90-minute budget") was the exact inverse of what
+# happened.
+#
+# So: the DIRECT child's exit ends the capture, and a pipe still held after it
+# is an orphan holdover — reported loudly and killed, never waited on.
+#
+#: Seconds of SILENCE tolerated after the direct child has exited before the
+#: remaining pipe holders are declared orphans. Buffered output already in the
+#: pipe is drained first (it makes the fd readable, which resets nothing) — this
+#: budget is only ever spent on a quiet pipe.
+ORPHAN_DRAIN_SECONDS: Final[float] = 5.0
+
+#: Poll granularity for the read loop. Bounds how long a quiet-but-live command
+#: waits between `poll()` checks; costs nothing on a chatty one.
+_READ_POLL_SECONDS: Final[float] = 0.5
+
+#: Seconds an orphaned process group gets after SIGTERM before SIGKILL.
+_ORPHAN_SIGKILL_GRACE_SECONDS: Final[float] = 2.0
+
+#: Env override for :data:`ORPHAN_DRAIN_SECONDS`, for a caller that legitimately
+#: emits nothing for longer between its last output and its exit. Not a knob any
+#: current lane needs; it exists so a future one is not forced to fork the file.
+ORPHAN_DRAIN_ENV_VAR: Final[str] = "KREPIS_SSM_ORPHAN_DRAIN_S"
+
+
+def _orphan_drain_seconds() -> float:
+    """Resolve the post-exit silence budget from the env, else the default."""
+    raw = os.environ.get(ORPHAN_DRAIN_ENV_VAR)
+    if not raw:
+        return ORPHAN_DRAIN_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "ssm_log_capture: %s=%r is not a number — using default %.1fs",
+            ORPHAN_DRAIN_ENV_VAR,
+            raw,
+            ORPHAN_DRAIN_SECONDS,
+        )
+        return ORPHAN_DRAIN_SECONDS
+    if value <= 0:
+        logger.warning(
+            "ssm_log_capture: %s=%r is not positive — using default %.1fs",
+            ORPHAN_DRAIN_ENV_VAR,
+            raw,
+            ORPHAN_DRAIN_SECONDS,
+        )
+        return ORPHAN_DRAIN_SECONDS
+    return value
+
+
+def _kill_orphan_group(pgid: int) -> str:
+    """SIGTERM then SIGKILL an orphaned process group. Never raises.
+
+    ``pgid`` is the direct child's pid, which IS the group id because
+    :func:`run` starts it with ``start_new_session=True``. Capturing it at
+    launch rather than deriving it later is deliberate: ``os.getpgid(pid)``
+    fails once the child has been reaped, which is exactly when this is needed.
+
+    The new session also means this signal can never reach the capture process
+    itself — the child leads its own group, so the blast radius is the leaked
+    workload and nothing else.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        return "{}: {}".format(type(exc).__name__, exc)
+    deadline = time.monotonic() + _ORPHAN_SIGKILL_GRACE_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, OSError):
+            return "SIGTERM"
+        time.sleep(0.1)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError) as exc:
+        return "SIGTERM, then {}: {}".format(type(exc).__name__, exc)
+    return "SIGTERM then SIGKILL"
 
 
 def _child_env(
@@ -423,6 +538,7 @@ def run(
     # (config-I6945).
     last_cause_line: Optional[str] = None
     exit_code = 1
+    orphan_note: Optional[str] = None
     try:
         with open(log_path, "wb") as logf:
             _write_correlation_header(logf, resolved_correlation_id)
@@ -431,31 +547,78 @@ def run(
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=_child_env(env, resolved_correlation_id),
+                # The child leads its own process group, so a leaked background
+                # descendant can be signalled as a group WITHOUT the signal
+                # reaching this capture process. See _kill_orphan_group.
+                start_new_session=True,
             )
+            # == the process-group id, because of start_new_session above.
+            # Captured now: os.getpgid() stops working once the child is reaped.
+            child_pgid = proc.pid
             assert proc.stdout is not None
             fd = proc.stdout.fileno()
+            drain_budget = _orphan_drain_seconds()
             # Buffer for tracking last meaningful line across chunk boundaries
             partial = ""
+            # Set when the DIRECT child has exited but the pipe is still held.
+            quiet_since: Optional[float] = None
             while True:
-                chunk = os.read(fd, 8192)
-                if not chunk:
+                # EOF on this pipe means "every write end closed", which a
+                # leaked background descendant never lets happen. Poll instead
+                # of blocking in os.read, so the direct child's exit — the thing
+                # that actually ends this capture — is observable.
+                readable, _, _ = select.select([fd], [], [], _READ_POLL_SECONDS)
+                if readable:
+                    chunk = os.read(fd, 8192)
+                    if not chunk:
+                        break  # true EOF: no writer left
+                    quiet_since = None
+                    sys.stdout.buffer.write(chunk)
+                    sys.stdout.buffer.flush()
+                    logf.write(chunk)
+                    logf.flush()
+                    # Track last non-empty output line for the failure message
+                    decoded = chunk.decode("utf-8", errors="replace")
+                    lines = (partial + decoded).split("\n")
+                    partial = lines.pop() if lines else ""
+                    for line in lines:
+                        stripped = line.strip()
+                        if stripped:
+                            last_output_line = stripped
+                            if _CAUSE_RE.search(stripped):
+                                last_cause_line = stripped
+                    continue
+                # Pipe quiet. A live child is merely slow — keep waiting, with
+                # no budget consumed; that is the ordinary long-phase case.
+                if proc.poll() is None:
+                    quiet_since = None
+                    continue
+                # The child has exited and the pipe is quiet but not closed:
+                # something it left behind still holds the write end.
+                if quiet_since is None:
+                    quiet_since = time.monotonic()
+                elif time.monotonic() - quiet_since >= drain_budget:
+                    orphan_note = (
+                        "ssm_log_capture: the inner command exited but left a "
+                        "process holding its output pipe; capture ended after "
+                        "{:.0f}s of silence rather than waiting for an EOF that "
+                        "cannot arrive (alpha-engine-config-I6948). A leaked "
+                        "background process in the launcher is a DEFECT — "
+                        "unfixed it converts any early failure into a full-"
+                        "budget timeout with no log shipped."
+                    ).format(drain_budget)
                     break
-                sys.stdout.buffer.write(chunk)
-                sys.stdout.buffer.flush()
-                logf.write(chunk)
-                logf.flush()
-                # Track last non-empty output line for the failure message
-                decoded = chunk.decode("utf-8", errors="replace")
-                lines = (partial + decoded).split("\n")
-                partial = lines.pop() if lines else ""
-                for line in lines:
-                    stripped = line.strip()
-                    if stripped:
-                        last_output_line = stripped
-                        if _CAUSE_RE.search(stripped):
-                            last_cause_line = stripped
             proc.wait()
             exit_code = proc.returncode
+            if orphan_note is not None:
+                disposition = _kill_orphan_group(child_pgid)
+                orphan_note += " Orphan group {} terminated ({}).".format(
+                    child_pgid, disposition
+                )
+                logger.warning("%s", orphan_note)
+                print(orphan_note, file=sys.stderr)
+                logf.write((orphan_note + "\n").encode("utf-8"))
+                logf.flush()
     except FileNotFoundError as exc:
         msg = f"krepis.ssm_log_capture: cannot exec {cmd!r}: {exc}\n"
         _append_log(log_path, msg)
