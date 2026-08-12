@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Any, Optional
 
@@ -99,6 +100,13 @@ _egress_placeholder = "unused-placeholder-see-key-isolation-config3007"
 #   4. Routes all traffic through egress proxies for DLP scanning.
 LITELLM_PROXY_URL = "http://127.0.0.1:8980"
 
+#: Env var overriding :data:`LITELLM_PROXY_URL`. A constant rather than a third
+#: string literal: the name is read in the override map, in
+#: :func:`_resolve_litellm_proxy_url`, and named in the error a consumer sees
+#: when it has NOT set it — three copies of one name is how the remediation
+#: instruction starts naming a variable the code no longer reads.
+LITELLM_PROXY_URL_ENV = "KREPIS_LITELLM_PROXY_URL"
+
 # Env-var overrides for every CLI-compatible endpoint (config#4923).
 # Each resolves at resolution time from (env var → default constant), so a
 # box-level bootstrap can export the override alongside its --port without
@@ -106,7 +114,7 @@ LITELLM_PROXY_URL = "http://127.0.0.1:8980"
 _ENV_OVERRIDE_MAP: dict[tuple[str, str | None], str] = {
     ("egress_proxy", "deepseek"): "KREPIS_DEEPSEEK_EGRESS_URL",
     ("openrouter", None):         "KREPIS_OPENROUTER_API_URL",
-    ("litellm_proxy", None):      "KREPIS_LITELLM_PROXY_URL",
+    ("litellm_proxy", None):      LITELLM_PROXY_URL_ENV,
 }
 
 # ── Execution context (model-router-policy R28/R29) ──────────────────────
@@ -176,7 +184,7 @@ def _resolve_litellm_proxy_url() -> str:
     This is the URL the LiteLLM health probe targets and the ``api_base_url``
     returned on the LiteLLM route — keeping the two in sync with one source
     of truth (config#4923)."""
-    return os.environ.get("KREPIS_LITELLM_PROXY_URL", LITELLM_PROXY_URL)
+    return os.environ.get(LITELLM_PROXY_URL_ENV, LITELLM_PROXY_URL)
 
 
 def _resolve_exec_context(exec_context: str | None = None) -> str:
@@ -1872,6 +1880,72 @@ def router_credential_secret_name() -> str:
     return raw
 
 
+def _is_plaintext_loopback(url: str) -> bool:
+    """True when *url* is plaintext HTTP to a loopback address.
+
+    Scheme is half the predicate, deliberately. The authenticated edge
+    terminates TLS, so ``https://127.0.0.1:8443`` is a legitimate way to
+    address the EDGE from a co-tenant consumer and must keep working
+    (model-router-policy R27d). Only ``http://`` to loopback is unambiguously
+    the router PROCESS behind it.
+    """
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+    except ValueError:
+        return False
+    if parsed.scheme != "http":
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1") or host.startswith("127.")
+
+
+def _refuse_unauthenticatable_pair(api_base_url: str, api_key_env: str) -> None:
+    """Refuse a ``(url, credential)`` pair that cannot authenticate.
+
+    A per-consumer credential is meaningful only AT the authenticated edge,
+    which is what exchanges it for the router's own key. The router process
+    behind that edge knows the master key and nothing else, and has no database
+    in which to resolve a virtual key — so pairing a per-consumer credential
+    with the plaintext loopback URL produces, on every single call::
+
+        400 {"error":{"message":"No connected db.","type":"no_db_connection"}}
+
+    ``resolve_group_spec`` returned that pair as a SUCCESSFUL resolution —
+    ``route == "litellm_proxy"``, ``degraded == False`` — so a consumer had no
+    way to tell it apart from a working one until the first call came back 400.
+
+    Measured (alpha-engine-config-I6965): morning-signal's unit declared
+    ``KREPIS_ROUTER_CREDENTIAL_SECRET`` and not ``KREPIS_LITELLM_PROXY_URL``,
+    took the loopback default, and aborted its configured primary on that 400
+    on EVERY scheduled run from 2026-08-09 to 2026-08-12, airing each episode
+    from a fallback. The fallback it reached is direct-OpenRouter linkage,
+    which alpha-engine-config-I6367 forbids.
+
+    model-router-policy R20 requires a failed resolution to fail CLOSED. This
+    pair is a resolution that cannot succeed, so it raises here rather than
+    being handed back as callable.
+
+    Master-key-on-loopback is untouched: that is the co-tenant arrangement
+    R27d permits, and it authenticates.
+    """
+    if api_key_env == "LITELLM_MASTER_KEY":
+        return
+    if not _is_plaintext_loopback(api_base_url):
+        return
+    raise RuntimeError(
+        f"router resolution produced a (url, credential) pair that cannot "
+        f"authenticate: api_base_url={api_base_url!r} is the plaintext "
+        f"loopback router PROCESS, but the credential is the per-consumer "
+        f"{api_key_env!r}, which only the authenticated edge can exchange for "
+        f"the router's own key. The process behind the edge has no database in "
+        f"which to resolve a virtual key, so every call returns "
+        f"400 no_db_connection (alpha-engine-config-I6965). "
+        f"Fix: set {LITELLM_PROXY_URL_ENV}=https://<router-edge>:8443, or drop "
+        f"{ROUTER_CREDENTIAL_SECRET_ENV} to authenticate as the master key over "
+        f"loopback."
+    )
+
+
 def route_is_degraded(route: dict) -> bool:
     """Whether RESOLUTION already fell past the group's primary entry.
 
@@ -1975,11 +2049,19 @@ def resolve_group_spec(
     # `litellm` and a readable registry inside every consumer, which is the
     # constraint that reverted crucible-evaluator-PR157.
     #
-    # `api_base_url` on this route already IS the edge, and the edge speaks
-    # OpenAI-compatible chat completions with the QUALIFIED primary
-    # deployment name ({group}-{mid}) as the model (config-I6727: addressing
-    # the bare group alias makes litellm's requested-model stamping report
-    # the alias as resp.model on every healthy call).
+    # `api_base_url` on this route is the edge WHEN THE DEPLOYMENT SAYS SO —
+    # i.e. when $KREPIS_LITELLM_PROXY_URL names it. It is NOT the edge by
+    # default: the default is `http://127.0.0.1:8980`, the router process, and
+    # this comment previously asserted the opposite as an unconditional fact.
+    # That is what a consumer author reads before concluding they need no URL
+    # of their own, and morning-signal's did (alpha-engine-config-I6965).
+    # `_refuse_unauthenticatable_pair` below now makes the difference a raise
+    # rather than a 400 on every call.
+    #
+    # The edge speaks OpenAI-compatible chat completions with the QUALIFIED
+    # primary deployment name ({group}-{mid}) as the model (config-I6727:
+    # addressing the bare group alias makes litellm's requested-model stamping
+    # report the alias as resp.model on every healthy call).
     # So the proxy route is emitted as a CUSTOM OpenAI-compatible endpoint —
     # ModelSpec's documented shape for exactly that (any provider name it
     # does not know, plus base_url + api_key_env). The chain is then walked
@@ -1987,6 +2069,10 @@ def resolve_group_spec(
     provider = route["provider"]
     if route.get("route") == "litellm_proxy":
         provider = ROUTER_EDGE_PROVIDER
+        # Fail CLOSED on a pair that cannot authenticate (R20), rather than
+        # returning it as a successful resolution the caller discovers is
+        # broken one 400 at a time.
+        _refuse_unauthenticatable_pair(route.get("api_base_url") or "", api_key_env)
 
     params = route.get("params") or {}
     spec = ModelSpec(
