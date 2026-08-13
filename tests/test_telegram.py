@@ -48,7 +48,22 @@ def mock_post():
 class TestEscapeMarkdown:
     def test_escapes_underscore_backtick_brackets(self):
         result = tg._escape_markdown("a_b `c` [d]")
-        assert result == "a-b 'c' (d)"
+        assert result == "a\\_b \\`c\\` \\[d\\]"
+
+    def test_the_identifier_survives_escaping(self):
+        """alpha-engine-config-I7168: this SUBSTITUTED until 2026-08-13, so a
+        box-health alert named `/home/ec2-user/flow-doctor/flow-doctor.db` — a
+        path that does not exist, while two OTHER files on that box really are
+        named `flow-doctor.db`. An identifier the reader is expected to copy
+        into a command must arrive intact."""
+        escaped = tg._escape_markdown("/home/ec2-user/flow-doctor/flow_doctor.db")
+        assert escaped.replace("\\", "") == "/home/ec2-user/flow-doctor/flow_doctor.db"
+        assert "flow-doctor.db" not in escaped.replace("\\", "").rsplit("/", 1)[-1]
+
+    def test_a_backslash_in_the_input_cannot_neutralise_an_escape(self):
+        """Escaping `_` after a caller-supplied backslash would emit `\\_`
+        meaning a literal backslash followed by an unescaped underscore."""
+        assert tg._escape_markdown("a\\_b") == "a\\\\\\_b"
 
     def test_preserves_asterisk_for_bold(self):
         assert tg._escape_markdown("*bold*") == "*bold*"
@@ -116,7 +131,8 @@ class TestSendMessageHappyPath:
     def test_escapes_markdown_in_text(self, configured_env, mock_post):
         tg.send_message("ticker_AAPL [BUY]")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "ticker-AAPL (BUY)"
+        assert payload["text"] == "ticker\\_AAPL \\[BUY\\]"
+        assert payload["text"].replace("\\", "") == "ticker_AAPL [BUY]"
 
     def test_preserves_bold_markers(self, configured_env, mock_post):
         tg.send_message("*BUY AAPL*")
@@ -263,8 +279,8 @@ class TestSendRollup:
     def test_rollup_escapes_markdown_in_findings(self, configured_env, mock_post):
         tg.send_rollup(["ticker_X hit [support]"])
         payload = mock_post.call_args.kwargs["json"]
-        # Escape applied at send_message layer, so '_' and '[]' are rewritten.
-        assert "ticker-X hit (support)" in payload["text"]
+        # Escape applied at the send_message layer; the finding survives it.
+        assert "ticker\\_X hit \\[support\\]" in payload["text"]
 
     def test_rollup_returns_false_when_secrets_missing(self, monkeypatch, mock_post):
         monkeypatch.setenv("ALPHA_ENGINE_SECRETS_SOURCE", "env")
