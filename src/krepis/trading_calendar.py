@@ -179,6 +179,65 @@ def count_trading_days(start: date, end: date) -> int:
 _NYSE_CLOSE_ET = time(16, 0)
 _NYSE_TZ = ZoneInfo("America/New_York")
 
+# NYSE regular-session open. Paired with ``_NYSE_CLOSE_ET`` above so the
+# session window has exactly one definition in the fleet.
+_NYSE_OPEN_ET = time(9, 30)
+
+
+def is_market_hours(
+    now: datetime | None = None,
+    *,
+    open_et: time | None = None,
+    close_et: time | None = None,
+) -> bool:
+    """Return True iff ``now`` falls inside a live NYSE regular session.
+
+    The session is the half-open interval ``[09:30, 16:00)`` ET on a
+    trading day — open-inclusive, close-EXCLUSIVE. The exclusive close is
+    load-bearing, not a detail: the post-close chain (daemon shutdown ->
+    ``ne-postclose-trading-pipeline``) fires *at* 16:00:0x ET, and a
+    close-inclusive boundary would classify the legitimate settlement run
+    as in-session. It matches ``session_date``'s partition, whose
+    ``(close(S-1), close(S)]`` convention puts the close instant itself in
+    the closing session rather than the next one.
+
+    Lifted here from ``crucible-executor/executor/market_hours.py``
+    (alpha-engine-config-I7111), which carried a second hand-maintained
+    copy of :data:`NYSE_HOLIDAYS`. This module already owns the NYSE
+    calendar and the close constant, so the session predicate belongs
+    beside them: one holiday table, one session window, one definition of
+    "the market is open". Reachable as
+    ``nousergon_lib.trading_calendar.is_market_hours`` — that module is an
+    alias for this one.
+
+    Deliberately answers only "is the regular session live". Early-close
+    sessions (the day after Thanksgiving, Christmas Eve) close at 13:00 ET
+    and are reported as open until 16:00; that is the conservative
+    direction for every caller this serves — a caller refusing to act
+    in-session refuses for three extra hours rather than acting inside a
+    session it thought had ended.
+
+    Args:
+        now: naive (assumed NYSE-local) or tz-aware datetime; defaults to
+            the current moment in NYSE time.
+        open_et / close_et: session-window overrides, for callers that
+            pin a different close (``crucible-executor`` exposes them as
+            ``MARKET_CLOSE_HOUR`` / ``MARKET_CLOSE_MINUTE``). Read per
+            call, never captured at import — a window baked in at process
+            start is a deploy artifact rather than a configuration.
+    """
+    if now is None:
+        now = datetime.now(_NYSE_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=_NYSE_TZ)
+    else:
+        now = now.astimezone(_NYSE_TZ)
+
+    if not is_trading_day(now.date()):
+        return False
+
+    return (open_et or _NYSE_OPEN_ET) <= now.time() < (close_et or _NYSE_CLOSE_ET)
+
 
 def session_date(
     now: datetime | None = None, *, strict: bool = False
