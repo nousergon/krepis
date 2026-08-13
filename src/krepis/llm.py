@@ -772,6 +772,22 @@ class LLMClient:
 
             key = resolve_router_credential(env_name)
         if not key:
+            # `EGRESS_PROXY_PLACEHOLDER` is exported into the LOCAL egress
+            # proxy process's own environment (nous-ergon-ops
+            # litellm-proxy-shim.sh), not into every consumer's — the proxy
+            # injects the real upstream key server-side and ignores whatever
+            # this client sends, so the client needs any non-empty string,
+            # not a shared secret. `krepis.model_registry.api_key_for()`
+            # already encodes that ("unset placeholder env -> literal
+            # default") for the config-generation path; this mirrors it for
+            # the runtime call path so a consumer with no reason to export
+            # the proxy's own placeholder variable is not blocked by its
+            # absence (alpha-engine-config-I7031).
+            from krepis import model_registry as _mr
+
+            if env_name == _mr.EGRESS_PLACEHOLDER_ENV:
+                key = _mr.EGRESS_PLACEHOLDER_DEFAULT
+        if not key:
             if self.spec.provider == ROUTER_EDGE_PROVIDER:
                 # Naming only the environment variable sends an operator to the
                 # wrong place on the path whose supported source is SSM.

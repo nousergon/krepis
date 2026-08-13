@@ -1780,15 +1780,29 @@ def resolve_group_structured(
 # absent from its dict, and the friendliest outcome is a KeyError at the call
 # site rather than a wrong credential sent to a real endpoint.
 
-#: ``auth_token_type`` -> the SECRET NAME holding that credential, or ``None``
-#: when the endpoint needs no client credential.
+#: ``auth_token_type`` -> the SECRET NAME holding that credential.
 #:
-#: ``placeholder`` means a local egress proxy holds the real key and the
-#: client sends a literal placeholder — ``None`` lets ``ModelSpec`` fall back
-#: to the provider registry default.  It is NOT the same as "credential
-#: missing", and collapsing the two breaks every direct route.
+#: ``placeholder`` is intentionally ABSENT from this table — it is resolved
+#: separately in :func:`resolve_group_spec` to
+#: :data:`krepis.model_registry.EGRESS_PLACEHOLDER_ENV`, never to ``None``.
+#: A local egress proxy holds the real upstream key and the client sends a
+#: literal placeholder; ``None`` here used to be read as "lets ``ModelSpec``
+#: fall back to the provider registry default," which is true only when
+#: ``provider`` also happens to be a krepis built-in (``anthropic`` /
+#: ``openai`` / ``openrouter``). Every egress_proxy entry in practice names a
+#: non-built-in upstream provider (``deepseek``, ``xai``, …), so
+#: ``ModelSpec.resolved_api_key_env()`` had no registry default to fall back
+#: to and raised "no api_key_env was supplied" at CALL time — reached only
+#: when the compelled-route chain fell through past the router edge onto a
+#: direct egress_proxy entry (morning-signal's canary, alpha-engine-config
+#: I7031, 2026-08-12). :mod:`krepis.model_registry` already derives this
+#: correctly for the litellm-config-generation path
+#: (``api_key_env()``/``EGRESS_PLACEHOLDER_ENV``); this table had simply never
+#: been updated to match — the exact `policy-shared-code` "same logic in two
+#: places, one wrong" failure mode. Do not add a second placeholder-name
+#: literal here — resolve it from :mod:`krepis.model_registry` so the two
+#: derivations cannot diverge again.
 _AUTH_TOKEN_SECRET: dict = {
-    "placeholder": None,
     "openrouter_key": "OPENROUTER_API_KEY",
     "litellm_master_key": "LITELLM_MASTER_KEY",
     "direct_api_key": "ANTHROPIC_API_KEY",
@@ -2008,14 +2022,26 @@ def resolve_group_spec(
         )
 
     auth_type = route["auth_token_type"]
-    if auth_type not in _AUTH_TOKEN_SECRET:
+    if auth_type == "placeholder":
+        # Local egress proxy holds the real upstream key; the client sends a
+        # literal placeholder (model-router-policy R25 key isolation). Must
+        # NOT be `None` here — see the table comment above for why that broke
+        # every direct-provider egress_proxy fallback (I7031). Sourced from
+        # `krepis.model_registry`, the module that already derives this
+        # correctly for litellm-config generation, so the two cannot diverge
+        # again.
+        from . import model_registry as _mr
+
+        api_key_env = _mr.EGRESS_PLACEHOLDER_ENV
+    elif auth_type not in _AUTH_TOKEN_SECRET:
         raise RuntimeError(
             f"unknown auth_token_type {auth_type!r} from krepis.router — "
             "refusing to authenticate against an unintended endpoint"
         )
-    api_key_env = _AUTH_TOKEN_SECRET[auth_type]
-    if auth_type == "litellm_master_key":
-        api_key_env = router_credential_secret_name()
+    else:
+        api_key_env = _AUTH_TOKEN_SECRET[auth_type]
+        if auth_type == "litellm_master_key":
+            api_key_env = router_credential_secret_name()
 
     # The router route is the EDGE, not the in-process Router.
     #
