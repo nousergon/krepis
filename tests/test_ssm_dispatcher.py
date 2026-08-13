@@ -29,13 +29,15 @@ alpha-engine-backtester ``spot_backtest.sh``) will rely on after the
 
 from __future__ import annotations
 
+import base64
 import io
+import json
 import sys
 from unittest.mock import MagicMock
 
 import pytest
 
-from krepis import ssm_dispatcher
+from krepis import rss_budget, ssm_dispatcher
 
 
 class _FakeClientError(Exception):
@@ -849,7 +851,13 @@ class TestRunWritesDiagnosticsOnTerminalFailure:
             s3_client=s3,
         )
         assert rc == 0
-        s3.put_object.assert_not_called()
+        # Narrowed 2026-08-13 (alpha-engine-config-I7260): the success path may
+        # now write the peak-RSS budget row under ops/checks/, which is a
+        # different surface with the opposite polarity (success-only, because
+        # an OOM-killed process reports no peak RSS). The clause this test
+        # owns is that no DIAGNOSTICS object is written on success.
+        for call in s3.put_object.call_args_list:
+            assert not call.kwargs["Key"].startswith("_spot_diagnostics/")
 
     def test_failed_without_diagnostics_config_does_not_call_s3(self):
         """Both flags must be set to trigger the write — backward-compat."""
@@ -1025,3 +1033,177 @@ class TestCliDiagnosticsFlags:
         assert rc == 0
         assert captured["diagnostics_bucket"] == "alpha-engine-research"
         assert captured["diagnostics_prefix"] == "_spot_diagnostics/ae-data"
+
+
+class TestPeakRssBudget:
+    """The peak-RSS budget wired into the dispatch chokepoint
+    (alpha-engine-config-I7260).
+
+    Placed HERE and not in ssm_log_capture because ssm_log_capture's direct
+    child is the dispatcher script on the dashboard box; the process that gets
+    OOM-killed runs on the spot instance reached through this module.
+    """
+
+    def test_success_publishes_the_stage_row(self):
+        reading = {
+            "measured": True,
+            "peak_rss_kb": 8 * 1024 * 1024,
+            "mem_total_kb": 16 * 1024 * 1024,
+            "instance_type": "m5.xlarge",
+        }
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Success",
+                    "StandardOutputContent": (
+                        "work\n" + rss_budget.SENTINEL + " " + json.dumps(reading) + "\n"
+                    ),
+                }
+            ]
+        )
+        s3 = MagicMock()
+        rc = ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        assert rc == 0
+        keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert "ops/checks/ae-rss-evaluator/latest.json" in keys
+
+    def test_the_script_is_wrapped_only_when_a_bucket_is_configured(self):
+        """No consumer gains an S3 write it did not already ask for."""
+        ssm = _fake_ssm(poll_sequence=[{"Status": "Success", "StandardOutputContent": ""}])
+        rc = ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+        )
+        assert rc == 0
+        sent = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        decoded = base64.b64decode(sent.split()[1]).decode()
+        assert "krepis-rss-body" not in decoded
+
+    def test_the_script_is_wrapped_when_a_bucket_is_configured(self):
+        ssm = _fake_ssm(poll_sequence=[{"Status": "Success", "StandardOutputContent": ""}])
+        ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=MagicMock(),
+        )
+        sent = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        decoded = base64.b64decode(sent.split()[1]).decode()
+        assert "krepis-rss-body" in decoded
+
+    def test_a_failed_run_publishes_no_budget_row(self):
+        """An OOM-killed process reports no peak RSS — the structural fact the
+        whole path exists because of. A failed run must not overwrite the last
+        row that was honest."""
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "Killed\n",
+                }
+            ]
+        )
+        s3 = MagicMock()
+        rc = ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        assert rc == 1
+        keys = [c.kwargs["Key"] for c in s3.put_object.call_args_list]
+        assert not any(k.startswith("ops/checks/") for k in keys)
+
+    def test_an_s3_failure_never_changes_the_stage_exit_code(self):
+        """The asymmetry: a failure to RECORD peak RSS may not fail a stage
+        that did its real work."""
+        ssm = _fake_ssm(poll_sequence=[{"Status": "Success", "StandardOutputContent": "ok\n"}])
+        s3 = MagicMock()
+        s3.get_object.side_effect = RuntimeError("NoSuchKey")
+        s3.put_object.side_effect = RuntimeError("AccessDenied")
+        rc = ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        assert rc == 0
+
+    def test_infrastructure_steps_are_neither_wrapped_nor_published(self):
+        ssm = _fake_ssm(poll_sequence=[{"Status": "Success", "StandardOutputContent": ""}])
+        s3 = MagicMock()
+        ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: bootstrap",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        sent = ssm.send_command.call_args.kwargs["Parameters"]["commands"][0]
+        decoded = base64.b64decode(sent.split()[1]).decode()
+        assert "krepis-rss-body" not in decoded
+        assert s3.put_object.call_args_list == []
+
+    def test_a_stage_that_reported_nothing_still_gets_an_unobserved_row(self):
+        """A missing row is indistinguishable from a stage that does not
+        exist; UNOBSERVED is the honest rendering (principles.md §2.7)."""
+        ssm = _fake_ssm(
+            poll_sequence=[{"Status": "Success", "StandardOutputContent": "no sentinel\n"}]
+        )
+        s3 = MagicMock()
+        s3.get_object.side_effect = RuntimeError("NoSuchKey")
+        ssm_dispatcher.run(
+            "i-abc",
+            "evaluator: evaluator",
+            "echo ok",
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-evaluator",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
+        assert body["status"] == rss_budget.ENVELOPE_ATTENTION
+        assert body["measured"] is False
