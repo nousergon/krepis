@@ -83,6 +83,26 @@ ambiguity.
   time, instance not registered) is logged + returns 1. The caller
   reads the failure from CloudWatch / SSM history; this module's job
   is to be a thin transport, not a recovery layer.
+
+**Peak-RSS budget (alpha-engine-config-I7260):**
+
+This module is the fleet's real chokepoint for work that runs ON A SPOT BOX —
+measured 2026-08-13, all three dispatcher repos funnel every remote step
+through ``_spot_common.sh::run_ssm`` into ``krepis.ssm_dispatcher run``. So it
+is where the peak resident set of the remote workload is measured: the script
+body is wrapped by :func:`krepis.rss_budget.wrap_script`, and on terminal
+Success the reading is folded into the stage's console row under
+``ops/checks/ae-rss-<stage>/latest.json``.
+
+This activates only when ``--diagnostics-bucket`` is set — the caller has then
+already declared that this dispatcher may persist run records to that bucket,
+so no consumer gains an S3 write it did not ask for, and none of the three
+dispatcher repos needs a flag change. The wrapper returns the body's exit
+status on every path, and the publication is best-effort and swallowed: an
+observability addition may not fail a stage that did its work. See
+:mod:`krepis.rss_budget` for why the floors it makes falsifiable were guesses,
+and why the thresholds shipped with it are declared initial values rather than
+measurements.
 """
 
 from __future__ import annotations
@@ -96,6 +116,8 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Final, Optional
+
+from . import rss_budget
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +152,14 @@ SSM_INLINE_OUTPUT_CAP_BYTES: Final[int] = 24 * 1024
 # signature without consuming the full SSM inline cap); the full log
 # lives in --output-bucket when configured.
 DIAGNOSTICS_TAIL_BYTES: Final[int] = 4 * 1024
+
+# Bytes of streamed stdout retained in memory purely so the peak-RSS sentinel
+# (emitted by the on-box harness AFTER the body exits, so always in the tail)
+# can be recovered on Success. Bounded on purpose: the inline SSM field is
+# capped at 24KB and rotates, and an unbounded accumulator on a multi-hour
+# chatty stage is the exact defect class of alpha-engine-config-I7021 (a
+# warning that fills the capture window and evicts the record beside it).
+RSS_SENTINEL_TAIL_BYTES: Final[int] = 64 * 1024
 
 
 class SsmDispatchError(Exception):
@@ -317,6 +347,33 @@ def run(
         )
         return 1
 
+    # Peak-RSS budget (alpha-engine-config-I7260). Gated on the caller having
+    # already opted this dispatcher into writing run records to a bucket, and
+    # skipped for the infrastructure steps whose readings would only dilute the
+    # stage's row. `wrap_script` returns the body's exit status on every path,
+    # including the branch where no interpreter exists to run the harness.
+    _rss_stage, _rss_step = rss_budget.split_description(description)
+    measure_rss = bool(diagnostics_bucket) and rss_budget.is_publishable_step(
+        _rss_step
+    )
+    if measure_rss:
+        try:
+            script = rss_budget.wrap_script(script)
+        except Exception as exc:
+            # (a) swallowed: any failure to BUILD the measurement wrapper.
+            # (b) the unwrapped body is dispatched instead, so the stage runs
+            #     exactly as it did before this feature existed.
+            # (c) recorded at WARNING in the dispatcher's captured log, which
+            #     ssm_log_capture ships to _ssm_logs/<slug>/<date>/.
+            logger.warning(
+                "ssm_dispatcher: could not wrap %r for peak-RSS measurement "
+                "(swallowed; dispatching unwrapped): %s: %s",
+                description,
+                type(exc).__name__,
+                exc,
+            )
+            measure_rss = False
+
     payload = _encode_command_payload(script)
     send_kwargs: dict = {
         "InstanceIds": [instance_id],
@@ -362,6 +419,10 @@ def run(
 
     start_monotonic = monotonic()
     last_out_len = 0
+    # Bounded tail of everything streamed, kept only to recover the peak-RSS
+    # sentinel on Success. Scanned from the accumulated DELTAS rather than the
+    # final response, because the 24KB inline field rotates.
+    rss_tail = ""
 
     while True:
         sleep(poll_interval_seconds)
@@ -403,8 +464,11 @@ def run(
         std_out = inv.get("StandardOutputContent", "") or ""
 
         if len(std_out) > last_out_len:
-            out.write(std_out[last_out_len:])
+            delta = std_out[last_out_len:]
+            out.write(delta)
             out.flush()
+            if measure_rss:
+                rss_tail = (rss_tail + delta)[-RSS_SENTINEL_TAIL_BYTES:]
             last_out_len = len(std_out)
         elif len(std_out) < last_out_len:
             # 24KB cap rotated the buffer; the full log is in S3 (if
@@ -422,9 +486,34 @@ def run(
             )
             err.write(cap_note)
             err.flush()
+            if measure_rss:
+                # The window rotated: this response is a fresh view, not a
+                # delta. Append the whole of it so a sentinel that landed
+                # inside the rotated window is still recoverable.
+                rss_tail = (rss_tail + std_out)[-RSS_SENTINEL_TAIL_BYTES:]
             last_out_len = len(std_out)
 
         if status == SUCCESS_STATUS:
+            if measure_rss:
+                # SUCCESS ONLY. An OOM-killed process reports no peak RSS —
+                # that is the structural fact this whole path exists because
+                # of (alpha-engine-config-I7260) — so a failed run has nothing
+                # honest to contribute to a budget and must not overwrite the
+                # last row that did.
+                body = rss_budget.publish(
+                    bucket=diagnostics_bucket,
+                    description=description,
+                    instance_id=instance_id,
+                    stdout=rss_tail,
+                    correlation_id=os.environ.get("RUN_TOKEN") or None,
+                    s3_client=s3_client,
+                )
+                if body is not None:
+                    err.write(
+                        f"    [ssm {description}] memory budget: "
+                        f"{body['status']} — {body['summary']}\n"
+                    )
+                    err.flush()
             return 0
         if status in TERMINAL_NON_SUCCESS:
             std_err = inv.get("StandardErrorContent", "") or ""
