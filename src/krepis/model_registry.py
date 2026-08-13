@@ -312,17 +312,32 @@ def api_key_for(entry: dict, style: str = "value", overrides: Optional[Dict[str,
 
 
 def extra_body(entry: dict) -> Optional[dict]:
-    """Extract ``params.reasoning`` into litellm's ``extra_body``, or None.
+    """Extract ``params.reasoning`` and OpenRouter provider pinning into
+    litellm's ``extra_body``, or None.
 
     The string ``"null"`` is treated as absent: it is what a YAML author writes
     meaning "no reasoning", and forwarding it verbatim sends the literal four
     characters upstream as a reasoning directive.
+
+    ``openrouter_provider_pinning`` (config#4532) is honoured only for
+    ``route: openrouter`` entries — OpenRouter routes without a pinned
+    provider reselect the upstream per request, which invalidates prefix
+    caches. When set, the generated config injects ``extra_body.provider``
+    so every request to this route targets the same (set of) upstream
+    provider(s). Checked against ``route``, not ``provider``: ``provider``
+    names the underlying model vendor (e.g. ``anthropic``), which is a
+    different field from the routing path.
     """
+    result: dict = {}
     params = entry.get("params") or {}
     reasoning = params.get("reasoning")
     if reasoning and reasoning != "null":
-        return {"reasoning": reasoning}
-    return None
+        result["reasoning"] = reasoning
+    if entry.get("route") == "openrouter":
+        provider_pinning = entry.get("openrouter_provider_pinning")
+        if provider_pinning and isinstance(provider_pinning, dict):
+            result["provider"] = provider_pinning
+    return result or None
 
 
 def deployment_params(
