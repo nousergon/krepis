@@ -72,6 +72,24 @@ FIXTURE = textwrap.dedent(
         status: active
         params:
           reasoning: "null"
+      - id: openrouter-pinned
+        provider: anthropic
+        route: openrouter
+        model: anthropic/claude-opus-5
+        status: active
+        openrouter_provider_pinning:
+          order: [anthropic]
+          allow_fallbacks: false
+      # Pinning declared on a non-openrouter route must be ignored — this is
+      # the provider-vs-route field confusion that caused the
+      # `anthropic-via-openrouter` incident above, applied to this field too.
+      - id: direct-route-pinning-field-ignored
+        provider: anthropic
+        route: direct
+        model: claude-opus-5
+        status: active
+        openrouter_provider_pinning:
+          order: [anthropic]
 
     model_groups:
       low:
@@ -196,6 +214,22 @@ def test_deployment_params_carry_api_base_and_upstream_host_for_egress(registry)
 def test_the_literal_string_null_is_not_forwarded_as_a_reasoning_directive(registry):
     assert mr.extra_body(registry.models["reasoning-null-string"]) is None
     assert "extra_body" not in mr.deployment_params(registry.models["reasoning-null-string"])
+
+
+def test_openrouter_provider_pinning_is_injected_on_openrouter_routes(registry):
+    entry = registry.models["openrouter-pinned"]
+    assert mr.extra_body(entry) == {
+        "provider": {"order": ["anthropic"], "allow_fallbacks": False}
+    }
+
+
+def test_openrouter_provider_pinning_is_ignored_off_the_openrouter_route(registry):
+    # Checked against `route`, not `provider` — this is the field confusion
+    # that produced the `anthropic/anthropic/...` incident for litellm_model
+    # and api_key_env, applied here too: a direct-route entry with the
+    # pinning field set must not have it forwarded.
+    entry = registry.models["direct-route-pinning-field-ignored"]
+    assert mr.extra_body(entry) is None
 
 
 def test_deployment_params_omit_rpm_tpm_and_timeout(registry):
