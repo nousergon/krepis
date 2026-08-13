@@ -860,3 +860,198 @@ class TestDryRun:
                 ])
         assert rc == 0
         boom.assert_not_called()
+
+
+# ─── Source-mute (v0.57.0) ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_boto3_with_ssm():
+    """boto3 stub extending fake_boto3 with an SSM client whose
+    ``get_parameter`` return value tests control via ``_ssm_value``."""
+    sts_client = MagicMock()
+    sts_client.get_caller_identity.return_value = {"Account": "711398986525"}
+    sns_client = MagicMock()
+    sns_client.publish.return_value = {"MessageId": "test-msg-id-abc123"}
+    ssm_client = MagicMock()
+
+    fake = MagicMock()
+
+    def _client(service: str, **kwargs):
+        if service == "sts":
+            return sts_client
+        if service == "sns":
+            return sns_client
+        if service == "ssm":
+            return ssm_client
+        raise AssertionError(f"unexpected boto3 client request: {service}")
+
+    fake.client.side_effect = _client
+    return fake, sts_client, sns_client, ssm_client
+
+
+def _ssm_value(ssm_client, value: str) -> None:
+    ssm_client.get_parameter.return_value = {"Parameter": {"Value": value}}
+
+
+class TestFetchSourceMutes:
+    def test_missing_parameter_returns_empty(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_malformed_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, "not json")
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_non_list_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '{"not": "a list"}')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_valid_list_parsed(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            entries = alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM)
+        assert entries == [
+            {"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}
+        ]
+
+    def test_boto3_unavailable_fails_open(self, monkeypatch):
+        with patch.dict("sys.modules", {"boto3": None}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+
+class TestFindLiveMute:
+    def test_matches_prefix_and_live(self):
+        entries = [
+            {
+                "source_prefix": "metron",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "reason": "x",
+            }
+        ]
+        assert alerts._find_live_mute("metron/deploy", entries) == entries[0]
+
+    def test_no_match_different_source(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("crucible-executor", entries) is None
+
+    def test_expired_entry_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_missing_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_unparseable_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "not-a-date"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_none_source_never_matches(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute(None, entries) is None
+
+    def test_non_dict_entries_skipped(self):
+        assert alerts._find_live_mute("metron/deploy", ["not-a-dict"]) is None
+
+
+class TestPublishSourceMute:
+    def test_suppressed_when_source_matches_live_mute(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z", '
+            '"reason": "focus on crucible"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                side_effect=AssertionError("telegram reached despite live mute"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is True
+        assert "metron" in result.mute_reason
+        assert result.any_ok is True
+        sns.publish.assert_not_called()
+
+    def test_not_suppressed_when_mute_expired(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_not_suppressed_for_non_matching_source(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("exec failed", source="crucible-executor")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_no_mute_list_does_not_suppress(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_mute_checked_before_dedup(self, fake_boto3_with_ssm):
+        """A muted source must not reach the (S3) dedup marker check —
+        the fixture only registers sts/sns/ssm clients, so an
+        unexpected boto3.client('s3') call raises."""
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            result = alerts.publish(
+                "deploy failed", source="metron/deploy",
+                dedup_key="metron-deploy-failed",
+            )
+        assert result.muted is True
+        assert result.dedup_skipped is False
+        ssm.get_parameter.assert_called_once()
+
+    def test_cli_stderr_reports_muted(self, fake_boto3_with_ssm, capsys):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = alerts.main([
+                "publish", "--message", "x", "--source", "metron/deploy",
+            ])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "muted=True" in captured.err
