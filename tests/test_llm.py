@@ -1514,6 +1514,54 @@ class TestRouterEdgeCredentialAtCallTime:
         assert seen == ["ROUTER_CONSUMER_THINKTANK", "ROUTER_CONSUMER_THINKTANK"]
 
 
+class TestEgressPlaceholderCredentialFallback:
+    """A direct egress_proxy spec (``resolve_group_spec`` falling through past
+    the router edge onto e.g. a ``deepseek``/``xai`` entry) authenticates with
+    a literal placeholder — the local proxy holds the real upstream key and
+    ignores whatever this client sends.
+
+    ``EGRESS_PROXY_PLACEHOLDER`` is exported into the PROXY process's own
+    environment (nous-ergon-ops litellm-proxy-shim.sh), not into every
+    consumer's. A consumer with no reason to export the proxy's own variable
+    must not be blocked by its absence — alpha-engine-config-I7031.
+    """
+
+    def test_unset_placeholder_env_falls_back_to_the_literal_default(self, monkeypatch):
+        from krepis import model_registry as _mr
+
+        monkeypatch.delenv(_mr.EGRESS_PLACEHOLDER_ENV, raising=False)
+        fake = FakeOpenAI([_openai_resp("hey")])
+        spec = ModelSpec(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="http://127.0.0.1:8990",
+            api_key_env=_mr.EGRESS_PLACEHOLDER_ENV,
+        )
+        client = _client(spec, fake)
+        assert client._resolve_api_key() == _mr.EGRESS_PLACEHOLDER_DEFAULT
+
+    def test_set_placeholder_env_wins_over_the_default(self, monkeypatch):
+        from krepis import model_registry as _mr
+
+        monkeypatch.setenv(_mr.EGRESS_PLACEHOLDER_ENV, "sk-from-proxy-env")
+        spec = ModelSpec(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="http://127.0.0.1:8990",
+            api_key_env=_mr.EGRESS_PLACEHOLDER_ENV,
+        )
+        client = LLMClient(spec=spec, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-proxy-env"
+
+    def test_other_providers_get_no_default_and_still_raise(self, monkeypatch):
+        """The fallback is scoped to the named placeholder env var only — it
+        must not quietly paper over a genuinely missing provider key."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        spec = ModelSpec(provider="openrouter", model="m")
+        with pytest.raises(LLMConfigError, match="OPENROUTER_API_KEY"):
+            LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+
+
 # ── Group alias must never masquerade as a served model (config-I6543) ────
 
 

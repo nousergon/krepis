@@ -1812,10 +1812,19 @@ class TestResolveGroupSpec:
         with pytest.raises(RuntimeError, match="auth_token_type"):
             _router.resolve_group_spec("med", exec_context="lambda")
 
-    def test_placeholder_auth_maps_to_no_credential_name(self, monkeypatch):
-        """`placeholder` means the local egress proxy holds the real key. It
-        is not a missing credential, and collapsing the two would break every
-        direct route from a context that can reach one."""
+    def test_placeholder_auth_maps_to_the_egress_placeholder_env(self, monkeypatch):
+        """`placeholder` means the local egress proxy holds the real key, and
+        the client sends a literal placeholder — NOT `None`.
+
+        `None` is not "no credential needed"; it means "fall back to
+        ModelSpec's built-in provider registry" (anthropic/openai/openrouter
+        only), which `deepseek` is not. A `None` here previously made
+        `ModelSpec.resolved_api_key_env()` raise "no api_key_env was
+        supplied" for every direct-provider egress_proxy fallback
+        (alpha-engine-config-I7031, morning-signal's canary 2026-08-12).
+        """
+        from krepis import model_registry as _mr
+
         self._patch(monkeypatch, self._route(
             auth_token_type="placeholder",
             provider="deepseek",
@@ -1826,7 +1835,10 @@ class TestResolveGroupSpec:
             primary_registry_id="deepseek-v4-flash-max",
         ))
         spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
-        assert spec.api_key_env is None
+        assert spec.api_key_env == _mr.EGRESS_PLACEHOLDER_ENV
+        # And the spec must actually construct — this is what raised before
+        # the fix (provider "deepseek" is not a krepis built-in).
+        assert spec.resolved_api_key_env() == _mr.EGRESS_PLACEHOLDER_ENV
 
     # ── per-consumer router credential ───────────────────────────────────
 
