@@ -1,5 +1,6 @@
 """Unit tests for krepis.trading_calendar."""
-from datetime import date
+from datetime import date, datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -7,11 +8,14 @@ from krepis.trading_calendar import (
     NYSE_HOLIDAYS,
     add_trading_days,
     count_trading_days,
+    is_market_hours,
     is_trading_day,
     next_trading_day,
     previous_trading_day,
     subtract_trading_days,
 )
+
+_ET = ZoneInfo("America/New_York")
 
 
 class TestIsTradingDay:
@@ -141,3 +145,92 @@ class TestCountTradingDays:
 )
 def test_add_trading_days_table(eval_date, horizon, expected):
     assert add_trading_days(eval_date, horizon) == expected
+
+
+class TestIsMarketHours:
+    """alpha-engine-config-I7111 — the session predicate lifted out of
+    ``crucible-executor/executor/market_hours.py``.
+
+    The boundary cases are the point: two live Step Functions pipelines gate
+    on this, and the postclose one is *triggered at* 16:00:0x ET.
+    """
+
+    # 2026-08-12 is a Wednesday and not an NYSE holiday.
+    _WED = date(2026, 8, 12)
+
+    def test_midsession_is_open(self):
+        assert is_market_hours(datetime(2026, 8, 12, 12, 0, tzinfo=_ET)) is True
+
+    def test_open_instant_is_inclusive(self):
+        assert is_market_hours(datetime(2026, 8, 12, 9, 30, 0, tzinfo=_ET)) is True
+
+    def test_one_second_before_open_is_closed(self):
+        assert is_market_hours(datetime(2026, 8, 12, 9, 29, 59, tzinfo=_ET)) is False
+
+    def test_close_instant_is_exclusive(self):
+        # Load-bearing: ne-postclose-trading-pipeline's daemon-shutdown
+        # trigger lands at 16:00:0x ET. A close-INCLUSIVE boundary would
+        # refuse the settlement run that carries NAV continuity.
+        assert is_market_hours(datetime(2026, 8, 12, 16, 0, 0, tzinfo=_ET)) is False
+
+    def test_one_second_before_close_is_open(self):
+        assert is_market_hours(datetime(2026, 8, 12, 15, 59, 59, tzinfo=_ET)) is True
+
+    def test_preopen_is_closed(self):
+        # ne-preopen-trading-pipeline's 05:15 PT cron == 08:15 ET.
+        assert is_market_hours(datetime(2026, 8, 12, 8, 15, tzinfo=_ET)) is False
+
+    def test_postclose_settlement_window_is_closed(self):
+        # Every observed eod-* execution start, 2026-07-08..2026-08-12.
+        assert is_market_hours(datetime(2026, 8, 12, 16, 0, 4, tzinfo=_ET)) is False
+        assert is_market_hours(datetime(2026, 8, 12, 16, 0, 56, tzinfo=_ET)) is False
+
+    def test_weekend_midsession_clock_is_closed(self):
+        assert is_market_hours(datetime(2026, 8, 15, 12, 0, tzinfo=_ET)) is False  # Sat
+        assert is_market_hours(datetime(2026, 8, 16, 12, 0, tzinfo=_ET)) is False  # Sun
+
+    def test_holiday_midsession_clock_is_closed(self):
+        # Good Friday 2026 — a weekday whose wall clock is inside the window.
+        assert date(2026, 4, 3) in NYSE_HOLIDAYS
+        assert is_market_hours(datetime(2026, 4, 3, 12, 0, tzinfo=_ET)) is False
+
+    def test_naive_datetime_is_read_as_eastern(self):
+        assert is_market_hours(datetime(2026, 8, 12, 12, 0)) is True
+        assert is_market_hours(datetime(2026, 8, 12, 8, 0)) is False
+
+    def test_utc_input_is_converted_not_compared_raw(self):
+        # 16:00 UTC on 2026-08-12 (EDT) == 12:00 ET -> open. Comparing the
+        # raw UTC clock against 09:30-16:00 would call it closed.
+        assert is_market_hours(datetime(2026, 8, 12, 16, 0, tzinfo=timezone.utc)) is True
+        # 13:00 UTC == 09:00 ET -> still pre-open.
+        assert is_market_hours(datetime(2026, 8, 12, 13, 0, tzinfo=timezone.utc)) is False
+
+    def test_dst_is_handled_by_the_zone_not_a_fixed_offset(self):
+        # January (EST, UTC-5): 14:30 UTC == 09:30 ET -> open at the bell.
+        assert is_market_hours(datetime(2027, 1, 5, 14, 30, tzinfo=timezone.utc)) is True
+        assert is_market_hours(datetime(2027, 1, 5, 14, 29, tzinfo=timezone.utc)) is False
+        # July (EDT, UTC-4): 14:30 UTC == 10:30 ET -> open; 13:30 == 09:30.
+        assert is_market_hours(datetime(2027, 7, 6, 13, 30, tzinfo=timezone.utc)) is True
+        assert is_market_hours(datetime(2027, 7, 6, 13, 29, tzinfo=timezone.utc)) is False
+
+    def test_close_override_is_read_per_call(self):
+        at_1545 = datetime(2026, 8, 12, 15, 45, tzinfo=_ET)
+        assert is_market_hours(at_1545) is True
+        assert is_market_hours(at_1545, close_et=time(15, 30)) is False
+
+    def test_open_override_is_read_per_call(self):
+        at_0900 = datetime(2026, 8, 12, 9, 0, tzinfo=_ET)
+        assert is_market_hours(at_0900) is False
+        assert is_market_hours(at_0900, open_et=time(8, 0)) is True
+
+    def test_no_argument_call_reads_the_eastern_clock(self):
+        # Guards the default branch (``now is None``), where a regression
+        # that skipped the tz attach would compare a naive UTC clock
+        # against the ET window and be wrong by 4-5 hours.
+        assert is_market_hours() is is_market_hours(datetime.now(_ET))
+
+    def test_unused_holiday_import_is_the_single_table(self):
+        # The executor's duplicate copy is deleted in crucible-executor;
+        # this asserts the surviving table is the one this module owns.
+        assert date(2026, 11, 26) in NYSE_HOLIDAYS  # Thanksgiving
+        assert is_market_hours(datetime(2026, 11, 26, 12, 0, tzinfo=_ET)) is False
