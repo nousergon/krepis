@@ -12,7 +12,16 @@ import json
 
 import pytest
 
-from krepis.cost_sink import DEFAULT_FLUSH_THRESHOLD, S3JsonlCostSink, resolve_run_id
+from krepis.cost_sink import (
+    BUCKET_ENV_VAR,
+    DEFAULT_FLUSH_THRESHOLD,
+    PREFIX_ENV_VAR,
+    CostSinkConfigError,
+    S3JsonlCostSink,
+    default_sink_from_env,
+    reset_default_sink_for_tests,
+    resolve_run_id,
+)
 
 
 class FakeS3:
@@ -221,3 +230,125 @@ class TestRunId:
         sink(_record())
         sink.flush()
         assert "276a5be44c7c-EXEL-v5" in s3.puts[0]["Key"]
+
+
+class TestDefaultSinkFromEnv:
+    """The default sink is what makes emission a property of the ENVIRONMENT
+    rather than of whoever wrote the call site.
+
+    alpha-engine-config-I7179: with the sink an opt-in constructor argument,
+    coverage equalled the set of authors who remembered to pass one — which
+    on 2026-08-13 was a single process, while every LLM-calling stage of the
+    weekly pipeline emitted nothing.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.delenv(BUCKET_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREFIX_ENV_VAR, raising=False)
+        monkeypatch.delenv("KREPIS_RUN_ID", raising=False)
+        reset_default_sink_for_tests()
+        yield
+        reset_default_sink_for_tests()
+
+    def test_unconfigured_returns_none(self):
+        """A public consumer that never asked for cost telemetry pays
+        nothing."""
+        assert default_sink_from_env() is None
+
+    def test_both_set_builds_a_sink_writing_where_told(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "alpha-engine-research")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "decision_artifacts/_cost_raw")
+        monkeypatch.setenv("KREPIS_RUN_ID", "sf-exec-1")
+        s3 = FakeS3()
+        sink = default_sink_from_env(s3_client=s3)
+        assert isinstance(sink, S3JsonlCostSink)
+        sink(_record(callsite_id="replay-concordance"))
+        sink.flush()
+        assert s3.puts[0]["Bucket"] == "alpha-engine-research"
+        assert s3.puts[0]["Key"] == (
+            "decision_artifacts/_cost_raw/2026-07-28/sf-exec-1/"
+            "replay-concordance.0.jsonl"
+        )
+
+    def test_one_sink_per_process(self, monkeypatch):
+        """A lane building a fresh client per request must not build a fresh
+        buffer per request — that is one PUT per call, which is the shape
+        S3JsonlCostSink exists to avoid."""
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        first = default_sink_from_env(s3_client=FakeS3())
+        second = default_sink_from_env(s3_client=FakeS3())
+        assert first is second
+
+    @pytest.mark.parametrize(
+        "set_var,missing_var",
+        [(BUCKET_ENV_VAR, PREFIX_ENV_VAR), (PREFIX_ENV_VAR, BUCKET_ENV_VAR)],
+    )
+    def test_half_configured_raises(self, monkeypatch, set_var, missing_var):
+        """Falling back to "no sink" here is how a deploy-time typo becomes
+        months of unattributed spend: the destination prefix simply keeps
+        not growing, which reads exactly like a quiet week."""
+        monkeypatch.setenv(set_var, "x")
+        with pytest.raises(CostSinkConfigError) as exc:
+            default_sink_from_env()
+        assert missing_var in str(exc.value)
+
+    def test_blank_values_are_treated_as_unset(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "   ")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "   ")
+        assert default_sink_from_env() is None
+
+
+class TestLLMClientDefaultsToTheEnvironmentSink:
+    """The wiring, asserted at the client rather than at the factory — a
+    default nothing consults is not a default."""
+
+    @pytest.fixture(autouse=True)
+    def _clean(self, monkeypatch):
+        monkeypatch.delenv(BUCKET_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREFIX_ENV_VAR, raising=False)
+        reset_default_sink_for_tests()
+        yield
+        reset_default_sink_for_tests()
+
+    def _spec(self):
+        from krepis.llm_config import ModelSpec
+
+        return ModelSpec(provider="openrouter", model="deepseek-v4-flash")
+
+    def test_client_with_no_sink_argument_emits_when_env_is_set(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        from krepis.llm import LLMClient
+
+        client = LLMClient(self._spec(), callsite_id="replay-concordance")
+        assert client._cost_sink is not None
+
+    def test_client_with_no_sink_argument_stays_silent_when_env_is_absent(self):
+        from krepis.llm import LLMClient
+
+        client = LLMClient(self._spec(), callsite_id="replay-concordance")
+        assert client._cost_sink is None
+
+    def test_explicit_sink_wins_over_the_environment(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        from krepis.llm import LLMClient
+
+        injected: list = []
+
+        def sink(record):
+            injected.append(record)
+
+        client = LLMClient(self._spec(), callsite_id="c", cost_sink=sink)
+        assert client._cost_sink is sink
+
+    def test_half_configured_environment_fails_at_construction(self, monkeypatch):
+        """Before the first billable call, not after seventeen days of
+        them."""
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        from krepis.llm import LLMClient
+
+        with pytest.raises(CostSinkConfigError):
+            LLMClient(self._spec(), callsite_id="c")

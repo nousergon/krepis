@@ -649,9 +649,25 @@ class LLMClient:
     ``cost_sink`` is an optional ``callable(record: dict) -> None``. When
     set, each completed call builds a priced record via
     :func:`krepis.cost.record_llm_call` — carrying token counts, cache
-    read/write splits and USD — and hands it to the sink. Default ``None``
-    means no emission, so public consumers pay nothing for a feature they
-    have not asked for.
+    read/write splits and USD — and hands it to the sink.
+
+    **When it is NOT set, the sink is resolved from the environment**
+    (:func:`krepis.cost_sink.default_sink_from_env`): if
+    ``KREPIS_COST_SINK_BUCKET`` and ``KREPIS_COST_SINK_PREFIX`` are both
+    exported, every client built in that process emits, whether or not
+    its author thought about cost telemetry. With neither set the default
+    is ``None`` and a public consumer pays nothing for a feature it has
+    not asked for.
+
+    That inversion is the point. While emission required a constructor
+    argument, coverage equalled *the set of authors who remembered*, and
+    on 2026-08-13 that set was one process: every per-call cost record in
+    the Alpha Engine research bucket came from the Think Tank, while the
+    weekly pipeline's own LLM stages — each holding a correct
+    ``callsite_id`` and passing no sink — were attributed to nothing
+    (``alpha-engine-config-I7179``). Emission is now a property of the
+    execution environment, which is where a fleet operator can actually
+    set it once, rather than a property of each call site.
     """
 
     def __init__(
@@ -677,6 +693,14 @@ class LLMClient:
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        if cost_sink is None:
+            # Deliberately NOT wrapped in try/except. A half-configured
+            # sink environment raises CostSinkConfigError here, before the
+            # first billable call — see default_sink_from_env for why
+            # falling through to silence is the worse failure.
+            from krepis.cost_sink import default_sink_from_env
+
+            cost_sink = default_sink_from_env()
         self._cost_sink = cost_sink
         self._client: Any = None
         if spec.supports_automatic_prefix_caching:
