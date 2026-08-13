@@ -347,6 +347,63 @@ _CAUSE_RE = re.compile(
     r"|^\s*assert\b|\bFAILED\b|\bfatal:)"
 )
 
+#: alpha-engine-config-I7258: a resource kill (OOM SIGKILL, or a shell-level
+#: `timeout` expiry) is NEVER a generic "cause" — Brian's 2026-08-13 ruling
+#: requires it be NAMED as a resource kill in what the operator reads, not
+#: folded into the same bucket as an application logic error. Matched with
+#: HIGHER priority than :data:`_CAUSE_RE`: bash's own foreground-job-killed
+#: message ("<script>: line N: <pid> Killed  <command>") does not contain
+#: any of ERROR/FAILED/Exception, so under the old single-bucket scan a
+#: later, more generic ERROR line (e.g. an SSM transport's own "terminal
+#: status=Failed") would win as the selected cause and the kill line — the
+#: only line that actually says what happened — was silently dropped.
+#: Measured 2026-08-13: `watch-rerun-2026-08-13-2` / `EvaluatorDiagnostics`,
+#: SIGKILLed by the kernel OOM path on a 4GB c5.large; the operator-visible
+#: message never contained "OOM", "Killed", "memory", or the exit signal.
+_RESOURCE_KILL_RE = re.compile(
+    r"(\bKilled\b|\bOOM\b|[Oo]ut of memory|oom.?killer|Cannot allocate memory"
+    r"|\bMemoryError\b|\bexecutionTimeout\b|\bExecutionTimedOut\b)"
+)
+
+#: Subprocess return codes that mean "killed for a resource reason", not
+#: "the program decided to fail". 137 = 128+SIGKILL (POSIX shell exit-code
+#: convention); -9 = SIGKILL as a Python negative-signal returncode. A
+#: caller that preserves the true exit code (rather than laundering it
+#: through its own `if ! cmd; then exit 1; fi`) lets this fire even when no
+#: kill line survived in the captured output.
+_OOM_RETURNCODES = frozenset({137, -9})
+
+#: 124 = the `timeout` coreutil's own convention for "I killed the child
+#: after the budget expired"; -14/143 = SIGALRM/SIGTERM-as-exit-128+15,
+#: the shape a `timeout --signal=TERM` or a watchdog SIGTERM produces.
+_TIMEOUT_RETURNCODES = frozenset({124, -14, 143})
+
+
+def _classify_resource_kill(
+    returncode: int | None, kill_line: str | None
+) -> str | None:
+    """Return ``"OOM"``, ``"TIMEOUT"``, or ``None`` (not a resource kill).
+
+    Two independent signals, either sufficient on its own:
+    ``returncode`` (authoritative when the real exit code survived to this
+    layer) and ``kill_line`` (a line matching :data:`_RESOURCE_KILL_RE`,
+    useful when an intermediate shell collapsed the real code to a bare
+    ``exit 1`` but the kernel's own kill message still made it into the
+    captured output). OOM takes precedence when both would otherwise match,
+    since a SIGKILL after an `executionTimeout` mention is still the memory
+    kill, not the budget.
+    """
+    if returncode in _OOM_RETURNCODES:
+        return "OOM"
+    if kill_line and re.search(r"\bKilled\b|\bOOM\b|[Oo]ut of memory|oom.?killer|Cannot allocate memory|\bMemoryError\b", kill_line):
+        return "OOM"
+    if returncode in _TIMEOUT_RETURNCODES:
+        return "TIMEOUT"
+    if kill_line and re.search(r"\bexecutionTimeout\b|\bExecutionTimedOut\b", kill_line):
+        return "TIMEOUT"
+    return None
+
+
 #: Cap on either line rendered into a failure message. The whole point is to
 #: fit inside a downstream window (SSM's 24KB StandardErrorContent, a Telegram
 #: message); a single unbounded line would evict the pair it is part of.
@@ -368,6 +425,7 @@ def format_subprocess_failure(
     returncode: int,
     last_output_line: str | None = None,
     cause_line: str | None = None,
+    kill_line: str | None = None,
 ) -> str:
     """Format a terminal-failure message naming the failing step + its cause.
 
@@ -389,6 +447,20 @@ def format_subprocess_failure(
     seen, per :data:`_CAUSE_RE` — is preferred when the two differ, and the
     last line is kept alongside it rather than dropped.
 
+    **Resource kills are classified, never folded into a generic cause**
+    (alpha-engine-config-I7258, Brian's 2026-08-13 ruling: any OOM or
+    timeout is a HARD FAIL, named as a resource kill in what the operator
+    reads). :func:`_classify_resource_kill` checks ``returncode`` first
+    (authoritative when it survived intact) and ``kill_line`` second (the
+    kernel/shell's own kill message, useful when an intermediate handler
+    laundered the real code to a bare ``exit 1``). When classified, the
+    message leads with ``RESOURCE KILL (OOM): `` / ``RESOURCE KILL
+    (TIMEOUT): `` and the kill line — ``cause_line`` and ``last_output_line``
+    are still appended so nothing previously surfaced is lost, but neither
+    can be mistaken for the cause: a cleanup trap's own terminal echo (e.g.
+    "Instance terminated; S3 staging cleaned.") is always honestly labeled
+    "(last output: ...)", never presented as the reason the run failed.
+
     Args:
         step_name: human-readable label for the failing step
             (e.g. ``"morning-enrich"``, ``"spot-train"``).
@@ -400,6 +472,12 @@ def format_subprocess_failure(
             Leads the message when it differs from ``last_output_line``;
             both are rendered so nothing that was previously surfaced is
             lost.
+        kill_line: the last line matching :data:`_RESOURCE_KILL_RE`
+            (e.g. a bash "Killed" message), or ``None``. Takes priority
+            over ``cause_line`` for the LEAD of the message when a resource
+            kill is classified — a specific "the kernel SIGKILLed this"
+            line is more informative than a generic downstream "ERROR" or
+            "terminal status=Failed" line that happens to sort later.
 
     Returns:
         A single-line string suitable for ``stderr``. New callers should
@@ -408,8 +486,21 @@ def format_subprocess_failure(
 
     Example output::
 
-        ssm_log_capture: ERROR: [spot-train] failed (rc=1) — AssertionError: validation failed
+        ssm_log_capture: RESOURCE KILL (OOM): [evaluate.py] failed (rc=137) — bash: line 31: 26756 Killed   python -u evaluate.py --mode diagnostics (last output: Instance terminated; S3 staging cleaned.)
     """
+    classification = _classify_resource_kill(returncode, kill_line)
+    if classification:
+        head = (
+            f"ssm_log_capture: RESOURCE KILL ({classification}): "
+            f"[{step_name}] failed (rc={returncode})"
+        )
+        lead = kill_line or cause_line
+        if lead and lead != last_output_line:
+            return f"{head} — {_clip(lead)} (last output: {_clip(last_output_line)})"
+        if lead:
+            return f"{head} — {_clip(lead)}"
+        return f"{head} — no kill line captured; last output: {_clip(last_output_line)}"
+
     head = f"ssm_log_capture: ERROR: [{step_name}] failed (rc={returncode})"
     if cause_line and cause_line != last_output_line:
         # Both, in this order: the cause is what the reader needs, the last
@@ -537,6 +628,13 @@ def run(
     # phase logs its error and the run continues to a generic exit
     # (config-I6945).
     last_cause_line: Optional[str] = None
+    # The last RESOURCE-KILL-SHAPED line (bash's own "Killed" message, an
+    # OOM-killer banner, an SSM ExecutionTimedOut marker). Tracked
+    # separately from last_cause_line and given priority in
+    # format_subprocess_failure — a generic later ERROR line must never
+    # out-compete the one line that actually names a resource kill
+    # (alpha-engine-config-I7258).
+    last_kill_line: Optional[str] = None
     exit_code = 1
     orphan_note: Optional[str] = None
     try:
@@ -585,7 +683,9 @@ def run(
                         stripped = line.strip()
                         if stripped:
                             last_output_line = stripped
-                            if _CAUSE_RE.search(stripped):
+                            if _RESOURCE_KILL_RE.search(stripped):
+                                last_kill_line = stripped
+                            elif _CAUSE_RE.search(stripped):
                                 last_cause_line = stripped
                     continue
                 # Pipe quiet. A live child is merely slow — keep waiting, with
@@ -638,6 +738,7 @@ def run(
                 returncode=exit_code,
                 last_output_line=last_output_line,
                 cause_line=last_cause_line,
+                kill_line=last_kill_line,
             )
             print(failure_msg, file=sys.stderr)
             _append_log(log_path, failure_msg + "\n")

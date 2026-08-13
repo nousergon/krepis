@@ -153,6 +153,41 @@ SSM_INLINE_OUTPUT_CAP_BYTES: Final[int] = 24 * 1024
 # lives in --output-bucket when configured.
 DIAGNOSTICS_TAIL_BYTES: Final[int] = 4 * 1024
 
+# alpha-engine-config-I7258: this module is where the REMOTE process's exit
+# status is actually read — `get_command_invocation`'s `ResponseCode` field
+# is the plugin's real shell exit code, set by SSM itself independent of
+# whatever text the remote script printed. It is authoritative in a way
+# text-scraping a "Killed" line never is: a caller's own `if ! cmd; then
+# echo "ERROR: ... failed"; exit 1; fi` launders the true code (137) to a
+# generic 1 in the SCRIPT's own exit, but the SSM agent still reports the
+# plugin's ResponseCode as observed on the box before that laundering
+# happened. Classifying here — "where the remote exit status is read", not
+# where a local dispatcher child is waited on (that's ssm_log_capture, a
+# different chokepoint one hop further out) — is what makes the
+# classification survive a launcher that has not yet been fixed to
+# preserve its own rc.
+_OOM_RESPONSE_CODES: Final[frozenset[int]] = frozenset({137, -9})
+_TIMEOUT_RESPONSE_CODES: Final[frozenset[int]] = frozenset({124, -14, 143})
+_TIMEOUT_STATUSES: Final[frozenset[str]] = frozenset({"TimedOut"})
+
+
+def _classify_terminal_failure(
+    status: str, response_code: Optional[int]
+) -> Optional[str]:
+    """Return ``"OOM"``, ``"TIMEOUT"``, or ``None`` for a terminal non-Success.
+
+    ``response_code`` is SSM's ``ResponseCode`` from `get_command_invocation`
+    — the remote plugin's real exit code — checked first as the
+    authoritative signal. ``status`` (SSM's own terminal status string)
+    covers the case where SSM itself killed the command for exceeding its
+    ``executionTimeout`` before any exit code was ever produced.
+    """
+    if response_code in _OOM_RESPONSE_CODES:
+        return "OOM"
+    if response_code in _TIMEOUT_RESPONSE_CODES or status in _TIMEOUT_STATUSES:
+        return "TIMEOUT"
+    return None
+
 # Bytes of streamed stdout retained in memory purely so the peak-RSS sentinel
 # (emitted by the on-box harness AFTER the body exits, so always in the tail)
 # can be recovered on Success. Bounded on purpose: the inline SSM field is
@@ -200,6 +235,8 @@ def _ship_diagnostics(
     instance_id: str,
     boto3_client=None,
     stderr_stream=None,
+    response_code: Optional[int] = None,
+    classification: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Write the terminal-non-Success diagnostics JSON to S3.
 
@@ -226,6 +263,13 @@ def _ship_diagnostics(
         "stdout_tail": stdout_tail,
         "stderr_tail": stderr_tail,
         "instance_id": instance_id,
+        # alpha-engine-config-I7258: response_code is SSM's ResponseCode
+        # (the remote plugin's real exit code); classification is "OOM" /
+        # "TIMEOUT" / null. Persisted here so a resource kill is still
+        # visibly classified for anyone reading the diagnostics JSON
+        # directly, not only in the stderr line above.
+        "response_code": response_code,
+        "classification": classification,
     }
     try:
         if boto3_client is None:
@@ -517,9 +561,30 @@ def run(
             return 0
         if status in TERMINAL_NON_SUCCESS:
             std_err = inv.get("StandardErrorContent", "") or ""
-            err.write(
-                f"ERROR: SSM step {description!r} terminal status={status}\n"
+            response_code = inv.get("ResponseCode")
+            classification = _classify_terminal_failure(status, response_code)
+            # Nested-log location is one copy-paste away rather than three
+            # inferences (alpha-engine-config-I7258 obligation 4): the full
+            # remote stdout/stderr — where a bash "Killed" line actually
+            # lives when it exceeds the 24KB inline cap — is under this
+            # exact S3 prefix, always stated, not only on cap-rotation.
+            full_log_hint = (
+                f"s3://{output_bucket}/{output_key_prefix}/"
+                if output_bucket
+                else "no --output-bucket configured; only the 24KB inline capture above is available"
             )
+            if classification:
+                err.write(
+                    f"RESOURCE KILL ({classification}): SSM step {description!r} "
+                    f"terminal status={status} response_code={response_code} "
+                    f"instance={instance_id} — full remote log: {full_log_hint}\n"
+                )
+            else:
+                err.write(
+                    f"ERROR: SSM step {description!r} terminal status={status} "
+                    f"response_code={response_code} instance={instance_id} — "
+                    f"full remote log: {full_log_hint}\n"
+                )
             if std_err:
                 err.write(
                     f"--- stderr ({SSM_INLINE_OUTPUT_CAP_BYTES // 1024}KB cap; "
@@ -550,6 +615,8 @@ def run(
                     instance_id=instance_id,
                     boto3_client=s3_client,
                     stderr_stream=err,
+                    response_code=response_code,
+                    classification=classification,
                 )
                 if ok:
                     err.write(

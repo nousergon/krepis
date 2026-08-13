@@ -274,6 +274,134 @@ class TestRunTerminalFailures:
         assert rc == 1
 
 
+class TestResourceKillClassification:
+    """alpha-engine-config-I7258: this module reads the REMOTE process's
+    exit status (SSM's own `ResponseCode`), so it is the chokepoint where
+    a resource kill must be classified — authoritative even when a
+    caller's own shell handler has not yet been fixed to preserve its rc,
+    because `ResponseCode` is what the SSM agent observed on the box
+    BEFORE any local `if ! cmd; then exit 1; fi` laundering happened.
+
+    Brian's 2026-08-13 ruling: any OOM or timeout is a HARD FAIL, NAMED as
+    a resource kill in what the operator reads.
+    """
+
+    def test_oom_response_code_137_is_named_in_the_terminal_message(self):
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": 137,
+                }
+            ]
+        )
+        err = io.StringIO()
+        rc = ssm_dispatcher.run(
+            "i-077d2a5479affe1d3",
+            "evaluator: evaluator",
+            "x",
+            stdout_stream=io.StringIO(),
+            stderr_stream=err,
+            sleep=lambda s: None,
+            boto3_client=ssm,
+        )
+        assert rc == 1
+        text = err.getvalue()
+        assert "RESOURCE KILL (OOM)" in text
+        assert "response_code=137" in text
+        assert "i-077d2a5479affe1d3" in text
+
+    def test_timeout_status_is_named_even_without_a_response_code(self):
+        # SSM's own executionTimeout kill: the plugin never produced an
+        # exit code at all, but the terminal Status IS "TimedOut".
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "TimedOut",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                }
+            ]
+        )
+        err = io.StringIO()
+        rc = ssm_dispatcher.run(
+            "i", "backtest", "x",
+            stdout_stream=io.StringIO(), stderr_stream=err,
+            sleep=lambda s: None, boto3_client=ssm,
+        )
+        assert rc == 1
+        assert "RESOURCE KILL (TIMEOUT)" in err.getvalue()
+
+    def test_response_code_124_is_a_timeout(self):
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": 124,
+                }
+            ]
+        )
+        err = io.StringIO()
+        ssm_dispatcher.run(
+            "i", "backtest", "x",
+            stdout_stream=io.StringIO(), stderr_stream=err,
+            sleep=lambda s: None, boto3_client=ssm,
+        )
+        assert "RESOURCE KILL (TIMEOUT)" in err.getvalue()
+
+    def test_ordinary_application_failure_rc1_is_not_a_resource_kill(self):
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "AssertionError: bad config",
+                    "ResponseCode": 1,
+                }
+            ]
+        )
+        err = io.StringIO()
+        ssm_dispatcher.run(
+            "i", "backtest", "x",
+            stdout_stream=io.StringIO(), stderr_stream=err,
+            sleep=lambda s: None, boto3_client=ssm,
+        )
+        text = err.getvalue()
+        assert "RESOURCE KILL" not in text
+        assert "ERROR: SSM step" in text
+
+    def test_nested_full_log_s3_key_is_always_stated_on_terminal_failure(self):
+        # Obligation 4: the S3 key holding the full remote stdout/stderr
+        # is one copy-paste away, not only surfaced on 24KB cap-rotation.
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": 137,
+                }
+            ]
+        )
+        err = io.StringIO()
+        ssm_dispatcher.run(
+            "i", "evaluator", "x",
+            output_bucket="alpha-engine-research",
+            output_key_prefix="tmp/spot_evaluator/20260813-i-077d2a5479affe1d3/ssm-output",
+            stdout_stream=io.StringIO(), stderr_stream=err,
+            sleep=lambda s: None, boto3_client=ssm,
+        )
+        text = err.getvalue()
+        assert (
+            "s3://alpha-engine-research/tmp/spot_evaluator/"
+            "20260813-i-077d2a5479affe1d3/ssm-output/" in text
+        )
+
+
 class TestUnknownStatus:
     def test_unknown_status_fails_loud(self):
         # Per [[feedback_no_silent_fails]] — anything outside the

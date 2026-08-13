@@ -796,6 +796,175 @@ class TestFailureMessageNamesTheCause:
         assert not ssm_log_capture._CAUSE_RE.search(line), line
 
 
+class TestResourceKillClassification:
+    """alpha-engine-config-I7258: an OOM or timeout is a HARD FAIL, NAMED as a
+    resource kill in what the operator reads (Brian's 2026-08-13 ruling) —
+    never folded into a generic "failed" message alongside an application
+    logic error.
+
+    Measured 2026-08-13, `watch-rerun-2026-08-13-2` / `EvaluatorDiagnostics`:
+    a process SIGKILLed by the kernel OOM path on a 4GB c5.large produced
+
+        ERROR: evaluate.py failed. Spot run marked FAILED.
+        (last output: Instance terminated; S3 staging cleaned.)
+
+    — no "OOM", "Killed", "memory", or exit signal anywhere in it, because
+    (a) rc=137 was never classified and (b) the cleanup trap's own terminal
+    echo ("Instance terminated; S3 staging cleaned.") is the ALWAYS-last
+    line on every exit path and was never distinguished from a real cause.
+    """
+
+    _KILL_LINE = (
+        "bash: line 31: 26756 Killed   $PYTHON_BIN -u evaluate.py "
+        "--mode diagnostics --upload --date 2026-08-13"
+    )
+    _TRAP_LINE = "Instance terminated; S3 staging cleaned."
+
+    def test_pre_fix_rc137_was_never_named_a_resource_kill(self):
+        """Documents the exact pre-fix defect this issue reports.
+
+        Reproduces the observed message shape verbatim (rc=137, a generic
+        cause_line, the trap's line as last_output_line, no kill_line
+        threaded through) and shows what the OLD single-bucket cause
+        scanner produced: nothing that says OOM/Killed/resource kill.
+        This class of call (no ``kill_line`` argument) is exactly what
+        every existing caller passed before this fix — the assertion
+        below is what SHOULD be true, and failed against krepis <0.60.0.
+        """
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py",
+            returncode=137,
+            last_output_line=self._TRAP_LINE,
+            cause_line="ERROR: evaluate.py failed. Spot run marked FAILED.",
+        )
+        assert "RESOURCE KILL" in msg and "OOM" in msg, (
+            "rc=137 (SIGKILL) must be named as a resource kill even with "
+            "no kill_line threaded through — the returncode alone is "
+            f"authoritative. Got: {msg!r}"
+        )
+
+    def test_oom_returncode_alone_is_classified(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=137, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+        assert "rc=137" in msg
+
+    def test_negative_sigkill_returncode_is_classified(self):
+        # subprocess.Popen surfaces a killed-by-signal child as -signum.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=-9, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+
+    def test_timeout_returncode_is_classified(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "backtest.py", returncode=124, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (TIMEOUT)" in msg
+
+    def test_kill_line_alone_classifies_even_when_rc_was_laundered_to_one(self):
+        # The exact failure mode: an intermediate `if ! cmd; then exit 1;
+        # fi` collapsed the real 137 down to a bare 1 before this layer
+        # ever saw it — but the kernel's own "Killed" message survived in
+        # the captured output.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=1,
+            last_output_line=self._TRAP_LINE,
+            kill_line=self._KILL_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+        assert self._KILL_LINE in msg
+
+    def test_kill_line_leads_over_a_later_generic_cause_line(self):
+        # The real regression: a later, more generic ERROR-shaped line
+        # (an SSM transport's own "terminal status=Failed") must not
+        # out-compete the one line that actually names the kill.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "pit-walkforward", returncode=1,
+            last_output_line=self._TRAP_LINE,
+            cause_line="ERROR: SSM step 'pit-walkforward' terminal status=Failed",
+            kill_line=self._KILL_LINE,
+        )
+        assert msg.index(self._KILL_LINE) < msg.index(self._TRAP_LINE)
+        assert "SSM step 'pit-walkforward' terminal status=Failed" not in msg or (
+            msg.index(self._KILL_LINE)
+            < msg.index("SSM step 'pit-walkforward' terminal status=Failed")
+        )
+
+    def test_cleanup_trap_line_never_stands_in_for_the_cause(self):
+        # Obligation 3: the trap's own terminal echo must never be
+        # presented AS the cause — only ever honestly labeled "last output".
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=137,
+            last_output_line=self._TRAP_LINE,
+            kill_line=self._KILL_LINE,
+        )
+        assert f"— {self._TRAP_LINE}" not in msg  # not presented as the lead
+        assert f"(last output: {self._TRAP_LINE})" in msg
+
+    def test_no_resource_kill_signal_falls_back_to_the_old_shape(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line="boom",
+        )
+        assert "RESOURCE KILL" not in msg
+        assert msg == "ssm_log_capture: ERROR: [x] failed (rc=1) — boom"
+
+    @pytest.mark.parametrize("line", [
+        "bash: line 31: 26756 Killed   python -u evaluate.py",
+        "Out of memory: Killed process 26756 (python3.12)",
+        "python3.12 invoked oom-killer",
+        "MemoryError: Unable to allocate 4.2 GiB",
+    ])
+    def test_resource_kill_lines_from_this_fleet_are_recognised(self, line):
+        assert ssm_log_capture._RESOURCE_KILL_RE.search(line), line
+
+    @pytest.mark.parametrize("line", [
+        "INFO: processed 932 tickers without incident",
+        "ERROR [data-collector] phase failed: no such table",
+    ])
+    def test_routine_and_generic_error_lines_are_not_kill_lines(self, line):
+        assert not ssm_log_capture._RESOURCE_KILL_RE.search(line), line
+
+
+class TestResourceKillThroughTheRealFormattingPath:
+    """Drives a DELIBERATELY OOM-killed (SIGKILL) real subprocess through
+    :func:`ssm_log_capture.run` end to end and asserts the operator-visible
+    stderr message names the resource kill. This is the acceptance test
+    for alpha-engine-config-I7258 — it exercises the real capture/scan/
+    format path, not a hand-built ``format_subprocess_failure`` call.
+    """
+
+    def test_a_sigkilled_child_is_named_a_resource_kill_in_the_real_output(
+        self, isolated_logfile, fake_boto3, capsys
+    ):
+        fake, _ = fake_boto3
+        # A child that prints a line shaped like bash's own foreground-
+        # job-killed message and then SIGKILLs itself — the closest a
+        # portable test gets to an OS-level OOM kill without actually
+        # exhausting memory in CI.
+        script = (
+            "import os, signal, sys\n"
+            "sys.stdout.write('26756 Killed   evaluate.py --mode diagnostics\\n')\n"
+            "sys.stdout.flush()\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "evaluator-diagnostics",
+                isolated_logfile,
+                [sys.executable, "-c", script],
+                correlation_id="watch-rerun-2026-08-13-2",
+                step_name="evaluate.py",
+            )
+        assert rc == -9 or rc == 137, f"expected a SIGKILL exit, got {rc}"
+        captured = capsys.readouterr()
+        assert "RESOURCE KILL (OOM)" in captured.err, (
+            "the real run()->format_subprocess_failure path must name the "
+            f"resource kill. stderr was: {captured.err!r}"
+        )
+
+
 # A child that leaks a background descendant holding the inherited stdout pipe,
 # prints, and then exits non-zero. This is `spot_predictor_training.sh` in
 # miniature: `_heartbeat_start` backgrounds a process, the next step fails, and
