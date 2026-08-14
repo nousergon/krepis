@@ -204,6 +204,69 @@ _JSON_INSTRUCTION = (
     "no prose, no markdown fences:\n{schema}"
 )
 
+# ── structured-output degradation ladder (model-portability-policy §7) ────
+#
+# The policy declares one ladder for structured output:
+#
+#   native (strict ``response_format=json_schema``)
+#     → tool_emulation (forced single-tool call whose input IS the object)
+#     → prompt_only (instruct + tolerant extraction + bounded repair)
+#
+# "The caller always receives a validated object or an exception. Which rung
+# ran is recorded on the result, because rung affects reliability and belongs
+# in the artifact." ``StructuredResult.structured_output_rung`` is that record,
+# and it is populated on EVERY structured call — including the undegraded ones,
+# so a healthy call publishes ``native``/``tool_emulation`` rather than nothing
+# (``principles.md`` §2.7: a component emitting nothing is not healthy, it is
+# unobserved).
+_STRUCTURED_RUNG_NATIVE = "native"
+_STRUCTURED_RUNG_TOOL_EMULATION = "tool_emulation"
+_STRUCTURED_RUNG_PROMPT_ONLY = "prompt_only"
+
+# A provider REFUSING ``response_format`` at request time — distinct from a
+# registry model that never declared support (I4 handles that declaratively,
+# via ``spec.structured_outputs``). This is the case the declaration cannot
+# cover: the registry says the deployment can serve it, or a caller overrode
+# ``params.structured_outputs``, and the endpoint answers 400.
+#
+# Live incident (alpha-engine-config-I7232): the Think Tank's ``sweep`` tier
+# overrides ``structured_outputs=True`` onto a DeepSeek deployment whose
+# registry params default it False; DeepSeek answered
+# ``400 This response_format type is unavailable now``. The exception escaped
+# ``_structured_openai`` entirely — it is neither a decode failure nor a
+# validation failure — and aborted every Think Tank run from 2026-08-11.
+# Descending one rung is the DECLARED path for exactly this, and it is what
+# turns a whole-run abort into a recorded degradation.
+#
+# Deliberately matched on the refusal WORDING and not on provider identity or
+# an HTTP status: I4 forbids branching request construction on provider name,
+# and the status alone (400) cannot distinguish "this parameter is unavailable"
+# from "your schema is malformed" — descending on the latter would hide a real
+# caller bug behind a weaker rung.
+_RESPONSE_FORMAT_REFUSAL_RE = re.compile(
+    r"response[_ ]?format",
+    re.IGNORECASE,
+)
+_RESPONSE_FORMAT_REFUSAL_CAUSE_RE = re.compile(
+    r"unavailable|unsupported|not supported|not available|not enabled",
+    re.IGNORECASE,
+)
+
+
+def _is_response_format_refusal(exc: BaseException) -> bool:
+    """True when *exc* is a provider refusing ``response_format`` itself.
+
+    Both halves must match: the message has to name the parameter AND say it
+    cannot be served. A 400 naming ``response_format`` because the SCHEMA was
+    rejected is a caller defect and must keep raising — degrading it would
+    swap a loud, correct failure for a quietly weaker rung.
+    """
+    text = str(exc)
+    return bool(
+        _RESPONSE_FORMAT_REFUSAL_RE.search(text)
+        and _RESPONSE_FORMAT_REFUSAL_CAUSE_RE.search(text)
+    )
+
 # Bounded jittered backoff between attempts of the retry loops below. The
 # SDK's own ``max_retries`` backs off for status/connection failures, but it
 # never sees the BODY-level failures this module retries (a non-JSON body, a
@@ -559,6 +622,13 @@ class StructuredResult(LLMResult):
     data: dict = field(default_factory=dict)
     # Pydantic instance when ``schema`` was a BaseModel subclass.
     parsed: Any = None
+    # Which rung of the model-portability-policy §7 structured-output ladder
+    # actually produced this payload: "native" (strict response_format=
+    # json_schema), "tool_emulation" (forced tool call — the anthropic
+    # transport's idiom), or "prompt_only" (JSON instruction + tolerant
+    # extraction). Always populated, including on undegraded calls, so the
+    # rung is a value in the artifact rather than an inference from silence.
+    structured_output_rung: str = ""
 
 
 @dataclass
@@ -598,8 +668,9 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
-def _emits_cost(method):
-    """Emit a priced cost record for whatever result *method* returns.
+def _finalize_result(method):
+    """Stamp the call's degradation record onto the result, then emit a priced
+    cost record for it.
 
     Applied at the PUBLIC method boundary rather than at each ``return``
     site, deliberately. ``complete`` / ``structured`` / ``complete_grounded``
@@ -608,11 +679,28 @@ def _emits_cost(method):
     return path would be invisible — no error, no log, just a call site that
     quietly stops being accounted for — which is precisely the failure class
     this arc exists to close (alpha-engine-config-I5206).
+
+    ``dropped_params`` is stamped for the same reason and was missing for the
+    same reason: the field existed on :class:`LLMResult` and documented itself
+    as the surface making a degraded call visible in the artifact, and NO
+    return site ever assigned it — so every degraded call read as fully
+    honored to every consumer of the artifact (alpha-engine-config-I7232).
+    Snapshot-and-clear, not just snapshot: ``self.dropped_params`` lives on the
+    client, so without the reset a drop on one call would ride along on every
+    later result from the same client and misreport it as degraded.
     """
 
     @functools.wraps(method)
     def _wrapped(self, *args, **kwargs):
-        result = method(self, *args, **kwargs)
+        self.dropped_params = []
+        try:
+            result = method(self, *args, **kwargs)
+        finally:
+            # Cleared even when the call RAISES: a drop recorded on a failed
+            # call must not attach itself to the next successful one.
+            dropped = self.dropped_params
+            self.dropped_params = []
+        result.dropped_params = dropped
         self._emit_cost_record(result)
         return result
 
@@ -1106,7 +1194,7 @@ class LLMClient:
 
     # ── plain completion ──────────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete(
         self,
         *,
@@ -1187,7 +1275,7 @@ class LLMClient:
 
     # ── structured completion ─────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def structured(
         self,
         *,
@@ -1224,6 +1312,18 @@ class LLMClient:
         ``response_format=json_schema`` when ``spec.structured_outputs``,
         else a JSON-instruction suffix + fence/preamble-tolerant extraction
         (Think Tank pattern).
+
+        **Degradation ladder** (``model-portability-policy`` §7). Which rung
+        served is on the result as ``structured_output_rung``, always — the
+        undegraded calls publish theirs too. On the openai transport, an
+        endpoint that REFUSES ``response_format`` (as opposed to a registry
+        entry that never claimed it) drops one rung to ``prompt_only`` for that
+        call, records ``response_format`` in ``dropped_params``, and logs at
+        ERROR. It is a recorded degradation, never a silent one, and it is
+        bounded: one descent per call, and the descent does not spend an
+        ``attempts`` retry. A refusal naming the SCHEMA rather than the
+        parameter's availability still raises — see
+        :func:`_is_response_format_refusal`.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
@@ -1331,6 +1431,12 @@ class LLMClient:
                     model=getattr(msg, "model", self.spec.model),
                     provider=self.spec.provider,
                     registry_id=self.spec.registry_id,
+                    # The anthropic transport's structured-output idiom IS the
+                    # §7 ladder's tool_emulation rung (forced tool_choice on a
+                    # tool whose input_schema is the schema). Stamped so the
+                    # rung is present on every transport's result, not only the
+                    # one that can degrade.
+                    structured_output_rung=_STRUCTURED_RUNG_TOOL_EMULATION,
                     usage=usage,
                     raw_request=payload,
                     raw_response=msg,
@@ -1378,36 +1484,59 @@ class LLMClient:
         attempts: int,
         max_tokens: int,
     ) -> StructuredResult:
-        messages: List[dict] = [{"role": "system", "content": system}]
-        kwargs: dict = {"model": self.spec.model, "max_tokens": max_tokens}
-        if self.spec.structured_outputs:
-            messages.append({"role": "user", "content": user_content})
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema_dict,
-                },
-            }
-        else:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": user_content
-                    + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
-                }
-            )
         extra_body = self._openai_extra_body()
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+
+        def _build(rung: str) -> tuple[List[dict], dict]:
+            """Request for one rung of the §7 ladder. The openai transport has
+            two reachable rungs (``tool_emulation`` is the anthropic idiom), and
+            building both here — rather than at one branch on entry — is what
+            lets the descent re-issue instead of aborting the caller's run."""
+            msgs: List[dict] = [{"role": "system", "content": system}]
+            kw: dict = {"model": self.spec.model, "max_tokens": max_tokens}
+            if rung == _STRUCTURED_RUNG_NATIVE:
+                msgs.append({"role": "user", "content": user_content})
+                kw["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema_dict,
+                    },
+                }
+            else:
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": user_content
+                        + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
+                    }
+                )
+            if extra_body:
+                kw["extra_body"] = extra_body
+            return msgs, kw
+
+        rung = (
+            _STRUCTURED_RUNG_NATIVE
+            if self.spec.structured_outputs
+            else _STRUCTURED_RUNG_PROMPT_ONLY
+        )
+        messages, kwargs = _build(rung)
 
         usage = LLMUsage()
         last_error: Any = None  # Exception (validation) or str (transport decode)
         raw_text = ""
         client = self._transport_client()
 
-        for attempt in range(attempts):
+        # ``budget`` rather than ``range(attempts)``: a rung descent is not a
+        # failed attempt, it is a different request, so it must not consume the
+        # caller's retry budget. It can happen at most once (there is exactly
+        # one rung below ``native`` on this transport), so the budget is bounded
+        # at ``attempts + 1``.
+        descended = False
+        budget = attempts
+        attempt = -1
+        while attempt + 1 < budget:
+            attempt += 1
             try:
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
@@ -1461,11 +1590,42 @@ class LLMClient:
                     self.spec.provider,
                     self.spec.model,
                     attempt + 1,
-                    attempts,
+                    budget,
                     last_error,
                 )
-                if attempt < attempts - 1:
+                if attempt < budget - 1:
                     _retry_backoff_sleep(attempt)
+                continue
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it is a refusal
+                # §7 ladder descent, the ONLY case handled here. Anything else
+                # re-raises unchanged: this clause must not become a general
+                # transport catch-all.
+                if not (
+                    rung == _STRUCTURED_RUNG_NATIVE
+                    and not descended
+                    and _is_response_format_refusal(exc)
+                ):
+                    raise
+                descended = True
+                budget += 1
+                rung = _STRUCTURED_RUNG_PROMPT_ONLY
+                self.dropped_params.append("response_format")
+                messages, kwargs = _build(rung)
+                logger.error(
+                    "llm structured provider=%s model=%s: the endpoint REFUSED "
+                    "response_format (%s: %s). Descending the "
+                    "model-portability-policy §7 ladder native -> prompt_only "
+                    "for this call and recording the drop on the result "
+                    "(dropped_params, structured_output_rung). The registry "
+                    "declares this deployment can serve strict structured "
+                    "output and the endpoint disagrees — that contradiction is "
+                    "a registry defect to fix, not a condition to live on "
+                    "(alpha-engine-config-I7232).",
+                    self.spec.provider,
+                    self.spec.model,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 continue
             try:
                 parsed = parse_and_validate(_extract_json(raw_text))
@@ -1474,6 +1634,7 @@ class LLMClient:
                     model=served_model,
                     provider=self.spec.provider,
                     served_provider=getattr(resp, "provider", None),
+                    structured_output_rung=rung,
                     usage=usage,
                     raw_request={"messages": messages, **kwargs},
                     raw_response=resp,
@@ -1503,8 +1664,8 @@ class LLMClient:
 
         raise LLMError(
             f"provider={self.spec.provider} model={self.spec.model}: "
-            f"structured output failed validation after {attempts} "
-            f"attempt(s): {last_error}",
+            f"structured output failed validation after {budget} "
+            f"attempt(s) at rung={rung}: {last_error}",
             usage=usage,
         )
 
@@ -1522,7 +1683,7 @@ class LLMClient:
 
     # ── grounded completion ───────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete_grounded(
         self,
         *,

@@ -153,7 +153,14 @@ class FakeOpenAI:
 
     def _create(self, **kwargs):
         self.kwargs.append(kwargs)
-        return self._responses.pop(0)
+        nxt = self._responses.pop(0)
+        # A queued Exception is RAISED rather than returned, so a test can
+        # script a provider-side rejection (a 400) in the same list as normal
+        # responses. The SDK raises for these; the fake must too, or the
+        # scripted failure silently becomes a success-shaped object.
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
 
 
 def _client(spec, fake):
@@ -387,6 +394,146 @@ class TestStructuredOpenAI:
         kwargs = fake.kwargs[0]
         assert "response_format" not in kwargs
         assert "JSON Schema" in kwargs["messages"][1]["content"]
+
+    def test_rung_is_recorded_on_an_undegraded_call(self):
+        """A healthy call publishes its rung too. `principles.md` §2.7: a
+        component emitting nothing is not healthy, it is unobserved — so the
+        field must never be the empty string on a successful call."""
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.structured_output_rung == "native"
+        assert result.dropped_params == []
+
+        fake2 = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])
+        loose = _client(OPENROUTER_LOOSE_SPEC, fake2).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert loose.structured_output_rung == "prompt_only"
+
+    def test_response_format_refusal_descends_one_rung_and_records_it(self):
+        """alpha-engine-config-I7232 — DeepSeek answered
+        ``400 This response_format type is unavailable now`` to the Think
+        Tank's sweep tier. That exception was neither a decode failure nor a
+        validation failure, so it escaped the retry loop entirely and aborted
+        every run from 2026-08-11. `model-portability-policy` §7 declares the
+        ladder for exactly this; the descent must happen, and be recorded."""
+        fake = FakeOpenAI([
+            RuntimeError(
+                "Error code: 400 - {'error': {'message': 'This "
+                "response_format type is unavailable now', 'type': "
+                "'invalid_request_error'}}"
+            ),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.parsed == Spec(name="a", score=5)
+        assert result.structured_output_rung == "prompt_only"
+        assert result.dropped_params == ["response_format"]
+        # The re-issued request is the prompt_only rung, not the same one.
+        assert "response_format" in fake.kwargs[0]
+        assert "response_format" not in fake.kwargs[1]
+        assert "JSON Schema" in fake.kwargs[1]["messages"][1]["content"]
+
+    def test_descent_does_not_spend_the_callers_retry_budget(self):
+        """A rung descent is a different request, not a failed attempt. With
+        ``attempts=1`` the descent must still get its one call — otherwise the
+        ladder exists but can never actually run at the default budget."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format is not supported by this model"),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec,
+            schema_name="emit_spec", attempts=1,
+        )
+        assert result.structured_output_rung == "prompt_only"
+        assert len(fake.kwargs) == 2
+
+    def test_descent_happens_at_most_once(self):
+        """The ladder has one rung below native on this transport. A second
+        refusal is a real failure and must raise, not loop."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format type is unavailable now"),
+            RuntimeError("400 response_format type is unavailable now"),
+        ])
+        with pytest.raises(RuntimeError, match="unavailable now"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 2
+
+    def test_a_schema_rejection_still_raises(self):
+        """A 400 that names ``response_format`` because the SCHEMA was
+        rejected is a caller defect. Degrading it would swap a loud, correct
+        failure for a quietly weaker rung — the refusal match requires the
+        message to also say the parameter cannot be served."""
+        fake = FakeOpenAI([
+            RuntimeError(
+                "400 Invalid schema for response_format 'emit_spec': "
+                "'score' is not of type 'string'"
+            ),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        with pytest.raises(RuntimeError, match="Invalid schema"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_an_unrelated_transport_error_still_raises(self):
+        """The descent clause must not become a general transport catch-all."""
+        fake = FakeOpenAI([RuntimeError("429 rate limited")])
+        with pytest.raises(RuntimeError, match="rate limited"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_a_loose_spec_never_descends(self):
+        """A spec that never claimed native structured output is already at
+        ``prompt_only``; there is nothing below it to descend to."""
+        fake = FakeOpenAI([RuntimeError("400 response_format is unavailable")])
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _client(OPENROUTER_LOOSE_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_dropped_params_do_not_leak_into_the_next_call(self):
+        """``dropped_params`` lives on the CLIENT and clients are reused. A
+        drop recorded on one call must not ride along on the next result and
+        misreport a fully-honored call as degraded."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format type is unavailable now"),
+            _openai_resp('{"name": "a", "score": 5}'),
+            _openai_resp('{"name": "b", "score": 6}'),
+        ])
+        client = _client(OPENROUTER_SPEC, fake)
+        first = client.structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        second = client.structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert first.dropped_params == ["response_format"]
+        assert second.dropped_params == []
+
+    def test_anthropic_rung_is_tool_emulation(self):
+        fake = FakeAnthropic([
+            _anthropic_msg([_tool_use_block("emit_spec", {"name": "a", "score": 5})])
+        ])
+        result = _client(ANTHROPIC_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.structured_output_rung == "tool_emulation"
 
     def test_raw_dict_schema(self):
         fake = FakeOpenAI([_openai_resp('{"anything": 1}')])
