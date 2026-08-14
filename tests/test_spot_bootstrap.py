@@ -21,11 +21,13 @@ import pytest
 
 from krepis.spot_bootstrap import (
     PYTHON,
+    Clone,
     ConfigCopy,
     SpotBootstrapSpec,
     main,
     render_bootstrap,
     render_install_deps,
+    scan_for_inline_bootstraps,
 )
 
 
@@ -408,3 +410,286 @@ def test_install_deps_keeps_pip_check_non_fatal():
     deps = render_install_deps(_spec())
     tail = deps.split("pip check", 1)[1]
     assert "||" in tail.splitlines()[0] or "WARNING" in tail
+
+
+# ── The superset the forks needed (config-I4992 / I6922 phase 2) ─────────
+#
+# Three capabilities existed only in a fork, and each was a reason that fork
+# stayed forked. `shared-code-policy` §3.1: prove the destination is a
+# SUPERSET before closing a fork, or the consolidation un-ships the losing
+# copy's behaviour.
+
+
+def test_a_hard_runtime_cap_is_rendered_when_asked():
+    """`crucible-backtester`'s fork capped runtime and nothing else did."""
+    script = render_bootstrap(_spec(max_runtime_seconds=7200))
+    assert "systemd-run --on-active=7200" in script
+    assert "shutdown -h now" in script
+
+
+def test_the_hard_cap_does_not_replace_the_liveness_watchdog():
+    """Two failure modes, two guarantees.
+
+    The backtester fork had the cap and no SSM-liveness unit; its twins had
+    the unit and no cap. Rendering one INSTEAD of the other would reproduce
+    the divergence inside the module that exists to end it.
+    """
+    script = render_bootstrap(_spec(max_runtime_seconds=600))
+    assert "systemd-run --on-active=600" in script
+    assert "ec2-spot-watchdog" in script
+    assert "Type=simple" in script
+
+
+def test_a_hard_cap_that_cannot_be_armed_aborts_the_bootstrap():
+    """An uncapped spot whose workload hangs runs until somebody reads a bill."""
+    script = render_bootstrap(_spec(max_runtime_seconds=600))
+    timer = script.split("--on-active=600", 1)[1].split("\n\n", 1)[0]
+    assert "exit 1" in timer
+    assert ">&2" in timer
+
+
+def test_no_hard_cap_is_rendered_by_default():
+    """Additive: every existing consumer's output is unchanged."""
+    assert "on-active" not in render_bootstrap(_spec())
+
+
+def test_extra_clones_render_in_order_and_each_is_idempotent():
+    """The backtester needs three checkouts; its predictor replay imports the
+    predictor's modules in-process."""
+    script = render_bootstrap(
+        _spec(
+            extra_clones=(
+                Clone(repo_url="https://x/exec.git", checkout="/home/ec2-user/exec"),
+                Clone(repo_url="https://x/pred.git", checkout="/home/ec2-user/pred"),
+            )
+        )
+    )
+    assert script.index("/home/ec2-user/exec") < script.index("/home/ec2-user/pred")
+    for path in ("/home/ec2-user/data", "/home/ec2-user/exec", "/home/ec2-user/pred"):
+        assert f"if [ ! -d {path}/.git ]; then" in script
+
+
+def test_an_extra_clone_may_pin_its_own_branch_and_otherwise_inherits():
+    script = render_bootstrap(
+        _spec(
+            branch="release",
+            extra_clones=(
+                Clone(repo_url="https://x/a.git", checkout="/c/a", branch="v1"),
+                Clone(repo_url="https://x/b.git", checkout="/c/b"),
+            ),
+        )
+    )
+    assert "--branch v1 https://x/a.git /c/a" in script
+    assert "--branch release https://x/b.git /c/b" in script
+
+
+def test_a_conditional_config_copy_announces_the_skip():
+    """An optional artifact that vanishes silently is indistinguishable from
+    one that failed to copy, and the workload dies on it minutes later in
+    another process."""
+    script = render_bootstrap(
+        _spec(
+            exports={"S3_STAGING": "s3://b/p"},
+            config_copies=(
+                ConfigCopy(
+                    source_name="predictor.yaml",
+                    dest="/c/predictor.yaml",
+                    when="${STAGED_PREDICTOR_CONFIG}",
+                ),
+            ),
+        )
+    )
+    assert 'if [ "${STAGED_PREDICTOR_CONFIG}" = "1" ]; then' in script
+    assert "else" in script
+    assert "SKIPPED: predictor.yaml not staged" in script
+    assert script.rstrip().endswith("fi")
+
+
+def test_an_unconditional_copy_gains_no_conditional_wrapper():
+    script = render_bootstrap(
+        _spec(
+            exports={"S3_STAGING": "s3://b/p"},
+            config_copies=(ConfigCopy(source_name="c.yaml", dest="/c/c.yaml"),),
+        )
+    )
+    assert "SKIPPED" not in script
+    assert "if [ \"" not in script.split("aws s3 cp", 1)[1]
+
+
+def test_cli_accepts_the_three_new_parameters(capsys):
+    rc = main([
+        "render",
+        "--repo-url", "https://x/a.git",
+        "--checkout", "/home/ec2-user/a",
+        "--max-runtime-seconds", "900",
+        "--extra-clone", "/home/ec2-user/b=https://x/b.git@v2",
+        "--export", "S3_STAGING=s3://b/p",
+        "--config-copy-if", "${WANT}:p.yaml:/home/ec2-user/a/p.yaml",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "--on-active=900" in out
+    assert "--branch v2 https://x/b.git /home/ec2-user/b" in out
+    assert 'if [ "${WANT}" = "1" ]; then' in out
+
+
+def test_cli_extra_clone_does_not_mistake_an_scp_style_remote_for_a_ref(capsys):
+    """`git@github.com:org/repo.git` carries an '@' that is not a ref."""
+    main([
+        "render", "--repo-url", "https://x/a.git", "--checkout", "/a",
+        "--extra-clone", "/b=git@github.com:nousergon/krepis.git",
+    ])
+    assert "git@github.com:nousergon/krepis.git /b" in capsys.readouterr().out
+
+
+def test_cli_rejects_a_malformed_extra_clone():
+    with pytest.raises(SystemExit):
+        main(["render", "--repo-url", "u", "--checkout", "/c", "--extra-clone", "nope"])
+
+
+def test_cli_rejects_a_malformed_conditional_copy():
+    with pytest.raises(SystemExit):
+        main(["render", "--repo-url", "u", "--checkout", "/c", "--config-copy-if", "a:b"])
+
+
+# ── The fork detector ────────────────────────────────────────────────────
+
+
+def _write(tmp_path, rel: str, body: str) -> Path:
+    p = tmp_path / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_the_detector_finds_a_fork_that_shares_no_marker_with_the_others(tmp_path):
+    """The measured miss, reproduced.
+
+    `crucible-backtester`'s copy was invisible to the fleet sweep because the
+    sweep grepped for `ec2-spot-watchdog` and that copy had never adopted the
+    unit. Its actual content — a transient timer, an interpreter install, a
+    clone — is what identifies it.
+    """
+    _write(tmp_path, "infrastructure/_spot_common.sh", """
+systemd-run --on-active=${MAX_RUNTIME_SECONDS} --unit=alpha-engine-watchdog /sbin/shutdown -h now
+dnf install -y -q python3.12 python3.12-pip git gcc
+git clone --depth 1 https://github.com/nousergon/x.git /home/ec2-user/x
+""")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.path.name for f in found] == ["_spot_common.sh"]
+    assert set(found[0].signatures) >= {
+        "systemd-transient-timer", "interpreter-install", "repo-clone", "self-terminate"
+    }
+
+
+def test_the_detector_is_blind_to_the_name_and_the_function_prefix(tmp_path):
+    """The backtester fork renamed every function it shared with its twin.
+    A seventh copy will not be called `_spot_common.sh` either."""
+    _write(tmp_path, "infrastructure/nested/provision_worker.bash", """
+spot_common_v2_bootstrap() {
+  dnf install -y python3.12
+  git clone https://x/y.git /home/ec2-user/y
+}
+""")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.path.name for f in found] == ["provision_worker.bash"]
+
+
+def test_a_file_that_delegates_to_the_renderer_is_not_a_fork(tmp_path):
+    _write(tmp_path, "infrastructure/launcher.sh", """
+BODY=$("$LIB_PYTHON" -m krepis.spot_bootstrap render --repo-url https://x/y.git \\
+  --checkout /home/ec2-user/y --max-runtime-seconds 3600)
+aws ssm send-command --parameters commands="$BODY"
+""")
+    assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+def test_one_category_alone_is_not_a_bootstrap(tmp_path):
+    """Each marker has honest lone uses. A detector that fires on any one of
+    them gets suppressed, and a suppressed detector measures nothing."""
+    _write(tmp_path, "infrastructure/install_unit.sh", "ExecStart=/usr/bin/true\n")
+    _write(tmp_path, "scripts/dev_clone.sh", "git clone https://x/y.git /home/ec2-user/y\n")
+    assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+def test_supervising_a_box_somebody_else_provisioned_is_not_a_bootstrap(tmp_path):
+    """The measured false positive, pinned.
+
+    `nousergon-data/infrastructure/preflight_sweep.sh` arms a hard-timeout
+    timer on an already-running box. Counting `systemd-run --on-active` and
+    the `shutdown -h now` it invokes as two independent signatures made one
+    act look like two and flagged it. A false positive earns the detector an
+    exemption list, and an exemption list is where the next real fork hides —
+    so the categories exist to keep the list empty.
+    """
+    _write(tmp_path, "infrastructure/preflight_sweep.sh", """
+systemd-run --on-active="${WATCHDOG_SECONDS}" --unit=preflight-watchdog \\
+  /sbin/shutdown -h now
+shutdown -h now || /sbin/shutdown -h now || true
+""")
+    assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+def test_provisioning_plus_supervision_is_a_bootstrap(tmp_path):
+    """The same file, one `dnf install` later, IS establishing a machine."""
+    _write(tmp_path, "infrastructure/preflight_sweep.sh", """
+systemd-run --on-active=600 --unit=w /sbin/shutdown -h now
+dnf install -y -q python3.12
+""")
+    assert len(scan_for_inline_bootstraps(tmp_path)) == 1
+
+
+def test_a_file_the_scan_cannot_read_is_reported_not_skipped(tmp_path):
+    """*No data* is never rendered as clean."""
+    p = _write(tmp_path, "infrastructure/opaque.sh", "x")
+    p.write_bytes(b"\xff\xfe\x00 dnf install python3\n git clone /home/ec2-user/z")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.signatures for f in found] == [("unreadable",)]
+
+
+def test_the_scan_ignores_directories_that_hold_no_launchers(tmp_path):
+    _write(tmp_path, "tests/fixtures/fake_bootstrap.sh", """
+dnf install python3.12
+git clone https://x/y.git /home/ec2-user/y
+""")
+    assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+def test_scan_cli_exit_code_is_the_verdict(tmp_path, capsys):
+    assert main(["scan", str(tmp_path)]) == 0
+    _write(tmp_path, "infrastructure/b.sh", """
+dnf install python3.12
+git clone https://x/y.git /home/ec2-user/y
+""")
+    assert main(["scan", str(tmp_path)]) == 1
+    assert "b.sh" in capsys.readouterr().out
+
+
+def test_a_comment_naming_the_module_does_not_clear_a_fork(tmp_path):
+    """The measured false negative, pinned.
+
+    Both surviving `_spot_common.sh` forks carry a comment reading "The fleet
+    copy is krepis.spot_bootstrap.render_install_deps; keep the two in step."
+    The first cut of this scan matched the module NAME and therefore cleared
+    the two files it was written to find — a detector reporting green on its
+    own subject. Adoption is an invocation.
+    """
+    _write(tmp_path, "infrastructure/_spot_common.sh", """
+# The fleet copy is krepis.spot_bootstrap.render_install_deps; keep the two in
+# step (tests/test_spot_bootstrap_invariants.py). Do not let this drift.
+dnf install -y -q python3.12 python3.12-pip git gcc
+git clone --depth 1 https://x/y.git /home/ec2-user/y
+""")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.path.name for f in found] == ["_spot_common.sh"]
+
+
+def test_a_commented_out_bootstrap_is_not_a_finding(tmp_path):
+    """The same stripping, pointed the other way: a file that EXPLAINS a
+    bootstrap must not read as one."""
+    _write(tmp_path, "infrastructure/notes.sh", """
+# dnf install -y python3.12
+# git clone https://x/y.git /home/ec2-user/y
+echo hi
+""")
+    assert scan_for_inline_bootstraps(tmp_path) == []
