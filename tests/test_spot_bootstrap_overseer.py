@@ -698,3 +698,58 @@ class TestEveryCapabilityIsNew:
     @pytest.mark.parametrize("capability,marker", sorted(MARKERS.items()))
     def test_the_capability_is_present_once_declared(self, capability, marker):
         assert marker in render_bootstrap(_overseer_spec()), capability
+
+
+def test_a_secret_value_can_never_reach_the_rendered_script():
+    """`SsmSecret` carries a parameter PATH and an env-var NAME, never a value.
+
+    This is the assertion behind the two `codeql[py/clear-text-logging-
+    sensitive-data]` suppressions in `main()`. CodeQL taints the rendered
+    script because the spec has a field called `secrets`; the flow it reports
+    is identifier-pattern matching, not a value flow — the value is fetched ON
+    THE BOX at runtime, by the instance profile, through `get_secret`.
+
+    Pinned rather than asserted in a comment: a suppression whose justification
+    lives only in prose is a suppression that survives the day the
+    justification stops being true.
+    """
+    poison = "AKIA-NOT-A-REAL-VALUE-0000"
+    spec = _overseer_spec(
+        secrets=(
+            SsmSecret(
+                env_var="GH_TOKEN",
+                parameter="/alpha-engine/saturday_sf_watch/github_pat",
+                required=True,
+                via_file=True,
+            ),
+        ),
+        # A credential planted everywhere a caller could plausibly put one.
+        privilege_drop=PrivilegeDrop(
+            user="ec2-user",
+            command=("bash", "/x.sh"),
+            env=(("GH_TOKEN", "${GH_TOKEN:-}"),),
+            secret_env_vars=("GH_TOKEN",),
+        ),
+    )
+    script = render_bootstrap(spec)
+    assert poison not in script
+    # What DOES appear is the parameter path and the variable name — the two
+    # things a reader needs in order to fix a missing secret, and neither of
+    # which is one.
+    assert "/alpha-engine/saturday_sf_watch/github_pat" in script
+    assert "get_secret" in script
+
+
+def test_the_codeql_suppressions_still_name_the_rule_they_suppress():
+    """A suppression comment that drifts off its line silently stops
+    suppressing, and the next reader sees a red check with no explanation."""
+    import krepis.spot_bootstrap as mod
+
+    text = Path(mod.__file__).read_text()
+    assert text.count("codeql[py/clear-text-logging-sensitive-data]") == 2, (
+        "expected exactly two inline suppressions — one per print path in main()"
+    )
+    assert "krepis-PR113" in text, (
+        "the suppression must cite the ruling that established this rule as a "
+        "false positive, or the next reader has to re-litigate it"
+    )

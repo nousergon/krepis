@@ -1530,10 +1530,19 @@ def main(argv: list[str] | None = None) -> int:
     else:
         spec = _spec_from_args(args)
     script = render_bootstrap(spec) if args.cmd == "render" else render_install_deps(spec)
+    # CodeQL `py/clear-text-logging-sensitive-data` taints `script` because the
+    # spec has a field called `secrets`. It is identifier-pattern matching, not
+    # a value flow: `SsmSecret` carries a parameter PATH and an env-var NAME,
+    # both of which are non-secret by construction, and the rendered script
+    # fetches the value on the box at runtime through `get_secret`. Pinned by
+    # `test_a_secret_value_can_never_reach_the_rendered_script` — if that ever
+    # becomes false, the test fails before this suppression can hide it.
+    # Same rule, same rationale, same remedy as Brian's 2026-08-04 ruling on
+    # krepis-PR113 / alpha-engine-config-I6414.
     if args.json:
-        print(json.dumps({"script": script}))
+        print(json.dumps({"script": script}))  # codeql[py/clear-text-logging-sensitive-data]
     else:
-        sys.stdout.write(script)
+        sys.stdout.write(script)  # codeql[py/clear-text-logging-sensitive-data]
     return 0
 
 
