@@ -60,15 +60,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shlex
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 __all__ = [
+    "BOOTSTRAP_SIGNATURES",
+    "MIN_CATEGORIES",
+    "Clone",
     "ConfigCopy",
+    "InlineBootstrap",
     "SpotBootstrapSpec",
     "render_bootstrap",
     "render_install_deps",
+    "scan_for_inline_bootstraps",
 ]
 
 #: Interpreter the fleet's `requirements.txt` files are resolved against. A
@@ -106,11 +113,35 @@ class ConfigCopy:
     #: the destination tree is created by root during bootstrap but read by
     #: ec2-user during the workload.
     chown: str | None = None
+    #: Shell condition gating this copy, e.g. ``"${STAGED_PREDICTOR_CONFIG}"``.
+    #: Rendered as ``if [ <when> = "1" ]``, with an ``else`` that SAYS the copy
+    #: was skipped. An optional artifact that vanishes silently is
+    #: indistinguishable from one that failed to copy, and the workload then
+    #: dies on a `FileNotFoundError` several minutes and one process later.
+    #: The condition is a launcher-side value that must reach the spot through
+    #: :attr:`SpotBootstrapSpec.exports`, like every other interpolation.
+    when: str | None = None
 
     def parent(self) -> str:
         if self.mkdir:
             return self.mkdir
         return self.dest.rsplit("/", 1)[0] or "/"
+
+
+@dataclass(frozen=True)
+class Clone:
+    """One additional repository checkout on the spot.
+
+    A workload that needs a sibling repo on ``sys.path`` clones more than one
+    — `crucible-backtester` clones three (itself, `crucible-executor`,
+    `crucible-predictor`) because its predictor replay runs the predictor's
+    modules in-process. Modelling that as data is what stops the third repo
+    from being a reason to keep a private fork of the whole bootstrap.
+    """
+
+    repo_url: str
+    checkout: str
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -129,6 +160,21 @@ class SpotBootstrapSpec:
     exports: dict[str, str] = field(default_factory=dict)
     branch: str = "main"
     region: str = "us-east-1"
+    #: Repos cloned in ADDITION to the primary one, in order.
+    extra_clones: tuple[Clone, ...] = ()
+    #: Hard runtime cap. Arms a transient ``systemd-run --on-active`` timer
+    #: that powers the instance off after this many seconds, whatever the
+    #: workload is doing.
+    #:
+    #: This is a SEPARATE guarantee from the ``ec2-spot-watchdog`` unit, not an
+    #: alternative to it, and the two are always rendered together. The unit
+    #: answers "the SSM agent died, so nothing can ever reach this box again";
+    #: the timer answers "the workload itself hung". `crucible-backtester`
+    #: carried only the timer and `nousergon-data`/`crucible-predictor` only
+    #: the unit, so each fork was uncovered against the other's failure mode —
+    #: which is the per-copy divergence this module exists to end, showing up
+    #: as a missing guarantee rather than as a bug.
+    max_runtime_seconds: int | None = None
 
 
 def _quote(value: str) -> str:
@@ -199,19 +245,58 @@ echo "Using: $({PYTHON} --version)"
 """.strip()
 
 
+def _hard_timeout_block(seconds: int) -> str:
+    """Power the box off after ``seconds``, whatever the workload is doing.
+
+    A transient timer rather than a unit file: it needs no ``[Install]``
+    section, no ``daemon-reload`` and no idempotence guard, and it dies with
+    the instance. ``systemd-run`` failing is fatal — an uncapped spot whose
+    workload hangs runs until somebody notices the bill, and "the cap could
+    not be armed" is exactly the condition under which the run must not
+    start.
+    """
+    return f"""
+systemd-run --on-active={int(seconds)} --unit=ec2-spot-hard-timeout \\
+    --description='spot hard runtime cap ({int(seconds)}s)' /sbin/shutdown -h now || {{
+  echo "ERROR: could not arm the {int(seconds)}s hard-timeout timer — refusing to start an uncapped spot workload" >&2
+  exit 1
+}}
+""".strip()
+
+
+def _one_clone(repo_url: str, checkout: str, branch: str) -> str:
+    q = _quote(checkout)
+    return (
+        f"if [ ! -d {q}/.git ]; then\n"
+        f"  rm -rf {q}\n"
+        f"  git clone --depth 1 --branch {_quote(branch)} {_quote(repo_url)} {q}\n"
+        f"fi"
+    )
+
+
 def _clone_block(spec: SpotBootstrapSpec) -> str:
-    """Clone the workload repo, idempotently.
+    """Clone the workload repo and any siblings, idempotently.
 
     The URL and branch are baked in as literals rather than interpolated from
     the spot's environment — see :class:`SpotBootstrapSpec`.
     """
-    checkout = _quote(spec.checkout)
-    return f"""
-if [ ! -d {checkout}/.git ]; then
-  rm -rf {checkout}
-  git clone --depth 1 --branch {_quote(spec.branch)} {_quote(spec.repo_url)} {checkout}
-fi
-""".strip()
+    blocks = [_one_clone(spec.repo_url, spec.checkout, spec.branch)]
+    for clone in spec.extra_clones:
+        blocks.append(
+            _one_clone(clone.repo_url, clone.checkout, clone.branch or spec.branch)
+        )
+    return "\n".join(blocks)
+
+
+def _one_config_copy(copy: ConfigCopy, region: str) -> "list[str]":
+    lines = [f"mkdir -p {_quote(copy.parent())}"]
+    lines.append(
+        f'aws s3 cp "${{S3_STAGING}}/{copy.source_name}" {_quote(copy.dest)} '
+        f"--region {_quote(region)} --quiet"
+    )
+    if copy.chown:
+        lines.append(f"chown -R ec2-user:ec2-user {_quote(copy.chown)}")
+    return lines
 
 
 def _config_block(spec: SpotBootstrapSpec) -> str:
@@ -219,13 +304,18 @@ def _config_block(spec: SpotBootstrapSpec) -> str:
         return ""
     lines: list[str] = []
     for copy in spec.config_copies:
-        lines.append(f"mkdir -p {_quote(copy.parent())}")
+        body = _one_config_copy(copy, spec.region)
+        if copy.when is None:
+            lines.extend(body)
+            continue
+        lines.append(f'if [ "{copy.when}" = "1" ]; then')
+        lines.extend(f"  {line}" for line in body)
+        lines.append("else")
         lines.append(
-            f'aws s3 cp "${{S3_STAGING}}/{copy.source_name}" {_quote(copy.dest)} '
-            f"--region {_quote(spec.region)} --quiet"
+            f'  echo "SKIPPED: {copy.source_name} not staged '
+            f'(condition {copy.when} was not 1) — {copy.dest} will not exist"'
         )
-        if copy.chown:
-            lines.append(f"chown -R ec2-user:ec2-user {_quote(copy.chown)}")
+        lines.append("fi")
     return "\n".join(lines)
 
 
@@ -247,12 +337,10 @@ def render_bootstrap(spec: SpotBootstrapSpec) -> str:
     if exports:
         preamble += f"\nexport {exports}"
 
-    blocks = [
-        preamble,
-        _watchdog_block(),
-        _interpreter_block(),
-        _clone_block(spec),
-    ]
+    blocks = [preamble, _watchdog_block()]
+    if spec.max_runtime_seconds is not None:
+        blocks.append(_hard_timeout_block(spec.max_runtime_seconds))
+    blocks += [_interpreter_block(), _clone_block(spec)]
     config = _config_block(spec)
     if config:
         blocks.append(config)
@@ -323,6 +411,141 @@ fi
 """
 
 
+# ── Fork detection ───────────────────────────────────────────────────────────
+#
+# The seventh copy is the one nobody looks for. `alpha-engine-config-I6922`
+# deliverable 4 said "search the fleet for further copies" and named the search:
+# `grep -rl ec2-spot-watchdog --include=*.sh`. It found exactly two, and it was
+# wrong — `crucible-backtester/infrastructure/_spot_common.sh` was a third copy,
+# 908 lines, invisible to that grep because it had never adopted the watchdog
+# unit whose name the grep anchored on. A search keyed to ONE marker cannot see
+# a fork whose divergence is the absence of that marker, which is the divergence
+# most worth seeing.
+#
+# So the detector is keyed on a SET of behaviours a spot bootstrap performs.
+#
+# A file trips it by matching two different CATEGORIES, not two patterns.
+# Categories, because several patterns describe one act: a transient timer
+# whose command is `shutdown -h now` matches both `systemd-transient-timer`
+# and `self-terminate` while doing a single thing, and counting that as two
+# made `nousergon-data/infrastructure/preflight_sweep.sh` — which arms a
+# watchdog on a box somebody else already provisioned — read as a bootstrap.
+# A detector with a false positive gets an exemption list, and an exemption
+# list is where the next real fork goes to hide.
+#
+# Only supervision collapses into one category, and only because that is where
+# the double-count was: installing an interpreter and cloning a checkout are
+# genuinely two acts, so they stay separate and a file doing both is caught
+# even when it neither supervises nor dispatches.
+
+#: ``name -> (category, pattern)``. Adding a signature here tightens every
+#: repo's detector at once, which is the point: a fleet-wide invariant with one
+#: definition cannot drift between the repos that enforce it.
+BOOTSTRAP_SIGNATURES = {
+    "systemd-unit": ("supervision", re.compile(r"^\s*ExecStart\s*=", re.M)),
+    "systemd-transient-timer": (
+        "supervision", re.compile(r"\bsystemd-run\b[^\n]*--on-active")
+    ),
+    "self-terminate": ("supervision", re.compile(r"\bshutdown\s+-h\s+now\b")),
+    "interpreter-install": (
+        "interpreter",
+        re.compile(r"\b(?:dnf|yum|apt-get)\s+install\b[^\n]*\bpython3"),
+    ),
+    "repo-clone": (
+        "checkout", re.compile(r"\bgit\s+clone\b[^\n]*/home/ec2-user/")
+    ),
+    "ssm-remote-dispatch": (
+        "dispatch",
+        re.compile(r"\bkrepis\.ssm_dispatcher\b|\baws\s+ssm\s+send-command\b"),
+    ),
+}
+
+#: A file that reaches the renderer is not a fork — it IS the shared copy.
+#: Matched against the INVOCATION, never a mention. Both surviving forks carry
+#: a comment naming `krepis.spot_bootstrap` and telling the reader to keep the
+#: copies in step; a detector matching the name would read those comments as
+#: proof of adoption and clear the two files the whole exercise is about.
+#: Measured — that is exactly what the first cut of this scan did.
+_DELEGATES = re.compile(r"-m\s+krepis\.spot_bootstrap\b")
+
+#: Minimum distinct signature CATEGORIES before a file is called a bootstrap.
+MIN_CATEGORIES = 2
+
+
+def _strip_comments(text: str) -> str:
+    """Drop whole-line shell comments before classifying.
+
+    Both directions matter. A file explaining a defect it has already fixed
+    must not read as carrying it — the fleet's existing guards were bitten by
+    a naive substring check that reported the `Type=oneshot` explanation as
+    the `Type=oneshot` bug. And a comment must not be able to CLEAR a file
+    either, which is the failure above.
+    """
+    return "\n".join(
+        line for line in text.splitlines() if not line.lstrip().startswith("#")
+    )
+
+
+@dataclass(frozen=True)
+class InlineBootstrap:
+    """One file that bootstraps a spot without going through this module."""
+
+    path: Path
+    signatures: "tuple[str, ...]"
+
+    def __str__(self) -> str:
+        return f"{self.path}: {', '.join(self.signatures)}"
+
+
+def scan_for_inline_bootstraps(
+    root: "Path | str",
+    *,
+    subdirs: "tuple[str, ...]" = ("infrastructure", "scripts", "bin"),
+    suffixes: "tuple[str, ...]" = (".sh", ".bash"),
+) -> "list[InlineBootstrap]":
+    """Every shell file under ``root`` that bootstraps a spot inline.
+
+    Returns the findings; raising is the caller's job, because the useful
+    assertion differs by repo — most want "none", and a repo mid-cutover wants
+    "none outside this declared set" for exactly as long as its cutover PR is
+    open.
+
+    Derived, not enumerated: nothing here names a file, and the classifier is
+    behavioural. A copy under a new name, in a new directory, with a new
+    function prefix — `crucible-backtester`'s fork renamed every function it
+    shared with its twin — still matches, because what it DOES is unchanged.
+    That is the property a filename list cannot have.
+    """
+    root = Path(root)
+    findings: list[InlineBootstrap] = []
+    for subdir in subdirs:
+        base = root / subdir
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix not in suffixes:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                # Unreadable is not clean. A file this scan cannot open is a
+                # file it cannot clear, and reporting it as absent is how a
+                # detector reports green while measuring nothing.
+                findings.append(InlineBootstrap(path=path, signatures=("unreadable",)))
+                continue
+            code = _strip_comments(text)
+            if _DELEGATES.search(code):
+                continue
+            hits = tuple(
+                name for name, (_, pat) in sorted(BOOTSTRAP_SIGNATURES.items())
+                if pat.search(code)
+            )
+            categories = {BOOTSTRAP_SIGNATURES[name][0] for name in hits}
+            if len(categories) >= MIN_CATEGORIES:
+                findings.append(InlineBootstrap(path=path, signatures=hits))
+    return findings
+
+
 def _spec_from_args(args: argparse.Namespace) -> SpotBootstrapSpec:
     copies: list[ConfigCopy] = []
     for raw in args.config_copy or []:
@@ -339,6 +562,38 @@ def _spec_from_args(args: argparse.Namespace) -> SpotBootstrapSpec:
                 chown=parts[2] if len(parts) == 3 else None,
             )
         )
+    for raw in getattr(args, "config_copy_if", None) or []:
+        # condition:source:dest[:chown]
+        parts = raw.split(":")
+        if len(parts) not in (3, 4):
+            raise SystemExit(
+                f"--config-copy-if expects condition:source:dest[:chown], got {raw!r}"
+            )
+        copies.append(
+            ConfigCopy(
+                when=parts[0],
+                source_name=parts[1],
+                dest=parts[2],
+                chown=parts[3] if len(parts) == 4 else None,
+            )
+        )
+    clones: list[Clone] = []
+    for raw in getattr(args, "extra_clone", None) or []:
+        # checkout=url[@branch] — keyed on the checkout because a URL contains
+        # colons and a path does not contain '='.
+        if "=" not in raw:
+            raise SystemExit(
+                f"--extra-clone expects checkout=url[@branch], got {raw!r}"
+            )
+        checkout, url = raw.split("=", 1)
+        branch = None
+        if "@" in url and not url.rstrip("/").endswith("@"):
+            head, _, tail = url.rpartition("@")
+            # Only a trailing @ref, never the '@' of a scp-style git remote,
+            # which appears before the first '/'.
+            if head and "/" in head:
+                url, branch = head, tail
+        clones.append(Clone(repo_url=url, checkout=checkout, branch=branch))
     exports: dict[str, str] = {}
     for raw in args.export or []:
         if "=" not in raw:
@@ -352,6 +607,8 @@ def _spec_from_args(args: argparse.Namespace) -> SpotBootstrapSpec:
         exports=exports,
         branch=args.branch,
         region=args.region,
+        extra_clones=tuple(clones),
+        max_runtime_seconds=getattr(args, "max_runtime_seconds", None),
     )
 
 
@@ -387,6 +644,34 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         p.add_argument(
+            "--config-copy-if",
+            action="append",
+            metavar="CONDITION:SOURCE:DEST[:CHOWN]",
+            help=(
+                "As --config-copy, but only when CONDITION evaluates to 1 on "
+                "the spot. The skip is announced, never silent. Repeatable."
+            ),
+        )
+        p.add_argument(
+            "--extra-clone",
+            action="append",
+            metavar="CHECKOUT=URL[@BRANCH]",
+            help=(
+                "Clone a sibling repo in addition to the primary one, for a "
+                "workload that imports another repo's modules. Repeatable."
+            ),
+        )
+        p.add_argument(
+            "--max-runtime-seconds",
+            type=int,
+            default=None,
+            help=(
+                "Arm a hard runtime cap that powers the instance off after N "
+                "seconds. Rendered alongside the SSM-liveness watchdog, never "
+                "instead of it."
+            ),
+        )
+        p.add_argument(
             "--export",
             action="append",
             metavar="KEY=VALUE",
@@ -398,7 +683,23 @@ def main(argv: list[str] | None = None) -> int:
             help="Emit {\"script\": ...} instead of the bare script.",
         )
 
+    scan = subparsers.add_parser(
+        "scan",
+        help="Report shell files under a repo that bootstrap a spot inline.",
+    )
+    scan.add_argument("root", help="Repository root to scan.")
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "scan":
+        findings = scan_for_inline_bootstraps(args.root)
+        for finding in findings:
+            print(finding)
+        # Exit code IS the verdict: this is meant to run in CI and in the
+        # fleet sweep, and a scanner whose only output is prose gets read by
+        # nobody twice.
+        return 1 if findings else 0
+
     spec = _spec_from_args(args)
     script = render_bootstrap(spec) if args.cmd == "render" else render_install_deps(spec)
     if args.json:
