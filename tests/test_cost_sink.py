@@ -19,6 +19,7 @@ from krepis.cost_sink import (
     CostSinkConfigError,
     S3JsonlCostSink,
     default_sink_from_env,
+    flush_default_sink,
     reset_default_sink_for_tests,
     resolve_run_id,
 )
@@ -352,3 +353,58 @@ class TestLLMClientDefaultsToTheEnvironmentSink:
 
         with pytest.raises(CostSinkConfigError):
             LLMClient(self._spec(), callsite_id="c")
+
+
+# ── flush_default_sink (alpha-engine-config-I7423) ──────────────────────────
+
+
+class TestFlushDefaultSink:
+    """A Lambda container is FROZEN between invocations, not exited, so the
+    atexit hook never runs. A handler finishing below the flush threshold
+    writes nothing at all.
+
+    Measured 2026-08-15 on weekly-SF execution watch-rerun-2026-08-15-2:
+    ReplayConcordance ran 812s of DeepSeek calls over 119 artifacts — under
+    the 200-record threshold — and the fan-in coverage check reported
+    "2 stage(s) ran and emitted no cost record ... Observed producers: (none)".
+    """
+
+    def test_returns_zero_and_does_not_raise_when_no_sink_is_configured(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(BUCKET_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREFIX_ENV_VAR, raising=False)
+        reset_default_sink_for_tests()
+        assert flush_default_sink() == 0
+
+    def test_flushes_a_buffer_that_never_reached_the_threshold(self, monkeypatch):
+        """The load-bearing case: a handler emits a handful of records and
+        returns. Without this call they are lost."""
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        reset_default_sink_for_tests()
+        s3 = FakeS3()
+        sink = default_sink_from_env(s3_client=s3)
+        assert sink is not None
+        for i in range(3):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c",
+                  "cost_usd": 0.1 * i})
+        assert s3.puts == [], "nothing should be written below the threshold"
+
+        assert flush_default_sink() == 1
+        assert len(s3.puts) == 1
+        reset_default_sink_for_tests()
+
+    def test_is_idempotent(self, monkeypatch):
+        """A handler may call it in a `finally` that runs after an explicit
+        flush; the second call must be a no-op, not a second empty object."""
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        reset_default_sink_for_tests()
+        s3 = FakeS3()
+        sink = default_sink_from_env(s3_client=s3)
+        sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+        assert flush_default_sink() == 1
+        assert flush_default_sink() == 0
+        assert len(s3.puts) == 1
+        reset_default_sink_for_tests()

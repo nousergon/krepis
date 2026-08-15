@@ -64,6 +64,7 @@ __all__ = [
     "S3JsonlCostSink",
     "resolve_run_id",
     "default_sink_from_env",
+    "flush_default_sink",
     "reset_default_sink_for_tests",
     "BUCKET_ENV_VAR",
     "PREFIX_ENV_VAR",
@@ -347,6 +348,38 @@ def default_sink_from_env(
                 bucket, prefix, run_id,
             )
         return _DEFAULT_SINK
+
+
+def flush_default_sink() -> int:
+    """Flush the process-default sink now. Returns the number of objects PUT.
+
+    **Required at the end of every AWS Lambda handler that makes LLM calls**
+    (alpha-engine-config-I7423). The sink buffers to
+    :data:`DEFAULT_FLUSH_THRESHOLD` records per ``(date, callsite_id)`` group
+    and otherwise relies on the ``atexit`` hook — and **a Lambda container is
+    frozen between invocations, not exited, so ``atexit`` does not run.** A
+    handler that finishes below the threshold therefore writes NOTHING, and
+    the container may be reclaimed hours later without ever unfreezing to a
+    normal interpreter shutdown.
+
+    Measured 2026-08-15 on weekly-SF execution ``watch-rerun-2026-08-15-2``:
+    ``ReplayConcordance`` ran 812 seconds of DeepSeek calls over 119 artifacts
+    — comfortably under the 200-record threshold — and the fan-in coverage
+    check reported ``2 stage(s) ran and emitted no cost record ... Observed
+    producers: (none)``. The env wiring was correct, the sink was constructed,
+    the records were accepted, and every one of them died in the buffer.
+
+    Returns 0 when no default sink is configured, so a caller may invoke this
+    unconditionally in a ``finally`` without knowing whether cost telemetry is
+    switched on. It never raises: :meth:`S3JsonlCostSink.flush` already
+    swallows and counts its own failures, on the principle that a telemetry
+    fault must not take down the work it was measuring.
+    """
+    with _DEFAULT_SINK_LOCK:
+        sink = _DEFAULT_SINK
+    if sink is None:
+        return 0
+    return sink.flush()
 
 
 def reset_default_sink_for_tests() -> None:
