@@ -174,6 +174,15 @@ class S3JsonlCostSink:
 
     def __call__(self, record: dict) -> None:
         """Accept one cost record. This is the ``cost_sink`` callable."""
+        # ``run_id`` on the ROW, not only in the key (alpha-engine-config-I7393).
+        # The sink already partitions by it — {prefix}/{date}/{run_id}/... — so
+        # it is the only layer that knows it; the record builder in cost.py
+        # cannot. The contract (nousergon-lib transparency_inventory.yaml
+        # `cost_telemetry`) asserts it as a COLUMN, and the aggregator
+        # (crucible-research scripts/aggregate_costs.py) builds its DataFrame
+        # straight from these rows, so a value present only in the S3 key never
+        # reaches the parquet. An explicitly-set run_id on the record wins.
+        record.setdefault("run_id", self.run_id)
         group = (self._record_date(record), str(record.get("callsite_id") or "unknown"))
         with self._lock:
             self._buffers[group].append(record)
