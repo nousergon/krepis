@@ -61,7 +61,23 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "moto>=5.0",
-    "litellm>=1.0",
+    # litellm 1.97.0 cannot be imported under Python 3.10: its `LiteLLM_Params`
+    # model carries a forward reference to `ChatCompletionReasoningSummaryTextBlock`
+    # that pydantic cannot resolve there, and every `krepis.router` group
+    # resolution raises `PydanticUserError` at litellm/router.py:7525. It is
+    # Python-version-dependent, not dependency-dependent: measured
+    # 2026-08-16 on 3.10 with litellm 1.97.0 against openai 2.54.0 AND 1.109.1,
+    # pydantic 2.13.4 AND 2.11.10 -- 9 failures in all four combinations, while
+    # the identical set passes on 3.12. 1.96.0 is the last release that imports
+    # on 3.10, and 1.97.0 is the newest that installs there at all, so the cell
+    # is unsatisfiable without this cap.
+    #
+    # 3.9 already resolves below the cap on its own; this makes 3.10 match it
+    # rather than dropping a declared interpreter to make CI quiet
+    # (alpha-engine-config-I7464). Remove when a litellm release supporting
+    # 3.10 fixes the forward ref.
+    "litellm>=1.0,<1.97; python_version < '3.11'",
+    "litellm>=1.0; python_version >= '3.11'",
     # Validates the router resolve contract against resolve_schema.json.
     # Declared (not merely assumed present) so the contract test RUNS in CI
     # instead of importorskip'ing itself into silence -- an unrun guard is
