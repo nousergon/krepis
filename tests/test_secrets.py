@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import boto3
 import pytest
-from botocore.exceptions import EndpointConnectionError
+from botocore.exceptions import ClientError, EndpointConnectionError
 from moto import mock_aws
 
 from krepis import secrets as secrets_mod
@@ -217,6 +217,45 @@ class TestSsmUnavailable:
         assert secrets_mod._ssm_unavailable is False
         # Second call to a different key should still try SSM and succeed.
         assert get_secret("POLYGON_API_KEY") == "poly-secret-from-ssm"
+
+    def test_access_denied_does_not_latch(self, monkeypatch):
+        """AccessDenied is a per-PARAMETER authorization answer, not a
+        statement that SSM is unusable — it must not disable SSM for every
+        later read in the process.
+
+        Measured 2026-08-16 (alpha-engine-config-I7448): on the canary-replay
+        box, whose instance role is least-privilege by design, an OPTIONAL
+        `FMP_API_KEY` read was denied at import and latched. The router
+        consumer credential requested seconds later then resolved to nothing,
+        the client sent an empty bearer token, and the router edge answered
+        401 — which reads as a broken credential rather than as a credential
+        that was never read. On a least-privilege role, denied is the normal
+        answer for anything outside the grant, so this is the common case, not
+        the exotic one.
+        """
+        monkeypatch.delenv(SOURCE_TOGGLE_ENV, raising=False)
+        monkeypatch.setenv("DENIED_KEY", "from-env-after-denial")
+
+        denied = ClientError(
+            {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+            "GetParameter",
+        )
+
+        with patch("boto3.client") as mock_client:
+            mock_client.return_value.get_parameter.side_effect = denied
+            assert get_secret("DENIED_KEY") == "from-env-after-denial"
+
+        assert secrets_mod._ssm_unavailable is False, (
+            "AccessDenied on one parameter latched SSM unavailable for the "
+            "whole process — every later secret silently falls through to env"
+        )
+
+        # And a granted parameter read afterwards still reaches SSM.
+        with patch("boto3.client") as mock_client:
+            mock_client.return_value.get_parameter.return_value = {
+                "Parameter": {"Value": "granted-value"}
+            }
+            assert get_secret("GRANTED_KEY") == "granted-value"
 
 
 # ── Region resolution ──────────────────────────────────────────────────────
