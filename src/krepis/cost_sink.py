@@ -50,6 +50,7 @@ default is ``None`` and a public consumer pays nothing.
 from __future__ import annotations
 
 import atexit
+import functools
 import json
 import logging
 import os
@@ -65,6 +66,7 @@ __all__ = [
     "resolve_run_id",
     "default_sink_from_env",
     "flush_default_sink",
+    "flush_cost_on_exit",
     "reset_default_sink_for_tests",
     "BUCKET_ENV_VAR",
     "PREFIX_ENV_VAR",
@@ -380,6 +382,46 @@ def flush_default_sink() -> int:
     if sink is None:
         return 0
     return sink.flush()
+
+
+def flush_cost_on_exit(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Decorator: flush the process-default cost sink when ``func`` returns.
+
+    The Lambda-handler form of :func:`flush_default_sink`
+    (alpha-engine-config-I7423). Wrapping the handler rather than calling the
+    flush before each ``return`` is deliberate: a handler grows return paths
+    over time — a dry-run short circuit, an early validation bail, an
+    exception branch — and a per-return call covers the paths that existed
+    when someone last thought about it. The one that gets added next is the
+    one that silently stops emitting.
+
+    Flushes on the exception path too, via ``finally``: records already
+    accepted describe spend that was really incurred, and losing them because
+    the handler failed afterwards is the same loss with a better excuse.
+
+    The flush never raises, so it cannot convert a successful handler into a
+    failed one, and it returns 0 when no sink is configured — a consumer with
+    cost telemetry switched off pays one function call.
+
+    Usage::
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            ...
+    """
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        finally:
+            try:
+                n = flush_default_sink()
+                if n:
+                    logger.info("cost sink: flushed %d object(s) on handler exit", n)
+            except Exception:  # noqa: BLE001 — telemetry never fails the work
+                logger.exception("cost sink: flush on handler exit failed")
+
+    return wrapper
 
 
 def reset_default_sink_for_tests() -> None:

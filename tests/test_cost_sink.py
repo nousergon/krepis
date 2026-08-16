@@ -19,6 +19,7 @@ from krepis.cost_sink import (
     CostSinkConfigError,
     S3JsonlCostSink,
     default_sink_from_env,
+    flush_cost_on_exit,
     flush_default_sink,
     reset_default_sink_for_tests,
     resolve_run_id,
@@ -408,3 +409,94 @@ class TestFlushDefaultSink:
         assert flush_default_sink() == 0
         assert len(s3.puts) == 1
         reset_default_sink_for_tests()
+
+
+class TestFlushCostOnExit:
+    """The decorator form. A handler grows return paths over time, and a
+    per-return flush covers only the ones that existed when someone last
+    thought about it."""
+
+    def _configured(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        reset_default_sink_for_tests()
+        s3 = FakeS3()
+        sink = default_sink_from_env(s3_client=s3)
+        return s3, sink
+
+    def test_flushes_on_the_normal_return_path(self, monkeypatch):
+        s3, sink = self._configured(monkeypatch)
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+            return {"status": "OK"}
+
+        assert handler({}, None) == {"status": "OK"}
+        assert len(s3.puts) == 1
+        reset_default_sink_for_tests()
+
+    def test_flushes_on_an_early_return_path(self, monkeypatch):
+        """The path a per-return call is most likely to miss."""
+        s3, sink = self._configured(monkeypatch)
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+            if event.get("bail"):
+                return {"status": "SKIPPED"}
+            return {"status": "OK"}
+
+        assert handler({"bail": True}, None) == {"status": "SKIPPED"}
+        assert len(s3.puts) == 1
+        reset_default_sink_for_tests()
+
+    def test_flushes_when_the_handler_raises(self, monkeypatch):
+        """Records already accepted describe spend really incurred; losing
+        them because the handler failed afterwards is the same loss with a
+        better excuse. The exception still propagates."""
+        s3, sink = self._configured(monkeypatch)
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+            raise RuntimeError("boom")
+
+        with pytest.raises(RuntimeError, match="boom"):
+            handler({}, None)
+        assert len(s3.puts) == 1
+        reset_default_sink_for_tests()
+
+    def test_a_flush_failure_cannot_fail_the_handler(self, monkeypatch):
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        reset_default_sink_for_tests()
+        sink = default_sink_from_env(s3_client=FakeS3(fail=True))
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+            return {"status": "OK"}
+
+        assert handler({}, None) == {"status": "OK"}
+        reset_default_sink_for_tests()
+
+    def test_costs_one_call_when_telemetry_is_off(self, monkeypatch):
+        monkeypatch.delenv(BUCKET_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREFIX_ENV_VAR, raising=False)
+        reset_default_sink_for_tests()
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            return {"status": "OK"}
+
+        assert handler({}, None) == {"status": "OK"}
+
+    def test_preserves_the_wrapped_function_identity(self):
+        @flush_cost_on_exit
+        def handler(event, context):
+            """docstring."""
+            return None
+
+        assert handler.__name__ == "handler"
+        assert handler.__doc__ == "docstring."
