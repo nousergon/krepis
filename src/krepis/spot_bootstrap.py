@@ -486,6 +486,45 @@ def _strip_comments(text: str) -> str:
     )
 
 
+def _mask_delegate_invocations(code: str) -> str:
+    """Blank the renderer INVOCATION, and only it — never the rest of the file.
+
+    ``scan_for_inline_bootstraps`` used to ``continue`` on the first
+    `_DELEGATES` match anywhere in a file (alpha-engine-config-I7378): a file
+    that renders through this module and still carries a restated heredoc
+    fork elsewhere read as clean, because the whole file stopped being
+    evaluated the moment the sanctioned call appeared in it. The cutover this
+    scanner exists to enforce made every file it converted permanently
+    exempt from it.
+
+    A shell statement invoking the renderer is usually spread across several
+    physical lines via backslash continuation (``--repo-url u \\``, one flag
+    per line) — every corpus example does this. So the unit masked is the
+    LOGICAL line: a run of physical lines chained by a trailing ``\\``. Only
+    the logical lines that themselves contain a real `_DELEGATES` match are
+    blanked; a heredoc body, a second statement, or anything else in the file
+    is untouched and still evaluated below. This keeps the two invariants
+    that matter: a comment can never clear anything (comments are already
+    gone by the time this runs), and a real invocation clears only the
+    statement it IS, never the file it lives in.
+    """
+    lines = code.split("\n")
+    n = len(lines)
+    masked = list(lines)
+    i = 0
+    while i < n:
+        group_end = i
+        while lines[group_end].rstrip().endswith("\\") and group_end + 1 < n:
+            group_end += 1
+        group = range(i, group_end + 1)
+        joined = "\n".join(lines[idx] for idx in group)
+        if _DELEGATES.search(joined):
+            for idx in group:
+                masked[idx] = ""
+        i = group_end + 1
+    return "\n".join(masked)
+
+
 @dataclass(frozen=True)
 class InlineBootstrap:
     """One file that bootstraps a spot without going through this module."""
@@ -533,9 +572,7 @@ def scan_for_inline_bootstraps(
                 # detector reports green while measuring nothing.
                 findings.append(InlineBootstrap(path=path, signatures=("unreadable",)))
                 continue
-            code = _strip_comments(text)
-            if _DELEGATES.search(code):
-                continue
+            code = _mask_delegate_invocations(_strip_comments(text))
             hits = tuple(
                 name for name, (_, pat) in sorted(BOOTSTRAP_SIGNATURES.items())
                 if pat.search(code)

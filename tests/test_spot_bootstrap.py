@@ -693,3 +693,51 @@ def test_a_commented_out_bootstrap_is_not_a_finding(tmp_path):
 echo hi
 """)
     assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+# ── I7378: the clear is regional, not file-level ─────────────────────────────
+#
+# `_DELEGATES` used to clear the WHOLE FILE on a match (`continue` before any
+# signature was evaluated) — every file that adopted the cutover this scanner
+# exists to enforce became permanently exempt from it, delegate invocation or
+# not. The corpus shape below (render call via backslash-continued flags,
+# `aws ssm send-command` on its own line, a heredoc-restated fork after it) is
+# the real shape every post-alpha-engine-config-I7372 launcher takes.
+
+
+def test_a_file_that_delegates_AND_still_carries_a_heredoc_fork_is_a_finding(tmp_path):
+    """The measured blindness, pinned: delegate + restated heredoc → finding."""
+    _write(tmp_path, "infrastructure/launcher.sh", """
+BODY=$("$LIB_PYTHON" -m krepis.spot_bootstrap render --repo-url https://x/y.git \\
+  --checkout /home/ec2-user/y --max-runtime-seconds 3600)
+aws ssm send-command --parameters commands="$BODY"
+
+cat > /tmp/rogue.sh <<'ROGUE'
+dnf install -y python3.12
+git clone https://x/y.git /home/ec2-user/y
+ROGUE
+""")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.path.name for f in found] == ["launcher.sh"]
+    assert set(found[0].signatures) >= {"interpreter-install", "repo-clone"}
+
+
+def test_a_file_that_only_delegates_is_still_clean(tmp_path):
+    """Delegate only, nothing else in the file → still not a fork."""
+    _write(tmp_path, "infrastructure/launcher.sh", """
+BODY=$("$LIB_PYTHON" -m krepis.spot_bootstrap render --repo-url https://x/y.git \\
+  --checkout /home/ec2-user/y --max-runtime-seconds 3600)
+aws ssm send-command --parameters commands="$BODY"
+""")
+    assert scan_for_inline_bootstraps(tmp_path) == []
+
+
+def test_a_heredoc_fork_with_no_delegate_anywhere_is_still_a_finding(tmp_path):
+    """No render call at all — the regional rewrite must not have narrowed
+    what a plain, undelegated fork trips."""
+    _write(tmp_path, "infrastructure/rogue.sh", """
+dnf install -y python3.12
+git clone https://x/y.git /home/ec2-user/y
+""")
+    found = scan_for_inline_bootstraps(tmp_path)
+    assert [f.path.name for f in found] == ["rogue.sh"]
