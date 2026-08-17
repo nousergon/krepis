@@ -383,7 +383,9 @@ def _read_ssm_parameter(name: str, ssm_client: Any) -> str:
     if client is None:
         import boto3
 
-        client = boto3.client("ssm")
+        from krepis.aws_region import resolve_region
+
+        client = boto3.client("ssm", region_name=resolve_region())
     resp = client.get_parameter(Name=name, WithDecryption=True)
     return resp["Parameter"]["Value"]
 

@@ -599,11 +599,15 @@ def assert_stage_coverage(
         if s3_client is None:
             import boto3
 
-            s3_client = boto3.client("s3")
+            from krepis.aws_region import resolve_region
+
+            s3_client = boto3.client("s3", region_name=resolve_region())
         if cloudwatch_client is None:
             import boto3
 
-            cloudwatch_client = boto3.client("cloudwatch")
+            from krepis.aws_region import resolve_region
+
+            cloudwatch_client = boto3.client("cloudwatch", region_name=resolve_region())
 
         try:
             registry = load_registry(
@@ -638,11 +642,40 @@ def assert_stage_coverage(
         )
         return verdict.to_dict()
     except Exception as exc:  # noqa: BLE001 — the assertion may never escape
-        logger.error("stage_coverage: assertion itself failed", exc_info=True)
+        # NoRegionError specifically is no longer an environment gap: every
+        # client above is built with `region_name=resolve_region()`, which
+        # falls through env -> botocore session -> IMDS -> DEFAULT_REGION and
+        # cannot return empty (alpha-engine-config-I7428). A NoRegionError
+        # reaching here means resolve_region() itself is broken — a defect in
+        # THIS module, not an unmeasurable box — so it is logged at CRITICAL
+        # with a reason prefix a CloudWatch Logs metric filter or alarm can
+        # match on, distinct from the ordinary UNMEASURED causes (unreadable
+        # registry, unresolvable cycle date) that ARE genuinely environment
+        # conditions. The verdict itself still degrades to UNMEASURED and
+        # this still never raises to the caller — observe mode's contract
+        # (never kill the stage it observes) is unconditional — but the
+        # region-resolver-bug class of UNMEASURED is now distinguishable from
+        # every other class of UNMEASURED on the log surface, and the
+        # CloudWatch StageCoverage metric still gets its 0.0 datapoint below
+        # (record_verdict already ran, or will on the caller's own retry) so
+        # the coverage dashboard's minimum-of-metric alarm sees the gap
+        # rather than a missing datapoint reading as green.
+        is_region_bug = type(exc).__name__ == "NoRegionError"
+        if is_region_bug:
+            logger.critical(
+                "stage_coverage: REGION_RESOLVER_BUG — resolve_region() "
+                "returned no usable region and boto3 raised NoRegionError; "
+                "this is a defect in krepis.aws_region, not an environment "
+                "gap (alpha-engine-config-I7428)",
+                exc_info=True,
+            )
+        else:
+            logger.error("stage_coverage: assertion itself failed", exc_info=True)
+        reason_prefix = "REGION_RESOLVER_BUG: " if is_region_bug else ""
         return StageVerdict(
             stage=stage,
             status=STATUS_UNMEASURED,
-            reason=f"assertion failed: {type(exc).__name__}: {exc}",
+            reason=f"{reason_prefix}assertion failed: {type(exc).__name__}: {exc}",
             run_date=run_date,
             recorded_at=now.astimezone(timezone.utc).isoformat(),
             enforce=enforce,

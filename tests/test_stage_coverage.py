@@ -359,6 +359,79 @@ def test_assert_stage_coverage_never_raises_when_everything_fails() -> None:
     assert out["status"] == sc.STATUS_UNMEASURED
 
 
+def test_assert_stage_coverage_builds_clients_with_no_region_in_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for alpha-engine-config-I7428.
+
+    SSM ``AWS-RunShellScript`` runs with neither ``AWS_REGION`` nor
+    ``AWS_DEFAULT_REGION`` set and no per-user boto profile — reproduced here
+    by clearing both. Before the fix, the internal ``boto3.client("s3")`` /
+    ``boto3.client("cloudwatch")`` construction (no clients injected, so the
+    module builds its own) raised ``NoRegionError`` on the CloudWatch client
+    and the whole assertion degraded to UNMEASURED on every single box run —
+    never a genuine COVERED/MISSING/STALE verdict. Patching
+    ``krepis.aws_region._from_botocore_session`` and ``_from_imds`` to ``None``
+    forces the chain all the way to :data:`krepis.aws_region.DEFAULT_REGION`,
+    matching a bare EC2/SSM box with no profile and no IMDS reachable in the
+    test sandbox.
+    """
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    from krepis import aws_region
+
+    monkeypatch.setattr(aws_region, "_from_botocore_session", lambda: None)
+    monkeypatch.setattr(aws_region, "_from_imds", lambda: None)
+
+    captured: dict[str, Any] = {}
+
+    def _spy_client(service_name: str, **kwargs: Any) -> Any:
+        captured[service_name] = kwargs.get("region_name")
+        # Don't actually touch the network — return a fake that satisfies
+        # the calls this test path makes.
+        if service_name == "s3":
+            return FakeS3({})
+        return FakeCW()
+
+    monkeypatch.setattr("boto3.client", _spy_client)
+
+    out = sc.assert_stage_coverage(
+        "SaturdayHealthCheck",
+        now=NOW,
+        registry_local_path=None,
+    )
+
+    assert captured.get("s3") == aws_region.DEFAULT_REGION
+    assert captured.get("cloudwatch") == aws_region.DEFAULT_REGION
+    # The registry read still fails (FakeS3({}) has no matching key), so the
+    # verdict is UNMEASURED — but for a REGISTRY reason, never a region one.
+    assert out["status"] == sc.STATUS_UNMEASURED
+    assert "NoRegionError" not in out["reason"]
+    assert "REGION_RESOLVER_BUG" not in out["reason"]
+
+
+def test_a_genuine_no_region_error_is_marked_as_a_resolver_bug(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``resolve_region()`` itself regresses to returning something boto3
+    rejects, the resulting NoRegionError must be distinguishable — on the log
+    surface and in the verdict's ``reason`` — from an ordinary environment
+    UNMEASURED (unreadable registry, unresolvable cycle date), per
+    alpha-engine-config-I7428 deliverable 5: a missing region is a caller
+    defect, not an unmeasurable condition."""
+    from botocore.exceptions import NoRegionError
+
+    def _boom(service_name: str, **_: Any) -> Any:
+        raise NoRegionError()
+
+    monkeypatch.setattr("boto3.client", _boom)
+
+    out = sc.assert_stage_coverage("SaturdayHealthCheck", now=NOW)
+
+    assert out["status"] == sc.STATUS_UNMEASURED
+    assert out["reason"].startswith("REGION_RESOLVER_BUG:")
+
+
 def test_record_verdict_is_fail_soft_on_both_surfaces(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

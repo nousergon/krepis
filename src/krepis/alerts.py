@@ -172,11 +172,9 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
     """Return the SNS topic ARN, resolving from env + STS if not explicit."""
     if explicit:
         return explicit
-    region = (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
     try:
         import boto3
 
@@ -286,11 +284,9 @@ def _fetch_source_mutes(ssm_param: str) -> list[dict]:
             "alerts.publish: mute check skipped — boto3 unavailable: %s", exc,
         )
         return []
-    region = (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
     try:
         client = boto3.client("ssm", region_name=region)
         resp = client.get_parameter(Name=ssm_param)
