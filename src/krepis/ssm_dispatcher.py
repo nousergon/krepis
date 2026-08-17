@@ -117,7 +117,7 @@ import time
 from datetime import datetime, timezone
 from typing import Final, Optional
 
-from . import rss_budget
+from . import resource_kill, rss_budget
 
 logger = logging.getLogger(__name__)
 
@@ -166,27 +166,133 @@ DIAGNOSTICS_TAIL_BYTES: Final[int] = 4 * 1024
 # different chokepoint one hop further out) — is what makes the
 # classification survive a launcher that has not yet been fixed to
 # preserve its own rc.
-_OOM_RESPONSE_CODES: Final[frozenset[int]] = frozenset({137, -9})
-_TIMEOUT_RESPONSE_CODES: Final[frozenset[int]] = frozenset({124, -14, 143})
-_TIMEOUT_STATUSES: Final[frozenset[str]] = frozenset({"TimedOut"})
+#
+# alpha-engine-config-I7442: the codes, the patterns and the verdict now live
+# ONCE, in :mod:`krepis.resource_kill`. This module and ssm_log_capture each
+# carried a private copy and they had already drifted — this one never scanned
+# text, that one never saw SSM's ``TimedOut`` status. Both delegate.
+#
+# I7442 also closes the case ResponseCode alone cannot: on 2026-08-15
+# PredictorBacktest's remote script laundered its own 137 to `exit 1`, so
+# ResponseCode was 1 and this classifier said "not a resource kill". The
+# `Killed` line existed — past the 24KB inline cap, in the S3 output prefix
+# SSM writes for exactly that reason. :func:`_fetch_remote_output_tail` reads
+# the TAIL of that object before returning, so the kill line is classified even
+# when every exit code on the path has been laundered.
 
 
 def _classify_terminal_failure(
-    status: str, response_code: Optional[int]
+    status: str, response_code: Optional[int], kill_line: Optional[str] = None
 ) -> Optional[str]:
     """Return ``"OOM"``, ``"TIMEOUT"``, or ``None`` for a terminal non-Success.
 
-    ``response_code`` is SSM's ``ResponseCode`` from `get_command_invocation`
-    — the remote plugin's real exit code — checked first as the
-    authoritative signal. ``status`` (SSM's own terminal status string)
-    covers the case where SSM itself killed the command for exceeding its
-    ``executionTimeout`` before any exit code was ever produced.
+    Thin delegation to :func:`krepis.resource_kill.classify`; kept as a named
+    function because the consumer contract tests in three repos import it.
     """
-    if response_code in _OOM_RESPONSE_CODES:
-        return "OOM"
-    if response_code in _TIMEOUT_RESPONSE_CODES or status in _TIMEOUT_STATUSES:
-        return "TIMEOUT"
-    return None
+    return resource_kill.classify(
+        returncode=response_code, status=status, kill_line=kill_line
+    )
+
+
+# Bytes read from the END of each SSM S3 output object on a terminal failure.
+# The tail, unconditionally and never the head: SSM's own inline capture keeps
+# the HEAD and that is precisely how the 2026-08-15 log came to be truncated at
+# the failure (`2026-08-15 12:44--output truncated--`). 32KB is comfortably
+# more than the ~1KB of shell/kernel kill output plus the workload's last
+# phase, and one range-get per failed stage is free next to the stage itself.
+REMOTE_TAIL_BYTES: Final[int] = 32 * 1024
+
+# The SSM agent uploads its stdout/stderr objects around the moment the command
+# reaches a terminal status, so the first list can legitimately race it. Bounded
+# and short — this runs on the failure path and must not add minutes to it.
+REMOTE_TAIL_ATTEMPTS: Final[int] = 4
+REMOTE_TAIL_RETRY_SECONDS: Final[float] = 2.0
+
+
+def _fetch_remote_output_tail(
+    *,
+    bucket: Optional[str],
+    key_prefix: Optional[str],
+    command_id: str,
+    s3_client=None,
+    sleep=time.sleep,
+    attempts: int = REMOTE_TAIL_ATTEMPTS,
+    tail_bytes: int = REMOTE_TAIL_BYTES,
+) -> str:
+    """Read the tail of SSM's own S3 upload of the remote stdout/stderr.
+
+    SSM writes the FULL remote output under
+    ``{key_prefix}/{command_id}/{instance-id}/awsrunShellScript/0.awsrunShellScript/{stdout,stderr}``
+    whenever ``OutputS3BucketName`` is configured — which every alpha-engine
+    launcher sets. That upload is the only copy not subject to the 24KB inline
+    cap, and reading it HERE is what makes it useful: this runs inside the
+    dispatcher, before any launcher EXIT trap has terminated the instance or
+    cleaned the staging prefix the upload lives under.
+
+    Returns the concatenated tails, or ``""``. Never raises — a diagnostic
+    read may not change a stage's outcome.
+    """
+    if not bucket or not key_prefix:
+        return ""
+    if s3_client is None:
+        try:
+            import boto3
+
+            s3_client = boto3.client("s3")
+        except Exception as exc:
+            logger.warning(
+                "ssm_dispatcher: no S3 client for the remote-output tail "
+                "(swallowed): %s: %s",
+                type(exc).__name__,
+                exc,
+            )
+            return ""
+    prefix = "{}/{}/".format(key_prefix.rstrip("/"), command_id)
+    keys: list = []
+    for attempt in range(attempts):
+        try:
+            resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+            keys = [
+                item["Key"]
+                for item in (resp.get("Contents", []) or [])
+                if item["Key"].endswith("/stdout") or item["Key"].endswith("/stderr")
+            ]
+        except Exception as exc:
+            logger.warning(
+                "ssm_dispatcher: listing %s failed (swallowed): %s: %s",
+                prefix,
+                type(exc).__name__,
+                exc,
+            )
+            return ""
+        if keys or attempt == attempts - 1:
+            break
+        sleep(REMOTE_TAIL_RETRY_SECONDS)
+    chunks = []
+    # stdout last: bash's own "<script>: line N: <pid> Killed" job-control
+    # message goes to the shell's stderr, but a launcher that redirects 2>&1
+    # puts it on stdout, and resource_kill scans tail-first — so ordering the
+    # blob stderr-then-stdout keeps the most recently written text last.
+    for key in sorted(keys, key=lambda k: (not k.endswith("/stderr"), k)):
+        try:
+            obj = s3_client.get_object(
+                Bucket=bucket, Key=key, Range="bytes=-{}".format(int(tail_bytes))
+            )
+            body = obj["Body"].read()
+            chunks.append(
+                "--- tail of s3://{}/{} ---\n{}".format(
+                    bucket, key, body.decode("utf-8", errors="replace")
+                )
+            )
+        except Exception as exc:
+            logger.warning(
+                "ssm_dispatcher: tail read of s3://%s/%s failed (swallowed): %s: %s",
+                bucket,
+                key,
+                type(exc).__name__,
+                exc,
+            )
+    return "\n".join(chunks)
 
 # Bytes of streamed stdout retained in memory purely so the peak-RSS sentinel
 # (emitted by the on-box harness AFTER the body exits, so always in the tail)
@@ -237,6 +343,8 @@ def _ship_diagnostics(
     stderr_stream=None,
     response_code: Optional[int] = None,
     classification: Optional[str] = None,
+    kill_line: Optional[str] = None,
+    remote_tail: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Write the terminal-non-Success diagnostics JSON to S3.
 
@@ -270,6 +378,12 @@ def _ship_diagnostics(
         # directly, not only in the stderr line above.
         "response_code": response_code,
         "classification": classification,
+        # alpha-engine-config-I7442: the line the classification was made from,
+        # and the tail of SSM's own S3 output upload. Persisted because this
+        # JSON outlives the staging prefix — before I7442 the only record of a
+        # 4-hour failure was a truncated capture pointing at an emptied prefix.
+        "kill_line": kill_line,
+        "remote_tail": remote_tail,
     }
     try:
         if boto3_client is None:
@@ -321,6 +435,7 @@ def run(
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     diagnostics_bucket: Optional[str] = None,
     diagnostics_prefix: Optional[str] = None,
+    resource_limit: Optional[str] = None,
     stdout_stream=None,
     stderr_stream=None,
     sleep=time.sleep,
@@ -355,6 +470,12 @@ def run(
             inner exit code is preserved.
         diagnostics_prefix: S3 key prefix for diagnostics JSON. Typical
             shape from consumer dispatchers: ``_spot_diagnostics/{repo}``.
+        resource_limit: free-text description of the resource bound the
+            LAUNCHER knows and this module cannot see — in practice the spot
+            instance type, e.g. ``"instance-type=c5.4xlarge"``. Rendered into
+            the ``limit=`` field of a classified resource kill alongside this
+            module's own ``executionTimeout``, per sf-pipeline-policy §3
+            obligation 3 ("name the stage, the limit and the observed value").
         stdout_stream: destination for streamed inner stdout (default:
             ``sys.stdout``).
         stderr_stream: destination for the terminal-failure stderr dump
@@ -562,22 +683,71 @@ def run(
         if status in TERMINAL_NON_SUCCESS:
             std_err = inv.get("StandardErrorContent", "") or ""
             response_code = inv.get("ResponseCode")
-            classification = _classify_terminal_failure(status, response_code)
+            elapsed_seconds = monotonic() - start_monotonic
+            # alpha-engine-config-I7442. Read the FULL remote output SSM
+            # uploaded to S3 — tail only, and before anything is torn down.
+            # This is the copy that carries the kill line when the inline 24KB
+            # window has rotated past it, and until now nothing ever read it:
+            # the launcher's EXIT trap deleted the prefix minutes later as part
+            # of handling the very failure it documented.
+            remote_tail = _fetch_remote_output_tail(
+                bucket=output_bucket,
+                key_prefix=output_key_prefix,
+                command_id=command_id,
+                s3_client=s3_client,
+                sleep=sleep,
+            )
+            kill_line = resource_kill.find_kill_line(
+                remote_tail
+            ) or resource_kill.find_kill_line("\n".join([std_err, std_out]))
+            classification = _classify_terminal_failure(
+                status, response_code, kill_line=kill_line
+            )
             # Nested-log location is one copy-paste away rather than three
             # inferences (alpha-engine-config-I7258 obligation 4): the full
             # remote stdout/stderr — where a bash "Killed" line actually
             # lives when it exceeds the 24KB inline cap — is under this
-            # exact S3 prefix, always stated, not only on cap-rotation.
+            # exact S3 prefix, always stated, not only on cap-rotation. Since
+            # I7442 that prefix is preserved to `_spot_evidence/` by
+            # `krepis.spot_evidence` rather than deleted, so the hint now
+            # points at something that still exists when it is read.
             full_log_hint = (
                 f"s3://{output_bucket}/{output_key_prefix}/"
                 if output_bucket
                 else "no --output-bucket configured; only the 24KB inline capture above is available"
             )
             if classification:
+                # sf-pipeline-policy §3 obligation 3: say OOM or TIMEOUT and
+                # name the stage, the limit and the observed value. The limit
+                # this module knows for certain is its own execution budget;
+                # `resource_limit` carries whatever the launcher knows on top
+                # (its instance type), and both are rendered even when unknown.
+                declared_limit = f"executionTimeout={int(timeout_seconds)}s"
+                if resource_limit:
+                    declared_limit = f"{resource_limit}, {declared_limit}"
+                observed = (
+                    f"{elapsed_seconds:.0f}s elapsed"
+                    if classification == resource_kill.TIMEOUT
+                    else None
+                )
                 err.write(
-                    f"RESOURCE KILL ({classification}): SSM step {description!r} "
-                    f"terminal status={status} response_code={response_code} "
-                    f"instance={instance_id} — full remote log: {full_log_hint}\n"
+                    resource_kill.format_cause(
+                        classification=classification,
+                        stage=description,
+                        returncode=response_code,
+                        kill_line=kill_line,
+                        limit=declared_limit,
+                        observed=observed,
+                    )
+                    # The trailing segment keeps the exact tokens the pre-I7442
+                    # message carried — SSM step {description!r},
+                    # response_code=, instance=, status= — because sf-watch,
+                    # the ops-alert fan-out and three repos' contract tests
+                    # grep them. New fields were added around them, none
+                    # renamed.
+                    + f" — SSM step {description!r} terminal status={status} "
+                    f"response_code={response_code} instance={instance_id} — "
+                    f"full remote log: {full_log_hint}\n"
                 )
             else:
                 err.write(
@@ -585,6 +755,18 @@ def run(
                     f"response_code={response_code} instance={instance_id} — "
                     f"full remote log: {full_log_hint}\n"
                 )
+            if remote_tail:
+                # Unconditional, and the TAIL. The captured `_ssm_logs` copy of
+                # this run previously ended at SSM's own `--output truncated--`
+                # marker — which keeps the HEAD — so the one region of the log
+                # that described the failure was the one region never kept.
+                err.write(
+                    f"--- remote output tail ({REMOTE_TAIL_BYTES // 1024}KB per "
+                    f"stream, read from S3 before teardown) ---\n"
+                )
+                err.write(remote_tail)
+                if not remote_tail.endswith("\n"):
+                    err.write("\n")
             if std_err:
                 err.write(
                     f"--- stderr ({SSM_INLINE_OUTPUT_CAP_BYTES // 1024}KB cap; "
@@ -617,6 +799,8 @@ def run(
                     stderr_stream=err,
                     response_code=response_code,
                     classification=classification,
+                    kill_line=kill_line,
+                    remote_tail=_tail_bytes(remote_tail),
                 )
                 if ok:
                     err.write(
@@ -746,6 +930,16 @@ def main(argv: list[str] | None = None) -> int:
             "'{prefix}/{YYYY-MM-DD}.json'."
         ),
     )
+    run_p.add_argument(
+        "--resource-limit",
+        default=None,
+        help=(
+            "Free-text description of the resource bound the launcher knows "
+            "and this module cannot see — in practice the spot instance type, "
+            "e.g. 'instance-type=c5.4xlarge'. Rendered into the limit= field "
+            "of a classified OOM/TIMEOUT cause (sf-pipeline-policy §3)."
+        ),
+    )
     script_grp = run_p.add_mutually_exclusive_group(required=True)
     script_grp.add_argument(
         "--script-file",
@@ -780,6 +974,7 @@ def main(argv: list[str] | None = None) -> int:
         poll_interval_seconds=args.poll_interval,
         diagnostics_bucket=args.diagnostics_bucket,
         diagnostics_prefix=args.diagnostics_prefix,
+        resource_limit=args.resource_limit,
     )
 
 
