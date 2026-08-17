@@ -165,9 +165,9 @@ def _fetch_from_ssm(name: str) -> str | None:
         _ssm_unavailable = True
         return None
 
-    region = os.environ.get("AWS_REGION") or os.environ.get(
-        "AWS_DEFAULT_REGION", "us-east-1"
-    )
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
     try:
         client = boto3.client("ssm", region_name=region)
         resp = client.get_parameter(

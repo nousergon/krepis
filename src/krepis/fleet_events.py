@@ -64,6 +64,8 @@ FALLBACK_BUCKET_ENV: Final[str] = "NOUSERGON_ALERTS_FALLBACK_BUCKET"
 DEFAULT_FALLBACK_BUCKET: Final[str] = "alpha-engine-research"
 FALLBACK_PREFIX: Final[str] = "overseer/intake-fallback"
 
+#: Kept for back-compat (public module constant) — the real default, and the
+#: full fallback chain, now live in :mod:`krepis.aws_region`.
 DEFAULT_REGION: Final[str] = "us-east-1"
 MAX_BODY_CHARS: Final[int] = 4000
 
@@ -117,11 +119,10 @@ def _resolve_source(explicit: Optional[str]) -> Optional[str]:
 
 
 def _region() -> str:
-    return (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    """Thin back-compat wrapper. Real resolution: :func:`krepis.aws_region.resolve_region`."""
+    from krepis.aws_region import resolve_region
+
+    return resolve_region()
 
 
 def _build_detail(
