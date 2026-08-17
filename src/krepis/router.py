@@ -573,8 +573,9 @@ def _litellm_master_key_from_ssm(name: str = "LITELLM_MASTER_KEY") -> Optional[s
         return None
 
     try:
-        _ssm = boto3.client("ssm", region_name=os.environ.get(
-            "AWS_REGION", "us-east-1"))
+        from krepis.aws_region import resolve_region
+
+        _ssm = boto3.client("ssm", region_name=resolve_region())
         _val = _ssm.get_parameter(
             Name=param, WithDecryption=True)["Parameter"]["Value"].strip()
     except Exception as exc:  # noqa: BLE001 - reason is logged, see docstring
@@ -730,7 +731,8 @@ def _find_registry_from_appconfig() -> Optional[Path]:
         # ── Cache miss or expired — poll AppConfig ───────────────────────
         try:
             import boto3 as _boto3
-            client = _boto3.client("appconfigdata", region_name=os.environ.get("AWS_REGION", "us-east-1"))
+            from krepis.aws_region import resolve_region
+            client = _boto3.client("appconfigdata", region_name=resolve_region())
 
             # Start a configuration session.
             session = client.start_configuration_session(

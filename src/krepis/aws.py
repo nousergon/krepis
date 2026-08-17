@@ -185,6 +185,10 @@ def invoke_lambda_with_retry(
     if client is None:  # pragma: no cover — exercised via injected client in tests
         import boto3
 
+        if not region:
+            from krepis.aws_region import resolve_region
+
+            region = resolve_region()
         client = boto3.client("lambda", region_name=region)
     from botocore.exceptions import ClientError
 
@@ -277,7 +281,11 @@ def merge_lambda_environment(
     if client is None:
         import boto3  # imported lazily so `import krepis.aws` costs nothing
 
-        client = boto3.client("lambda", region_name=region) if region else boto3.client("lambda")
+        if not region:
+            from krepis.aws_region import resolve_region
+
+            region = resolve_region()
+        client = boto3.client("lambda", region_name=region)
 
     try:
         client.get_waiter("function_updated").wait(FunctionName=function_name)
