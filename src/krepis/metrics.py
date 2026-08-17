@@ -29,7 +29,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 StatusLiteral = Literal[
     "GREEN",
@@ -44,6 +44,14 @@ CriticalityLiteral = Literal["critical", "supporting", "diagnostic"]
 MetricTypeLiteral = Literal[
     "ic", "lift", "ratio", "pct", "count", "duration",
     "sharpe", "calibration", "p_value", "zscore", "log_return",
+    # Report Card v3 (alpha-engine-config-I7473, T2 §3): a component's measured
+    # leave-one-out / baseline-substitution marginal contribution to the ONE
+    # objective (net-of-cost 21d log-alpha vs SPY). Producers emit it with
+    # ``unit="log_alpha_21d"`` and ``red_line=0.0`` (a component whose measured
+    # contribution is <= 0 is not paying for its complexity budget). Kept a
+    # distinct kind from ``lift`` because ``lift`` records are IC/precision-
+    # space deltas that never ran through the cost-bearing simulator.
+    "contribution_lift",
 ]
 TrendDecorationLiteral = Literal["↑↑", "↑", "→", "↓", "↓↓"]
 
@@ -66,6 +74,21 @@ class MetricRecord(BaseModel):
     )
     metric_type: MetricTypeLiteral
     value: float | None = Field(default=None, description="Measured value (None when N/A-*).")
+    unit: str | None = Field(
+        default=None,
+        description=(
+            "Unit `value` is expressed in, e.g. 'ratio', 'bps', 'days', "
+            "'usd'. `metric_type` names the metric's STATISTICAL KIND "
+            "(ic/lift/ratio/pct/...), not its unit — the two are declared "
+            "separately because a kind does not pin a unit (a 'ratio' "
+            "metric_type can be a fraction-of-one or a percent-of-hundred). "
+            "Required whenever `value` is set (see the validator below): a "
+            "numeric field with no declared unit is the exact defect "
+            "observability-policy.md §3.4 forbids — `avg_volume_20d` was "
+            "emitted as a normalized ratio and consumed as raw shares, "
+            "silently failing 901 of 903 tickers for months."
+        ),
+    )
     ci_low: float | None = Field(default=None)
     ci_high: float | None = Field(default=None)
     ci_method: str | None = Field(
@@ -89,6 +112,26 @@ class MetricRecord(BaseModel):
     @property
     def is_na(self) -> bool:
         return self.status.startswith(_NA_PREFIX)
+
+    @model_validator(mode="after")
+    def _unit_required_when_value_present(self) -> "MetricRecord":
+        """A numeric field with no unit is forbidden, never merely discouraged.
+
+        Fires only when `value` is not None (an N/A-* record legitimately has
+        neither a value nor a unit — there is nothing to be misread). This is
+        the console-native report card's own unit contract
+        (alpha-engine-config-I7477, console-policy.md §5.8: "`unit` is
+        required" for a Signal's `value` field) enforced at the one chokepoint
+        every producer already imports, rather than left to whichever
+        consumer happens to check.
+        """
+        if self.value is not None and not self.unit:
+            raise ValueError(
+                f"MetricRecord {self.name!r} sets `value`={self.value!r} with "
+                "no `unit`. A numeric value with no declared unit is not a "
+                "measurement a consumer can safely render or compare."
+            )
+        return self
 
 
 def derive_trend_decoration(
