@@ -145,6 +145,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Final, Optional
 
+from . import resource_kill
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET: Final[str] = "alpha-engine-research"
@@ -360,23 +362,15 @@ _CAUSE_RE = re.compile(
 #: Measured 2026-08-13: `watch-rerun-2026-08-13-2` / `EvaluatorDiagnostics`,
 #: SIGKILLed by the kernel OOM path on a 4GB c5.large; the operator-visible
 #: message never contained "OOM", "Killed", "memory", or the exit signal.
-_RESOURCE_KILL_RE = re.compile(
-    r"(\bKilled\b|\bOOM\b|[Oo]ut of memory|oom.?killer|Cannot allocate memory"
-    r"|\bMemoryError\b|\bexecutionTimeout\b|\bExecutionTimedOut\b)"
-)
-
-#: Subprocess return codes that mean "killed for a resource reason", not
-#: "the program decided to fail". 137 = 128+SIGKILL (POSIX shell exit-code
-#: convention); -9 = SIGKILL as a Python negative-signal returncode. A
-#: caller that preserves the true exit code (rather than laundering it
-#: through its own `if ! cmd; then exit 1; fi`) lets this fire even when no
-#: kill line survived in the captured output.
-_OOM_RETURNCODES = frozenset({137, -9})
-
-#: 124 = the `timeout` coreutil's own convention for "I killed the child
-#: after the budget expired"; -14/143 = SIGALRM/SIGTERM-as-exit-128+15,
-#: the shape a `timeout --signal=TERM` or a watchdog SIGTERM produces.
-_TIMEOUT_RETURNCODES = frozenset({124, -14, 143})
+#:
+#: alpha-engine-config-I7442: the patterns and the verdict moved to
+#: :mod:`krepis.resource_kill`, the fleet's single classifier. This module and
+#: :mod:`krepis.ssm_dispatcher` each carried a private copy that had already
+#: drifted apart. Re-exported under the old private names because the consumer
+#: contract tests in three repos reference them.
+_RESOURCE_KILL_RE = resource_kill.KILL_LINE_RE
+_OOM_RETURNCODES = resource_kill.OOM_RETURNCODES
+_TIMEOUT_RETURNCODES = resource_kill.TIMEOUT_RETURNCODES
 
 
 def _classify_resource_kill(
@@ -384,24 +378,13 @@ def _classify_resource_kill(
 ) -> str | None:
     """Return ``"OOM"``, ``"TIMEOUT"``, or ``None`` (not a resource kill).
 
-    Two independent signals, either sufficient on its own:
-    ``returncode`` (authoritative when the real exit code survived to this
-    layer) and ``kill_line`` (a line matching :data:`_RESOURCE_KILL_RE`,
-    useful when an intermediate shell collapsed the real code to a bare
-    ``exit 1`` but the kernel's own kill message still made it into the
-    captured output). OOM takes precedence when both would otherwise match,
-    since a SIGKILL after an `executionTimeout` mention is still the memory
-    kill, not the budget.
+    Thin delegation to :func:`krepis.resource_kill.classify`. Two independent
+    signals, either sufficient on its own: ``returncode`` (authoritative when
+    the real exit code survived to this layer) and ``kill_line`` (useful when
+    an intermediate shell collapsed the real code to a bare ``exit 1`` but the
+    kernel's own kill message still made it into the captured output).
     """
-    if returncode in _OOM_RETURNCODES:
-        return "OOM"
-    if kill_line and re.search(r"\bKilled\b|\bOOM\b|[Oo]ut of memory|oom.?killer|Cannot allocate memory|\bMemoryError\b", kill_line):
-        return "OOM"
-    if returncode in _TIMEOUT_RETURNCODES:
-        return "TIMEOUT"
-    if kill_line and re.search(r"\bexecutionTimeout\b|\bExecutionTimedOut\b", kill_line):
-        return "TIMEOUT"
-    return None
+    return resource_kill.classify(returncode=returncode, kill_line=kill_line)
 
 
 #: Cap on either line rendered into a failure message. The whole point is to
