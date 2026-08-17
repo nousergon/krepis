@@ -30,7 +30,7 @@ def _record(**overrides):
 
 class TestMetricRecord:
     def test_minimal_valid_record(self):
-        r = _record(value=0.48, n_samples=626)
+        r = _record(value=0.48, n_samples=626, unit="ratio")
         assert r.module == "predictor" and r.value == 0.48
         assert r.trend_decoration == "→"  # default
         assert r.is_na is False
@@ -39,7 +39,7 @@ class TestMetricRecord:
         assert _record(status="N/A-LOW-N").is_na is True
 
     def test_extra_fields_allowed(self):
-        r = _record(value=0.1, n_samples=200, future_field="ok")
+        r = _record(value=0.1, n_samples=200, unit="ratio", future_field="ok")
         assert r.value == 0.1
 
     def test_bad_status_rejected(self):
@@ -49,6 +49,22 @@ class TestMetricRecord:
     def test_bad_metric_type_rejected(self):
         with pytest.raises(ValidationError):
             _record(metric_type="vibes")
+
+    def test_value_with_no_unit_rejected(self):
+        # alpha-engine-config-I7477 / console-policy.md §5.8: a numeric field
+        # with no declared unit is forbidden, not merely discouraged.
+        with pytest.raises(ValidationError, match="no `unit`"):
+            _record(value=0.48, n_samples=626)
+
+    def test_value_with_unit_accepted(self):
+        r = _record(value=0.48, n_samples=626, unit="ratio")
+        assert r.unit == "ratio"
+
+    def test_na_record_needs_no_unit(self):
+        # No value -> nothing to misread -> the validator does not fire.
+        r = _record(status="N/A-NOT-RUN")
+        assert r.value is None
+        assert r.unit is None
 
 
 class TestDeriveTrendDecoration:
