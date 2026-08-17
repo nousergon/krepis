@@ -60,6 +60,17 @@ class TestMetricRecord:
         r = _record(value=0.48, n_samples=626, unit="ratio")
         assert r.unit == "ratio"
 
+    def test_contribution_lift_is_a_valid_metric_type(self):
+        # RC v3 T2 §3 emission contract: contribution_lift records carry a
+        # return-space unit and a zero red_line; the literal must be accepted
+        # by the schema or every T5 replay producer fails validation.
+        r = _record(
+            metric_type="contribution_lift", value=0.012, unit="log_alpha_21d",
+            n_samples=64, red_line=0.0,
+        )
+        assert r.metric_type == "contribution_lift"
+        assert r.unit == "log_alpha_21d"
+
     def test_na_record_needs_no_unit(self):
         # No value -> nothing to misread -> the validator does not fire.
         r = _record(status="N/A-NOT-RUN")

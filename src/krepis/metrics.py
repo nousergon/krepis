@@ -44,6 +44,14 @@ CriticalityLiteral = Literal["critical", "supporting", "diagnostic"]
 MetricTypeLiteral = Literal[
     "ic", "lift", "ratio", "pct", "count", "duration",
     "sharpe", "calibration", "p_value", "zscore", "log_return",
+    # Report Card v3 (alpha-engine-config-I7473, T2 §3): a component's measured
+    # leave-one-out / baseline-substitution marginal contribution to the ONE
+    # objective (net-of-cost 21d log-alpha vs SPY). Producers emit it with
+    # ``unit="log_alpha_21d"`` and ``red_line=0.0`` (a component whose measured
+    # contribution is <= 0 is not paying for its complexity budget). Kept a
+    # distinct kind from ``lift`` because ``lift`` records are IC/precision-
+    # space deltas that never ran through the cost-bearing simulator.
+    "contribution_lift",
 ]
 TrendDecorationLiteral = Literal["↑↑", "↑", "→", "↓", "↓↓"]
 
