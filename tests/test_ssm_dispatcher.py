@@ -1335,3 +1335,215 @@ class TestPeakRssBudget:
         body = json.loads(s3.put_object.call_args.kwargs["Body"].decode())
         assert body["status"] == rss_budget.ENVELOPE_ATTENTION
         assert body["measured"] is False
+
+
+class _FakeS3ForTail:
+    """S3 stand-in for the terminal-failure remote-output tail read (I7442)."""
+
+    def __init__(self, objects=None, list_empty_first=0):
+        self.objects = dict(objects or {})
+        self.list_empty_first = list_empty_first
+        self.ranges = []
+        self.list_calls = 0
+        self.put_calls = []
+
+    def list_objects_v2(self, Bucket, Prefix, **kw):
+        self.list_calls += 1
+        if self.list_calls <= self.list_empty_first:
+            return {"Contents": [], "IsTruncated": False}
+        return {
+            "Contents": [
+                {"Key": k} for k in sorted(self.objects) if k.startswith(Prefix)
+            ],
+            "IsTruncated": False,
+        }
+
+    def get_object(self, Bucket, Key, Range=None):
+        self.ranges.append(Range)
+        return {"Body": io.BytesIO(self.objects[Key])}
+
+    def put_object(self, **kw):
+        self.put_calls.append(kw)
+        return {}
+
+
+_TAIL_PREFIX = "tmp/spot_predictor-backtest/20260815T123311Z-i-08a/ssm-output"
+_STDOUT_KEY = (
+    _TAIL_PREFIX + "/cmd-abc/i-08a/awsrunShellScript/0.awsrunShellScript/stdout"
+)
+
+
+class TestRemoteOutputTail:
+    """alpha-engine-config-I7442.
+
+    The 2026-08-15 weekly PredictorBacktest failure: the remote script laundered
+    its 137 to `exit 1`, the inline 24KB window had rotated past the kill line,
+    and the S3 copy that held it was deleted by teardown before anyone read it.
+    The dispatcher now reads that copy's TAIL, in-process, before returning.
+    """
+
+    def _run(self, s3, *, response_code=1, poll_out=""):
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": poll_out,
+                    "StandardErrorContent": "",
+                    "ResponseCode": response_code,
+                }
+            ]
+        )
+        err = io.StringIO()
+        rc = ssm_dispatcher.run(
+            "i-08a",
+            "predictor-backtest: backtest",
+            "x",
+            output_bucket="alpha-engine-research",
+            output_key_prefix=_TAIL_PREFIX,
+            stdout_stream=io.StringIO(),
+            stderr_stream=err,
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        return rc, err.getvalue()
+
+    def test_a_laundered_exit_code_is_still_classified_from_the_s3_tail(self):
+        s3 = _FakeS3ForTail(
+            {_STDOUT_KEY: b"bash: line 16: 26748 Killed   python -u backtest.py\n"}
+        )
+        rc, text = self._run(s3)
+        assert rc == 1
+        assert "RESOURCE KILL (OOM)" in text
+        assert "26748 Killed" in text
+
+    def test_the_tail_is_read_not_the_head(self):
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"x"})
+        self._run(s3)
+        assert s3.ranges == ["bytes=-{}".format(ssm_dispatcher.REMOTE_TAIL_BYTES)]
+
+    def test_the_tail_is_appended_to_stderr_unconditionally(self):
+        """The captured _ssm_logs copy previously ended at SSM's own
+        `--output truncated--` marker, which keeps the HEAD."""
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"the last thing that happened\n"})
+        _, text = self._run(s3)
+        assert "remote output tail" in text
+        assert "the last thing that happened" in text
+
+    def test_an_upload_race_is_retried_briefly(self):
+        s3 = _FakeS3ForTail(
+            {_STDOUT_KEY: b"bash: line 1: 2 Killed  python\n"}, list_empty_first=2
+        )
+        _, text = self._run(s3)
+        assert s3.list_calls == 3
+        assert "RESOURCE KILL (OOM)" in text
+
+    def test_an_unreadable_tail_never_changes_the_outcome(self):
+        class Broken:
+            def list_objects_v2(self, **kw):
+                raise RuntimeError("AccessDenied")
+
+        rc, text = self._run(Broken())
+        assert rc == 1
+        assert "ERROR: SSM step" in text
+
+    def test_a_genuine_domain_failure_is_not_labelled_a_resource_kill(self):
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"ValueError: no rows for 2026-08-15\n"})
+        _, text = self._run(s3)
+        assert "RESOURCE KILL" not in text
+        assert "ERROR: SSM step" in text
+
+    def test_kill_line_and_tail_reach_the_diagnostics_json(self):
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"bash: line 1: 2 Killed  python\n"})
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": 1,
+                }
+            ]
+        )
+        ssm_dispatcher.run(
+            "i-08a",
+            "predictor-backtest: backtest",
+            "x",
+            output_bucket="alpha-engine-research",
+            output_key_prefix=_TAIL_PREFIX,
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-backtester",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        payload = json.loads(s3.put_calls[-1]["Body"].decode("utf-8"))
+        assert payload["classification"] == "OOM"
+        assert "Killed" in payload["kill_line"]
+        assert "Killed" in payload["remote_tail"]
+
+
+class TestResourceLimitIsNamed:
+    """sf-pipeline-policy §3 obligation 3 — name the stage, the LIMIT and the
+    observed value in what the operator reads."""
+
+    def test_launcher_supplied_limit_and_own_budget_both_appear(self):
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"bash: line 1: 2 Killed  python\n"})
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": 137,
+                }
+            ]
+        )
+        err = io.StringIO()
+        ssm_dispatcher.run(
+            "i-08a",
+            "predictor-backtest: backtest",
+            "x",
+            timeout_seconds=14400,
+            output_bucket="alpha-engine-research",
+            output_key_prefix=_TAIL_PREFIX,
+            resource_limit="instance-type=c5.4xlarge",
+            stdout_stream=io.StringIO(),
+            stderr_stream=err,
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        text = err.getvalue()
+        assert "limit=instance-type=c5.4xlarge, executionTimeout=14400s" in text
+        assert "observed=" in text
+        assert "stage=predictor-backtest: backtest" in text
+
+    def test_a_timeout_reports_elapsed_as_the_observed_value(self):
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "TimedOut",
+                    "StandardOutputContent": "",
+                    "StandardErrorContent": "",
+                    "ResponseCode": None,
+                }
+            ]
+        )
+        err = io.StringIO()
+        ssm_dispatcher.run(
+            "i",
+            "rag-ingestion",
+            "x",
+            timeout_seconds=21600,
+            stdout_stream=io.StringIO(),
+            stderr_stream=err,
+            sleep=lambda s: None,
+            boto3_client=ssm,
+        )
+        text = err.getvalue()
+        assert "RESOURCE KILL (TIMEOUT)" in text
+        assert "limit=executionTimeout=21600s" in text
+        assert "s elapsed" in text
