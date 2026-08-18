@@ -1,11 +1,13 @@
 """Tests for ``krepis.llm.LLMClient`` — both transports via fake clients."""
 
+import logging
 from types import SimpleNamespace
 
 import pytest
 from pydantic import BaseModel, Field
 
 from krepis.llm import (
+    BudgetExhaustedError,
     LLMClient,
     LLMError,
     NullChoicesError,
@@ -13,7 +15,7 @@ from krepis.llm import (
     _extract_json,
     _first_choice,
 )
-from krepis.llm_config import LLMConfigError, ModelSpec
+from krepis.llm_config import ROUTER_EDGE_PROVIDER, LLMConfigError, ModelSpec
 
 
 # ── fixtures / fakes ──────────────────────────────────────────────────────
@@ -86,13 +88,20 @@ class FakeAnthropic:
 
 def _openai_usage(
     prompt=100, completion=50, cached=0, cost=None, searches=None,
-    nested_searches=None, nested_searches_obj=None,
+    nested_searches=None, nested_searches_obj=None, reasoning=None,
 ):
     u = SimpleNamespace(
         prompt_tokens=prompt,
         completion_tokens=completion,
         prompt_tokens_details=SimpleNamespace(cached_tokens=cached),
     )
+    if reasoning is not None:
+        # `reasoning` may be an int (typed SDK shape) or a dict, because a
+        # proxied provider delivers this as raw decoded JSON — both must read.
+        u.completion_tokens_details = (
+            reasoning if isinstance(reasoning, dict)
+            else SimpleNamespace(reasoning_tokens=reasoning)
+        )
     if cost is not None:
         u.cost = cost
     if searches is not None:
@@ -150,7 +159,14 @@ class FakeOpenAI:
 
     def _create(self, **kwargs):
         self.kwargs.append(kwargs)
-        return self._responses.pop(0)
+        nxt = self._responses.pop(0)
+        # A queued Exception is RAISED rather than returned, so a test can
+        # script a provider-side rejection (a 400) in the same list as normal
+        # responses. The SDK raises for these; the fake must too, or the
+        # scripted failure silently becomes a success-shaped object.
+        if isinstance(nxt, BaseException):
+            raise nxt
+        return nxt
 
 
 def _client(spec, fake):
@@ -384,6 +400,146 @@ class TestStructuredOpenAI:
         kwargs = fake.kwargs[0]
         assert "response_format" not in kwargs
         assert "JSON Schema" in kwargs["messages"][1]["content"]
+
+    def test_rung_is_recorded_on_an_undegraded_call(self):
+        """A healthy call publishes its rung too. `principles.md` §2.7: a
+        component emitting nothing is not healthy, it is unobserved — so the
+        field must never be the empty string on a successful call."""
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.structured_output_rung == "native"
+        assert result.dropped_params == []
+
+        fake2 = FakeOpenAI([_openai_resp('{"name": "a", "score": 5}')])
+        loose = _client(OPENROUTER_LOOSE_SPEC, fake2).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert loose.structured_output_rung == "prompt_only"
+
+    def test_response_format_refusal_descends_one_rung_and_records_it(self):
+        """alpha-engine-config-I7232 — DeepSeek answered
+        ``400 This response_format type is unavailable now`` to the Think
+        Tank's sweep tier. That exception was neither a decode failure nor a
+        validation failure, so it escaped the retry loop entirely and aborted
+        every run from 2026-08-11. `model-portability-policy` §7 declares the
+        ladder for exactly this; the descent must happen, and be recorded."""
+        fake = FakeOpenAI([
+            RuntimeError(
+                "Error code: 400 - {'error': {'message': 'This "
+                "response_format type is unavailable now', 'type': "
+                "'invalid_request_error'}}"
+            ),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.parsed == Spec(name="a", score=5)
+        assert result.structured_output_rung == "prompt_only"
+        assert result.dropped_params == ["response_format"]
+        # The re-issued request is the prompt_only rung, not the same one.
+        assert "response_format" in fake.kwargs[0]
+        assert "response_format" not in fake.kwargs[1]
+        assert "JSON Schema" in fake.kwargs[1]["messages"][1]["content"]
+
+    def test_descent_does_not_spend_the_callers_retry_budget(self):
+        """A rung descent is a different request, not a failed attempt. With
+        ``attempts=1`` the descent must still get its one call — otherwise the
+        ladder exists but can never actually run at the default budget."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format is not supported by this model"),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec,
+            schema_name="emit_spec", attempts=1,
+        )
+        assert result.structured_output_rung == "prompt_only"
+        assert len(fake.kwargs) == 2
+
+    def test_descent_happens_at_most_once(self):
+        """The ladder has one rung below native on this transport. A second
+        refusal is a real failure and must raise, not loop."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format type is unavailable now"),
+            RuntimeError("400 response_format type is unavailable now"),
+        ])
+        with pytest.raises(RuntimeError, match="unavailable now"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 2
+
+    def test_a_schema_rejection_still_raises(self):
+        """A 400 that names ``response_format`` because the SCHEMA was
+        rejected is a caller defect. Degrading it would swap a loud, correct
+        failure for a quietly weaker rung — the refusal match requires the
+        message to also say the parameter cannot be served."""
+        fake = FakeOpenAI([
+            RuntimeError(
+                "400 Invalid schema for response_format 'emit_spec': "
+                "'score' is not of type 'string'"
+            ),
+            _openai_resp('{"name": "a", "score": 5}'),
+        ])
+        with pytest.raises(RuntimeError, match="Invalid schema"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_an_unrelated_transport_error_still_raises(self):
+        """The descent clause must not become a general transport catch-all."""
+        fake = FakeOpenAI([RuntimeError("429 rate limited")])
+        with pytest.raises(RuntimeError, match="rate limited"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_a_loose_spec_never_descends(self):
+        """A spec that never claimed native structured output is already at
+        ``prompt_only``; there is nothing below it to descend to."""
+        fake = FakeOpenAI([RuntimeError("400 response_format is unavailable")])
+        with pytest.raises(RuntimeError, match="unavailable"):
+            _client(OPENROUTER_LOOSE_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec,
+                schema_name="emit_spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_dropped_params_do_not_leak_into_the_next_call(self):
+        """``dropped_params`` lives on the CLIENT and clients are reused. A
+        drop recorded on one call must not ride along on the next result and
+        misreport a fully-honored call as degraded."""
+        fake = FakeOpenAI([
+            RuntimeError("400 response_format type is unavailable now"),
+            _openai_resp('{"name": "a", "score": 5}'),
+            _openai_resp('{"name": "b", "score": 6}'),
+        ])
+        client = _client(OPENROUTER_SPEC, fake)
+        first = client.structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        second = client.structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert first.dropped_params == ["response_format"]
+        assert second.dropped_params == []
+
+    def test_anthropic_rung_is_tool_emulation(self):
+        fake = FakeAnthropic([
+            _anthropic_msg([_tool_use_block("emit_spec", {"name": "a", "score": 5})])
+        ])
+        result = _client(ANTHROPIC_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="emit_spec"
+        )
+        assert result.structured_output_rung == "tool_emulation"
 
     def test_raw_dict_schema(self):
         fake = FakeOpenAI([_openai_resp('{"anything": 1}')])
@@ -844,7 +1000,7 @@ class TestCallsiteIdAndCostEmission:
         # metric is computed from downstream.
         for field_name in (
             "input_tokens", "output_tokens", "cache_read_tokens",
-            "prompt_cache_miss_tokens", "cost_usd",
+            "prompt_cache_miss_tokens", "reasoning_tokens", "cost_usd",
         ):
             assert field_name in rec, f"{field_name} missing from cost record"
         assert result.cost_emission_error is None
@@ -1024,3 +1180,775 @@ class TestRetryBackoff:
         finally:
             _mod._time.sleep = real_sleep
         assert all(0.0 <= d <= _RETRY_DELAY_CAP_S for d in seen), seen
+
+
+# ── budget ownership + empty-content visibility (alpha-engine-config#6396) ──
+
+
+class TestEffectiveMaxTokens:
+    """`max_tokens` is registry-owned. A caller literal wins — say so.
+
+    `structured`/`complete`/`structured_with_search` all resolve the budget as
+    "the caller's if given, else the row's". Raising it is ordinary. LOWERING
+    it silently reverses the registry, and on a reasoning model that is not a
+    smaller answer — `max_tokens` bounds reasoning + content together, so the
+    trace consumes the budget and `content` comes back `''`.
+
+    Live 2026-08-04: the Director passed a literal 8000 against a row carrying
+    65536. Two ~100s completions, both fully billed, both empty. Raising the
+    ROW 16384 -> 65536 as the remediation changed nothing, because the literal
+    was what the request carried, and nothing logged the wire value.
+    """
+
+    def test_the_ADDRESSED_registry_entry_survives_onto_the_result(self):
+        """`model` is the upstream name the provider reports; `registry_id` is
+        the entry we addressed. They are NOT interchangeable: three registry
+        entries (`deepseek-v4-flash`, `-low`, `-max`) share one upstream model
+        string while declaring `{exclude: true}`, `{effort: low}` and
+        `{effort: max}`. Without this, three configurations collapse into one
+        row and cost cannot be attributed. alpha-engine-config-I6908.
+        """
+        spec = ModelSpec(
+            "openrouter", "deepseek-v4-flash", max_tokens=1024,
+            reasoning={"effort": "max"}, registry_id="deepseek-v4-flash-max",
+        )
+        fake = FakeOpenAI([_openai_resp("hi", model="deepseek-v4-flash")])
+        result = _client(spec, fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash", "the provider's own name"
+        assert result.registry_id == "deepseek-v4-flash-max", "the entry addressed"
+        assert result.model != result.registry_id, (
+            "the whole point is that these differ — a test asserting them equal "
+            "would pass on a spec where the distinction does not exist"
+        )
+
+    def test_a_hand_built_spec_records_no_registry_entry(self):
+        """`None` means 'not resolved from the registry', which is a different
+        statement from 'resolved and unknown'."""
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.registry_id is None
+
+    def test_the_reasoning_share_is_recorded_on_a_SUCCESSFUL_call(self):
+        """Until now the draw was observable only when a call came back EMPTY
+        (`_budget_exhausted_error`), i.e. once per outage. A budget floor
+        cannot be derived from a quantity recorded only on failure — which is
+        why all three instances of this class were remediated by a guess.
+        """
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning=108))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+        assert result.usage.output_tokens == 111, (
+            "reasoning is a SUBSET of output tokens, not an addition"
+        )
+
+    def test_the_reasoning_share_reads_from_a_raw_dict_too(self):
+        """`getattr` on a dict silently returns the default — how
+        `server_tool_use_details` read 0 for weeks (config#1659)."""
+        fake = FakeOpenAI([_openai_resp("OK", usage=_openai_usage(
+            prompt=17, completion=111, reasoning={"reasoning_tokens": 108}))])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 108
+
+    def test_a_non_reasoning_response_records_zero_not_an_error(self):
+        fake = FakeOpenAI([_openai_resp("OK")])
+        result = _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert result.usage.reasoning_tokens == 0
+
+    def test_none_uses_the_registry_budget(self):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert fake.kwargs[0]["max_tokens"] == 1024
+
+    def test_a_lower_caller_value_reaches_the_wire_and_warns(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+                max_tokens=8,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 8, (
+            "the caller's value is what the request carries — the library "
+            "does not overrule it, it only refuses to hide it"
+        )
+        warned = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert warned, "a caller shrinking the registry budget logged nothing"
+        assert "1024" in warned[0].getMessage(), (
+            "the warning must name the registry value being overridden, or an "
+            "operator cannot tell a registry change is inert"
+        )
+
+    def test_a_higher_caller_value_does_not_warn(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+                max_tokens=4096,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 4096
+        assert not [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_complete_resolves_the_budget_the_same_way(self, caplog):
+        fake = FakeOpenAI([_openai_resp("hello")])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u", max_tokens=8,
+            )
+        assert fake.kwargs[0]["max_tokens"] == 8
+        assert [r for r in caplog.records if r.levelno == logging.WARNING], (
+            "the override is invisible on `complete` too — every budget site "
+            "goes through the same resolver, or the guard covers some of them"
+        )
+
+
+class TestEmptyContentIsVisible:
+    """An empty `message.content` on a 200 must not pass silently.
+
+    The caller-facing symptom actively misdirects: a structured caller reports
+    `no JSON object found in response: ''`, which reads as a model that
+    answered in prose. Three diagnostic cycles were spent on that reading
+    while the response was 30 KB of reasoning trace.
+    """
+
+    def _empty_reasoning_resp(self):
+        usage = _openai_usage()
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=7998)
+        resp = _openai_resp("", usage=usage, finish_reason="stop")
+        resp.choices[0].message.reasoning_content = "x" * 30000
+        return resp
+
+    def test_empty_content_logs_the_reasoning_budget(self, caplog):
+        """WARNING, not ERROR, on the structured path — the caller raises with
+        the same diagnostics, so an ERROR here is a second report of one event
+        (see `_choice_text`). The DIAGNOSTICS are what this test is about and
+        they are unchanged; only the level moved."""
+        fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        warnings = [r.getMessage() for r in caplog.records
+                    if r.levelno == logging.WARNING]
+        assert warnings, "an empty content produced no diagnostic line"
+        msg = warnings[0]
+        assert "reasoning_tokens=7998" in msg, (
+            "without the reasoning-token count, an exhausted budget and a lost "
+            "response body are the same log line"
+        )
+        assert "finish_reason='stop'" in msg
+        assert "reasoning_content" in msg, (
+            "the populated sibling fields are what say WHERE the output went"
+        )
+
+    def test_provider_extra_fields_are_named(self, caplog):
+        """The most diagnostic field lives in pydantic's extras, not `vars()`.
+
+        Measured 2026-08-04 against the live edge: `vars(message)` reported
+        `['role']` on a message carrying 29,877 chars of `reasoning_content`,
+        naming none of what an operator needs.
+        """
+        from krepis.llm import _empty_content_diagnostics
+
+        class _Msg:
+            def __init__(self):
+                self.role = "assistant"
+                self.content = ""
+
+            model_extra = {"reasoning_content": "x" * 100, "refusal": None}
+
+        choice = SimpleNamespace(message=_Msg(), finish_reason="length")
+        out = _empty_content_diagnostics(
+            SimpleNamespace(choices=[choice]), choice
+        )
+        assert "reasoning_content" in out
+        assert "refusal" not in out, "empty fields are noise, not signal"
+
+    def test_non_empty_content_logs_nothing(self, caplog):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert not [r for r in caplog.records
+                    if r.levelno >= logging.WARNING]
+
+    def test_whitespace_only_content_counts_as_empty(self, caplog):
+        fake = FakeOpenAI([_openai_resp("   \n  ")] * 2)
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        assert [r for r in caplog.records if r.levelno == logging.WARNING]
+
+    def test_structured_path_does_not_double_report_at_ERROR(self, caplog):
+        """One failed call must produce ONE alert-level record.
+
+        Alert handlers attach at ERROR (`krepis.logging.setup_logging`), so an
+        ERROR here plus the caller's own report of the raised exception is two
+        dispatches for one event. A single Think Tank abort on 2026-08-11
+        produced three separate ERROR dispatches this way
+        (alpha-engine-config-I6921 D3).
+        """
+        fake = FakeOpenAI([self._empty_reasoning_resp()] * 2)
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            with pytest.raises(LLMError):
+                _client(OPENROUTER_SPEC, fake).structured(
+                    system="s", user_content="u", schema=Spec,
+                    schema_name="Spec",
+                )
+        empties = [r for r in caplog.records
+                   if "EMPTY message.content" in r.getMessage()]
+        assert empties, "the diagnostic must still be emitted"
+        assert not [r for r in empties if r.levelno >= logging.ERROR], (
+            "the structured path raises with these same diagnostics — logging "
+            "them at ERROR too is a duplicate alert, not extra coverage"
+        )
+
+    def test_plain_completion_still_logs_at_ERROR(self, caplog):
+        """The default stays ERROR and this is why: `complete()` RETURNS the
+        empty string and nothing raises, so this line is the only signal that
+        anything happened. Demoting it fleet-wide to buy quiet on the
+        structured path would trade a duplicate alert for a missing one."""
+        fake = FakeOpenAI([_openai_resp("")])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            result = _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u",
+            )
+        assert result.text == ""
+        assert [r for r in caplog.records
+                if "EMPTY message.content" in r.getMessage()
+                and r.levelno == logging.ERROR]
+
+    def test_diagnostics_never_mask_the_fault(self):
+        """A response the diagnostic cannot introspect must still return ''."""
+        from krepis.llm import _choice_text
+
+        class _Hostile:
+            @property
+            def message(self):
+                return SimpleNamespace(content="")
+
+            def __getattr__(self, name):
+                raise RuntimeError("this response resists introspection")
+
+        resp = SimpleNamespace(choices=[_Hostile()])
+        assert _choice_text(resp) == ""
+
+
+class TestBudgetExhaustedIsNotRetried:
+    """An exhausted budget is a certainty about every remaining attempt.
+
+    `no JSON object found in response: ''` says *the model returned something
+    unparseable* — a prompt or model problem. The actual fault is *max_tokens
+    was too small for this ask*, a one-line registry change. Three wrong
+    hypotheses were chased against a live paid endpoint before anyone looked
+    at `finish_reason` (alpha-engine-config#6391).
+
+    Retrying does not merely fail to inform. Measured on the Director's weekly
+    call: two attempts, ~100s of generation each, both fully billed, and the
+    second was guaranteed to fail before the first returned.
+    """
+
+    def _length_capped_empty(self):
+        usage = _openai_usage()
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=7993)
+        return _openai_resp("", usage=usage, finish_reason="length")
+
+    def test_it_raises_on_the_first_occurrence(self):
+        fake = FakeOpenAI([self._length_capped_empty()] * 2)
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert len(fake.kwargs) == 1, (
+            "the second attempt re-issues the identical ask under the "
+            "identical ceiling — it can only fail again, and it bills again"
+        )
+        msg = str(exc.value)
+        assert "max_tokens=1024" in msg, "name the budget that was too small"
+        assert "reasoning_tokens=7993" in msg
+        assert "no JSON object" not in msg, (
+            "the old message points at the prompt; this fault is the budget"
+        )
+
+    def test_it_is_an_llm_error_so_callers_still_catch_it(self):
+        fake = FakeOpenAI([self._length_capped_empty()])
+        with pytest.raises(LLMError):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+
+    def test_it_carries_the_usage_of_the_billed_attempt(self):
+        fake = FakeOpenAI([self._length_capped_empty()])
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert exc.value.usage is not None
+        assert exc.value.usage.output_tokens > 0, (
+            "the attempt was billed — a failed call still has spend to record"
+        )
+
+    def test_empty_with_finish_reason_stop_keeps_the_retry(self):
+        """A DIFFERENT fault: a model that answered with nothing.
+
+        A retry can fix that one, so it must keep the corrective-retry path.
+        """
+        fake = FakeOpenAI([
+            _openai_resp("", finish_reason="stop"),
+            _openai_resp('{"name": "a", "score": 1}', finish_reason="stop"),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.name == "a"
+        assert len(fake.kwargs) == 2
+
+    def test_length_capped_WITH_content_is_ordinary_truncation(self):
+        """Truncation the caller may still parse — not this fault."""
+        fake = FakeOpenAI([
+            _openai_resp('{"name": "a", "score": 1}', finish_reason="length"),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.score == 1
+
+    def test_anthropic_max_tokens_before_the_tool_block(self):
+        msg = _anthropic_msg([_text_block("thinking...")])
+        msg.stop_reason = "max_tokens"
+        fake = FakeAnthropic([msg, msg])
+        with pytest.raises(BudgetExhaustedError) as exc:
+            _client(ANTHROPIC_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert "stop_reason='max_tokens'" in str(exc.value)
+        assert len(fake.payloads) == 1
+
+
+# ── Router-edge credential resolution at CALL time (config-I6373) ─────────
+
+
+class TestRouterEdgeCredentialAtCallTime:
+    """The edge credential resolves on the full chain, not the environment.
+
+    ``resolve_group_spec`` names a per-consumer credential and the supported
+    home for its value is SSM — precisely so the secret never enters an
+    environment, a Lambda config, a CloudWatch log, or an SSM command string.
+    Route admission resolved it that way; this leg read ``os.environ`` alone.
+    A consumer configured exactly as alpha-engine-config-I6373 intends was
+    therefore ADMITTED to the route and then failed the call it had just been
+    admitted for.
+
+    Measured 2026-08-04: the Think Tank spot box aborted 5s into its daily run
+    with 0 theses written and ``challenger_selection`` unwritten, and
+    ``alpha-engine-research-runner`` failed identically — both with all six
+    ``KREPIS_*`` variables set and ``/alpha-engine/ROUTER_CONSUMER_*`` present
+    and readable. Both halves had tests; neither test could see the other half,
+    which is why the class-level test below exercises the SEAM rather than
+    either side of it.
+    """
+
+    ROUTER_SPEC = ModelSpec(
+        provider="litellm_proxy",
+        model="med",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    def test_credential_only_in_ssm_resolves(self, monkeypatch):
+        """The live failure, reproduced: nothing in the environment, value in SSM."""
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": (
+                "sk-from-ssm" if name == "ROUTER_CONSUMER_THINKTANK" else None
+            ),
+        )
+        client = LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-ssm"
+
+    def test_ssm_lookup_uses_this_consumers_name_not_the_shared_key(self, monkeypatch):
+        """The edge identifies a consumer BY its credential value, so resolving
+        the shared name would collapse this consumer into the director."""
+        seen = []
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": seen.append(name) or "sk",
+        )
+        LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")._resolve_api_key()
+        assert seen == ["ROUTER_CONSUMER_THINKTANK"]
+        assert "LITELLM_MASTER_KEY" not in seen
+
+    def test_environment_still_wins_when_set(self, monkeypatch):
+        monkeypatch.setenv("ROUTER_CONSUMER_THINKTANK", "sk-from-env")
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": "sk-from-ssm",
+        )
+        client = LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-env"
+
+    def test_unresolvable_edge_credential_names_the_ssm_parameter(self, monkeypatch):
+        """Naming only the env var sends an operator to the wrong place on the
+        one path whose supported source is SSM."""
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        with pytest.raises(LLMConfigError) as exc:
+            LLMClient(spec=self.ROUTER_SPEC, callsite_id="t")._resolve_api_key()
+        message = str(exc.value)
+        # All three sources, so the message matches the chain that was walked.
+        # The pre-I6373 message named the environment variable ALONE, which is
+        # the one source a correctly-configured consumer deliberately does not
+        # use — it read as "you forgot to set it" to an operator who had not.
+        assert "/alpha-engine/ROUTER_CONSUMER_THINKTANK" in message
+        assert "environment variable" in message
+        assert "api_key=" in message
+
+    def test_non_router_providers_stay_environment_only(self, monkeypatch):
+        """Every other provider authenticates from a key that is deliberately in
+        the environment. This change must not quietly give them an SSM read."""
+        called = []
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": called.append(name) or "sk",
+        )
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        spec = ModelSpec(provider="openrouter", model="m")
+        with pytest.raises(LLMConfigError) as exc:
+            LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+        assert called == []
+        assert "OPENROUTER_API_KEY environment variable" in str(exc.value)
+
+    def test_explicit_api_key_still_short_circuits(self, monkeypatch):
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        client = LLMClient(
+            spec=self.ROUTER_SPEC, callsite_id="t", api_key="sk-explicit"
+        )
+        assert client._resolve_api_key() == "sk-explicit"
+
+    def test_the_two_halves_agree_on_the_credential_name(self, monkeypatch):
+        """THE SEAM. Route admission and the call must look up the same name.
+
+        Both halves passed their own tests while disagreeing about which
+        credential the consumer had — first about the NAME (I6414), then about
+        where its VALUE may live (this change). Asserting them separately is
+        what let that happen twice, so this walks the whole path: the name the
+        admission check resolves is the name the client authenticates with.
+        """
+        import krepis.router as _router
+
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_THINKTANK"
+        )
+        monkeypatch.delenv("ROUTER_CONSUMER_THINKTANK", raising=False)
+        seen = []
+        monkeypatch.setattr(
+            "krepis.router._litellm_master_key_from_ssm",
+            lambda name="LITELLM_MASTER_KEY": seen.append(name) or "sk-shared",
+        )
+
+        admission = _router._resolve_litellm_master_key()
+        spec = ModelSpec(
+            provider=_router.ROUTER_EDGE_PROVIDER,
+            model="med",
+            base_url="https://router.example.invalid:8443",
+            api_key_env=_router.router_credential_secret_name(),
+        )
+        call = LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+
+        assert admission == call == "sk-shared"
+        assert seen == ["ROUTER_CONSUMER_THINKTANK", "ROUTER_CONSUMER_THINKTANK"]
+
+
+class TestEgressPlaceholderCredentialFallback:
+    """A direct egress_proxy spec (``resolve_group_spec`` falling through past
+    the router edge onto e.g. a ``deepseek``/``xai`` entry) authenticates with
+    a literal placeholder — the local proxy holds the real upstream key and
+    ignores whatever this client sends.
+
+    ``EGRESS_PROXY_PLACEHOLDER`` is exported into the PROXY process's own
+    environment (nous-ergon-ops litellm-proxy-shim.sh), not into every
+    consumer's. A consumer with no reason to export the proxy's own variable
+    must not be blocked by its absence — alpha-engine-config-I7031.
+    """
+
+    def test_unset_placeholder_env_falls_back_to_the_literal_default(self, monkeypatch):
+        from krepis import model_registry as _mr
+
+        monkeypatch.delenv(_mr.EGRESS_PLACEHOLDER_ENV, raising=False)
+        fake = FakeOpenAI([_openai_resp("hey")])
+        spec = ModelSpec(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="http://127.0.0.1:8990",
+            api_key_env=_mr.EGRESS_PLACEHOLDER_ENV,
+        )
+        client = _client(spec, fake)
+        assert client._resolve_api_key() == _mr.EGRESS_PLACEHOLDER_DEFAULT
+
+    def test_set_placeholder_env_wins_over_the_default(self, monkeypatch):
+        from krepis import model_registry as _mr
+
+        monkeypatch.setenv(_mr.EGRESS_PLACEHOLDER_ENV, "sk-from-proxy-env")
+        spec = ModelSpec(
+            provider="deepseek",
+            model="deepseek-v4-flash",
+            base_url="http://127.0.0.1:8990",
+            api_key_env=_mr.EGRESS_PLACEHOLDER_ENV,
+        )
+        client = LLMClient(spec=spec, callsite_id="t")
+        assert client._resolve_api_key() == "sk-from-proxy-env"
+
+    def test_other_providers_get_no_default_and_still_raise(self, monkeypatch):
+        """The fallback is scoped to the named placeholder env var only — it
+        must not quietly paper over a genuinely missing provider key."""
+        monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+        spec = ModelSpec(provider="openrouter", model="m")
+        with pytest.raises(LLMConfigError, match="OPENROUTER_API_KEY"):
+            LLMClient(spec=spec, callsite_id="t")._resolve_api_key()
+
+
+# ── Group alias must never masquerade as a served model (config-I6543) ────
+
+
+class TestGroupServedModelNeverAliasesToTheGroupName:
+    """A group-addressed spec's ``model`` is a synthetic name ("low" / "med"
+    / "high" / "ultra") that is never itself a billable model and carries no
+    price card. When the router response's ``model`` field comes back empty
+    or equal to the alias, the client must raise rather than report the
+    alias as the served model — the prior behavior let "low" flow all the
+    way into ``thinktank/client.py::_cost_for``, which correctly found no
+    price card for it and aborted the run with 0 theses written (live
+    2026-08-04, alpha-engine-config-I6543).
+    """
+
+    ROUTER_SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="low",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    @staticmethod
+    def _router_client(fake):
+        # The router edge resolves its credential on the full SSM chain
+        # (I6373); an explicit api_key short-circuits that so these tests
+        # exercise served-model resolution, not credential resolution.
+        return LLMClient(
+            TestGroupServedModelNeverAliasesToTheGroupName.ROUTER_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+        )
+
+    def test_structured_raises_when_response_model_is_the_alias(self):
+        fake = FakeOpenAI([_openai_resp('{"anything": 1}', model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).structured(
+                system="s", user_content="u",
+                schema={"type": "object"}, schema_name="blob",
+            )
+        # Not retried: an alias echo is a data-integrity problem, not a
+        # transient validation failure a corrective retry could fix.
+        assert len(fake.kwargs) == 1
+
+    def test_structured_raises_when_response_model_is_empty(self):
+        fake = FakeOpenAI([_openai_resp('{"anything": 1}', model="")])
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            self._router_client(fake).structured(
+                system="s", user_content="u",
+                schema={"type": "object"}, schema_name="blob",
+            )
+
+    def test_structured_accepts_a_real_served_model(self):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="deepseek/deepseek-v4-flash")
+        ])
+        result = self._router_client(fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "deepseek/deepseek-v4-flash"
+
+    def test_complete_raises_when_response_model_is_the_alias(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
+    def test_complete_accepts_a_real_served_model(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="deepseek/deepseek-v4-flash")])
+        result = self._router_client(fake).complete(
+            system="s", user_content="u"
+        )
+        assert result.model == "deepseek/deepseek-v4-flash"
+
+    def test_non_router_provider_is_unaffected_by_alias_matching_model(self):
+        """A pinned (non-group-addressed) spec legitimately requests and
+        receives the SAME model name back — that must never raise. The
+        strict check is scoped to ``ROUTER_EDGE_PROVIDER`` only."""
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="moonshotai/kimi-k2.6")
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "moonshotai/kimi-k2.6"
+
+    # ── qualified {group}-{mid} deployment names (0.39.0 derivation) ──
+
+    _STRIP_REGISTRY = """
+model_groups:
+  low:
+    - deepseek-v4-flash
+    - gpt-oss-120b
+
+models:
+  - id: deepseek-v4-flash
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
+    model: deepseek-v4-flash
+    status: active
+  - id: gpt-oss-120b
+    provider: openrouter
+    route: openrouter
+    model: openai/gpt-oss-120b
+    status: active
+"""
+
+    @pytest.fixture
+    def strip_registry(self, tmp_path, monkeypatch):
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(self._STRIP_REGISTRY)
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+
+    def test_qualified_primary_name_passes_the_guard_and_resolves(
+        self, strip_registry
+    ):
+        """A wire response whose ``model`` is the qualified primary
+        deployment name ``{group}-{mid}`` — what the 0.39.0 derivation
+        names every deployment, primary included — must pass the guard and
+        come back as the registry entry's upstream model, the identifier
+        the price cards are keyed on (alpha-engine-config-I6543,
+        2026-08-09 comment)."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-deepseek-v4-flash")])
+        result = self._router_client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash"
+
+    def test_qualified_fallback_name_resolves_to_its_route_correct_slug(
+        self, strip_registry
+    ):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="low-gpt-oss-120b")
+        ])
+        result = self._router_client(fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "openai/gpt-oss-120b"
+
+    # ── deployment-ADDRESSED calls (the wire shape since router.py emits
+    # deployment_id = _qualified_primary on the litellm_proxy route) ──
+
+    _DEPLOYMENT_SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="low-deepseek-v4-flash",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    def _deployment_client(self, fake):
+        return LLMClient(
+            self._DEPLOYMENT_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+        )
+
+    def test_echoed_qualified_deployment_name_is_not_masquerade(
+        self, strip_registry
+    ):
+        """The consumer addressed a concrete deployment; LiteLLM stamps the
+        model AS ADDRESSED back, so served == spec.model on every HEALTHY
+        call. Rejecting that rejected every successful call: the Think Tank
+        challenger arm aborted with 0 theses written and wrote no challenger
+        selection between 2026-08-01 and 2026-08-10 (run b150c317eeef,
+        `group='med-deepseek-v4-flash-max'`)."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-deepseek-v4-flash")])
+        result = self._deployment_client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek-v4-flash"
+
+    def test_echoed_deployment_name_resolves_in_structured_too(
+        self, strip_registry
+    ):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="low-gpt-oss-120b")
+        ])
+        spec = ModelSpec(
+            provider=ROUTER_EDGE_PROVIDER,
+            model="low-gpt-oss-120b",
+            base_url="https://router.example.invalid:8443",
+            api_key_env="ROUTER_CONSUMER_THINKTANK",
+        )
+        client = LLMClient(
+            spec, callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake, api_key="sk-router-test",
+        )
+        result = client.structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "openai/gpt-oss-120b"
+
+    def test_echoed_bare_group_raises_without_touching_the_registry(self):
+        """No ``strip_registry`` fixture on purpose: a bare group echo must
+        produce the precise masquerade error even where no registry exists
+        on disk (this repo's own CI). Asking the registry about "low" turned
+        that into a FileNotFoundError."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
+    def test_echoed_bare_group_still_raises(self, strip_registry):
+        """The masquerade this guard exists for is UNCHANGED: a bare group
+        name is not a derived deployment name, does not resolve through the
+        registry, and must never be billed or recorded."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low")])
+        with pytest.raises(LLMConfigError, match="group='low'"):
+            self._router_client(fake).complete(system="s", user_content="u")
+
+    def test_echoed_unresolvable_deployment_name_still_raises(
+        self, strip_registry
+    ):
+        """An echoed name the registry cannot resolve is indistinguishable
+        from masquerade — the registry, never the string's shape, is what
+        licenses the pass."""
+        spec = ModelSpec(
+            provider=ROUTER_EDGE_PROVIDER,
+            model="low-model-we-never-heard-of",
+            base_url="https://router.example.invalid:8443",
+            api_key_env="ROUTER_CONSUMER_THINKTANK",
+        )
+        fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
+        client = LLMClient(
+            spec, callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake, api_key="sk-router-test",
+        )
+        with pytest.raises(LLMConfigError, match="did not report a served model"):
+            client.complete(system="s", user_content="u")
+
+    def test_unresolvable_group_prefixed_name_raises(self, strip_registry):
+        """A ``{group}-``-prefixed served model the local registry cannot
+        resolve means the router and this consumer read different
+        registries — fail loud, not at the price-card lookup downstream."""
+        fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
+        with pytest.raises(LLMConfigError, match="does not resolve through"):
+            self._router_client(fake).complete(system="s", user_content="u")

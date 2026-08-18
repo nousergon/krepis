@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.25.6"
+version = "0.59.14"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS/Web Push alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -44,7 +44,7 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # so the dependency is declared here — a consumer wires flow-doctor with
 # `krepis[flow_doctor]` + `from krepis.logging import setup_logging`, no AGPL
 # nousergon-lib required.
-flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.9"]
+flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.14"]
 # krepis.llm transports. Both SDKs are lazy-imported at call time, so a
 # consumer installs only the transport(s) its ModelSpec can resolve to:
 # `krepis[anthropic]` for the native Anthropic transport, `krepis[openai]`
@@ -61,7 +61,23 @@ dev = [
     "pytest>=7.0",
     "pytest-cov>=4.0",
     "moto>=5.0",
-    "litellm>=1.0",
+    # litellm 1.97.0 cannot be imported under Python 3.10: its `LiteLLM_Params`
+    # model carries a forward reference to `ChatCompletionReasoningSummaryTextBlock`
+    # that pydantic cannot resolve there, and every `krepis.router` group
+    # resolution raises `PydanticUserError` at litellm/router.py:7525. It is
+    # Python-version-dependent, not dependency-dependent: measured
+    # 2026-08-16 on 3.10 with litellm 1.97.0 against openai 2.54.0 AND 1.109.1,
+    # pydantic 2.13.4 AND 2.11.10 -- 9 failures in all four combinations, while
+    # the identical set passes on 3.12. 1.96.0 is the last release that imports
+    # on 3.10, and 1.97.0 is the newest that installs there at all, so the cell
+    # is unsatisfiable without this cap.
+    #
+    # 3.9 already resolves below the cap on its own; this makes 3.10 match it
+    # rather than dropping a declared interpreter to make CI quiet
+    # (alpha-engine-config-I7464). Remove when a litellm release supporting
+    # 3.10 fixes the forward ref.
+    "litellm>=1.0,<1.97; python_version < '3.11'",
+    "litellm>=1.0; python_version >= '3.11'",
     # Validates the router resolve contract against resolve_schema.json.
     # Declared (not merely assumed present) so the contract test RUNS in CI
     # instead of importorskip'ing itself into silence -- an unrun guard is

@@ -63,5 +63,5 @@ jobs:
   notify-main-failure:
     needs: [test]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@4dcac9035511ee72a251b80b414e087160e02ff6
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@87765003b9cdda605db698f96879f8b1117ec864
     secrets: inherit

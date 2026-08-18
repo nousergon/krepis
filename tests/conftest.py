@@ -34,6 +34,11 @@ def _no_ssm_master_key_lookup_from_tests(monkeypatch):
     ``krepis.router._litellm_master_key_from_ssm`` directly.
     """
     monkeypatch.setattr(
-        "krepis.router._litellm_master_key_from_ssm", lambda: None, raising=True
+        "krepis.router._litellm_master_key_from_ssm",
+        # Takes the consumer's credential name since alpha-engine-config-I6414.
+        # The default keeps this stub callable by any test that still invokes
+        # the leg with no argument.
+        lambda name="LITELLM_MASTER_KEY": None,
+        raising=True,
     )
     yield

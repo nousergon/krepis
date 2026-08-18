@@ -1207,6 +1207,91 @@ def test_record_llm_call_persists_cache_miss():
     assert denom and rec["cache_read_tokens"] / denom == 0.9
 
 
+class _CompletionDetails:
+    def __init__(self, reasoning_tokens=0):
+        self.reasoning_tokens = reasoning_tokens
+
+
+def test_openai_metadata_reads_the_reasoning_share():
+    """The quantity a reasoning model's `max_tokens` must clear.
+
+    Recorded nowhere on a SUCCESSFUL call until now — it surfaced only in
+    `krepis.llm._budget_exhausted_error`, i.e. once per outage. Three budget
+    starvation outages in eight days (alpha-engine-config#6396, I6893, I6858)
+    were each remediated with a guessed number for exactly that reason.
+    """
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=17, completion_tokens=111,
+                           completion_tokens_details=_CompletionDetails(108))),
+        provider="openrouter",
+    )
+    assert md.reasoning_tokens == 108
+    assert md.output_tokens == 111, (
+        "reasoning is a SUBSET of output tokens, never an addition — pricing "
+        "that summed the two would double-bill every reasoning call"
+    )
+
+
+def test_openai_metadata_reads_the_reasoning_share_from_a_raw_dict():
+    """A proxied provider can deliver this field as raw decoded JSON, and
+    `getattr` on a dict silently returns the default — the exact way
+    `server_tool_use_details` read 0 for weeks (config#1659)."""
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=17, completion_tokens=111,
+                           completion_tokens_details={"reasoning_tokens": 108})),
+        provider="openrouter",
+    )
+    assert md.reasoning_tokens == 108
+
+
+def test_openai_metadata_without_reasoning_details_is_zero_not_error():
+    md = metadata_from_openai_completion(
+        _Completion(_Usage(prompt_tokens=10, completion_tokens=5)),
+        provider="openrouter",
+    )
+    assert md.reasoning_tokens == 0
+
+
+def test_the_addressed_registry_entry_reaches_the_persisted_record():
+    """In-memory is not measurement. Measured 2026-08-11: two Think Tank tiers
+    on `med` recorded `deepseek-v4-flash` and read as a misroute to `low` for an
+    hour, because the record could not name the entry that was addressed.
+    alpha-engine-config-I6908.
+    """
+    from krepis.llm import LLMResult, LLMUsage
+
+    result = LLMResult(
+        text="hi",
+        model="deepseek-v4-flash",
+        provider="openrouter",
+        registry_id="deepseek-v4-flash-max",
+        usage=LLMUsage(input_tokens=10, output_tokens=5, provider_cost_usd=0.001),
+        raw_request={},
+    )
+    rec = record_llm_call(result)
+    assert rec["model"] == "deepseek-v4-flash", "the provider's own name"
+    assert rec["addressed_registry_id"] == "deepseek-v4-flash-max", "the entry addressed"
+    assert rec["model"] != rec["addressed_registry_id"], (
+        "the whole point is that these differ"
+    )
+
+
+def test_record_llm_call_persists_the_reasoning_share():
+    """In-memory normalization is not measurement. The field has to reach the
+    persisted record, or a budget floor still cannot be derived from it —
+    which is how the sibling cache-miss field failed before it was wired."""
+    rec = record_llm_call(
+        _Completion(_Usage(prompt_tokens=17, completion_tokens=111,
+                           completion_tokens_details=_CompletionDetails(108),
+                           cost=0.001)),
+        provider="openrouter",
+        model_name="glm-5.2",
+    )
+    assert rec["reasoning_tokens"] == 108
+    assert rec["output_tokens"] == 111
+    assert rec["reasoning_tokens"] <= rec["output_tokens"]
+
+
 # ── claude -p result normalization (harness transport) ───────────────────
 
 

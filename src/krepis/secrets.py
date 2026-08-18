@@ -30,10 +30,16 @@ happens at most once per name per process; subsequent calls hit the dict.
 Lambda cold-starts pay the round-trip once; warm invocations reuse the cache.
 :func:`clear_cache` is exposed for tests.
 
-**SSM-unavailable latch.** If the first SSM call fails (no boto3, no creds,
-network error), latch ``_ssm_unavailable = True`` and skip SSM for the rest of
-the process. Avoids repeated multi-second timeouts in local dev. Reset via
-:func:`clear_cache` if a test needs to re-probe SSM.
+**SSM-unavailable latch.** If an SSM call fails in a way that says SSM itself
+is unusable here (no boto3, no credentials, network/endpoint error), latch
+``_ssm_unavailable = True`` and skip SSM for the rest of the process. Avoids
+repeated multi-second timeouts in local dev. Reset via :func:`clear_cache` if a
+test needs to re-probe SSM.
+
+Errors that answer a question about ONE parameter -- ``ParameterNotFound``,
+``AccessDeniedException`` -- do NOT latch. On a least-privilege role "denied"
+is the normal answer for any parameter outside the grant, so latching on it
+turns one optional secret into a process-wide outage of every other one.
 
 **Migration arc**: ``alpha-engine-config/private-docs/ROADMAP.md`` line ~2780
 (Deprecate ``.env`` entirely). Plan doc:
@@ -50,6 +56,13 @@ from typing import Final
 logger = logging.getLogger(__name__)
 
 SSM_PREFIX: Final[str] = "/alpha-engine/"
+
+#: ClientError codes that answer a question about ONE parameter and say nothing
+#: about whether SSM is reachable. They must never latch (see
+#: :func:`_fetch_from_ssm`).
+_PER_PARAMETER_MISS_CODES: Final[frozenset[str]] = frozenset(
+    {"ParameterNotFound", "AccessDeniedException", "ParameterVersionNotFound"}
+)
 SOURCE_TOGGLE_ENV: Final[str] = "ALPHA_ENGINE_SECRETS_SOURCE"
 
 _cache: dict[str, str] = {}
@@ -152,9 +165,9 @@ def _fetch_from_ssm(name: str) -> str | None:
         _ssm_unavailable = True
         return None
 
-    region = os.environ.get("AWS_REGION") or os.environ.get(
-        "AWS_DEFAULT_REGION", "us-east-1"
-    )
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
     try:
         client = boto3.client("ssm", region_name=region)
         resp = client.get_parameter(
@@ -164,10 +177,24 @@ def _fetch_from_ssm(name: str) -> str | None:
         return resp["Parameter"]["Value"]
     except ClientError as e:
         code = e.response.get("Error", {}).get("Code", "")
-        if code == "ParameterNotFound":
-            # Genuine miss — not an SSM-availability problem. Fall through
-            # to env without latching, since other secrets may resolve fine.
-            logger.debug("SSM miss for %s (ParameterNotFound)", name)
+        if code in _PER_PARAMETER_MISS_CODES:
+            # Per-PARAMETER answers, not statements about SSM's availability.
+            # Falling through to env without latching is what lets the other
+            # secrets in this process still resolve.
+            #
+            # `AccessDeniedException` belongs here for the same reason
+            # `ParameterNotFound` does, and it matters more: on a
+            # least-privilege instance role, "denied" is the NORMAL answer for
+            # any parameter outside the grant, and the first optional secret a
+            # process happens to ask for is usually one of them. Latching on it
+            # disabled SSM for every later read in the process — measured
+            # 2026-08-16 on the canary-replay box, where an optional
+            # `FMP_API_KEY` read latched at import and the router consumer
+            # credential requested seconds later silently resolved to nothing.
+            # The route stayed `litellm_proxy` and reported healthy; the edge
+            # answered 401, which reads as a broken credential rather than as a
+            # credential that was never read (alpha-engine-config-I7448).
+            logger.debug("SSM miss for %s (%s)", name, code)
             return None
         logger.warning(
             "SSM read for %s failed (%s) — latching unavailable for this process",

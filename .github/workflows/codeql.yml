@@ -1,0 +1,60 @@
+name: CodeQL
+
+# Advanced setup (alpha-engine-config-I7517). Replaces GitHub's default-setup
+# CodeQL for this repo: default setup does not honour inline
+# `# codeql[<rule-id>]` alert-suppression comments, which
+# src/krepis/spot_bootstrap.py relies on for a pinned, test-verified
+# identifier-pattern false positive. Enabling this workflow on the default
+# branch automatically disables default setup for the repo — see
+# .github/codeql/codeql-config.yml for why no query-filters entry is added.
+#
+# languages: [python, actions] mirrors default setup's own coverage
+# (`gh api repos/nousergon/krepis/code-scanning/default-setup` reported
+# languages: ["actions","python"] before this PR disabled it). Dropping
+# "actions" here would silently stop scanning every workflow YAML in this
+# repo for supply-chain/permissions issues — the class of finding this PR's
+# own notify-main-failure job tripped (actions/missing-workflow-permissions,
+# alert #29) during review.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: "0 8 * * 1"  # Mondays 08:00 UTC
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, actions]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd  # v4.37.7
+
+  # Alert (Telegram) on genuine post-merge failure of this workflow on the
+  # default branch. Reusable workflow + transport in nousergon-lib. See
+  # alpha-engine-config#1128.
+  notify-main-failure:
+    needs: [analyze]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    permissions: {}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@87765003b9cdda605db698f96879f8b1117ec864
+    secrets: inherit

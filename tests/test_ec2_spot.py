@@ -17,6 +17,8 @@ lib CLI:
 
 from __future__ import annotations
 
+import json
+
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -856,3 +858,126 @@ class TestRelaunchDecisionCLI:
             ])
         assert rc == 75
         assert "sf-budget-exceeded" in capsys.readouterr().out
+
+
+class TestRelaunchDecisionJsonContract:
+    """``--json``: the verdict is a FIELD, the exit status is only "could I answer".
+
+    WHY THIS CONTRACT EXISTS
+
+    The legacy shape signals "hold" — the ordinary verdict for every failure
+    that is not an AWS reclaim, i.e. the large majority of calls — by exiting
+    ``NO_RELAUNCH_EXIT_CODE`` (75). That puts the API's NORMAL ANSWER into the
+    one channel ``set -e`` treats as fatal, and every bash adopter wrote the
+    natural ``VAR="$(cmd)"``, a simple command whose status IS the
+    substitution's. Errexit therefore fired on the normal answer, inside the
+    EXIT trap doing the asking, and ``terminate-instances`` was never reached.
+
+    Measured 2026-08-12: six call sites across five repos, all written the same
+    way, none guarded. Three were live spot-instance leaks (crucible-predictor,
+    crucible-backtester — whose copy is reached by ten per-stage launchers —
+    and crucible-dashboard); two more escaped only because their single caller
+    happened to write ``|| reason=""``. Six of six adopters is an API defect,
+    not six user errors.
+
+    ``--json`` is the fix at the API layer rather than at each call site. The
+    legacy shape is retained unchanged, and pinned below, because callers that
+    already branch on 75 would break silently otherwise.
+    """
+
+    @staticmethod
+    def _classified_reclaim(fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.describe_spot_instance_requests.return_value = {"SpotInstanceRequests": []}
+        ec2.describe_instances.return_value = _describe_resp(
+            "terminated", reason_code="Server.SpotInstanceTermination"
+        )
+        return fake
+
+    @staticmethod
+    def _hold(fake_boto3):
+        fake, ec2 = fake_boto3
+        ec2.describe_spot_instance_requests.return_value = {"SpotInstanceRequests": []}
+        ec2.describe_instances.return_value = _describe_resp(
+            "running", transition_reason=""
+        )
+        return fake
+
+    def test_hold_exits_zero_and_reports_the_verdict_in_the_payload(
+        self, fake_boto3, capsys
+    ):
+        """The whole point: a held decision is a SUCCESSFUL answer."""
+        fake = self._hold(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--json", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1",
+            ])
+        assert rc == 0, (
+            "a hold verdict must not be an error exit — that is the defect this "
+            "flag exists to remove"
+        )
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["relaunch"] is False
+        assert payload["verdict"] == "hold"
+        assert payload["classification"] == "other"
+        assert "reason" in payload and payload["reason"]
+
+    def test_relaunch_also_exits_zero(self, fake_boto3, capsys):
+        fake = self._classified_reclaim(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--json", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1", "--max-attempts", "2",
+            ])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["relaunch"] is True
+        assert payload["verdict"] == "relaunch"
+        assert payload["classification"] == "reclaim"
+        assert payload["attempts_remaining"] == 1
+
+    def test_budget_guard_hold_also_exits_zero(self, fake_boto3, capsys):
+        """Even the SF-budget refusal is a decision, not a failure."""
+        fake = self._classified_reclaim(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--json", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1", "--max-attempts", "2",
+                "--sf-execution-timeout", "5400", "--per-attempt-seconds", "3000",
+            ])
+        assert rc == 0
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["verdict"] == "hold"
+        assert "sf-budget-exceeded" in payload["reason"]
+
+    def test_payload_is_a_single_parseable_line(self, fake_boto3, capsys):
+        """Bash reads this with one `jq`; multi-line output would break that."""
+        fake = self._hold(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ec2_spot.main([
+                "relaunch-decision", "--json", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1",
+            ])
+        out = capsys.readouterr().out
+        assert out.count("\n") == 1, out
+        json.loads(out)
+
+    def test_legacy_contract_is_unchanged_without_the_flag(self, fake_boto3, capsys):
+        """Backward compatibility, pinned.
+
+        Four bash call sites currently branch on ``rc == 0`` versus 75. If the
+        default shape ever moves, they do not fail — they silently take the
+        wrong branch, which on the relaunch side means re-running a workload
+        that failed for a real reason.
+        """
+        fake = self._hold(fake_boto3)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ec2_spot.main([
+                "relaunch-decision", "--instance-id", "i-abc",
+                "--region", "us-east-1", "--attempt", "1",
+            ])
+        assert rc == ec2_spot.NO_RELAUNCH_EXIT_CODE == 75
+        out = capsys.readouterr().out.strip()
+        assert "\t" in out and out.split("\t")[0] == "hold"
+        assert not out.startswith("{"), "the default output must stay TAB-separated"

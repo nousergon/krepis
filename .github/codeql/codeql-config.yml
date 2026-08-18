@@ -1,0 +1,22 @@
+name: "krepis CodeQL config"
+
+# Advanced-setup CodeQL config for this repo. alpha-engine-config-I7517:
+# GitHub's default-setup CodeQL does not process inline
+# `# codeql[<rule-id>]` alert-suppression comments — advanced setup does.
+# That is the entire reason this file and the accompanying
+# .github/workflows/codeql.yml exist.
+#
+# Deliberately no `query-filters` entry here. GitHub's query-filters block
+# excludes a query by its own metadata only (id / tags / severity / kind) —
+# it has no path attribute, so a single filter cannot be scoped to both a
+# rule id AND a file path (verified against GitHub's advanced-setup config
+# docs, 2026-08-17). Adding `query-filters: - exclude: {id:
+# py/clear-text-logging-sensitive-data}` here would silently disable that
+# rule repo-wide, which I7517 explicitly forbids as an unacceptable outcome.
+#
+# The existing inline `# codeql[py/clear-text-logging-sensitive-data]`
+# comments in src/krepis/spot_bootstrap.py (krepis-PR153) are already
+# scoped to the exact line they annotate — finer-grained than any path
+# filter — and start being honoured the moment this repo analyzes under
+# advanced setup instead of default setup. No change to spot_bootstrap.py
+# suppression comments is made or needed by this PR.

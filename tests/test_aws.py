@@ -10,8 +10,11 @@ import pytest
 from krepis.aws import (
     DEFAULT_RETRYABLE_INVOKE_CODES,
     InvokeResult,
+    LambdaEnvMergeError,
     LambdaInvokeError,
     invoke_lambda_with_retry,
+    main,
+    merge_lambda_environment,
 )
 
 _NOSLEEP = lambda _d: None  # noqa: E731
@@ -194,3 +197,115 @@ def _passthrough_using(fake_client):
         )
 
     return _inner
+
+
+class FakeWaiter:
+    def __init__(self, log, name):
+        self.log, self.name = log, name
+
+    def wait(self, **kw):
+        self.log.append(("wait", self.name, kw.get("FunctionName")))
+
+
+class FakeLambda:
+    """Duck-typed boto3 lambda client with a declared starting environment."""
+
+    def __init__(self, variables=None, read_error=None, write_error=None):
+        self.variables = dict(variables or {})
+        self.read_error = read_error
+        self.write_error = write_error
+        self.calls = []
+
+    def get_waiter(self, name):
+        return FakeWaiter(self.calls, name)
+
+    def get_function_configuration(self, FunctionName):  # noqa: N803
+        if self.read_error:
+            raise self.read_error
+        self.calls.append(("read", FunctionName))
+        return {"Environment": {"Variables": dict(self.variables)}}
+
+    def update_function_configuration(self, FunctionName, Environment):  # noqa: N803
+        if self.write_error:
+            raise self.write_error
+        self.calls.append(("write", FunctionName))
+        self.variables = dict(Environment["Variables"])
+
+
+class TestMergeLambdaEnvironment:
+    """alpha-engine-config-I7179: turning cost telemetry on is an environment
+    edit across three repos' Lambdas, and the merge that does it may not
+    delete the live-only variables it does not know about."""
+
+    def test_existing_variables_survive(self):
+        client = FakeLambda({"ANTHROPIC_API_KEY": "live-only", "RAG_DATABASE_URL": "x"})
+        total = merge_lambda_environment(
+            "alpha-engine-replay-concordance",
+            {"KREPIS_COST_SINK_BUCKET": "alpha-engine-research"},
+            client=client,
+        )
+        assert client.variables["ANTHROPIC_API_KEY"] == "live-only"
+        assert client.variables["RAG_DATABASE_URL"] == "x"
+        assert client.variables["KREPIS_COST_SINK_BUCKET"] == "alpha-engine-research"
+        assert total == 3
+
+    def test_merge_overwrites_only_the_named_keys(self):
+        client = FakeLambda({"KREPIS_COST_SINK_PREFIX": "old"})
+        merge_lambda_environment("f", {"KREPIS_COST_SINK_PREFIX": "new"}, client=client)
+        assert client.variables == {"KREPIS_COST_SINK_PREFIX": "new"}
+
+    def test_absent_environment_block_is_not_a_crash(self):
+        class Bare(FakeLambda):
+            def get_function_configuration(self, FunctionName):  # noqa: N803
+                return {}
+
+        client = Bare()
+        merge_lambda_environment("f", {"A": "1"}, client=client)
+        assert client.variables == {"A": "1"}
+
+    @pytest.mark.parametrize("value", ["", None])
+    def test_empty_value_is_refused(self, value):
+        """An empty variable reads as unset at the consumer and silently
+        disables whatever it gates — the failure this whole issue is
+        about, one layer down."""
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"K": value}, client=FakeLambda())
+
+    def test_no_updates_is_refused(self):
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {}, client=FakeLambda())
+
+    def test_read_failure_fails_loud_and_does_not_write(self):
+        client = FakeLambda(read_error=RuntimeError("denied"))
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"A": "1"}, client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_write_failure_fails_loud(self):
+        client = FakeLambda(write_error=RuntimeError("conflict"))
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"A": "1"}, client=client)
+
+
+class TestMergeLambdaEnvCli:
+    def test_values_are_never_printed(self, capsys, monkeypatch):
+        client = FakeLambda()
+        monkeypatch.setattr(
+            "krepis.aws.merge_lambda_environment",
+            lambda fn, updates, region=None: len(updates),
+        )
+        rc = main([
+            "merge-lambda-env",
+            "--function-name", "alpha-engine-evaluator-director",
+            "--set", "KREPIS_COST_SINK_BUCKET=alpha-engine-research",
+        ])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "KREPIS_COST_SINK_BUCKET" in out
+        assert "alpha-engine-research" not in out
+        assert client.calls == []
+
+    def test_malformed_pair_is_rejected(self):
+        assert main([
+            "merge-lambda-env", "--function-name", "f", "--set", "NOEQUALS",
+        ]) == 2

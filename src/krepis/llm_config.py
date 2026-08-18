@@ -56,7 +56,37 @@ class LLMConfigError(RuntimeError):
 
 TRANSPORT_ANTHROPIC = "anthropic"
 TRANSPORT_OPENAI = "openai"
-TRANSPORT_LITELLM = "litellm"
+
+#: The provider name :class:`ModelSpec` REFUSES to construct.
+#:
+#: It used to name a third transport — an in-process LiteLLM Router built
+#: inside the consumer, calling each upstream provider directly from it. That
+#: transport is gone (alpha-engine-config-I6665); the name survives only as
+#: the thing the guard in ``ModelSpec.__post_init__`` recognises, because
+#: consumers and stored configs still say it and must get a pointer rather
+#: than a confusing "unknown provider needs a base_url".
+#:
+#: `krepis.router.get_router` still builds a Router — for `resolve_group`,
+#: `get_group_primary` and the CLI, none of which issue completions.
+REFUSED_IN_PROCESS_PROVIDER = "litellm"
+
+#: Backwards-compatible alias. It no longer names a transport.
+TRANSPORT_LITELLM = REFUSED_IN_PROCESS_PROVIDER
+
+#: Provider name emitted for the router-edge route by
+#: :func:`krepis.router.resolve_group_spec`.
+#:
+#: Deliberately NOT ``"litellm"``: :class:`ModelSpec` refuses that name
+#: outright (see :data:`REFUSED_IN_PROCESS_PROVIDER`).  This name is absent
+#: from :data:`PROVIDER_REGISTRY`, so :class:`ModelSpec` treats it as a custom
+#: OpenAI-compatible endpoint — which is what the edge is.
+#:
+#: Defined HERE, in the module both :mod:`krepis.router` (which stamps it onto
+#: the spec) and :mod:`krepis.llm` (which must recognise it to authenticate on
+#: the router credential chain) already import, rather than in either of them.
+#: ``krepis.router.ROUTER_EDGE_PROVIDER`` re-exports it, so the name keeps
+#: working where it is already used.
+ROUTER_EDGE_PROVIDER = "litellm_proxy"
 
 
 @dataclass(frozen=True)
@@ -86,11 +116,6 @@ PROVIDER_REGISTRY: dict = {
         transport=TRANSPORT_OPENAI,
         base_url="https://openrouter.ai/api/v1",
         api_key_env="OPENROUTER_API_KEY",
-    ),
-    "litellm": ProviderDefaults(
-        transport=TRANSPORT_LITELLM,
-        base_url=None,
-        api_key_env="LITELLM_MASTER_KEY",
     ),
 }
 
@@ -149,6 +174,18 @@ class ModelSpec:
         billed at all) while producing the longest content. Without this
         knob a reasoning model can silently produce a well-formed, fully
         billed, EMPTY response through this adapter.
+    supports_automatic_prefix_caching
+        Whether the provider/model supports server-side automatic prefix
+        caching (e.g. DeepSeek, Moonshot/Kimi, Zhipu/GLM). When ``True``,
+        the provider caches repeated prompt prefixes transparently with
+        no client-side ``cache_control`` markers needed. Defaults to
+        ``False`` (conservative) — set explicitly in the SSM JSON spec
+        or code default when the model is known to support it. Read by
+        :class:`krepis.llm.LLMClient` for cache-aware logging; no
+        client-side behavior change is required since the caching is
+        automatic. Contrast with ``prompt_caching`` (Anthropic-style
+        explicit ``cache_control`` breakpoints) which is transport-level
+        and needs no ModelSpec field.
     """
 
     provider: str
@@ -158,6 +195,68 @@ class ModelSpec:
     structured_outputs: bool = True
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
+    supports_automatic_prefix_caching: bool = False
+    # The registry entry this spec was resolved FROM, when it came from the
+    # model registry (``route["registry_id"]``). ``None`` for a hand-built spec.
+    #
+    # It is not cosmetic and it is not the same as ``model``. Three registry
+    # entries — `deepseek-v4-flash`, `-low`, `-max` — all carry the upstream
+    # model string `deepseek-v4-flash` while declaring THREE DIFFERENT reasoning
+    # configs (`{exclude: true}`, `{effort: low}`, `{effort: max}`). The
+    # provider reports the upstream name, so without this field a cost record
+    # cannot say which entry was addressed: spend across three distinct
+    # configurations collapses into one row, and `{exclude: true}` is
+    # indistinguishable from `{effort: max}` downstream — the exact distinction
+    # the reasoning-budget class turns on (alpha-engine-config-I6901, I6908).
+    registry_id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        # `provider="litellm"` used to select an IN-PROCESS LiteLLM Router,
+        # built inside the consumer and calling each upstream provider directly
+        # from it. That transport is gone (alpha-engine-config-I6665), but the
+        # NAME survives in stored configs and in people's fingers, and a
+        # consumer typing it is always making the same mistake: it means "the
+        # `high` group", and it used to get "be your own router".
+        #
+        # Refusing by name rather than letting it fall through to the
+        # unknown-provider path is deliberate. Unknown providers are treated as
+        # custom OpenAI-compatible endpoints, so without this the failure would
+        # be "provider 'litellm' is not a built-in and no base_url was
+        # supplied" — true, useless, and pointing at the wrong fix.
+        #
+        # The objection is stated in full above `krepis.router.
+        # resolve_group_spec`. In short, that path (a) egresses straight to the
+        # upstream provider, unscanned by the egress proxy; (b) bypasses the
+        # authenticated edge, so per-consumer identity, rate limiting and spend
+        # attribution never apply; (c) requires `litellm` and a readable model
+        # registry inside every consumer.
+        #
+        # It failed all three ways in production before this guard existed.
+        # morning-signal set this provider on 2026-08-02 and every episode for
+        # the next six days aborted its primary on `ModuleNotFoundError: No
+        # module named 'litellm'` and silently aired on a direct-provider
+        # fallback. The package was never installed, so the transport this name
+        # selects had never once run — and nothing said so, because the failure
+        # was indistinguishable from a provider being down.
+        #
+        # Raising at CONSTRUCTION rather than at first call is the point: a
+        # spec that cannot work should not survive resolution. Deferring it to
+        # call time is what let six days pass.
+        if self.provider == REFUSED_IN_PROCESS_PROVIDER:
+            raise LLMConfigError(
+                "ModelSpec(provider='litellm') selects the IN-PROCESS LiteLLM "
+                "Router, which calls upstream providers directly from this "
+                "consumer — bypassing the egress proxy, the authenticated "
+                "router edge, and per-consumer attribution.\n\n"
+                "To address a model GROUP, resolve it instead:\n"
+                "    from krepis.router import resolve_group_spec\n"
+                "    spec, route = resolve_group_spec("
+                f"{self.model!r}, exec_context=..., wire='openai')\n\n"
+                "That returns a spec pointing at the router edge, with the "
+                "model, endpoint and credential decided by the registry. To "
+                "call one provider directly and deliberately, name that "
+                "provider."
+            )
 
     def _registry_defaults(self) -> Optional[ProviderDefaults]:
         return PROVIDER_REGISTRY.get(self.provider)
@@ -204,6 +303,7 @@ _SPEC_JSON_FIELDS = {
     "structured_outputs",
     "api_key_env",
     "reasoning",
+    "supports_automatic_prefix_caching",
 }
 
 
@@ -283,7 +383,9 @@ def _read_ssm_parameter(name: str, ssm_client: Any) -> str:
     if client is None:
         import boto3
 
-        client = boto3.client("ssm")
+        from krepis.aws_region import resolve_region
+
+        client = boto3.client("ssm", region_name=resolve_region())
     resp = client.get_parameter(Name=name, WithDecryption=True)
     return resp["Parameter"]["Value"]
 

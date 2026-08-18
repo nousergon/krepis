@@ -45,11 +45,16 @@ from krepis.anthropic_payload import (
     build_web_search_tool,
 )
 from krepis.llm_config import (
+    ROUTER_EDGE_PROVIDER,
     TRANSPORT_ANTHROPIC,
-    TRANSPORT_LITELLM,
     LLMConfigError,
     ModelSpec,
 )
+from krepis.router import served_model_for_deployment
+# Only the prefix constant, so the router-edge failure message can name the
+# SSM parameter an operator has to look at. `krepis.secrets` imports boto3
+# lazily, so this costs nothing at import time.
+from krepis.secrets import SSM_PREFIX as _SSM_PREFIX
 from krepis.llm_search import (
     Citation,
     SearchEvent,
@@ -64,38 +69,6 @@ from krepis.session_dlp import (
 )
 
 logger = logging.getLogger(__name__)
-
-# ── LiteLLM Router (lazy singleton) ────────────────────────────────────────
-# When provider=litellm, calls route through a litellm.Router configured with
-# the model groups defined in LLM_MODEL_REGISTRY.yaml. The Router handles
-# fallback chains transparently — a call to model "low" tries the primary
-# in the low group, then falls back through the ordered chain on failure.
-#
-# The Router config is the SINGLE source of truth, derived from
-# LLM_MODEL_REGISTRY.yaml at init time (with a hardcoded fallback if the
-# registry file can't be found). See krepis.router for the registry loader
-# and CLI (python3 -m krepis.router resolve <group>).
-#
-# Model groups (no Anthropic — per Brian's 2026-07-24 ruling):
-#   low:  deepseek-v4-flash → gemini-2.5-flash → gpt-oss-120b → gemini-2.5-pro
-#   med:  deepseek-v4-flash (reasoning=max) → same via OpenRouter → v4-pro
-#   high: deepseek-v4-pro (reasoning=max) → same via OpenRouter
-#   ultra: glm-5.2 → kimi-k3 → deepseek-v4-pro (reasoning=max)
-#
-# Initialized on first use so importing krepis.llm doesn't pay the Router
-# construction cost until a caller actually uses the litellm transport.
-
-
-def _get_router() -> Any:
-    """Return the module-level LiteLLM Router singleton.
-
-    Delegates to :func:`krepis.router.get_router` which builds from
-    LLM_MODEL_REGISTRY.yaml (preferred) or a hardcoded fallback.
-    """
-    from krepis.router import get_router as _router_get
-
-    return _router_get()
-
 
 # Per-group fallback-state tracker so callers can detect sign-on / sign-off
 # transitions.  Keyed by group name ("low", "med", "high", "ultra"); True
@@ -123,6 +96,97 @@ def _check_fallback_transition(group: str, fallback_used: bool, served_model: st
     _fallback_state[group] = fallback_used
 
 
+def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
+    """Return the real model that served a group-addressed call, or raise.
+
+    ``spec.model`` on a group-addressed spec is a synthetic alias ("low" /
+    "med" / "high" / "ultra") that never appears in ``krepis.cost``'s price
+    cards and is never itself a billable model. When the router response's
+    ``model`` field comes back empty, or (for reasons not yet root-caused —
+    alpha-engine-config-I6543) equal to the alias itself, the previous code
+    silently substituted the alias as the served model. That value then
+    flowed into ``krepis.cost.load_default_pricing().get(served_model, ...)``
+    and, for THIS consumer, failed there — but the defect is here: an alias
+    is not a served model, in a Lambda whose cost lookup happens to succeed
+    to find a coincidentally-matching card, or logged to a manifest as the
+    served model, either would be silently wrong rather than loudly wrong.
+
+    Raising here surfaces the failure at its source with the diagnostic
+    payload (``_hidden_params``, when the transport is litellm's own Router
+    object) needed to root-cause why the field was unusable, instead of at
+    a downstream consumer with none of that context.
+
+    A served model of the qualified ``{group}-{mid}`` form — the deployment
+    naming the registry derivation produces as of 0.39.0 — is resolved
+    through the registry to the entry's upstream model identifier, so what
+    this returns is always a real, priceable model id, never a derived
+    deployment name. An unresolvable ``{group}-``-prefixed name raises:
+    it means the router served a deployment this consumer's registry does
+    not know (registry drift), and letting it flow would only move the
+    failure into the price-card lookup with less context.
+
+    **A response echoing a QUALIFIED DEPLOYMENT name is not masquerade.**
+    Since ``router.py``'s litellm_proxy route began emitting
+    ``deployment_id = _qualified_primary`` (config-I6543), a proxy-routed
+    consumer addresses ``med-deepseek-v4-flash-max`` on the wire, not the
+    bare group — and LiteLLM stamps the model AS ADDRESSED back onto the
+    response, so ``served_model == spec.model`` on every healthy call. The
+    addressing half of that fix shipped without the accounting half: this
+    function still assumed ``spec.model`` was always a bare group, so it
+    rejected every successful call. Measured cost: the Think Tank
+    challenger arm aborted with ``theses_written: 0`` and wrote no
+    challenger selection (2026-08-10 run ``b150c317eeef``; the arm's last
+    valid selection is 2026-07-31).
+
+    So when the echoed name resolves through the registry as a derived
+    deployment, this returns its upstream model — a real, priceable id, and
+    exactly what the caller asked to be served. Genuine masquerade still
+    raises: a bare group name ("med") is not a derived deployment name, so
+    it does not resolve and falls through to the error below.
+    """
+    served_model = getattr(resp, "model", "") or ""
+    if served_model and served_model == spec.model and "-" in served_model:
+        # Deployment-addressed call: the caller named a concrete deployment
+        # and the router served it. Resolve to the billable upstream id.
+        # The REGISTRY licenses the pass — an echoed name that does not
+        # resolve is indistinguishable from the alias masquerade this
+        # function exists to reject, and still falls through to the raise.
+        # The ``"-" in`` precondition is what keeps a bare group name off
+        # the registry path entirely: groups are "low"/"med"/"high"/"ultra",
+        # and asking the registry about one turned the precise masquerade
+        # error into a FileNotFoundError wherever no registry is on disk
+        # (caught by this repo's own CI, which has none). An unreadable
+        # registry still propagates for a ``{group}-{mid}``-shaped name,
+        # exactly as the != branch below already lets it: a consumer
+        # holding such a name resolved it through a registry to begin with.
+        upstream = served_model_for_deployment(served_model)
+        if upstream:
+            return upstream
+    if served_model and served_model != spec.model:
+        if served_model.startswith(f"{spec.model}-"):
+            upstream = served_model_for_deployment(served_model)
+            if upstream:
+                return upstream
+            raise LLMConfigError(
+                f"provider={spec.provider!r} group={spec.model!r}: the router "
+                f"reported served model {served_model!r}, which is shaped like "
+                f"a derived deployment name for this group but does not "
+                f"resolve through the local LLM_MODEL_REGISTRY.yaml. The "
+                f"router and this consumer are reading different registries "
+                f"(alpha-engine-config-I6543)."
+            )
+        return served_model
+    hidden = getattr(resp, "_hidden_params", None)
+    raise LLMConfigError(
+        f"provider={spec.provider!r} group={spec.model!r}: the router "
+        f"response did not report a served model distinct from the group "
+        f"alias (model field was {served_model!r}). Refusing to bill or "
+        f"record the call under the alias — it is not a real model and "
+        f"carries no price card (alpha-engine-config-I6543). "
+        f"resp._hidden_params={hidden!r}"
+    )
+
+
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
 
 # Special/control-token leakage: some open-weight models (confirmed live
@@ -143,6 +207,69 @@ _JSON_INSTRUCTION = (
     "\n\nRespond with ONLY a single JSON object matching this JSON Schema — "
     "no prose, no markdown fences:\n{schema}"
 )
+
+# ── structured-output degradation ladder (model-portability-policy §7) ────
+#
+# The policy declares one ladder for structured output:
+#
+#   native (strict ``response_format=json_schema``)
+#     → tool_emulation (forced single-tool call whose input IS the object)
+#     → prompt_only (instruct + tolerant extraction + bounded repair)
+#
+# "The caller always receives a validated object or an exception. Which rung
+# ran is recorded on the result, because rung affects reliability and belongs
+# in the artifact." ``StructuredResult.structured_output_rung`` is that record,
+# and it is populated on EVERY structured call — including the undegraded ones,
+# so a healthy call publishes ``native``/``tool_emulation`` rather than nothing
+# (``principles.md`` §2.7: a component emitting nothing is not healthy, it is
+# unobserved).
+_STRUCTURED_RUNG_NATIVE = "native"
+_STRUCTURED_RUNG_TOOL_EMULATION = "tool_emulation"
+_STRUCTURED_RUNG_PROMPT_ONLY = "prompt_only"
+
+# A provider REFUSING ``response_format`` at request time — distinct from a
+# registry model that never declared support (I4 handles that declaratively,
+# via ``spec.structured_outputs``). This is the case the declaration cannot
+# cover: the registry says the deployment can serve it, or a caller overrode
+# ``params.structured_outputs``, and the endpoint answers 400.
+#
+# Live incident (alpha-engine-config-I7232): the Think Tank's ``sweep`` tier
+# overrides ``structured_outputs=True`` onto a DeepSeek deployment whose
+# registry params default it False; DeepSeek answered
+# ``400 This response_format type is unavailable now``. The exception escaped
+# ``_structured_openai`` entirely — it is neither a decode failure nor a
+# validation failure — and aborted every Think Tank run from 2026-08-11.
+# Descending one rung is the DECLARED path for exactly this, and it is what
+# turns a whole-run abort into a recorded degradation.
+#
+# Deliberately matched on the refusal WORDING and not on provider identity or
+# an HTTP status: I4 forbids branching request construction on provider name,
+# and the status alone (400) cannot distinguish "this parameter is unavailable"
+# from "your schema is malformed" — descending on the latter would hide a real
+# caller bug behind a weaker rung.
+_RESPONSE_FORMAT_REFUSAL_RE = re.compile(
+    r"response[_ ]?format",
+    re.IGNORECASE,
+)
+_RESPONSE_FORMAT_REFUSAL_CAUSE_RE = re.compile(
+    r"unavailable|unsupported|not supported|not available|not enabled",
+    re.IGNORECASE,
+)
+
+
+def _is_response_format_refusal(exc: BaseException) -> bool:
+    """True when *exc* is a provider refusing ``response_format`` itself.
+
+    Both halves must match: the message has to name the parameter AND say it
+    cannot be served. A 400 naming ``response_format`` because the SCHEMA was
+    rejected is a caller defect and must keep raising — degrading it would
+    swap a loud, correct failure for a quietly weaker rung.
+    """
+    text = str(exc)
+    return bool(
+        _RESPONSE_FORMAT_REFUSAL_RE.search(text)
+        and _RESPONSE_FORMAT_REFUSAL_CAUSE_RE.search(text)
+    )
 
 # Bounded jittered backoff between attempts of the retry loops below. The
 # SDK's own ``max_retries`` backs off for status/connection failures, but it
@@ -196,9 +323,109 @@ def _first_choice(resp: Any) -> Any:
     return choices[0]
 
 
-def _choice_text(resp: Any) -> str:
-    """First choice's message content, stripped. Raises on null choices."""
-    return (_first_choice(resp).message.content or "").strip()
+def _empty_content_diagnostics(resp: Any, choice: Any) -> str:
+    """Why ``message.content`` came back empty, in one line.
+
+    An empty content on an otherwise successful response has several causes
+    that look identical from the outside, and the SDK surfaces none of them:
+
+    - a **reasoning model that spent the whole output budget on its trace**.
+      ``max_tokens`` bounds reasoning + content together, so the response is
+      large, ``choices`` is present, and ``content`` is ``''``. This is what
+      the Director hit on 2026-08-04 (alpha-engine-config#6396): two ~100s
+      completions, both fully billed, nginx logging 30 KB responses, and the
+      only signal was ``no JSON object found in response: ''``;
+    - a refusal or a content filter, which lands in a sibling field;
+    - a genuinely truncated body (``finish_reason='length'``);
+    - a provider whose content sits somewhere other than ``message.content``.
+
+    ``finish_reason`` alone does not separate them — a budget consumed by
+    reasoning reports ``length`` on some routes and ``stop`` on others. The
+    reasoning-token count and the sibling field names do.
+    """
+    # The ONE swallow in this module's fail-loud contract, and it is bounded to
+    # instrumentation: (a) the failure mode swallowed is this function's own
+    # introspection raising — an SDK response object whose attribute access
+    # has side effects, which `getattr(x, y, None)` does NOT protect against,
+    # because a raising `__getattr__` propagates past the default; (b) the
+    # primary deliverable survives untouched — the caller still receives the
+    # content it read and classifies it exactly as before, since a diagnostic
+    # that can break the call it describes is worse than no diagnostic;
+    # (c) the recording surface is the same ERROR line, which still emits and
+    # names the introspection failure instead of the fields.
+    try:
+        msg = getattr(choice, "message", None)
+        usage = getattr(resp, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning = getattr(msg, "reasoning_content", None) or getattr(
+            msg, "reasoning", None
+        )
+        # `vars()` alone is not enough: on a pydantic-modelled SDK response
+        # the provider's non-standard fields live in `__pydantic_extra__`, and
+        # `reasoning_content` — the single most diagnostic name here — is
+        # exactly one of those. Measured 2026-08-04 against the live edge:
+        # `vars()` reported `['role']` on a message carrying 29,877 chars of
+        # reasoning, i.e. it named none of what the operator needs.
+        attrs = dict(vars(msg)) if msg is not None and hasattr(msg, "__dict__") else {}
+        attrs.update(getattr(msg, "model_extra", None) or {})
+        fields = sorted(k for k, v in attrs.items() if v not in (None, "", [], {}))
+        return (
+            f"finish_reason={getattr(choice, 'finish_reason', None)!r} "
+            f"native_finish_reason="
+            f"{getattr(choice, 'native_finish_reason', None)!r} "
+            f"completion_tokens={getattr(usage, 'completion_tokens', None)!r} "
+            f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)!r} "
+            f"reasoning_chars="
+            f"{len(reasoning) if isinstance(reasoning, str) else None} "
+            f"populated_message_fields={fields} "
+            f"response_type={type(resp).__name__} "
+            f"id={getattr(resp, 'id', None)!r} "
+            f"model={getattr(resp, 'model', None)!r}"
+        )
+    except Exception as exc:  # noqa: BLE001 — see the three-part rationale above
+        return (
+            f"diagnostics unavailable: introspecting the response raised "
+            f"{exc.__class__.__name__}: {exc} "
+            f"(response_type={type(resp).__name__})"
+        )
+
+
+def _choice_text(resp: Any, *, caller_raises_on_empty: bool = False) -> str:
+    """First choice's message content, stripped. Raises on null choices.
+
+    Logs the diagnostics when the content is empty. The emptiness itself is not
+    an error here — callers classify it — but it is invisible without this
+    line, and the caller-facing symptom actively misdirects: a structured
+    caller reports ``no JSON object found in response: ''``, which reads as a
+    model that answered in prose. Instrumented at THIS chokepoint rather than
+    at the structured paths, for the same reason ``_first_choice`` is: a guard
+    applied at four of five call sites is not a guard.
+
+    ``caller_raises_on_empty`` sets the LEVEL, and only the level — the line is
+    emitted either way. This function's own docstring says the emptiness is not
+    an error and that callers classify it, so logging it at ERROR
+    unconditionally contradicts that: on the structured path the caller raises
+    with the SAME diagnostics microseconds later, so an ERROR here is a second
+    report of one event. Alert handlers attach at ERROR
+    (``krepis.logging.setup_logging``), so that duplication reached the on-call
+    human: one Think Tank abort on 2026-08-11 produced three separate ERROR
+    dispatches for a single failed call (alpha-engine-config-I6921 D3).
+
+    The default stays ERROR, deliberately. On the plain-completion path
+    (:meth:`LLMClient.complete`) an empty string is RETURNED to the caller and
+    nothing raises — there this line is the only signal that anything happened,
+    and demoting it fleet-wide to buy quiet on the structured path would trade
+    a duplicate alert for a missing one.
+    """
+    choice = _first_choice(resp)
+    text = (getattr(choice.message, "content", None) or "").strip()
+    if not text:
+        logger.log(
+            logging.WARNING if caller_raises_on_empty else logging.ERROR,
+            "llm: EMPTY message.content on a successful response — %s",
+            _empty_content_diagnostics(resp, choice),
+        )
+    return text
 
 
 class LLMError(RuntimeError):
@@ -212,6 +439,82 @@ class LLMError(RuntimeError):
     def __init__(self, message: str, *, usage: "Optional[LLMUsage]" = None):
         super().__init__(message)
         self.usage = usage
+
+
+class BudgetExhaustedError(LLMError):
+    """The completion budget ran out before any content was produced.
+
+    A distinct type because it has a distinct fix. ``no JSON object found in
+    response: ''`` — what this used to surface as — says *the model returned
+    something unparseable*, which is a prompt or model problem. The actual
+    fault is *``max_tokens`` was too small for this ask*, a one-line change to
+    the registry row. Three wrong hypotheses were chased against a live paid
+    endpoint before anyone looked at ``finish_reason``
+    (alpha-engine-config#6391).
+
+    **Never retried.** The second attempt cannot succeed under the same
+    budget: it re-issues the identical ask against the identical ceiling.
+    Measured on the Director's weekly call — two attempts, ~100s of generation
+    each, both fully billed, both guaranteed to fail before the first one
+    returned. Retrying does not merely fail to inform, it doubles the cost of
+    a certain failure.
+
+    Empty content with ``finish_reason='stop'`` is a DIFFERENT fault and keeps
+    the ordinary corrective-retry path — that one really is a model returning
+    nothing useful, and a retry can fix it.
+    """
+
+
+def _budget_exhausted_error(
+    *,
+    spec: "ModelSpec",
+    max_tokens: int,
+    stop_signal: str,
+    reasoning_tokens: Any = None,
+    usage: "Optional[LLMUsage]" = None,
+) -> "BudgetExhaustedError":
+    """The one message, built the same way for every transport."""
+    return BudgetExhaustedError(
+        f"provider={spec.provider} model={spec.model}: the completion budget "
+        f"was exhausted before any content was produced — max_tokens="
+        f"{max_tokens}, {stop_signal}, reasoning_tokens={reasoning_tokens!r}. "
+        f"On a reasoning model max_tokens bounds reasoning AND content "
+        f"together, so the trace consumed the whole budget and nothing was "
+        f"left to answer with. Raise the budget for this ask — not the "
+        f"prompt, and not the schema.",
+        usage=usage,
+    )
+
+
+def _reject_budget_exhausted(
+    resp: Any,
+    text: str,
+    *,
+    spec: "ModelSpec",
+    max_tokens: int,
+    usage: "Optional[LLMUsage]" = None,
+) -> None:
+    """Raise :exc:`BudgetExhaustedError` for an empty, length-capped response.
+
+    No-op unless the content is empty AND the provider says it stopped because
+    it hit the ceiling. Both conditions matter: a length-capped response WITH
+    content is ordinary truncation the caller may still parse, and an empty
+    response that stopped naturally is a different fault entirely
+    (a model that answered with nothing, which a retry can fix).
+    """
+    if text:
+        return
+    choice = _first_choice(resp)
+    if getattr(choice, "finish_reason", None) != "length":
+        return
+    details = getattr(getattr(resp, "usage", None), "completion_tokens_details", None)
+    raise _budget_exhausted_error(
+        spec=spec,
+        max_tokens=max_tokens,
+        stop_signal="finish_reason='length'",
+        reasoning_tokens=getattr(details, "reasoning_tokens", None),
+        usage=usage,
+    )
 
 
 # ── Result types ──────────────────────────────────────────────────────────
@@ -232,6 +535,29 @@ class LLMUsage:
     #   hit_rate = cache_read / (cache_read + prompt_cache_miss)
     # when both fields are populated (0 = provider didn't report it).
     prompt_cache_miss_tokens: int = 0
+    # reasoning_tokens — the share of ``output_tokens`` the model spent on its
+    # chain of thought, where the provider reports it (0 = not reported, which
+    # on a non-reasoning model is also the true value).
+    #
+    # WHY THIS FIELD EXISTS. On a reasoning model ``max_tokens`` bounds
+    # reasoning AND content together, so a budget sized to the expected ANSWER
+    # yields no answer at all — a fully-billed response with
+    # ``finish_reason=length`` and ``content=''``. That failure has now
+    # occurred three times in eight days (alpha-engine-config#6396 the
+    # Director, I6893 Think Tank's ``pillar`` tier aborting a daily run with
+    # zero theses, I6858 ``router-canary`` paging intermittently), and every
+    # remediation so far has been a GUESS, because the quantity a budget must
+    # clear was recorded nowhere.
+    #
+    # It was visible only in the error path: ``_budget_exhausted_error`` reads
+    # ``reasoning_tokens`` off the response when a call comes back empty. So
+    # the draw was observable exactly once per outage and never on a healthy
+    # call — an unobserved quantity, not a healthy one (principles.md §2.7).
+    # Recording it on every call is what makes a measured floor possible at
+    # all; sizing rules are alpha-engine-config-I6901 and are deliberately NOT
+    # in this change, because the two candidate rules both fail against
+    # measurement today (see that issue).
+    reasoning_tokens: int = 0
     web_search_requests: int = 0
     web_fetch_requests: int = 0
     # Provider-reported USD cost when available (OpenRouter returns it in
@@ -266,6 +592,13 @@ class LLMResult:
     # Consumers needing jurisdiction/compliance checks (config#3006) read
     # this instead of parsing ``raw_response`` themselves.
     served_provider: Optional[str] = None
+    # The registry entry this call ADDRESSED, carried through from
+    # :attr:`ModelSpec.registry_id`. Distinct from ``model``, which is the
+    # upstream name the provider reports: three registry entries can share one
+    # upstream model string while declaring three different reasoning configs,
+    # so ``model`` alone cannot say which was addressed
+    # (alpha-engine-config-I6908). ``None`` for a hand-built spec.
+    registry_id: Optional[str] = None
     # True when a fallback model in the group's chain served this request
     # (the primary failed and LiteLLM's Router transparently tried the
     # next model).  Always False on non-litellm transports.
@@ -293,6 +626,13 @@ class StructuredResult(LLMResult):
     data: dict = field(default_factory=dict)
     # Pydantic instance when ``schema`` was a BaseModel subclass.
     parsed: Any = None
+    # Which rung of the model-portability-policy §7 structured-output ladder
+    # actually produced this payload: "native" (strict response_format=
+    # json_schema), "tool_emulation" (forced tool call — the anthropic
+    # transport's idiom), or "prompt_only" (JSON instruction + tolerant
+    # extraction). Always populated, including on undegraded calls, so the
+    # rung is a value in the artifact rather than an inference from silence.
+    structured_output_rung: str = ""
 
 
 @dataclass
@@ -332,8 +672,9 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
-def _emits_cost(method):
-    """Emit a priced cost record for whatever result *method* returns.
+def _finalize_result(method):
+    """Stamp the call's degradation record onto the result, then emit a priced
+    cost record for it.
 
     Applied at the PUBLIC method boundary rather than at each ``return``
     site, deliberately. ``complete`` / ``structured`` / ``complete_grounded``
@@ -342,11 +683,28 @@ def _emits_cost(method):
     return path would be invisible — no error, no log, just a call site that
     quietly stops being accounted for — which is precisely the failure class
     this arc exists to close (alpha-engine-config-I5206).
+
+    ``dropped_params`` is stamped for the same reason and was missing for the
+    same reason: the field existed on :class:`LLMResult` and documented itself
+    as the surface making a degraded call visible in the artifact, and NO
+    return site ever assigned it — so every degraded call read as fully
+    honored to every consumer of the artifact (alpha-engine-config-I7232).
+    Snapshot-and-clear, not just snapshot: ``self.dropped_params`` lives on the
+    client, so without the reset a drop on one call would ride along on every
+    later result from the same client and misreport it as degraded.
     """
 
     @functools.wraps(method)
     def _wrapped(self, *args, **kwargs):
-        result = method(self, *args, **kwargs)
+        self.dropped_params = []
+        try:
+            result = method(self, *args, **kwargs)
+        finally:
+            # Cleared even when the call RAISES: a drop recorded on a failed
+            # call must not attach itself to the next successful one.
+            dropped = self.dropped_params
+            self.dropped_params = []
+        result.dropped_params = dropped
         self._emit_cost_record(result)
         return result
 
@@ -383,9 +741,25 @@ class LLMClient:
     ``cost_sink`` is an optional ``callable(record: dict) -> None``. When
     set, each completed call builds a priced record via
     :func:`krepis.cost.record_llm_call` — carrying token counts, cache
-    read/write splits and USD — and hands it to the sink. Default ``None``
-    means no emission, so public consumers pay nothing for a feature they
-    have not asked for.
+    read/write splits and USD — and hands it to the sink.
+
+    **When it is NOT set, the sink is resolved from the environment**
+    (:func:`krepis.cost_sink.default_sink_from_env`): if
+    ``KREPIS_COST_SINK_BUCKET`` and ``KREPIS_COST_SINK_PREFIX`` are both
+    exported, every client built in that process emits, whether or not
+    its author thought about cost telemetry. With neither set the default
+    is ``None`` and a public consumer pays nothing for a feature it has
+    not asked for.
+
+    That inversion is the point. While emission required a constructor
+    argument, coverage equalled *the set of authors who remembered*, and
+    on 2026-08-13 that set was one process: every per-call cost record in
+    the Alpha Engine research bucket came from the Think Tank, while the
+    weekly pipeline's own LLM stages — each holding a correct
+    ``callsite_id`` and passing no sink — were attributed to nothing
+    (``alpha-engine-config-I7179``). Emission is now a property of the
+    execution environment, which is where a fleet operator can actually
+    set it once, rather than a property of each call site.
     """
 
     def __init__(
@@ -411,8 +785,22 @@ class LLMClient:
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        if cost_sink is None:
+            # Deliberately NOT wrapped in try/except. A half-configured
+            # sink environment raises CostSinkConfigError here, before the
+            # first billable call — see default_sink_from_env for why
+            # falling through to silence is the worse failure.
+            from krepis.cost_sink import default_sink_from_env
+
+            cost_sink = default_sink_from_env()
         self._cost_sink = cost_sink
         self._client: Any = None
+        if spec.supports_automatic_prefix_caching:
+            logger.info(
+                "LLMClient(%s/%s): automatic prefix caching is active for this model "
+                "(server-side, no client-side cache_control markers needed)",
+                spec.provider, spec.model,
+            )
         # Parameters the route could not honor and the caller allowed us to
         # drop. Surfaced on LLMResult so a degraded call is visible in the
         # artifact rather than only in a log line.
@@ -525,7 +913,62 @@ class LLMClient:
             return self._api_key
         env_name = self.spec.resolved_api_key_env()
         key = os.environ.get(env_name)
+        if not key and self.spec.provider == ROUTER_EDGE_PROVIDER:
+            # The ROUTER EDGE resolves on the full credential chain, not the
+            # environment alone (alpha-engine-config-I6373).
+            #
+            # Every other provider here authenticates from a key that is
+            # deliberately in the environment, and that stays true. The edge is
+            # different in kind: `resolve_group_spec` names a PER-CONSUMER
+            # credential (`$KREPIS_ROUTER_CREDENTIAL_SECRET`), the edge
+            # identifies the consumer BY that credential's value, and the
+            # supported home for it is SSM under `/alpha-engine/<name>` —
+            # precisely so the secret never enters an environment, a Lambda
+            # config, a CloudWatch log, or an SSM command string on the way to
+            # the box.
+            #
+            # Route admission already resolved it that way. This leg did not,
+            # so a consumer configured exactly as intended passed admission and
+            # then failed the call it had just been admitted for. Measured
+            # 2026-08-04: the Think Tank spot box aborted 5s into its daily run
+            # having written 0 theses, with all six KREPIS_* variables set and
+            # the SSM parameter present and readable; `alpha-engine-research-
+            # runner` failed identically. Both halves had tests; neither test
+            # could see the other half.
+            #
+            # Lazy import: `krepis.router` imports `krepis.llm_config` and is
+            # the heavier module, so it is reached the same way every other
+            # router call in this file is.
+            from krepis.router import resolve_router_credential
+
+            key = resolve_router_credential(env_name)
         if not key:
+            # `EGRESS_PROXY_PLACEHOLDER` is exported into the LOCAL egress
+            # proxy process's own environment (nous-ergon-ops
+            # litellm-proxy-shim.sh), not into every consumer's — the proxy
+            # injects the real upstream key server-side and ignores whatever
+            # this client sends, so the client needs any non-empty string,
+            # not a shared secret. `krepis.model_registry.api_key_for()`
+            # already encodes that ("unset placeholder env -> literal
+            # default") for the config-generation path; this mirrors it for
+            # the runtime call path so a consumer with no reason to export
+            # the proxy's own placeholder variable is not blocked by its
+            # absence (alpha-engine-config-I7031).
+            from krepis import model_registry as _mr
+
+            if env_name == _mr.EGRESS_PLACEHOLDER_ENV:
+                key = _mr.EGRESS_PLACEHOLDER_DEFAULT
+        if not key:
+            if self.spec.provider == ROUTER_EDGE_PROVIDER:
+                # Naming only the environment variable sends an operator to the
+                # wrong place on the path whose supported source is SSM.
+                raise LLMConfigError(
+                    f"no router-edge credential {env_name!r}: pass api_key=, "
+                    f"set the {env_name} environment variable, or put the "
+                    f"value in SSM at {_SSM_PREFIX}{env_name} "
+                    "(this consumer's identity at the edge is its credential "
+                    "VALUE — do not point it at a shared key)"
+                )
             raise LLMConfigError(
                 f"no API key for provider {self.spec.provider!r}: pass "
                 f"api_key= or set the {env_name} environment variable"
@@ -661,6 +1104,13 @@ class LLMClient:
             usage.web_fetch_requests += int(
                 getattr(stu, "web_fetch_requests", 0) or 0
             )
+        # Anthropic's own API does NOT break out a reasoning share — extended
+        # thinking is counted inside ``output_tokens``, so this stays 0 on the
+        # real Anthropic transport and that zero is truthful. Read anyway,
+        # because DeepSeek's Anthropic-compatible endpoint already returns
+        # OpenAI-shaped extras here (see the cache fields above) and a
+        # provider that does report it should not be silently dropped.
+        usage.reasoning_tokens += int(getattr(u, "reasoning_tokens", None) or 0)
         return usage
 
     @staticmethod
@@ -671,6 +1121,22 @@ class LLMClient:
             return usage
         usage.input_tokens += int(getattr(u, "prompt_tokens", 0) or 0)
         usage.output_tokens += int(getattr(u, "completion_tokens", 0) or 0)
+        # OpenAI-shape providers report the reasoning share under
+        # completion_tokens_details.reasoning_tokens. Absent on non-reasoning
+        # models and on providers that do not break it out.
+        # Handle both shapes deliberately: the openai SDK types this field, but
+        # a proxied or non-conforming provider can deliver it as a raw dict,
+        # and ``getattr`` on a dict silently returns the default — the exact
+        # way ``server_tool_use_details`` read 0 for weeks below (config#1659).
+        completion_details = getattr(u, "completion_tokens_details", None)
+        if isinstance(completion_details, dict):
+            usage.reasoning_tokens += int(
+                completion_details.get("reasoning_tokens", 0) or 0
+            )
+        elif completion_details is not None:
+            usage.reasoning_tokens += int(
+                getattr(completion_details, "reasoning_tokens", 0) or 0
+            )
         details = getattr(u, "prompt_tokens_details", None)
         if details is not None:
             usage.cache_read_tokens += int(getattr(details, "cached_tokens", 0) or 0)
@@ -713,6 +1179,41 @@ class LLMClient:
             usage.provider_cost_usd = (usage.provider_cost_usd or 0.0) + float(cost)
         return usage
 
+    def _effective_max_tokens(self, max_tokens: Optional[int]) -> int:
+        """The budget actually sent, warning when a caller shrinks the row's.
+
+        ``max_tokens`` is a registry-owned parameter, and a caller-supplied
+        value wins over :attr:`ModelSpec.max_tokens` outright. Raising it is
+        ordinary — a caller that knows its own ask is larger than the row's
+        default. LOWERING it silently reverses the registry, and on a
+        reasoning model that is not a smaller answer, it is NO answer:
+        ``max_tokens`` bounds reasoning + content together, so the trace
+        consumes the budget and ``content`` comes back ``''``.
+
+        Live 2026-08-04 (alpha-engine-config#6396): the Director passed a
+        literal 8000 against a row carrying 65536. Two ~100s completions, both
+        fully billed, both empty — and raising the ROW from 16384 to 65536 as
+        the remediation changed nothing, because the literal was what the
+        request carried. Nothing anywhere logged the number on the wire.
+
+        This is a warning rather than a refusal: shrinking the budget is a
+        legitimate cost control, and this library does not get to overrule a
+        caller. It only has to stop the override being invisible.
+        """
+        if max_tokens is None:
+            return self.spec.max_tokens
+        if max_tokens < self.spec.max_tokens:
+            logger.warning(
+                "llm: caller max_tokens=%d OVERRIDES the registry's %d for "
+                "provider=%s model=%s — the wire carries %d. A registry-side "
+                "budget change cannot reach this call while the override "
+                "stands, and on a reasoning model max_tokens bounds reasoning "
+                "+ content together (alpha-engine-config#6396).",
+                max_tokens, self.spec.max_tokens, self.spec.provider,
+                self.spec.model, max_tokens,
+            )
+        return max_tokens
+
     def _openai_extra_body(self) -> Optional[dict]:
         body: dict = {}
         if self._is_openrouter():
@@ -752,7 +1253,7 @@ class LLMClient:
 
     # ── plain completion ──────────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete(
         self,
         *,
@@ -773,7 +1274,7 @@ class LLMClient:
         — there is nothing to forward and nothing is lost.
         """
         self._reject_reasoning_on_anthropic()
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             payload = build_messages_payload(
@@ -795,65 +1296,10 @@ class LLMClient:
                 text=text,
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,
-            )
-
-        if self.spec.transport == TRANSPORT_LITELLM:
-            # LiteLLM Router handles fallback chains — model is the group name.
-            from krepis.router import get_group_primary as _get_primary
-            from krepis.router import group_supports_explicit_cache_breakpoints as _grp_pc
-
-            # cache_system asks for EXPLICIT cache_control breakpoints. Whether
-            # the served model honors them is a per-model fact resolved from
-            # the registry via the group's primary — never assumed, and never
-            # silently dropped, which is what this branch used to do.
-            if cache_system:
-                self._capability_gate(
-                    "cache_system",
-                    _grp_pc(self.spec.model),
-                    on_unsupported=on_unsupported,
-                    detail="the model serving this group uses automatic prefix "
-                           "caching (or none), which takes no client markers",
-                )
-
-            router = _get_router()
-            self._dlp_scan_request(
-                {
-                    "model": self.spec.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user_content},
-                    ],
-                    "max_tokens": limit,
-                },
-                context=f"complete litellm group={self.spec.model}",
-            )
-            resp = router.completion(
-                model=self.spec.model,  # "low", "med", "high", "ultra"
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content},
-                ],
-                max_tokens=limit,
-            )
-            served_model = getattr(resp, "model", "")
-            primary = _get_primary(self.spec.model)
-            fallback_used = bool(primary and served_model and served_model != primary)
-            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
-            text = self._choice_text_or_llm_error(resp)
-            return LLMResult(
-                text=text,
-                model=served_model or self.spec.model,
-                provider=self.spec.provider,
-                served_provider=getattr(resp, "_hidden_params", {}).get("model_id", None),
-                usage=self._usage_from_openai(resp),
-                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
-                raw_response=resp,
-                fallback_used=fallback_used,
-                model_requested=self.spec.model,
-                dropped_params=list(self.dropped_params),
             )
 
         kwargs: dict = {
@@ -872,10 +1318,16 @@ class LLMClient:
         self._dlp_scan_request(kwargs, context=f"complete openai model={self.spec.model}")
         resp = self._transport_client().chat.completions.create(**kwargs)
         text = self._choice_text_or_llm_error(resp)
+        served_model = (
+            _resolve_group_served_model(resp, spec=self.spec)
+            if self.spec.provider == ROUTER_EDGE_PROVIDER
+            else getattr(resp, "model", self.spec.model)
+        )
         return LLMResult(
             text=text,
-            model=getattr(resp, "model", self.spec.model),
+            model=served_model,
             provider=self.spec.provider,
+            registry_id=self.spec.registry_id,
             served_provider=getattr(resp, "provider", None),
             usage=self._usage_from_openai(resp),
             raw_request=kwargs,
@@ -884,7 +1336,7 @@ class LLMClient:
 
     # ── structured completion ─────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def structured(
         self,
         *,
@@ -921,6 +1373,18 @@ class LLMClient:
         ``response_format=json_schema`` when ``spec.structured_outputs``,
         else a JSON-instruction suffix + fence/preamble-tolerant extraction
         (Think Tank pattern).
+
+        **Degradation ladder** (``model-portability-policy`` §7). Which rung
+        served is on the result as ``structured_output_rung``, always — the
+        undegraded calls publish theirs too. On the openai transport, an
+        endpoint that REFUSES ``response_format`` (as opposed to a registry
+        entry that never claimed it) drops one rung to ``prompt_only`` for that
+        call, records ``response_format`` in ``dropped_params``, and logs at
+        ERROR. It is a recorded degradation, never a silent one, and it is
+        bounded: one descent per call, and the descent does not spend an
+        ``attempts`` retry. A refusal naming the SCHEMA rather than the
+        parameter's availability still raises — see
+        :func:`_is_response_format_refusal`.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
@@ -928,7 +1392,7 @@ class LLMClient:
 
         is_pydantic = hasattr(schema, "model_json_schema")
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         def _parse_and_validate(raw_data: Any):
             if is_pydantic:
@@ -946,17 +1410,6 @@ class LLMClient:
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             return self._structured_anthropic(
-                system=system,
-                user_content=user_content,
-                schema_dict=schema_dict,
-                schema_name=schema_name,
-                parse_and_validate=_parse_and_validate,
-                is_pydantic=is_pydantic,
-                attempts=attempts,
-                max_tokens=limit,
-            )
-        if self.spec.transport == TRANSPORT_LITELLM:
-            return self._structured_litellm(
                 system=system,
                 user_content=user_content,
                 schema_dict=schema_dict,
@@ -1018,6 +1471,18 @@ class LLMClient:
             msg = client.messages.create(**payload)
             self._usage_from_anthropic(msg, into=usage)
             tool_input = self._extract_tool_input(msg, schema_name)
+            # Same fault, Anthropic's spelling of it: the forced tool never
+            # got emitted because the budget ran out first. Raised outside the
+            # retry classification for the same reason as the openai path —
+            # the next attempt re-issues the identical ask under the identical
+            # ceiling.
+            if tool_input is None and getattr(msg, "stop_reason", None) == "max_tokens":
+                raise _budget_exhausted_error(
+                    spec=self.spec,
+                    max_tokens=max_tokens,
+                    stop_signal="stop_reason='max_tokens'",
+                    usage=usage,
+                )
             try:
                 if tool_input is None:
                     raise ValueError(
@@ -1028,6 +1493,13 @@ class LLMClient:
                     text="",
                     model=getattr(msg, "model", self.spec.model),
                     provider=self.spec.provider,
+                    registry_id=self.spec.registry_id,
+                    # The anthropic transport's structured-output idiom IS the
+                    # §7 ladder's tool_emulation rung (forced tool_choice on a
+                    # tool whose input_schema is the schema). Stamped so the
+                    # rung is present on every transport's result, not only the
+                    # one that can degrade.
+                    structured_output_rung=_STRUCTURED_RUNG_TOOL_EMULATION,
                     usage=usage,
                     raw_request=payload,
                     raw_response=msg,
@@ -1075,43 +1547,85 @@ class LLMClient:
         attempts: int,
         max_tokens: int,
     ) -> StructuredResult:
-        messages: List[dict] = [{"role": "system", "content": system}]
-        kwargs: dict = {"model": self.spec.model, "max_tokens": max_tokens}
-        if self.spec.structured_outputs:
-            messages.append({"role": "user", "content": user_content})
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema_dict,
-                },
-            }
-        else:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": user_content
-                    + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
-                }
-            )
         extra_body = self._openai_extra_body()
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+
+        def _build(rung: str) -> tuple[List[dict], dict]:
+            """Request for one rung of the §7 ladder. The openai transport has
+            two reachable rungs (``tool_emulation`` is the anthropic idiom), and
+            building both here — rather than at one branch on entry — is what
+            lets the descent re-issue instead of aborting the caller's run."""
+            msgs: List[dict] = [{"role": "system", "content": system}]
+            kw: dict = {"model": self.spec.model, "max_tokens": max_tokens}
+            if rung == _STRUCTURED_RUNG_NATIVE:
+                msgs.append({"role": "user", "content": user_content})
+                kw["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema_dict,
+                    },
+                }
+            else:
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": user_content
+                        + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
+                    }
+                )
+            if extra_body:
+                kw["extra_body"] = extra_body
+            return msgs, kw
+
+        rung = (
+            _STRUCTURED_RUNG_NATIVE
+            if self.spec.structured_outputs
+            else _STRUCTURED_RUNG_PROMPT_ONLY
+        )
+        messages, kwargs = _build(rung)
 
         usage = LLMUsage()
         last_error: Any = None  # Exception (validation) or str (transport decode)
         raw_text = ""
         client = self._transport_client()
 
-        for attempt in range(attempts):
+        # ``budget`` rather than ``range(attempts)``: a rung descent is not a
+        # failed attempt, it is a different request, so it must not consume the
+        # caller's retry budget. It can happen at most once (there is exactly
+        # one rung below ``native`` on this transport), so the budget is bounded
+        # at ``attempts + 1``.
+        descended = False
+        budget = attempts
+        attempt = -1
+        while attempt + 1 < budget:
+            attempt += 1
             try:
                 if attempt == 0:
                     scan_payload: dict = {"messages": messages, **kwargs}
                     self._dlp_scan_request(scan_payload, context=f"structured openai model={self.spec.model}")
                 resp = client.chat.completions.create(messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
-                raw_text = _choice_text(resp)
+                raw_text = _choice_text(resp, caller_raises_on_empty=True)
+                # Deliberately OUTSIDE the retry classification below: a
+                # budget exhausted before any content is not an attempt
+                # failure, it is a certainty about every remaining attempt.
+                _reject_budget_exhausted(
+                    resp, raw_text, spec=self.spec,
+                    max_tokens=max_tokens, usage=usage,
+                )
+                # Also outside the retry classification, and computed before
+                # JSON validation: an unresolvable served model is a router/
+                # transport data-integrity problem, not a validation failure,
+                # and cannot be fixed by a corrective retry against the same
+                # response. Letting it fall into the validation except below
+                # would burn `attempts` retries on an unrecoverable condition
+                # and report it as "failed validation" (alpha-engine-config-I6543).
+                served_model = (
+                    _resolve_group_served_model(resp, spec=self.spec)
+                    if self.spec.provider == ROUTER_EDGE_PROVIDER
+                    else getattr(resp, "model", self.spec.model)
+                )
             except (json.JSONDecodeError, NullChoicesError) as exc:
                 # Two body-level transport failures on what the SDK treated as
                 # a SUCCESSFUL transaction, both invisible to its own
@@ -1142,19 +1656,51 @@ class LLMClient:
                     self.spec.provider,
                     self.spec.model,
                     attempt + 1,
-                    attempts,
+                    budget,
                     last_error,
                 )
-                if attempt < attempts - 1:
+                if attempt < budget - 1:
                     _retry_backoff_sleep(attempt)
+                continue
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it is a refusal
+                # §7 ladder descent, the ONLY case handled here. Anything else
+                # re-raises unchanged: this clause must not become a general
+                # transport catch-all.
+                if not (
+                    rung == _STRUCTURED_RUNG_NATIVE
+                    and not descended
+                    and _is_response_format_refusal(exc)
+                ):
+                    raise
+                descended = True
+                budget += 1
+                rung = _STRUCTURED_RUNG_PROMPT_ONLY
+                self.dropped_params.append("response_format")
+                messages, kwargs = _build(rung)
+                logger.error(
+                    "llm structured provider=%s model=%s: the endpoint REFUSED "
+                    "response_format (%s: %s). Descending the "
+                    "model-portability-policy §7 ladder native -> prompt_only "
+                    "for this call and recording the drop on the result "
+                    "(dropped_params, structured_output_rung). The registry "
+                    "declares this deployment can serve strict structured "
+                    "output and the endpoint disagrees — that contradiction is "
+                    "a registry defect to fix, not a condition to live on "
+                    "(alpha-engine-config-I7232).",
+                    self.spec.provider,
+                    self.spec.model,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 continue
             try:
                 parsed = parse_and_validate(_extract_json(raw_text))
                 return StructuredResult(
                     text=raw_text,
-                    model=getattr(resp, "model", self.spec.model),
+                    model=served_model,
                     provider=self.spec.provider,
                     served_provider=getattr(resp, "provider", None),
+                    structured_output_rung=rung,
                     usage=usage,
                     raw_request={"messages": messages, **kwargs},
                     raw_response=resp,
@@ -1184,111 +1730,8 @@ class LLMClient:
 
         raise LLMError(
             f"provider={self.spec.provider} model={self.spec.model}: "
-            f"structured output failed validation after {attempts} "
-            f"attempt(s): {last_error}",
-            usage=usage,
-        )
-
-    def _structured_litellm(
-        self,
-        *,
-        system: str,
-        user_content: str,
-        schema_dict: dict,
-        schema_name: str,
-        parse_and_validate: Callable[[Any], Any],
-        is_pydantic: bool,
-        attempts: int,
-        max_tokens: int,
-    ) -> StructuredResult:
-        """Structured completion via LiteLLM Router with fallback chains."""
-        from krepis.router import get_group_primary as _get_primary
-
-        json_instruction = _JSON_INSTRUCTION.format(
-            schema=json.dumps(schema_dict, indent=2)
-        )
-        usage = LLMUsage()
-        last_error: Optional[str] = None
-        fallback_used = False
-
-        for attempt in range(1, attempts + 1):
-            router = _get_router()
-            prompt = (
-                user_content + json_instruction
-                if attempt == 1
-                else user_content
-                + f"\n\nPrevious attempt failed: {last_error}\n"
-                + json_instruction
-            )
-            try:
-                if attempt == 1:
-                    self._dlp_scan_request(
-                        {
-                            "model": self.spec.model,
-                            "messages": [
-                                {"role": "system", "content": system},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "max_tokens": max_tokens,
-                        },
-                        context=f"structured litellm group={self.spec.model}",
-                    )
-                resp = router.completion(
-                    model=self.spec.model,  # "low", "med", "high", "ultra"
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                )
-            except Exception as exc:
-                last_error = str(exc)
-                if attempt == attempts:
-                    raise LLMError(
-                        f"litellm Router call failed after {attempts} "
-                        f"attempt(s) — all models in group "
-                        f"{self.spec.model!r} exhausted (primary → "
-                        f"fallbacks all failed): {last_error}",
-                        usage=usage,
-                    ) from exc
-                continue
-
-            served_model = getattr(resp, "model", "")
-            primary = _get_primary(self.spec.model)
-            if primary and served_model and served_model != primary:
-                fallback_used = True
-            _check_fallback_transition(self.spec.model, fallback_used, served_model, primary or "")
-
-            self._usage_from_openai(resp, into=usage)
-            try:
-                # _choice_text is inside the guarded block: a null/empty
-                # ``choices`` body is a retryable provider failure here too,
-                # not a bare TypeError escaping the loop. No explicit backoff
-                # on this branch — the Router's fallback chain means the next
-                # attempt goes to a DIFFERENT model, so sleeping first would
-                # delay a call that is not hitting the unhealthy endpoint.
-                raw_text = _choice_text(resp)
-                parsed = self._extract_json(raw_text)
-                validated = parse_and_validate(parsed)
-            except Exception as exc:
-                last_error = str(exc)
-                continue
-            return StructuredResult(
-                text=raw_text,
-                parsed=validated if is_pydantic else None,
-                data=validated if not is_pydantic else None,
-                model=served_model or self.spec.model,
-                provider=self.spec.provider,
-                usage=usage,
-                raw_request={"model": self.spec.model, "system": system, "user_content": user_content},
-                raw_response=resp,
-                fallback_used=fallback_used,
-                model_requested=self.spec.model,
-            )
-
-        raise LLMError(
-            f"structured output failed validation after {attempts} "
-            f"attempt(s): {last_error}",
+            f"structured output failed validation after {budget} "
+            f"attempt(s) at rung={rung}: {last_error}",
             usage=usage,
         )
 
@@ -1306,7 +1749,7 @@ class LLMClient:
 
     # ── grounded completion ───────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete_grounded(
         self,
         *,
@@ -1374,7 +1817,7 @@ class LLMClient:
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
-        limit = max_tokens if max_tokens is not None else self.spec.max_tokens
+        limit = self._effective_max_tokens(max_tokens)
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             extra: dict = {
@@ -1396,6 +1839,7 @@ class LLMClient:
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
                 model=getattr(msg, "model", self.spec.model),
                 provider=self.spec.provider,
+                registry_id=self.spec.registry_id,
                 usage=self._usage_from_anthropic(msg),
                 raw_request=payload,
                 raw_response=msg,

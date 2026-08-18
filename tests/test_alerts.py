@@ -759,3 +759,299 @@ class TestTestEnvGuard:
                 result = alerts.publish("boom", source="x")
         # Guard did NOT short-circuit — the mocked transports ran.
         assert result.any_ok is True
+
+
+class TestDryRun:
+    """``dry_run=True`` (config-I6759) — verify a call site's argument
+    shape without sending anything. Motivated by PR165: a delivery
+    verification call site paged Brian with a synthetic ERROR because
+    ``publish()`` previously only suppressed fan-out under
+    ``PYTEST_CURRENT_TEST``."""
+
+    def test_never_constructs_boto3_client(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        boom = MagicMock(side_effect=AssertionError("boto3.client() reached in dry-run!"))
+        fake_boto3_module = MagicMock()
+        fake_boto3_module.client = boom
+        with patch.dict("sys.modules", {"boto3": fake_boto3_module}):
+            result = alerts.publish("boom", source="x", dry_run=True)
+        boom.assert_not_called()
+        assert result.sns.ok is True
+        assert result.telegram.ok is True
+
+    def test_never_touches_telegram_transport(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_publish_telegram",
+            side_effect=AssertionError("_publish_telegram reached in dry-run!"),
+        ) as tg:
+            result = alerts.publish("boom", source="x", dry_run=True)
+        tg.assert_not_called()
+        assert result.telegram.ok is True
+        assert result.telegram.detail == "dry-run: would send"
+
+    def test_never_calls_publish_sns(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_publish_sns",
+            side_effect=AssertionError("_publish_sns reached in dry-run!"),
+        ) as sns_fn:
+            result = alerts.publish("boom", source="x", dry_run=True)
+        sns_fn.assert_not_called()
+        assert result.sns.ok is True
+        assert result.sns.detail == "dry-run: would send"
+
+    def test_writes_no_dedup_marker(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        with patch.object(
+            alerts, "_write_dedup_marker",
+            side_effect=AssertionError("_write_dedup_marker reached in dry-run!"),
+        ) as write_marker:
+            result = alerts.publish(
+                "boom", source="x", dedup_key="dry-run-key", dry_run=True,
+            )
+        write_marker.assert_not_called()
+        assert result.dedup_skipped is False
+        assert result.sns.ok is True
+        assert result.telegram.ok is True
+
+    def test_emits_no_overseer_intake_event(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        from krepis import fleet_events
+
+        with patch.object(
+            fleet_events, "emit_alert_event",
+            side_effect=AssertionError("emit_alert_event reached in dry-run!"),
+        ) as emit:
+            alerts.publish("boom", source="x", dry_run=True)
+        emit.assert_not_called()
+
+    def test_dry_run_result_shape(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        result = alerts.publish("boom", severity="error", source="x", dry_run=True)
+        assert isinstance(result, alerts.PublishResult)
+        assert result.sns == alerts.ChannelResult(ok=True, detail="dry-run: would send")
+        assert result.telegram == alerts.ChannelResult(ok=True, detail="dry-run: would send")
+        assert result.any_ok is True
+        assert result.all_ok is True
+        assert result.dedup_skipped is False
+
+    def test_dry_run_respects_channel_disable(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        result = alerts.publish("boom", source="x", sns=False, telegram=False, dry_run=True)
+        assert result.sns.ok is True
+        assert "sns disabled" in result.sns.detail
+        assert result.telegram.ok is True
+        assert "telegram disabled" in result.telegram.detail
+
+    def test_cli_dry_run_flag_returns_0(self, monkeypatch):
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        boom = MagicMock(side_effect=AssertionError("boto3.client() reached in dry-run!"))
+        fake_boto3_module = MagicMock()
+        fake_boto3_module.client = boom
+        with patch.dict("sys.modules", {"boto3": fake_boto3_module}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                side_effect=AssertionError("_publish_telegram reached in dry-run!"),
+            ):
+                rc = alerts.main([
+                    "publish", "--dry-run",
+                    "--message", "x", "--severity", "error", "--source", "y",
+                ])
+        assert rc == 0
+        boom.assert_not_called()
+
+
+# ─── Source-mute (v0.57.0) ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_boto3_with_ssm():
+    """boto3 stub extending fake_boto3 with an SSM client whose
+    ``get_parameter`` return value tests control via ``_ssm_value``."""
+    sts_client = MagicMock()
+    sts_client.get_caller_identity.return_value = {"Account": "711398986525"}
+    sns_client = MagicMock()
+    sns_client.publish.return_value = {"MessageId": "test-msg-id-abc123"}
+    ssm_client = MagicMock()
+
+    fake = MagicMock()
+
+    def _client(service: str, **kwargs):
+        if service == "sts":
+            return sts_client
+        if service == "sns":
+            return sns_client
+        if service == "ssm":
+            return ssm_client
+        raise AssertionError(f"unexpected boto3 client request: {service}")
+
+    fake.client.side_effect = _client
+    return fake, sts_client, sns_client, ssm_client
+
+
+def _ssm_value(ssm_client, value: str) -> None:
+    ssm_client.get_parameter.return_value = {"Parameter": {"Value": value}}
+
+
+class TestFetchSourceMutes:
+    def test_missing_parameter_returns_empty(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_malformed_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, "not json")
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_non_list_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '{"not": "a list"}')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_valid_list_parsed(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            entries = alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM)
+        assert entries == [
+            {"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}
+        ]
+
+    def test_boto3_unavailable_fails_open(self, monkeypatch):
+        with patch.dict("sys.modules", {"boto3": None}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+
+class TestFindLiveMute:
+    def test_matches_prefix_and_live(self):
+        entries = [
+            {
+                "source_prefix": "metron",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "reason": "x",
+            }
+        ]
+        assert alerts._find_live_mute("metron/deploy", entries) == entries[0]
+
+    def test_no_match_different_source(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("crucible-executor", entries) is None
+
+    def test_expired_entry_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_missing_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_unparseable_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "not-a-date"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_none_source_never_matches(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute(None, entries) is None
+
+    def test_non_dict_entries_skipped(self):
+        assert alerts._find_live_mute("metron/deploy", ["not-a-dict"]) is None
+
+
+class TestPublishSourceMute:
+    def test_suppressed_when_source_matches_live_mute(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z", '
+            '"reason": "focus on crucible"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                side_effect=AssertionError("telegram reached despite live mute"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is True
+        assert "metron" in result.mute_reason
+        assert result.any_ok is True
+        sns.publish.assert_not_called()
+
+    def test_not_suppressed_when_mute_expired(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_not_suppressed_for_non_matching_source(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("exec failed", source="crucible-executor")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_no_mute_list_does_not_suppress(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_mute_checked_before_dedup(self, fake_boto3_with_ssm):
+        """A muted source must not reach the (S3) dedup marker check —
+        the fixture only registers sts/sns/ssm clients, so an
+        unexpected boto3.client('s3') call raises."""
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            result = alerts.publish(
+                "deploy failed", source="metron/deploy",
+                dedup_key="metron-deploy-failed",
+            )
+        assert result.muted is True
+        assert result.dedup_skipped is False
+        ssm.get_parameter.assert_called_once()
+
+    def test_cli_stderr_reports_muted(self, fake_boto3_with_ssm, capsys):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = alerts.main([
+                "publish", "--message", "x", "--source", "metron/deploy",
+            ])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "muted=True" in captured.err

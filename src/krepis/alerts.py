@@ -33,6 +33,18 @@ CLI convention.
   branches). Exit code is ``0`` if *either* channel succeeded, ``1`` if
   *both* failed.
 
+**Dry-run** (``--dry-run`` CLI flag / ``dry_run=True`` kwarg, config-I6759).
+Runs argument parsing + ``_format_message`` and reports a synthetic
+``ok=True, detail="dry-run: would send"`` :class:`ChannelResult` per
+channel — no SNS publish, no Telegram call, no dedup marker write, no
+Overseer intake event, and no boto3 client construction. The
+short-circuit fires before the dedup check and before the
+``PYTEST_CURRENT_TEST`` guard, so it is deterministic in every caller
+environment. Use it to verify a delivery call site's argument shape
+without paging the operator (PR165 paged Brian with a synthetic ERROR
+because ``publish()`` previously only suppressed fan-out under
+``PYTEST_CURRENT_TEST``).
+
 **Severity tiering.** ``severity`` is a free-form string that is
 prepended to the message (``[ERROR] ...`` / ``[WARNING] ...``) for both
 channels. Telegram pushes (``disable_notification=False``) for
@@ -52,6 +64,14 @@ network) and Telegram errors both log at WARNING and return a
 :class:`PublishResult` with the failed channel marked ``ok=False``. This
 is by design — the caller is already in a failure path; secondary
 surveillance failure must not mask the primary error.
+
+**Source-keyed suppression** (v0.57.0, alpha-engine-config mute-arc).
+Distinct from dedup: an operator can mute an entire alert *source*
+(e.g. ``"metron"``) for a stated, expiring window via a JSON list in
+SSM (:data:`DEFAULT_MUTE_SSM_PARAM`) — see the :func:`publish`
+``mute_ssm_param`` parameter and :attr:`PublishResult.muted`. Checked
+before dedup; fails open (never suppresses) on any fetch/parse error
+or on a missing/expired ``expires_at``.
 """
 
 from __future__ import annotations
@@ -84,6 +104,19 @@ DEFAULT_DEDUP_BUCKET: Final[str] = _dedup.DEFAULT_DEDUP_BUCKET
 DEDUP_MARKER_PREFIX: Final[str] = "_alerts/_dedup"
 DEFAULT_DEDUP_WINDOW_MIN: Final[int] = 60
 
+# ── Source-keyed suppression (v0.57.0; alpha-engine-config-I<mute-issue>) ───
+# Distinct from dedup: dedup rate-limits a *recurring* alert (resets on any
+# new finding text — a systemd-drift finding for a different unit resets the
+# window even while metron is "muted"); a mute is an operator-declared,
+# time-boxed "stop paging me about this SOURCE" that holds regardless of
+# message content. Config lives in SSM (not a file in alpha-engine-config)
+# because ``publish`` callers span EC2 boxes, Lambdas and CI runners that do
+# not reliably have that private repo checked out, but already reach SSM for
+# every other runtime secret/toggle (mirrors ``krepis.secrets`` /
+# ``krepis.router``'s ``ssm.get_parameter`` pattern). One parameter holds a
+# JSON list so an operator edits one value instead of one-param-per-mute.
+DEFAULT_MUTE_SSM_PARAM: Final[str] = "/alpha-engine/alerts/source_mutes"
+
 
 @dataclass
 class ChannelResult:
@@ -107,22 +140,30 @@ class PublishResult:
     neither channel is attempted; :attr:`any_ok` still reports True
     (the alert is logically in the operator's hands by virtue of the
     earlier successful publish).
+
+    When the alert's ``source`` matches a live entry in the source-mute
+    list, :attr:`muted` is True and neither channel is attempted;
+    :attr:`any_ok` reports True (an intentional operator-declared skip,
+    not a delivery failure — a Bash caller's ``|| echo '...failed'``
+    fallback must not fire for a mute).
     """
 
     sns: ChannelResult = field(default_factory=lambda: ChannelResult(ok=False, detail="not attempted"))
     telegram: ChannelResult = field(default_factory=lambda: ChannelResult(ok=False, detail="not attempted"))
     dedup_skipped: bool = False
     dedup_reason: str = ""
+    muted: bool = False
+    mute_reason: str = ""
 
     @property
     def any_ok(self) -> bool:
-        if self.dedup_skipped:
+        if self.dedup_skipped or self.muted:
             return True
         return self.sns.ok or self.telegram.ok
 
     @property
     def all_ok(self) -> bool:
-        if self.dedup_skipped:
+        if self.dedup_skipped or self.muted:
             return True
         return self.sns.ok and self.telegram.ok
 
@@ -131,11 +172,9 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
     """Return the SNS topic ARN, resolving from env + STS if not explicit."""
     if explicit:
         return explicit
-    region = (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
     try:
         import boto3
 
@@ -227,6 +266,99 @@ def _write_dedup_marker(
     )
 
 
+def _fetch_source_mutes(ssm_param: str) -> list[dict]:
+    """Fetch + parse the source-mute list from SSM.
+
+    Fail-*open* throughout: boto3 unavailable, the parameter missing,
+    an SSM error, or unparseable/malformed JSON all resolve to "no
+    mutes" (``[]``) so a fetch failure suppresses nothing — an alert
+    that should have been muted but wasn't is a nuisance page; an alert
+    that should have fired but was silently swallowed by a broken mute
+    fetch is a missed incident. Never raises.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import ClientError
+    except ImportError as exc:
+        logger.debug(
+            "alerts.publish: mute check skipped — boto3 unavailable: %s", exc,
+        )
+        return []
+    from krepis.aws_region import resolve_region
+
+    region = resolve_region()
+    try:
+        client = boto3.client("ssm", region_name=region)
+        resp = client.get_parameter(Name=ssm_param)
+        raw = resp["Parameter"]["Value"]
+    except ClientError as exc:
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code != "ParameterNotFound":
+            logger.debug(
+                "alerts.publish: mute list fetch errored (fail-open, no "
+                "mutes applied): %s", exc,
+            )
+        return []
+    except Exception as exc:  # boto3 missing at call time, network, etc.
+        logger.debug(
+            "alerts.publish: mute list fetch errored (fail-open, no mutes "
+            "applied): %s", exc,
+        )
+        return []
+
+    try:
+        import json
+
+        entries = json.loads(raw)
+    except Exception as exc:
+        logger.warning(
+            "alerts.publish: mute list at %s is not valid JSON (fail-open, "
+            "no mutes applied): %s", ssm_param, exc,
+        )
+        return []
+    if not isinstance(entries, list):
+        logger.warning(
+            "alerts.publish: mute list at %s is not a JSON list (fail-open, "
+            "no mutes applied)", ssm_param,
+        )
+        return []
+    return entries
+
+
+def _find_live_mute(source: str | None, entries: list[dict]) -> dict | None:
+    """Return the first live (non-expired) mute entry matching ``source``.
+
+    An entry is a ``{source_prefix, expires_at, reason}`` dict. Matches
+    when ``source`` starts with ``source_prefix``. "Live" requires an
+    ``expires_at`` that parses as ISO8601 AND is still in the future —
+    a missing, unparseable, or already-past ``expires_at`` does NOT
+    suppress (fail toward alerting: a typo'd or omitted expiry must
+    never become an accidental permanent mute).
+    """
+    if not source:
+        return None
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        prefix = entry.get("source_prefix")
+        expires_at = entry.get("expires_at")
+        if not prefix or not expires_at:
+            continue
+        if not source.startswith(prefix):
+            continue
+        try:
+            expires = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if expires <= now:
+            continue
+        return entry
+    return None
+
+
 def publish(
     message: str,
     *,
@@ -238,6 +370,8 @@ def publish(
     dedup_key: str | None = None,
     dedup_window_min: int | None = DEFAULT_DEDUP_WINDOW_MIN,
     dedup_bucket: str | None = None,
+    mute_ssm_param: str | None = None,
+    dry_run: bool = False,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -292,6 +426,27 @@ def publish(
         ``dedup_key`` for the lifetime of the marker bucket).
     :param dedup_bucket: S3 bucket holding the markers. Defaults to
         ``alpha-engine-research`` (the shared corpus bucket).
+    :param mute_ssm_param: Override the SSM parameter holding the
+        source-mute list. Defaults to :data:`DEFAULT_MUTE_SSM_PARAM`
+        (``/alpha-engine/alerts/source_mutes``), a JSON list of
+        ``{source_prefix, expires_at, reason}`` objects maintained by an
+        operator (e.g. via ``aws ssm put-parameter``). Checked BEFORE
+        the dedup step: if ``source`` starts with any entry's
+        ``source_prefix`` and that entry's ``expires_at`` (ISO8601) is
+        still in the future, the alert is suppressed on both channels
+        — logged at DEBUG (never silent), never raised to WARNING/ERROR
+        so a live mute doesn't itself look like a problem. Missing,
+        expired, or malformed entries never suppress (fail toward
+        alerting). See :attr:`PublishResult.muted`.
+    :param dry_run: When ``True``, short-circuits before the dedup
+        check and before any boto3 client construction. Argument
+        parsing, ``_format_message``, and (if ``sns`` and an explicit
+        ``sns_topic_arn`` were given) topic-ARN echoing still run; no
+        SNS publish, no Telegram call, no dedup marker write, and no
+        Overseer intake event fire. Returns a :class:`PublishResult`
+        with ``ok=True, detail="dry-run: would send"`` per attempted
+        channel so callers verifying a delivery call site's shape exit
+        ``0`` without paging the operator (config-I6759).
     :returns: :class:`PublishResult` — caller can inspect per-channel
         outcomes. :attr:`PublishResult.any_ok` is the typical success
         gate; :attr:`PublishResult.all_ok` is the strict variant.
@@ -300,6 +455,28 @@ def publish(
     """
     result = PublishResult()
     formatted = _format_message(message, severity, source)
+
+    # ── Dry-run short-circuit (config-I6759) ─────────────────────────────
+    # Fires before the dedup check and before any boto3 client construction
+    # (SNS ARN resolution's ``sts.get_caller_identity`` call included) so a
+    # caller verifying a delivery call site's argument shape never pages
+    # the operator and never depends on AWS credentials being present.
+    # Deliberately does NOT attempt live SNS topic-ARN resolution — only an
+    # already-explicit ``sns_topic_arn`` is echoed — so this path never
+    # imports boto3. No dedup marker write, no Overseer intake event
+    # (full suppression; no ``dry_run`` field added to the event schema).
+    if dry_run:
+        detail = "dry-run: would send"
+        if sns:
+            sns_detail = f"{detail} to {sns_topic_arn}" if sns_topic_arn else detail
+            result.sns = ChannelResult(ok=True, detail=sns_detail)
+        else:
+            result.sns = ChannelResult(ok=True, detail="dry-run: sns disabled (sns=False)")
+        if telegram:
+            result.telegram = ChannelResult(ok=True, detail=detail)
+        else:
+            result.telegram = ChannelResult(ok=True, detail="dry-run: telegram disabled (telegram=False)")
+        return result
 
     # ── Test-environment guard (defense-in-depth) ────────────────────────
     # NEVER fan out a real SNS / Telegram alert from inside a test process.
@@ -320,6 +497,27 @@ def publish(
         detail = "suppressed in test env (PYTEST_CURRENT_TEST set)"
         result.sns = ChannelResult(ok=False, detail=detail)
         result.telegram = ChannelResult(ok=False, detail=detail)
+        return result
+
+    # ── Source-mute check (pre-dedup) ────────────────────────────────────
+    # Deliberately runs BEFORE the dedup step: a mute is a coarser,
+    # operator-declared "stop paging about this source" that must hold
+    # regardless of how the message text varies (unlike dedup, which keys
+    # on message content and resets whenever a new finding appears).
+    mute_entries = _fetch_source_mutes(mute_ssm_param or DEFAULT_MUTE_SSM_PARAM)
+    live_mute = _find_live_mute(source, mute_entries)
+    if live_mute is not None:
+        reason = (
+            f"source={source!r} matches muted prefix "
+            f"{live_mute.get('source_prefix')!r} "
+            f"(expires {live_mute.get('expires_at')}, "
+            f"reason: {live_mute.get('reason', '')!r})"
+        )
+        logger.debug("alerts.publish: suppressed alert — %s", reason)
+        result.muted = True
+        result.mute_reason = reason
+        result.sns = ChannelResult(ok=False, detail="suppressed by source mute")
+        result.telegram = ChannelResult(ok=False, detail="suppressed by source mute")
         return result
 
     # ── Dedup check (pre-publish) ────────────────────────────────────────
@@ -429,6 +627,18 @@ def main(argv: list[str] | None = None) -> int:
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Verify the delivery call site's argument shape without "
+            "sending anything: runs arg parsing + message formatting, "
+            "attempts no SNS publish, no Telegram call, writes no dedup "
+            "marker, and never constructs a boto3 client. Exits 0. "
+            "Use this to smoke-test a call site's flags instead of "
+            "issuing a real (or synthetic-ERROR) alert (config-I6759)."
+        ),
+    )
+    pub.add_argument(
         "--sns-topic-arn",
         default=None,
         help=(
@@ -491,11 +701,17 @@ def main(argv: list[str] | None = None) -> int:
         dedup_key=args.dedup_key,
         dedup_window_min=window_min,
         dedup_bucket=args.dedup_bucket,
+        dry_run=args.dry_run,
     )
 
     # One-line status to stderr (stdout reserved for structured output if
     # any caller starts parsing it). Bash callers can ignore.
-    if result.dedup_skipped:
+    if result.muted:
+        print(
+            f"alerts.publish: muted=True ({result.mute_reason})",
+            file=sys.stderr,
+        )
+    elif result.dedup_skipped:
         print(
             f"alerts.publish: dedup_skipped=True ({result.dedup_reason})",
             file=sys.stderr,

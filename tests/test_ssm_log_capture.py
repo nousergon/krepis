@@ -715,3 +715,467 @@ class TestChildEnvUnit:
         caller = {"BASE": "yes"}
         ssm_log_capture._child_env(caller, "abc-123")
         assert caller == {"BASE": "yes"}, "caller's env dict was mutated"
+
+
+class TestFailureMessageNamesTheCause:
+    """The last line of a failing run is the exit path, not the cause.
+
+    2026-08-11, weekly SF `ed3c8b3d`: DataPhase1 logged
+
+        ERROR [data-collector] historical_constituents phase failed: No
+        'Selected changes to the list' table found ...
+
+    at 22:05, ran on for fifteen more minutes, and exited with `failed to
+    run commands: exit status 1` as its last line. That last line is what
+    the failure message carried, and what reached the Telegram alert and the
+    SF `cause` field was a git-fetch banner. Diagnosing it took a manual
+    `aws s3 cp` of the whole log (alpha-engine-config-I6945).
+    """
+
+    _CAUSE = (
+        "ERROR [data-collector] historical_constituents phase failed: "
+        "No 'Selected changes to the list' table found"
+    )
+    _LAST = "failed to run commands: exit status 1"
+
+    def test_the_cause_leads_and_the_last_line_is_kept(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "data-weekly", returncode=1,
+            last_output_line=self._LAST, cause_line=self._CAUSE,
+        )
+        assert msg.index(self._CAUSE) < msg.index(self._LAST), (
+            "the cause must lead — a reader who only sees the first clause "
+            "is the case this exists for"
+        )
+
+    def test_it_is_not_rendered_twice_when_they_are_the_same_line(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line=self._CAUSE, cause_line=self._CAUSE,
+        )
+        assert msg.count(self._CAUSE) == 1
+
+    def test_the_old_shape_is_unchanged_when_no_cause_was_seen(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=2, last_output_line="boom",
+        )
+        assert msg == "ssm_log_capture: ERROR: [x] failed (rc=2) — boom"
+
+    def test_no_output_at_all_still_says_so(self):
+        msg = ssm_log_capture.format_subprocess_failure("x", returncode=3)
+        assert "no output captured" in msg
+
+    def test_a_runaway_line_is_clipped_so_it_cannot_evict_the_pair(self):
+        # An unbounded line defeats the purpose: the message exists to fit
+        # inside SSM's 24KB StandardErrorContent and a Telegram message.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line="z" * 50_000,
+            cause_line="y" * 50_000,
+        )
+        assert len(msg) < 1200
+        assert "chars)" in msg
+
+    @pytest.mark.parametrize("line", [
+        "Traceback (most recent call last):",
+        "ERROR [data-collector] phase failed: nope",
+        "RuntimeError: flow-doctor is not installed",
+        "ModuleNotFoundError: No module named 'flow_doctor'",
+        "PHASE_END name=historical_constituents status=error",
+        "fatal: repository '' does not exist",
+        "    assert 0 == 1",
+        "tests/test_x.py::test_y FAILED",
+    ])
+    def test_real_failure_lines_from_this_fleet_are_recognised(self, line):
+        assert ssm_log_capture._CAUSE_RE.search(line), line
+
+    @pytest.mark.parametrize("line", [
+        "Batch 12/19 — 600 refreshed so far (65%)",
+        "INFO [data-collector] Applied daily delta: 932 tickers updated",
+        "==> Terminating spot instance i-0b1bd59ff7ad9e2b0...",
+    ])
+    def test_routine_progress_lines_are_not_mistaken_for_causes(self, line):
+        assert not ssm_log_capture._CAUSE_RE.search(line), line
+
+
+class TestResourceKillClassification:
+    """alpha-engine-config-I7258: an OOM or timeout is a HARD FAIL, NAMED as a
+    resource kill in what the operator reads (Brian's 2026-08-13 ruling) —
+    never folded into a generic "failed" message alongside an application
+    logic error.
+
+    Measured 2026-08-13, `watch-rerun-2026-08-13-2` / `EvaluatorDiagnostics`:
+    a process SIGKILLed by the kernel OOM path on a 4GB c5.large produced
+
+        ERROR: evaluate.py failed. Spot run marked FAILED.
+        (last output: Instance terminated; S3 staging cleaned.)
+
+    — no "OOM", "Killed", "memory", or exit signal anywhere in it, because
+    (a) rc=137 was never classified and (b) the cleanup trap's own terminal
+    echo ("Instance terminated; S3 staging cleaned.") is the ALWAYS-last
+    line on every exit path and was never distinguished from a real cause.
+    """
+
+    _KILL_LINE = (
+        "bash: line 31: 26756 Killed   $PYTHON_BIN -u evaluate.py "
+        "--mode diagnostics --upload --date 2026-08-13"
+    )
+    _TRAP_LINE = "Instance terminated; S3 staging cleaned."
+
+    def test_pre_fix_rc137_was_never_named_a_resource_kill(self):
+        """Documents the exact pre-fix defect this issue reports.
+
+        Reproduces the observed message shape verbatim (rc=137, a generic
+        cause_line, the trap's line as last_output_line, no kill_line
+        threaded through) and shows what the OLD single-bucket cause
+        scanner produced: nothing that says OOM/Killed/resource kill.
+        This class of call (no ``kill_line`` argument) is exactly what
+        every existing caller passed before this fix — the assertion
+        below is what SHOULD be true, and failed against krepis <0.60.0.
+        """
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py",
+            returncode=137,
+            last_output_line=self._TRAP_LINE,
+            cause_line="ERROR: evaluate.py failed. Spot run marked FAILED.",
+        )
+        assert "RESOURCE KILL" in msg and "OOM" in msg, (
+            "rc=137 (SIGKILL) must be named as a resource kill even with "
+            "no kill_line threaded through — the returncode alone is "
+            f"authoritative. Got: {msg!r}"
+        )
+
+    def test_oom_returncode_alone_is_classified(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=137, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+        assert "rc=137" in msg
+
+    def test_negative_sigkill_returncode_is_classified(self):
+        # subprocess.Popen surfaces a killed-by-signal child as -signum.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=-9, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+
+    def test_timeout_returncode_is_classified(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "backtest.py", returncode=124, last_output_line=self._TRAP_LINE,
+        )
+        assert "RESOURCE KILL (TIMEOUT)" in msg
+
+    def test_kill_line_alone_classifies_even_when_rc_was_laundered_to_one(self):
+        # The exact failure mode: an intermediate `if ! cmd; then exit 1;
+        # fi` collapsed the real 137 down to a bare 1 before this layer
+        # ever saw it — but the kernel's own "Killed" message survived in
+        # the captured output.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=1,
+            last_output_line=self._TRAP_LINE,
+            kill_line=self._KILL_LINE,
+        )
+        assert "RESOURCE KILL (OOM)" in msg
+        assert self._KILL_LINE in msg
+
+    def test_kill_line_leads_over_a_later_generic_cause_line(self):
+        # The real regression: a later, more generic ERROR-shaped line
+        # (an SSM transport's own "terminal status=Failed") must not
+        # out-compete the one line that actually names the kill.
+        msg = ssm_log_capture.format_subprocess_failure(
+            "pit-walkforward", returncode=1,
+            last_output_line=self._TRAP_LINE,
+            cause_line="ERROR: SSM step 'pit-walkforward' terminal status=Failed",
+            kill_line=self._KILL_LINE,
+        )
+        assert msg.index(self._KILL_LINE) < msg.index(self._TRAP_LINE)
+        assert "SSM step 'pit-walkforward' terminal status=Failed" not in msg or (
+            msg.index(self._KILL_LINE)
+            < msg.index("SSM step 'pit-walkforward' terminal status=Failed")
+        )
+
+    def test_cleanup_trap_line_never_stands_in_for_the_cause(self):
+        # Obligation 3: the trap's own terminal echo must never be
+        # presented AS the cause — only ever honestly labeled "last output".
+        msg = ssm_log_capture.format_subprocess_failure(
+            "evaluate.py", returncode=137,
+            last_output_line=self._TRAP_LINE,
+            kill_line=self._KILL_LINE,
+        )
+        assert f"— {self._TRAP_LINE}" not in msg  # not presented as the lead
+        assert f"(last output: {self._TRAP_LINE})" in msg
+
+    def test_no_resource_kill_signal_falls_back_to_the_old_shape(self):
+        msg = ssm_log_capture.format_subprocess_failure(
+            "x", returncode=1, last_output_line="boom",
+        )
+        assert "RESOURCE KILL" not in msg
+        assert msg == "ssm_log_capture: ERROR: [x] failed (rc=1) — boom"
+
+    @pytest.mark.parametrize("line", [
+        "bash: line 31: 26756 Killed   python -u evaluate.py",
+        "Out of memory: Killed process 26756 (python3.12)",
+        "python3.12 invoked oom-killer",
+        "MemoryError: Unable to allocate 4.2 GiB",
+    ])
+    def test_resource_kill_lines_from_this_fleet_are_recognised(self, line):
+        assert ssm_log_capture._RESOURCE_KILL_RE.search(line), line
+
+    @pytest.mark.parametrize("line", [
+        "INFO: processed 932 tickers without incident",
+        "ERROR [data-collector] phase failed: no such table",
+    ])
+    def test_routine_and_generic_error_lines_are_not_kill_lines(self, line):
+        assert not ssm_log_capture._RESOURCE_KILL_RE.search(line), line
+
+
+class TestResourceKillThroughTheRealFormattingPath:
+    """Drives a DELIBERATELY OOM-killed (SIGKILL) real subprocess through
+    :func:`ssm_log_capture.run` end to end and asserts the operator-visible
+    stderr message names the resource kill. This is the acceptance test
+    for alpha-engine-config-I7258 — it exercises the real capture/scan/
+    format path, not a hand-built ``format_subprocess_failure`` call.
+    """
+
+    def test_a_sigkilled_child_is_named_a_resource_kill_in_the_real_output(
+        self, isolated_logfile, fake_boto3, capsys
+    ):
+        fake, _ = fake_boto3
+        # A child that prints a line shaped like bash's own foreground-
+        # job-killed message and then SIGKILLs itself — the closest a
+        # portable test gets to an OS-level OOM kill without actually
+        # exhausting memory in CI.
+        script = (
+            "import os, signal, sys\n"
+            "sys.stdout.write('26756 Killed   evaluate.py --mode diagnostics\\n')\n"
+            "sys.stdout.flush()\n"
+            "os.kill(os.getpid(), signal.SIGKILL)\n"
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "evaluator-diagnostics",
+                isolated_logfile,
+                [sys.executable, "-c", script],
+                correlation_id="watch-rerun-2026-08-13-2",
+                step_name="evaluate.py",
+            )
+        assert rc == -9 or rc == 137, f"expected a SIGKILL exit, got {rc}"
+        captured = capsys.readouterr()
+        assert "RESOURCE KILL (OOM)" in captured.err, (
+            "the real run()->format_subprocess_failure path must name the "
+            f"resource kill. stderr was: {captured.err!r}"
+        )
+
+
+# A child that leaks a background descendant holding the inherited stdout pipe,
+# prints, and then exits non-zero. This is `spot_predictor_training.sh` in
+# miniature: `_heartbeat_start` backgrounds a process, the next step fails, and
+# the failure path never stops it (alpha-engine-config-I6948).
+_LEAKS_A_BACKGROUND_HOLDER = (
+    "import subprocess, sys\n"
+    # Inherits this process's stdout — i.e. the capture pipe's write end.
+    "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+    "print('RuntimeError: flow-doctor is not installed')\n"
+    "sys.stdout.flush()\n"
+    "sys.exit(1)\n"
+)
+
+_EXITS_CLEANLY = "import sys; print('all done'); sys.exit(0)\n"
+
+
+class TestOrphanHoldoverDoesNotHangTheCapture:
+    """A leaked background process must not outlive the capture.
+
+    Regression pin for alpha-engine-config-I6948. `run()` used to read the
+    child's stdout until EOF, and EOF needs EVERY write-end holder to close.
+    One leaked `krepis.heartbeat emit ... &` therefore held the pipe open after
+    the workload had already failed, and the SSM command ran to its full
+    `executionTimeout` before being SIGKILLed — `ResponseCode 137`, no log
+    shipped, and a 142-second failure reported as a 90-minute overrun.
+
+    Measured on ne-weekly-freshness-pipeline/watch-rerun-2026-08-10-9,
+    2026-08-11: PredictorTraining entered 15:22:14 PT, smoke failed 15:24:36,
+    SSM killed the command at 16:52:14 (5400s exactly).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _short_drain(self, monkeypatch):
+        # Keep the test fast without weakening what it asserts: the contract is
+        # "bounded by the drain budget", not "bounded by 5 seconds".
+        monkeypatch.setenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, "1.0")
+
+    def test_returns_the_inner_exit_code_instead_of_hanging(
+        self, isolated_logfile, fake_boto3
+    ):
+        import time as _time
+
+        fake, _ = fake_boto3
+        started = _time.monotonic()
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "predictor-training",
+                isolated_logfile,
+                [sys.executable, "-c", _LEAKS_A_BACKGROUND_HOLDER],
+            )
+        elapsed = _time.monotonic() - started
+        assert rc == 1
+        # The leaked holder sleeps 600s. Anything near that is the old hang.
+        assert elapsed < 30, "capture waited on the orphan (elapsed=%.1fs)" % elapsed
+
+    def test_the_log_is_shipped_rather_than_dying_with_the_command(
+        self, isolated_logfile, fake_boto3
+    ):
+        # The half that actually cost the diagnostics: the S3 ship happens
+        # AFTER the read loop, so a loop that never returns ships nothing.
+        fake, s3 = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "predictor-training",
+                isolated_logfile,
+                [sys.executable, "-c", _LEAKS_A_BACKGROUND_HOLDER],
+            )
+        s3.upload_file.assert_called_once()
+        assert "flow-doctor is not installed" in isolated_logfile.read_text()
+
+    def test_the_holdover_is_reported_not_silently_absorbed(
+        self, isolated_logfile, fake_boto3, capfd
+    ):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "predictor-training",
+                isolated_logfile,
+                [sys.executable, "-c", _LEAKS_A_BACKGROUND_HOLDER],
+            )
+        err = capfd.readouterr().err
+        assert "holding its output pipe" in err
+        assert "I6948" in err
+        # And it survives in the shipped artifact, not only on the console.
+        assert "holding its output pipe" in isolated_logfile.read_text()
+
+    def test_the_real_failure_still_leads_the_failure_message(
+        self, isolated_logfile, fake_boto3, capfd
+    ):
+        # The orphan is the exit path; the ImportError is the cause. A reader
+        # given only the exit path debugs the wrong thing (config-I6945).
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "predictor-training",
+                isolated_logfile,
+                [sys.executable, "-c", _LEAKS_A_BACKGROUND_HOLDER],
+                step_name="predictor-training",
+            )
+        err = capfd.readouterr().err
+        assert "flow-doctor is not installed" in err
+
+    def test_the_orphan_is_killed_not_merely_abandoned(
+        self, isolated_logfile, fake_boto3
+    ):
+        # Left alive on a spot box it keeps a terminated stage's process around
+        # and holds whatever else it inherited.
+        import time as _time
+
+        fake, _ = fake_boto3
+        marker = isolated_logfile.parent / "orphan-still-alive"
+        script = (
+            "import subprocess, sys\n"
+            "subprocess.Popen([sys.executable, '-c',\n"
+            "  \"import time; time.sleep(3); open(%r,'w').write('x')\"])\n"
+            "print('parent done')\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(7)\n"
+        ) % str(marker)
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "predictor-training", isolated_logfile, [sys.executable, "-c", script]
+            )
+        assert rc == 7
+        _time.sleep(4)
+        assert not marker.exists(), "orphan survived the capture and kept running"
+
+
+class TestOrphanBreakerDoesNotDisturbTheNormalPath:
+    """The breaker must cost nothing when there is no orphan.
+
+    A hang-breaker that fires on healthy runs would truncate every log in the
+    fleet, so both directions are pinned.
+    """
+
+    def test_clean_exit_returns_immediately_without_spending_the_drain_budget(
+        self, isolated_logfile, fake_boto3, monkeypatch
+    ):
+        import time as _time
+
+        monkeypatch.setenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, "30")
+        fake, _ = fake_boto3
+        started = _time.monotonic()
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug", isolated_logfile, [sys.executable, "-c", _EXITS_CLEANLY]
+            )
+        elapsed = _time.monotonic() - started
+        assert rc == 0
+        assert elapsed < 15, (
+            "a clean exit waited on the orphan budget (elapsed=%.1fs)" % elapsed
+        )
+
+    def test_no_holdover_warning_on_a_clean_run(
+        self, isolated_logfile, fake_boto3, capfd
+    ):
+        fake, _ = fake_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ssm_log_capture.run(
+                "slug", isolated_logfile, [sys.executable, "-c", _EXITS_CLEANLY]
+            )
+        assert "holding its output pipe" not in capfd.readouterr().err
+
+    def test_a_quiet_but_live_child_is_not_mistaken_for_an_orphan(
+        self, isolated_logfile, fake_boto3, monkeypatch, capfd
+    ):
+        # The failure mode to avoid: a long phase that prints nothing for a
+        # while gets its log truncated mid-run. Silence is only meaningful
+        # AFTER the direct child has exited.
+        monkeypatch.setenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, "0.5")
+        fake, _ = fake_boto3
+        script = (
+            "import sys, time\n"
+            "print('phase start'); sys.stdout.flush()\n"
+            "time.sleep(3)\n"
+            "print('phase end'); sys.stdout.flush()\n"
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = ssm_log_capture.run(
+                "slug", isolated_logfile, [sys.executable, "-c", script]
+            )
+        assert rc == 0
+        body = isolated_logfile.read_text()
+        assert "phase start" in body and "phase end" in body
+        assert "holding its output pipe" not in capfd.readouterr().err
+
+
+class TestOrphanDrainBudgetResolution:
+    def test_default_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, raising=False)
+        assert (
+            ssm_log_capture._orphan_drain_seconds()
+            == ssm_log_capture.ORPHAN_DRAIN_SECONDS
+        )
+
+    @pytest.mark.parametrize("bad", ["", "abc", "0", "-3"])
+    def test_unusable_values_fall_back_to_the_default(self, monkeypatch, bad):
+        # A zero or negative budget would declare every clean exit an orphan.
+        monkeypatch.setenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, bad)
+        assert (
+            ssm_log_capture._orphan_drain_seconds()
+            == ssm_log_capture.ORPHAN_DRAIN_SECONDS
+        )
+
+    def test_explicit_override_is_honoured(self, monkeypatch):
+        monkeypatch.setenv(ssm_log_capture.ORPHAN_DRAIN_ENV_VAR, "12.5")
+        assert ssm_log_capture._orphan_drain_seconds() == 12.5
+
+
+class TestKillOrphanGroupNeverRaises:
+    def test_a_group_that_is_already_gone_is_not_an_error(self):
+        # Reaped between the decision and the signal — routine, not a fault.
+        detail = ssm_log_capture._kill_orphan_group(999_999)
+        assert isinstance(detail, str) and detail

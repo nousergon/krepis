@@ -869,13 +869,15 @@ def record_anthropic_call(
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
         "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
+        "reasoning_tokens": metadata.reasoning_tokens,
+        "addressed_registry_id": metadata.addressed_registry_id,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
     }
     if extra_fields:
         record.update(extra_fields)
-    return record
+    return _apply_contract_columns(record)
 
 
 # ── OpenAI-compatible SDK adapter ─────────────────────────────────────────
@@ -1021,6 +1023,9 @@ def metadata_from_openai_completion(
     """
     u = getattr(resp, "usage", None)
     details = getattr(u, "prompt_tokens_details", None) if u is not None else None
+    completion_details = (
+        getattr(u, "completion_tokens_details", None) if u is not None else None
+    )
     reported_cost = getattr(u, "cost", None) if u is not None else None
     return ModelMetadata(
         model_name=model_name if model_name is not None else resp.model,
@@ -1045,6 +1050,18 @@ def metadata_from_openai_completion(
         # ``ModelMetadata.prompt_cache_miss_tokens``.
         prompt_cache_miss_tokens=int(getattr(u, "prompt_cache_miss_tokens", 0) or 0)
             if u else 0,
+        # The reasoning share of ``output_tokens`` — a SUBSET of it, never an
+        # addition, so recompute_cost must not price the two separately.
+        # Mirrors ``krepis.llm._usage_from_openai``, including the dict shape:
+        # a proxied provider can deliver this as raw JSON, and ``getattr`` on a
+        # dict silently returns the default (config#1659's failure mode).
+        reasoning_tokens=(
+            int(completion_details.get("reasoning_tokens", 0) or 0)
+            if isinstance(completion_details, dict)
+            else int(getattr(completion_details, "reasoning_tokens", 0) or 0)
+            if completion_details is not None
+            else 0
+        ),
         web_search_requests=int(getattr(u, "web_search_requests", 0) or 0)
             if u else 0,
         provider_reported_cost_usd=float(reported_cost)
@@ -1071,10 +1088,50 @@ def _metadata_from_llm_result(result: Any, *, model_name: str | None) -> ModelMe
         cache_create_tokens=u.cache_create_tokens,
         cache_create_1h_tokens=u.cache_create_1h_tokens,
         prompt_cache_miss_tokens=u.prompt_cache_miss_tokens,
+        reasoning_tokens=getattr(u, "reasoning_tokens", 0) or 0,
+        addressed_registry_id=getattr(result, "registry_id", None),
         web_search_requests=u.web_search_requests,
         web_fetch_requests=u.web_fetch_requests,
         provider_reported_cost_usd=u.provider_cost_usd,
     )
+
+
+#: Schema version stamped onto every cost record (alpha-engine-config-I7393).
+#: Bump when a column is REMOVED or its meaning changes — additive columns do
+#: not need one, per the S3 contract-safety convention the aggregator follows
+#: (crucible-research scripts/aggregate_costs.py: "v1 rows predate the
+#: tool-fee columns; the aggregator treats missing as zero").
+#:
+#: Starts at 1, not 2: rows written before this constant existed carry NO
+#: schema_version at all, and the aggregator already treats absent as the
+#: earliest shape. Numbering these 1 keeps "absent" and "1" meaning the same
+#: thing rather than inventing a version nothing ever wrote.
+COST_RECORD_SCHEMA_VERSION = 1
+
+
+def _apply_contract_columns(record: "dict[str, Any]") -> "dict[str, Any]":
+    """Stamp the columns the fleet's cost contract declares, in place.
+
+    Called by EVERY record builder in this module. One helper rather than a
+    copy per builder, because two hand-maintained copies of a contract is how
+    `alpha-engine-config-I7393` started: three consumers declared
+    ``schema_version``/``run_id``/``agent_id``/``model_name`` and the builders
+    emitted none of them.
+
+    Additive only. ``model`` and ``callsite_id`` keep their original names, so
+    consumers reading historical rows are untouched; a rename would have fixed
+    the contract readers by breaking everyone else.
+
+    ``run_id`` is NOT set here — the sink owns it (`krepis.cost_sink`
+    partitions by it and stamps it at write time), because a builder has no
+    way to know it.
+    """
+    record.setdefault("schema_version", COST_RECORD_SCHEMA_VERSION)
+    if record.get("model") and "model_name" not in record:
+        record["model_name"] = record["model"]
+    if record.get("callsite_id") and "agent_id" not in record:
+        record["agent_id"] = record["callsite_id"]
+    return record
 
 
 def record_llm_call(
@@ -1148,6 +1205,8 @@ def record_llm_call(
         "cache_create_tokens": metadata.cache_create_tokens,
         "cache_create_1h_tokens": metadata.cache_create_1h_tokens,
         "prompt_cache_miss_tokens": metadata.prompt_cache_miss_tokens,
+        "reasoning_tokens": metadata.reasoning_tokens,
+        "addressed_registry_id": metadata.addressed_registry_id,
         "web_search_requests": metadata.web_search_requests,
         "web_fetch_requests": metadata.web_fetch_requests,
         "cost_usd": metadata.cost_usd,
@@ -1155,4 +1214,4 @@ def record_llm_call(
     }
     if extra_fields:
         record.update(extra_fields)
-    return record
+    return _apply_contract_columns(record)

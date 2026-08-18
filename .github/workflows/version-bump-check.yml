@@ -1,212 +1,153 @@
 name: Version-bump check
 
-# On PRs that touch the package source under ``src/**``, require a
-# ``pyproject.toml::version`` bump AND that the bumped version is not
-# already tagged. Without this, a public-surface src change can merge
-# with the version unchanged, ``auto-tag.yml`` idempotently skips, and
-# the next downstream consumer that pins to the expected
-# ``@vX.Y.Z`` fails ``pip install`` until someone notices.
+# ADOPTED FOR krepis 2026-08-13 (alpha-engine-config-I7197). Mirrors
+# nousergon-lib, where this has run since config-I2716 (2026-07-16); the
+# fleet's rule is to mirror an existing SOTA pattern rather than invent a
+# parallel one.
 #
-# Origin: alpha-engine-lib #76 (AggregateCosts registry entry) merged
-# 2026-05-25 with a public-surface src change but no version bump.
-# auto-tag saw the same ``0.36.0`` it had already tagged and skipped.
-# Downstream alpha-engine-dashboard #129's ``@v0.36.1`` pin failed in
-# CI for ~10 min until a follow-up #77 bumped pyproject. Recoverable
-# but operator-visible — and a recurrence class (any future
-# src-touching PR could repeat this). ROADMAP L347.
+# The krepis instance: PR#141 and PR#142 merged FIVE SECONDS apart, both
+# declaring 0.58.0. #142 published; #141's publish failed the byte-identity
+# check, so the telegram escape fix it carried sat on main installable by
+# nothing until a human noticed the old behaviour in a scratch venv. krepis
+# already had `strict: true` (branches up to date) and it did not help —
+# GitHub recomputes mergeability asynchronously and a five-second window slips
+# through. A guard cannot win that race; removing the racing resource from the
+# PR surface ends it.
 #
-# What this workflow does NOT do:
-#   - It does not enforce a SemVer-style bump (patch vs minor vs
-#     major). That call belongs with the PR author.
-#   - It does not fire on PRs that only touch docs / tests / CI /
-#     README / pyproject metadata. Those are real refactors that
-#     legitimately don't bump the version.
-#   - It does not deduplicate against the PR-time pre-bump state.
-#     If two PRs race the same bump, the second to merge will fail
-#     this check on the "tag already exists" branch and need a
-#     follow-up to pick the next version.
+# INVERTED as of config-I2716 (2026-07-16): PRs must NOT touch the version.
+#
+# The old contract ("every src-touching PR bumps pyproject::version") made
+# every pair of concurrently-open PRs conflict on the version line — each
+# merge re-conflicted every sibling PR (the "version-bump conflict
+# treadmill"; evidence: nousergon-lib #190 accumulated 5+ bot merge-of-main
+# commits in 3 days, conflicting again within hours each time).
+#
+# New contract:
+#   - PRs leave pyproject.toml::version and __init__.__version__ untouched.
+#   - ``auto-version-bump.yml`` bumps the patch version AT MERGE TIME (push
+#     to main), via a deploy-key ruleset bypass; ``auto-tag.yml`` +
+#     ``publish.yml`` then release exactly as before. The original defect
+#     this workflow guarded (src change merges → auto-tag idempotently
+#     skips → downstream pin fails; alpha-engine-lib #76, 2026-05-25) is
+#     now impossible rather than merely detected: the version writer runs
+#     unconditionally after every src-touching merge.
+#   - Deliberate minor/major releases: label the PR ``release:manual`` and
+#     edit both version lines; this check then validates lockstep +
+#     monotonicity + not-already-tagged instead of forbidding the edit.
 #
 # Composes with:
-#   - ``auto-tag.yml``: this workflow is the PR-time guard that
-#     ensures the post-merge auto-tag has something new to tag.
-#   - ``tests/test_version_pin.py``: pyproject.toml and
-#     ``__init__.__version__`` must already match (lockstep
-#     invariant) — this workflow extends the chokepoint from
-#     internal-consistency to external-monotonicity.
+#   - ``auto-version-bump.yml``: the sole routine version writer.
+#   - ``tests/test_version_pin.py``: pyproject/__init__ lockstep invariant.
 
-permissions:
-  contents: read
+permissions: {}
 
 on:
   pull_request:
     branches: [main]
+    # labeled/unlabeled included so applying release:manual re-evaluates
+    # the check without needing a new push.
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
 
 jobs:
-  version-bump-check:
-    name: pyproject version bumped for src/ changes
+  version-policy:
+    name: version untouched by PRs (merge-time autobump)
     runs-on: ubuntu-latest
     steps:
+      - name: Skip in merge_group (version already validated on pull_request)
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "SKIP: version-bump check already passed on the pull_request event."
+          echo "No version files are evaluated in merge_group — the merge commit"
+          echo "is created by GitHub's merge machinery, not by the PR author."
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        if: github.event_name != 'merge_group'
         with:
-          # Need the base branch + tags so we can diff vs main and check
-          # ``git tag --list`` for the proposed new version.
           fetch-depth: 0
 
-      - name: Detect whether PR touches src/**
-        id: detect
-        run: |
-          set -euo pipefail
-          # GITHUB_BASE_REF is the PR's target branch (main); fetch its
-          # tip explicitly so the diff base is correct even on shallow
-          # checkouts (fetch-depth: 0 above guards this, but be explicit).
-          git fetch --no-tags origin "${GITHUB_BASE_REF}"
-          base="origin/${GITHUB_BASE_REF}"
-          changed=$(git diff --name-only "${base}...HEAD")
-          echo "Changed files vs ${base}:"
-          echo "${changed}" | sed 's/^/  /'
-          if echo "${changed}" | grep -qE '^src/'; then
-            echo "src_touched=true" >> "${GITHUB_OUTPUT}"
-          else
-            echo "src_touched=false" >> "${GITHUB_OUTPUT}"
-            echo "PR does not touch src/** — version-bump check skipped."
-          fi
-
-      - name: Read pyproject.toml versions (base vs PR)
+      - name: Read versions (merge-base vs PR, both files)
         id: versions
-        if: steps.detect.outputs.src_touched == 'true'
+        if: github.event_name == 'pull_request'
         run: |
           set -euo pipefail
-          base="origin/${GITHUB_BASE_REF}"
-          # Use a tiny Python snippet for tomllib-correct parsing rather
-          # than a fragile grep — pyproject's [project] section may evolve
-          # (e.g., a future [tool.uv] block that also carries a version
-          # field would break a naive ``grep '^version = '``).
-          pr_version=$(python -c "import tomllib,sys; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          # git show emits the file content at the base ref so we can
-          # parse THAT pyproject too (the PR may have moved it).
+          git fetch --no-tags origin "${GITHUB_BASE_REF}"
+          # Compare against the MERGE-BASE, not main's tip (config-I2772
+          # follow-up, 2026-07-16): the question is "did this PR EDIT the
+          # version lines", not "is this PR's version current". Comparing
+          # against the tip re-redded every open branch on every autobump
+          # release (main 0.123.1→.3 in one afternoon re-failed lib#204/#205
+          # and got them wrongly escalated+drafted). A branch that never
+          # touched the version relative to its fork point passes; staleness
+          # vs the moving tip is the auto-merge machinery's update-branch
+          # concern, not a version-policy violation.
+          base="$(git merge-base HEAD "origin/${GITHUB_BASE_REF}")"
+          pr_py=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           git show "${base}:pyproject.toml" > /tmp/pyproject-base.toml
-          base_version=$(python -c "import tomllib,sys; print(tomllib.load(open('/tmp/pyproject-base.toml','rb'))['project']['version'])")
-          echo "Base version (origin/${GITHUB_BASE_REF}): ${base_version}"
-          echo "PR version (HEAD): ${pr_version}"
-          echo "base_version=${base_version}" >> "${GITHUB_OUTPUT}"
-          echo "pr_version=${pr_version}" >> "${GITHUB_OUTPUT}"
+          base_py=$(python -c "import tomllib; print(tomllib.load(open('/tmp/pyproject-base.toml','rb'))['project']['version'])")
+          pr_init=$(python -c "import re; print(re.search(r'__version__ = \"([^\"]+)\"', open('src/krepis/__init__.py').read()).group(1))")
+          echo "base_py=${base_py}" >> "${GITHUB_OUTPUT}"
+          echo "pr_py=${pr_py}" >> "${GITHUB_OUTPUT}"
+          echo "pr_init=${pr_init}" >> "${GITHUB_OUTPUT}"
+          echo "base ${base_py} → PR pyproject ${pr_py} / __init__ ${pr_init}"
 
-      - name: Require version bump for src/** changes
-        if: steps.detect.outputs.src_touched == 'true'
+      - name: Forbid version edits (unless release:manual)
+        if: github.event_name == 'pull_request' && steps.versions.outputs.base_py != steps.versions.outputs.pr_py && !contains(github.event.pull_request.labels.*.name, 'release:manual')
         env:
-          BASE_VERSION: ${{ steps.versions.outputs.base_version }}
-          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
+          BASE_VERSION: ${{ steps.versions.outputs.base_py }}
+          PR_VERSION: ${{ steps.versions.outputs.pr_py }}
         run: |
           set -euo pipefail
+          cat >&2 <<EOF
+          ERROR: this PR changes pyproject.toml::version (${BASE_VERSION} → ${PR_VERSION}).
+
+          PRs no longer bump the version — auto-version-bump.yml bumps the
+          patch version at merge time, which is what killed the version-line
+          conflict treadmill (config-I2716). Revert the version lines in
+          pyproject.toml and src/krepis/__init__.py to match main.
+
+          Deliberate minor/major release: add the ``release:manual`` label
+          to this PR and keep both version lines edited in lockstep.
+          EOF
+          exit 1
+
+      - name: Forbid lone __init__ version edit (unless release:manual)
+        if: github.event_name == 'pull_request' && steps.versions.outputs.base_py == steps.versions.outputs.pr_py && steps.versions.outputs.pr_init != steps.versions.outputs.pr_py && !contains(github.event.pull_request.labels.*.name, 'release:manual')
+        run: |
+          set -euo pipefail
+          echo "ERROR: __init__.__version__ differs from pyproject.toml::version — PRs must leave BOTH untouched (autobump owns them)." >&2
+          exit 1
+
+      - name: Validate manual release (release:manual only)
+        if: github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'release:manual')
+        env:
+          BASE_VERSION: ${{ steps.versions.outputs.base_py }}
+          PR_VERSION: ${{ steps.versions.outputs.pr_py }}
+          PR_INIT: ${{ steps.versions.outputs.pr_init }}
+        run: |
+          set -euo pipefail
+          if [ "${PR_VERSION}" != "${PR_INIT}" ]; then
+            echo "ERROR: release:manual PR must bump pyproject (${PR_VERSION}) and __init__ (${PR_INIT}) in lockstep." >&2
+            exit 1
+          fi
           if [ "${BASE_VERSION}" = "${PR_VERSION}" ]; then
-            cat >&2 <<EOF
-          ERROR: PR touches src/** but pyproject.toml::version is unchanged.
-
-            base (origin/${GITHUB_BASE_REF}): ${BASE_VERSION}
-            PR (HEAD):                       ${PR_VERSION}
-
-          Origin: alpha-engine-lib #76 merged a public-surface src change
-          without bumping pyproject. auto-tag.yml idempotently skipped, and
-          the next downstream consumer's pin failed pip install for ~10 min
-          until follow-up #77 bumped the version. This guard catches the
-          same class at PR time.
-
-          Fix: bump pyproject.toml::version (and src/alpha_engine_lib/
-          __init__.py::__version__ — test_version_pin enforces lockstep)
-          to a new tag that is NOT in ``git tag --list``.
-
-          Or: if the src change is genuinely no-op for consumers (whitespace,
-          comment, deferred import inside an existing function — a NO-public-
-          surface-change), prefer to split the diff so the src touch lives
-          in a separate doc/internal PR that this guard correctly skips.
-          EOF
+            echo "ERROR: release:manual PR must actually change the version (still ${PR_VERSION})." >&2
             exit 1
           fi
-          echo "OK: pyproject.toml::version bumped ${BASE_VERSION} → ${PR_VERSION}"
-
-      - name: Require new version is not already tagged
-        if: steps.detect.outputs.src_touched == 'true'
-        env:
-          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
-        run: |
-          set -euo pipefail
-          tag="v${PR_VERSION}"
-          # Local clone is fetch-depth:0 + actions/checkout pulls tags by
-          # default; an explicit fetch is belt-and-suspenders.
           git fetch --tags origin
-          if git tag --list | grep -Fxq "${tag}"; then
-            cat >&2 <<EOF
-          ERROR: pyproject.toml::version v${PR_VERSION} already exists as a tag.
-
-          auto-tag.yml will NOT re-tag an existing version — your PR's
-          version bump will appear to succeed but the auto-tag run on
-          merge will idempotently skip, and the consumer pin to
-          ``@v${PR_VERSION}`` will resolve to the OLD commit instead of
-          your PR's HEAD.
-
-          Fix: bump pyproject.toml::version to the next unused version
-          (check ``git tag --list | sort -V | tail`` for the highest
-          existing tag).
-          EOF
+          if git tag --list | grep -Fxq "v${PR_VERSION}"; then
+            echo "ERROR: v${PR_VERSION} already exists as a tag — pick the next unused version (git tag --list | sort -V | tail)." >&2
             exit 1
           fi
-          echo "OK: v${PR_VERSION} not yet tagged — auto-tag.yml will create it on merge."
+          highest=$(printf '%s\n' "${BASE_VERSION}" "${PR_VERSION}" | sort -V | tail -1)
+          if [ "${highest}" != "${PR_VERSION}" ]; then
+            echo "ERROR: manual release ${PR_VERSION} is not greater than base ${BASE_VERSION}." >&2
+            exit 1
+          fi
+          echo "OK: manual release ${BASE_VERSION} → ${PR_VERSION} (lockstep, untagged, monotonic)."
 
-      - name: Require PyPI has no byte-divergent artifact for this version
-        # The tag check above only guards against LOCAL re-tagging. It says
-        # nothing about what's already published: publish.yml runs
-        # `skip-existing: true` unconditionally, so if PR_VERSION was ever
-        # uploaded to PyPI before (a manual release, a deleted-then-reused
-        # git tag, a hand-run workflow_dispatch) with DIFFERENT bytes than
-        # this PR produces, publish.yml will silently no-op on merge and
-        # PyPI stays pinned to the OLD artifact forever while main/the git
-        # tag point at the NEW one — a byte-divergence that version-bump-
-        # check previously had no way to catch (alpha-engine-config#1424:
-        # 0.5.0 on PyPI != 0.5.0 on main). Root-cause fix: compare content,
-        # not just the version string.
-        if: steps.detect.outputs.src_touched == 'true'
-        env:
-          PR_VERSION: ${{ steps.versions.outputs.pr_version }}
+      - name: Version untouched — OK
+        if: github.event_name == 'pull_request' && steps.versions.outputs.base_py == steps.versions.outputs.pr_py && steps.versions.outputs.pr_init == steps.versions.outputs.pr_py
         run: |
-          set -euo pipefail
-          http_code=$(curl -s -o /tmp/pypi-release.json -w '%{http_code}' \
-            "https://pypi.org/pypi/krepis/${PR_VERSION}/json")
-          if [ "${http_code}" = "404" ]; then
-            echo "OK: v${PR_VERSION} not yet published to PyPI — nothing to diverge from."
-            exit 0
-          fi
-          if [ "${http_code}" != "200" ]; then
-            echo "::warning::PyPI JSON API returned HTTP ${http_code} for krepis ${PR_VERSION} — cannot verify byte-identity, failing closed rather than risk a silent divergence."
-            exit 1
-          fi
-
-          echo "PyPI already has a release for ${PR_VERSION} — verifying this PR's sdist is byte-identical before allowing merge."
-          python -m pip install --upgrade pip build >/dev/null
-          rm -rf /tmp/sdist-check && python -m build --sdist --outdir /tmp/sdist-check >/dev/null
-          local_sha=$(sha256sum /tmp/sdist-check/*.tar.gz | awk '{print $1}')
-          published_sha=$(python -c "import json; data = json.load(open('/tmp/pypi-release.json')); sdists = [u for u in data.get('urls', []) if u.get('packagetype') == 'sdist']; print(sdists[0]['digests']['sha256'] if sdists else '')")
-          if [ -z "${published_sha}" ]; then
-            echo "::warning::PyPI has a release for ${PR_VERSION} but no sdist artifact to compare against — cannot verify byte-identity, failing closed."
-            exit 1
-          fi
-          if [ "${local_sha}" != "${published_sha}" ]; then
-            cat >&2 <<EOF
-          ERROR: pyproject.toml::version v${PR_VERSION} is ALREADY published on
-          PyPI with DIFFERENT content than this PR's sdist.
-
-            local sdist sha256:  ${local_sha}
-            PyPI sdist sha256:   ${published_sha}
-
-          publish.yml's \`skip-existing: true\` will silently no-op on merge,
-          leaving PyPI's ${PR_VERSION} pinned to the OLD bytes while main's
-          git tag v${PR_VERSION} points at THIS PR's NEW bytes — the exact
-          byte-divergence class from alpha-engine-config#1424.
-
-          Fix: bump pyproject.toml::version to a version that has never been
-          published to PyPI (check https://pypi.org/pypi/krepis/json for the
-          full release list — local \`git tag --list\` is not sufficient,
-          since it can't see manual/out-of-band PyPI uploads).
-          EOF
-            exit 1
-          fi
-          echo "OK: v${PR_VERSION} already on PyPI but byte-identical to this PR's build — safe to no-op on publish."
+          echo "OK: version untouched — auto-version-bump.yml releases on merge."

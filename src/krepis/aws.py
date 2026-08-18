@@ -185,6 +185,10 @@ def invoke_lambda_with_retry(
     if client is None:  # pragma: no cover — exercised via injected client in tests
         import boto3
 
+        if not region:
+            from krepis.aws_region import resolve_region
+
+            region = resolve_region()
         client = boto3.client("lambda", region_name=region)
     from botocore.exceptions import ClientError
 
@@ -231,6 +235,94 @@ def invoke_lambda_with_retry(
     raise LambdaInvokeError(
         label or function_name, max_attempts, last_code, last_msg
     )  # pragma: no cover
+
+
+class LambdaEnvMergeError(RuntimeError):
+    """Raised when a Lambda environment merge could not be completed."""
+
+
+def merge_lambda_environment(
+    function_name: str,
+    updates: "dict[str, str]",
+    *,
+    region: "str | None" = None,
+    client: "object | None" = None,
+) -> int:
+    """Merge *updates* into a Lambda's environment. Returns the total var count.
+
+    **Read-modify-write, never replace.** ``update-function-configuration
+    --environment`` replaces the WHOLE variable map, and the fleet's
+    functions carry provider keys, database URLs and operator-set flags
+    that exist only on the live function and are codified nowhere. A
+    deploy script that writes a fresh map deletes every one of them.
+
+    **Nothing is echoed.** The current map is read into memory and merged
+    in-process; only the resulting variable COUNT and the merged KEY names
+    are printed. The values never reach stdout, a command line, or a shell
+    trace.
+
+    Why this lives in krepis rather than in each ``deploy.sh``: three
+    alpha-engine repos need the same merge to turn on cost telemetry
+    (``alpha-engine-config-I7179``), and the Bash+heredoc form of it had
+    already been written once in crucible-research. A second and third copy
+    is the drift mechanism ``shared-code-policy`` names, and this one is
+    re-expressible as a Python CLI entry, which is where the fleet rule
+    stops permitting a mirrored Bash primitive.
+    """
+    if not updates:
+        raise LambdaEnvMergeError("merge_lambda_environment called with no updates")
+    for key, value in updates.items():
+        if not key or not isinstance(value, str) or value == "":
+            raise LambdaEnvMergeError(
+                f"refusing to merge an empty value for {key!r} — an empty "
+                f"environment variable is indistinguishable from an unset "
+                f"one at the reader and silently disables whatever it gates"
+            )
+    if client is None:
+        import boto3  # imported lazily so `import krepis.aws` costs nothing
+
+        if not region:
+            from krepis.aws_region import resolve_region
+
+            region = resolve_region()
+        client = boto3.client("lambda", region_name=region)
+
+    try:
+        client.get_waiter("function_updated").wait(FunctionName=function_name)
+    except Exception as exc:  # noqa: BLE001 — duck-typed boto errors
+        # DELIBERATE non-raising degradation, with rationale:
+        # (a) swallowed: the waiter failed (function has never been
+        #     deployed, or the waiter is unavailable on a stubbed client).
+        # (b) the primary deliverable survives because the update below is
+        #     the load-bearing call and raises on its own failure — this
+        #     wait only avoids a ResourceConflictException race.
+        # (c) recorded here, and by the update's own exception if the race
+        #     does bite.
+        _DEFAULT_LOGGER.debug("function_updated waiter skipped for %s: %s", function_name, exc)
+
+    try:
+        config = client.get_function_configuration(FunctionName=function_name)
+    except Exception as exc:  # noqa: BLE001
+        raise LambdaEnvMergeError(
+            f"could not read the current environment of {function_name}: {exc}"
+        ) from exc
+    variables = dict((config.get("Environment") or {}).get("Variables") or {})
+    variables.update(updates)
+
+    try:
+        client.update_function_configuration(
+            FunctionName=function_name,
+            Environment={"Variables": variables},
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise LambdaEnvMergeError(
+            f"could not write the merged environment of {function_name}: {exc}"
+        ) from exc
+    try:
+        client.get_waiter("function_updated").wait(FunctionName=function_name)
+    except Exception as exc:  # noqa: BLE001 — same rationale as above
+        _DEFAULT_LOGGER.debug("post-update waiter skipped for %s: %s", function_name, exc)
+    return len(variables)
 
 
 def main(argv: "list[str] | None" = None) -> int:
@@ -288,7 +380,59 @@ def main(argv: "list[str] | None" = None) -> int:
         help="Optional label for log/error context (defaults to the function name).",
     )
 
+    env = subparsers.add_parser(
+        "merge-lambda-env",
+        help=(
+            "Merge KEY=VALUE pairs into a Lambda's environment, preserving "
+            "every variable already set on the live function. Values are "
+            "never echoed."
+        ),
+    )
+    env.add_argument(
+        "--function-name",
+        required=True,
+        help="Function name (no alias — configuration is version-independent).",
+    )
+    env.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        required=True,
+        help="Variable to merge. Repeatable. VALUE may not be empty.",
+    )
+    env.add_argument(
+        "--region",
+        default=None,
+        help="AWS region (defaults to the ambient boto3/AWS_REGION config).",
+    )
+
     args = parser.parse_args(argv)
+
+    if args.cmd == "merge-lambda-env":
+        _logging.basicConfig(
+            level=_logging.WARNING, format="%(message)s", stream=sys.stderr
+        )
+        updates = {}
+        for pair in args.set:
+            if "=" not in pair:
+                print(f"ERROR: --set expects KEY=VALUE, got {pair!r}", file=sys.stderr)
+                return 2
+            key, value = pair.split("=", 1)
+            updates[key.strip()] = value
+        try:
+            total = merge_lambda_environment(
+                args.function_name, updates, region=args.region
+            )
+        except LambdaEnvMergeError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+        # Keys, never values.
+        print(
+            f"merged {len(updates)} variable(s) [{', '.join(sorted(updates))}] "
+            f"into {args.function_name} ({total} total; values not shown)"
+        )
+        return 0
 
     if args.cmd == "invoke-canary":
         # Surface the backoff WARNINGs to the deploy log (stderr).
