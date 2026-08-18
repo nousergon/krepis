@@ -261,18 +261,37 @@ def test_cli_render_deps_emits_the_deps_script(capsys):
 # ── Parity with the two live Bash copies ─────────────────────────────────
 #
 # The cutover only holds if the rendered script does what the copies it
-# replaces do. These read the live files from sibling checkouts and SKIP when
-# absent (CI runners have no fleet checkout), so they are a laptop-side and
-# fleet-CI guard, not a hard dependency.
+# replaces do. These read the live files from sibling checkouts.
+#
+# alpha-engine-config-I7619: a bare `pytest.skip` on absence is a SILENT
+# GREEN on every CI run forever — CI never has the fleet checked out, so
+# this parity guard would report success while never once executing. `CI`
+# is asserted present and the sibling absent is now a hard failure there;
+# a dev laptop without the sibling checked out still gets a named skip.
+# `FLEET_DIR` lets CI provision an explicit fleet root instead of relying
+# on `Path.home() / "Development"`.
 
 import os  # noqa: E402
 from pathlib import Path  # noqa: E402
 
-_FLEET = Path.home() / "Development"
+_FLEET = Path(os.environ["FLEET_DIR"]) if os.environ.get("FLEET_DIR") else Path.home() / "Development"
+_ON_CI = os.environ.get("CI", "").lower() in {"1", "true", "yes"}
 _COPIES = {
     "nousergon-data": _FLEET / "nousergon-data" / "infrastructure" / "_spot_common.sh",
     "crucible-predictor": _FLEET / "alpha-engine-predictor" / "infrastructure" / "_spot_common.sh",
 }
+
+
+def _require_live_copy(repo: str, path: Path) -> None:
+    if path.exists():
+        return
+    message = (
+        f"{path} not present. CI must check out {repo} and set FLEET_DIR; "
+        f"a dev laptop uses the default sibling checkout at {_FLEET}."
+    )
+    if _ON_CI:
+        pytest.fail(f"{message} On CI this is a broken guard, not an absent layout.")
+    pytest.skip(message)
 
 
 @pytest.mark.parametrize("repo,path", sorted(_COPIES.items()))
@@ -284,8 +303,7 @@ def test_the_rendered_script_carries_every_hardening_the_live_copy_has(repo: str
     (bugclass: a rewrite drops properties the original had). Each invariant
     below is a fix somebody landed after an outage.
     """
-    if not path.exists():
-        pytest.skip(f"{path} not present")
+    _require_live_copy(repo, path)
     live = path.read_text()
     rendered = render_bootstrap(
         _spec(exports={"S3_STAGING": "s3://b/p"}, config_copies=(
@@ -306,18 +324,27 @@ def test_the_rendered_script_carries_every_hardening_the_live_copy_has(repo: str
         assert needle in rendered, f"{repo}: rendered script drops {name!r}"
 
 
-@pytest.mark.skipif(
-    not (_COPIES["nousergon-data"]).exists(),
-    reason="fleet checkout absent",
-)
 def test_the_live_copies_no_longer_carry_the_defects_this_module_encodes():
     """Both Bash copies were fixed on 2026-08-11. If either regresses before
     the cutover completes, this is where it shows — the module is not the
-    only thing that has to stay correct while two implementations coexist."""
+    only thing that has to stay correct while two implementations coexist.
+
+    nousergon-data has since finished the consolidation (config-I7372,
+    config-I6922): its copy no longer carries an inline bootstrap/deps
+    duplicate at all — it calls ``python -m krepis.spot_bootstrap render`` /
+    ``render-deps`` at runtime, so none of the original defects (oneshot
+    watchdog, missing dnf install) can recur there by construction. The
+    inline-defect assertions only still apply to a copy that still carries
+    its own duplicate logic (crucible-predictor, as of this writing).
+    """
     for repo, path in _COPIES.items():
-        if not path.exists():
-            continue
+        _require_live_copy(repo, path)
         live = path.read_text()
+        if "krepis.spot_bootstrap" in live:
+            # Fully delegates to this module at runtime — no local copy of
+            # the watchdog/interpreter logic exists to regress.
+            assert "render" in live, f"{repo}: no longer calls krepis.spot_bootstrap render"
+            continue
         service = live.split("[Service]", 1)
         if len(service) > 1:
             unit = service[1].split("[Install]", 1)[0]
