@@ -90,6 +90,19 @@ FIXTURE = textwrap.dedent(
         status: active
         openrouter_provider_pinning:
           order: [anthropic]
+      # R25/R26-conformant shape (alpha-engine-config-I6286): OpenRouter
+      # reached via the egress proxy, not a direct route. Pinning must still
+      # apply — it is keyed on the actual upstream, not on `route` alone.
+      - id: openrouter-pinned-via-proxy
+        provider: openrouter
+        route: egress_proxy
+        api_base: http://127.0.0.1:8990
+        upstream_host: openrouter.ai
+        model: deepseek/deepseek-v4-pro
+        status: active
+        openrouter_provider_pinning:
+          order: [deepseek]
+          allow_fallbacks: false
 
     model_groups:
       low:
@@ -230,6 +243,16 @@ def test_openrouter_provider_pinning_is_ignored_off_the_openrouter_route(registr
     # pinning field set must not have it forwarded.
     entry = registry.models["direct-route-pinning-field-ignored"]
     assert mr.extra_body(entry) is None
+
+
+def test_openrouter_provider_pinning_is_injected_when_proxied_to_openrouter(registry):
+    # alpha-engine-config-I6286: route: egress_proxy with upstream_host:
+    # openrouter.ai is the R25/R26-conformant shape. Pinning must still
+    # apply — the discriminator is the actual upstream, not `route == "openrouter"`.
+    entry = registry.models["openrouter-pinned-via-proxy"]
+    assert mr.extra_body(entry) == {
+        "provider": {"order": ["deepseek"], "allow_fallbacks": False}
+    }
 
 
 def test_deployment_params_omit_rpm_tpm_and_timeout(registry):

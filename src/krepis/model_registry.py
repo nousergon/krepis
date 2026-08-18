@@ -319,21 +319,30 @@ def extra_body(entry: dict) -> Optional[dict]:
     meaning "no reasoning", and forwarding it verbatim sends the literal four
     characters upstream as a reasoning directive.
 
-    ``openrouter_provider_pinning`` (config#4532) is honoured only for
-    ``route: openrouter`` entries — OpenRouter routes without a pinned
-    provider reselect the upstream per request, which invalidates prefix
-    caches. When set, the generated config injects ``extra_body.provider``
-    so every request to this route targets the same (set of) upstream
-    provider(s). Checked against ``route``, not ``provider``: ``provider``
-    names the underlying model vendor (e.g. ``anthropic``), which is a
-    different field from the routing path.
+    ``openrouter_provider_pinning`` (config#4532) is honoured only for an
+    entry whose upstream is actually OpenRouter — OpenRouter requests without
+    a pinned provider reselect the upstream per request, which invalidates
+    prefix caches. When set, the generated config injects
+    ``extra_body.provider`` so every request to this entry targets the same
+    (set of) upstream provider(s).
+
+    An entry reaches OpenRouter one of two ways: ``route: openrouter``
+    (direct, real key in-process), or ``route: egress_proxy`` with
+    ``upstream_host: openrouter.ai`` (proxied — the R25/R26-conformant
+    shape, alpha-engine-config-I6286). Both must honour pinning; neither is
+    ``provider``, which names the underlying model vendor (e.g.
+    ``anthropic``) and is a different field from the routing path.
     """
     result: dict = {}
     params = entry.get("params") or {}
     reasoning = params.get("reasoning")
     if reasoning and reasoning != "null":
         result["reasoning"] = reasoning
-    if entry.get("route") == "openrouter":
+    targets_openrouter = (
+        entry.get("route") == "openrouter"
+        or entry.get("upstream_host") == "openrouter.ai"
+    )
+    if targets_openrouter:
         provider_pinning = entry.get("openrouter_provider_pinning")
         if provider_pinning and isinstance(provider_pinning, dict):
             result["provider"] = provider_pinning
