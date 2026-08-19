@@ -13,6 +13,13 @@ Usage::
     python3 -m krepis.router resolve ultra
     # → moonshotai/kimi-k3
 
+    # resolve-shell-env — print KEY=value lines for `eval` in a shell caller.
+    # Replaces a bash-side `resolve --json` + contract-checking `python3 -c`
+    # heredoc (alpha-engine-config-I7373/G16) with one krepis-side derivation.
+    eval "$(python3 -m krepis.router resolve-shell-env med)"
+    # → RESOLVED_MODEL, ROUTE, PROVIDER, ANTHROPIC_BASE_URL, DEPLOYMENT_ID,
+    #   AUTH_TYPE set in the calling shell
+
     # List all groups
     python3 -m krepis.router groups
 
@@ -2124,18 +2131,99 @@ def resolve_group_spec(
 
 # ── CLI ──────────────────────────────────────────────────────────────────
 
+#: Fields a shell consumer needs to configure the Claude CLI environment, and
+#: the ``KEY=`` name each is printed under by ``resolve-shell-env``. This is
+#: the byte-identical contract five alpha-engine-config runners each carried
+#: their own ``python3 -c`` heredoc to parse (alpha-engine-config-I7373/G16) —
+#: one KREPIS-side derivation replaces five bash-side copies.
+_SHELL_ENV_FIELDS: tuple[tuple[str, str], ...] = (
+    ("model", "RESOLVED_MODEL"),
+    ("route", "ROUTE"),
+    ("provider", "PROVIDER"),
+    ("api_base_url", "ANTHROPIC_BASE_URL"),
+    ("deployment_id", "DEPLOYMENT_ID"),
+    ("auth_token_type", "AUTH_TYPE"),
+)
+
+
+def _resolve_shell_env(argv: list[str]) -> None:
+    """``resolve-shell-env <group>`` — print ``KEY=value`` lines for ``eval``.
+
+    Replaces the ``python3 -m krepis.router resolve <group> --json`` call plus
+    the contract-checking ``python3 -c`` heredoc that ``alert_drain_run.sh``,
+    ``ci_watch_run.sh``, ``groom_run.sh``, ``overseer_run.sh`` and
+    ``sf_watch_run.sh`` each carried as a byte-identical copy. One resolve,
+    one contract check, one output format — in krepis, not relocated to a
+    sixth bash copy.
+
+    Exits nonzero with a stderr message on failure: unresolvable group (a
+    :class:`ValueError`/:class:`FileNotFoundError` from resolution) or a
+    resolved dict missing a required field (a contract mismatch — the
+    alpha-engine-config-I4453 failure mode, where a missing field silently
+    produced an empty environment instead of an aborted run). Prints nothing
+    to stdout on failure, so a caller doing
+    ``out="$(... resolve-shell-env ...)" || true; [ -z "$out" ]`` still
+    detects the failure exactly as it did against the old heredoc.
+    """
+    if not argv:
+        print(
+            "Usage: python3 -m krepis.router resolve-shell-env <low|med|high|ultra> "
+            "[--exec-context <ctx>] [--wire <fmt>]",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    group = argv[0]
+    exec_context: str | None = None
+    wire = DEFAULT_WIRE
+    for i, arg in enumerate(argv):
+        if arg == "--exec-context" and i + 1 < len(argv):
+            exec_context = argv[i + 1]
+        elif arg == "--wire" and i + 1 < len(argv):
+            wire = argv[i + 1]
+
+    info = resolve_group_structured(group, exec_context=exec_context, wire=wire)
+
+    missing = [field for field, _ in _SHELL_ENV_FIELDS if field not in info]
+    if missing:
+        print(
+            f"krepis.router resolve-shell-env: resolved JSON missing fields: {missing}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    for field, key in _SHELL_ENV_FIELDS:
+        value = info[field]
+        # Values come from the registry (operator-controlled YAML) and the
+        # router's own resolution, not free-form user input, but a bare
+        # newline in one would still split into a second, unintended
+        # `eval`-able line. Refuse rather than emit a shell statement no
+        # caller wrote.
+        if "\n" in str(value):
+            print(
+                f"krepis.router resolve-shell-env: field {field!r} contains a "
+                f"newline, cannot be emitted as a shell KEY=value line",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        print(f"{key}={value}")
+
+
 def _cli() -> None:
     """Entry point for ``python3 -m krepis.router``."""
     if len(sys.argv) < 2:
         print("Usage: python3 -m krepis.router <command> [args]", file=sys.stderr)
         print("  resolve <group> [--json]  — print first healthy model for group", file=sys.stderr)
+        print("  resolve-shell-env <group> — print KEY=value lines for `eval` (shell consumers)", file=sys.stderr)
         print("  groups                    — list all model groups", file=sys.stderr)
         print("  models                    — list all models in the Router", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
 
-    if cmd == "resolve":
+    if cmd == "resolve-shell-env":
+        _resolve_shell_env(sys.argv[2:])
+
+    elif cmd == "resolve":
         if len(sys.argv) < 3:
             print("Usage: python3 -m krepis.router resolve <low|med|high|ultra> [--json] [--exec-context <ctx>] [--wire <fmt>]", file=sys.stderr)
             print(f"  --exec-context  one of {list(EXEC_CONTEXTS)} (default: $KREPIS_EXEC_CONTEXT, else {DEFAULT_EXEC_CONTEXT})", file=sys.stderr)

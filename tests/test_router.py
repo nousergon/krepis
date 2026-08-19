@@ -1106,6 +1106,138 @@ class TestCLIResolveGroup:
             assert exc.value.code == 1
 
 
+# ── CLI resolve-shell-env ─────────────────────────────────────────────────
+# alpha-engine-config-I7373/G16: five runners each carried a byte-identical
+# `python3 -c` heredoc parsing `resolve --json`'s output into `KEY=value`
+# lines for `eval`. This pins the replacement's output shape so any of the
+# five bash call sites can regression-test their old-heredoc-vs-new-CLI
+# behavior against the same fixture.
+
+class TestCLIResolveShellEnv:
+    def test_output_shape(self, registry_file, monkeypatch, capsys):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys, "argv", ["krepis.router", "resolve-shell-env", "med"]
+                ):
+                    _router._cli()
+            captured = capsys.readouterr()
+            lines = [ln for ln in captured.out.splitlines() if ln]
+            keys = [ln.split("=", 1)[0] for ln in lines]
+            assert keys == [
+                "RESOLVED_MODEL",
+                "ROUTE",
+                "PROVIDER",
+                "ANTHROPIC_BASE_URL",
+                "DEPLOYMENT_ID",
+                "AUTH_TYPE",
+            ], (
+                "resolve-shell-env's KEY=value lines are a cross-repo shell "
+                "contract (alpha-engine-config's five *_run.sh scripts `eval` "
+                "them) — order and names must match the retired heredoc's"
+            )
+            values = dict(ln.split("=", 1) for ln in lines)
+            assert values["RESOLVED_MODEL"] == "deepseek-v4-flash"
+            assert values["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8971"
+            assert values["AUTH_TYPE"] == "placeholder"
+            assert values["DEPLOYMENT_ID"]
+            assert values["PROVIDER"]
+            assert values["ROUTE"]
+        finally:
+            _router._router = None
+
+    def test_output_is_eval_safe(self, registry_file, monkeypatch, capsys):
+        """The exact property the five runners depend on: `eval "$out"` sets
+        the named variables and nothing else, in a fresh shell."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys, "argv", ["krepis.router", "resolve-shell-env", "high"]
+                ):
+                    _router._cli()
+            captured = capsys.readouterr()
+            import subprocess
+
+            script = (
+                captured.out
+                + 'echo "RESOLVED_MODEL=$RESOLVED_MODEL"\n'
+                + 'echo "AUTH_TYPE=$AUTH_TYPE"\n'
+            )
+            proc = subprocess.run(
+                ["/bin/sh", "-c", script], capture_output=True, text=True, timeout=10
+            )
+            assert proc.returncode == 0, proc.stderr
+            assert "RESOLVED_MODEL=deepseek-v4-pro" in proc.stdout
+            assert "AUTH_TYPE=placeholder" in proc.stdout
+        finally:
+            _router._router = None
+
+    def test_no_group_exits_1(self, capsys):
+        with mock.patch.object(
+            sys, "argv", ["krepis.router", "resolve-shell-env"]
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _router._cli()
+            assert exc.value.code == 1
+
+    def test_unresolvable_group_prints_nothing_to_stdout(
+        self, registry_file, monkeypatch, capsys
+    ):
+        """A caller doing `out="$(... ) " || true; [ -z "$out" ]` must still
+        detect the failure — no partial `KEY=value` output on a resolution
+        failure."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["krepis.router", "resolve-shell-env", "not-a-real-group"],
+                ):
+                    with pytest.raises(Exception):
+                        _router._cli()
+            captured = capsys.readouterr()
+            assert captured.out == ""
+        finally:
+            _router._router = None
+
+    def test_missing_field_fails_closed(self, registry_file, monkeypatch, capsys):
+        """The I4453 failure mode: a resolved dict missing a required field
+        must abort with nothing printed to stdout, not silently emit a
+        partial environment that leaves e.g. AUTH_TYPE unset."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    _router,
+                    "resolve_group_structured",
+                    return_value={"model": "x", "route": "y"},
+                ):
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        ["krepis.router", "resolve-shell-env", "med"],
+                    ):
+                        with pytest.raises(SystemExit) as exc:
+                            _router._cli()
+                        assert exc.value.code == 1
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "missing fields" in captured.err
+        finally:
+            _router._router = None
+
+
 # ── resolve contract: schema + versioning ────────────────────────────────
 # Regression cover for alpha-engine-config-I4453 (the anthropic_base_url ->
 # api_base_url rename that broke all four consumers) and I4454 (groom_driver
