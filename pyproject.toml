@@ -44,7 +44,24 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # so the dependency is declared here — a consumer wires flow-doctor with
 # `krepis[flow_doctor]` + `from krepis.logging import setup_logging`, no AGPL
 # nousergon-lib required.
-flow_doctor = ["flow-doctor[diagnosis,s3]>=0.8.1,<0.14"]
+#
+# krepis.logging touches exactly two names off the bare `flow_doctor`
+# package root — `flow_doctor.FlowDoctor.from_config()` and
+# `flow_doctor.FlowDoctorHandler(...)` (src/krepis/logging.py) — both are
+# base-package exports needing no extra. The old `[diagnosis,s3]` extras
+# pulled the `anthropic` SDK (diagnosis) and `boto3` (s3 storage backend)
+# onto every `krepis[flow_doctor]` consumer regardless of whether it uses
+# LLM diagnosis or an S3 dedup store — neither is krepis's own glue, both
+# are a consumer's own flow-doctor.yaml choice. flow-doctor 0.15.0 removed
+# the `anthropic` distribution outright and the `diagnosis` extra with it
+# (alpha-engine-config-I7722); a consumer that wants LLM diagnosis or S3
+# storage now names `flow-doctor[diagnosis-openai]`, `flow-doctor[router]`,
+# or `flow-doctor[s3]` itself. No upper bound: 0.8.1 through 0.15.0's
+# CHANGELOG carries no change to `FlowDoctor.from_config()` or
+# `FlowDoctorHandler`'s constructor signature, the only surface krepis
+# touches (0.15.0 breaks `diagnosis.provider` defaults and the `anthropic`
+# transport, neither reachable from krepis's own glue).
+flow_doctor = ["flow-doctor>=0.8.1"]
 # krepis.llm transports. Both SDKs are lazy-imported at call time, so a
 # consumer installs only the transport(s) its ModelSpec can resolve to:
 # `krepis[anthropic]` for the native Anthropic transport, `krepis[openai]`
