@@ -157,7 +157,29 @@ _ENV_OVERRIDE_MAP: dict[tuple[str, str | None], str] = {
 EXEC_CONTEXT_LAPTOP = "laptop"
 EXEC_CONTEXT_EC2 = "ec2"
 EXEC_CONTEXT_LAMBDA = "lambda"
-EXEC_CONTEXTS = (EXEC_CONTEXT_LAPTOP, EXEC_CONTEXT_EC2, EXEC_CONTEXT_LAMBDA)
+# A GitHub-hosted Actions runner (alpha-engine-config-I7853).  The first
+# context here that is not one of our own hosts, and the reason it needed
+# naming: crucible-research's `Judge Perturbation Smoke` reused the production
+# judge's `lambda` declaration because there was no truer word available, and a
+# consumer that has to lie about where it runs is a vocabulary gap, never a
+# consumer defect (R29's corollary: give the registry the vocabulary and the
+# resolver the input, rather than letting the caller act on what it knows).
+#
+# ZERO direct-provider entries are reachable from here, and that is the
+# designed shape rather than an omission: a CI runner has no egress proxy, so a
+# provider endpoint it could reach would be an UNCOMPELLED egress path with
+# nothing observing it (llm-egress-proxy-policy §2a, CI row — custodial: it
+# holds one credential, for the router, and no provider key).  The router edge
+# is the single path there, which R28 already guarantees is enough, since the
+# litellm_proxy route carries no `reachable_from` and is offered in every
+# context.  Its unavailability from CI is an OUTAGE, not a degraded mode.
+EXEC_CONTEXT_CI = "ci"
+EXEC_CONTEXTS = (
+    EXEC_CONTEXT_LAPTOP,
+    EXEC_CONTEXT_EC2,
+    EXEC_CONTEXT_LAMBDA,
+    EXEC_CONTEXT_CI,
+)
 DEFAULT_EXEC_CONTEXT = EXEC_CONTEXT_LAPTOP
 
 # ── Wire formats ─────────────────────────────────────────────────────────
