@@ -1303,114 +1303,21 @@ def _upstream_model(litellm_model: str) -> str:
 
 # ── group resolution (structured, for shell scripts) ────────────────────
 
-def _resolve_group_json(
-    group: str,
-    *,
-    exec_context: str | None = None,
-    wire: str = DEFAULT_WIRE,
-) -> dict:
-    """Return full routing info for *group* as a JSON-ready dict.
+def _litellm_edge_admission() -> tuple[bool, str, list[str]]:
+    """Decide whether the router edge may serve this process, and say why not.
 
-    Reads the registry directly (bypasses the Router's cooldown state).
-    Prefers the LiteLLM proxy when healthy (port resolved from
-    ``KREPIS_LITELLM_PROXY_URL`` env var or :data:`LITELLM_PROXY_URL`
-    constant) — it handles format translation for all providers, making
-    every registry model CLI-compatible.  Falls back to per-provider
-    resolution when LiteLLM is unavailable.
+    Returns ``(admitted, url, skip_reasons)``.  ``admitted`` is True only when
+    the edge answered its health probe AND this consumer's router credential
+    resolved; ``skip_reasons`` carries the stated cause otherwise, because a
+    weekly unattended caller frequently leaves nothing else behind.
 
-    Parameters
-    ----------
-    group
-        The model group name (``low``, ``med``, ``high``, ``ultra``).
-    exec_context
-        The caller's execution context — one of :data:`EXEC_CONTEXTS`.
-        Declared, never inferred (R29). Defaults to ``KREPIS_EXEC_CONTEXT``
-        and then to :data:`DEFAULT_EXEC_CONTEXT`. Entries the registry does
-        not declare ``reachable_from`` this context are skipped, and each
-        lands in ``skipped_entries`` naming the context — so "unreachable
-        from here" is never confused with "unhealthy".
-    wire
-        The wire format the caller speaks: :data:`WIRE_ANTHROPIC` (the
-        Claude CLI's Messages format, the default) or :data:`WIRE_OPENAI`.
-        An entry that declares no endpoint for this format is skipped with
-        that as the stated reason.
-
-    Produces a dict with every field a shell script needs to configure
-    the Claude CLI environment: endpoint URL, auth type, provider, route,
-    deployment ID, registry ID, capabilities (prompt_caching, etc.), and
-    cache pricing.
-
-    The ``api_base_url`` is the CLI-compatible endpoint.  The LiteLLM proxy
-    is the preferred path — it translates between CLI wire format and
-    provider-native formats.  DeepSeek and OpenRouter are direct-fallback
-    paths when LiteLLM is unavailable.  Every endpoint is resolvable via
-    an env override (config#4923), so box-level bootstraps can export the
-    override alongside their ``--port`` from a single configuration value.
-
-    Raises :exc:`ValueError` if NO model in the group is CLI-compatible.
+    Extracted from :func:`_resolve_group_json` so that group resolution and
+    single-model resolution (:func:`_resolve_model_json`) share ONE admission
+    implementation.  Two copies of this decision would be a second derivation
+    of the same routing fact (model-router-policy R6), and the failure mode is
+    the one that has already happened here: a probe that could only speak one
+    scheme reported a live router as unreachable for weeks.
     """
-    import yaml as _yaml
-
-    # `exclude_route` used to be accepted here. It let a caller narrow the
-    # fallback chain — which is holding a routing table at layer 5, whatever
-    # the mechanism (model-router-policy §2). Both callers that passed it were
-    # expressing "this route is not reachable from where I am running", which
-    # is `exec_context` plus the registry's `reachable_from` (R28/R29). It was
-    # deprecated in 0.27.0, both call sites migrated (crucible-evaluator #170;
-    # the clauder wrapper's degraded path), and this is the R19 removal.
-    #
-    # It is worth remembering WHY it is gone rather than merely deprecated: it
-    # was added to make the Director Lambda succeed while the path to the
-    # LiteLLM proxy was down, and it worked — resolution fell through to
-    # `glm-5.2` at openrouter.ai, DLP-unscanned, logging a healthy route for
-    # weeks. Nothing failed when the proxy path was never restored. An argument
-    # that lets a consumer route around an unreachable control is a control the
-    # consumer can turn off.
-    exec_context = _resolve_exec_context(exec_context)
-    if wire not in WIRE_FORMATS:
-        raise ValueError(
-            f"Unknown wire format {wire!r}; declared formats are "
-            f"{list(WIRE_FORMATS)}"
-        )
-
-    reg_path = _find_registry()
-    if not reg_path:
-        raise FileNotFoundError(
-            "LLM_MODEL_REGISTRY.yaml not found — set "
-            "LLM_MODEL_REGISTRY_PATH or run from within a repo "
-            "whose private-docs/ directory contains the file."
-        )
-
-    from . import model_registry as _mr
-
-    registry = _mr.load_registry(reg_path)
-    models_by_id: dict[str, dict] = registry.models
-    group_ids: list[str] = registry.groups.get(group, [])
-
-    if not group_ids:
-        raise ValueError(
-            f"Model group {group!r} not found in registry. "
-            f"Available groups: {list(registry.groups)}"
-        )
-
-    # ── Prefer LiteLLM proxy (format-translating central router) ──────────
-    # When the LiteLLM proxy is healthy, it is ALWAYS the best endpoint for
-    # the Claude CLI: it translates between CLI wire format and provider-native
-    # formats, making every provider in the registry CLI-compatible regardless
-    # of its native API format.  It also handles fallback chains with cooldown
-    # and passes through caching hints.  All traffic still flows through egress
-    # proxies for DLP scanning (placeholder key → real key injection).
-    #
-    # The probe URL comes from _resolve_litellm_proxy_url() so the port is
-    # configurable via KREPIS_LITELLM_PROXY_URL env var (config#4923).
-    #
-    # Four SOTA checks gate the LiteLLM path:
-    #   1. Proxy health (port reachable at the resolved URL)
-    #   2. Master key resolvable (env → secrets.env → SSM)
-    #   3. Running config not stale vs registry (LiteLLM boot-time config
-    #      newer than or equal to registry mtime)
-    #   4. Group exists in the registry (for the cache-capability lookup)
-    # Any check failing → fall through to per-provider resolution.
     _litellm_url = _resolve_litellm_proxy_url()
     _litellm_reachable = False
     _litellm_probe_error = ""
@@ -1502,6 +1409,111 @@ def _resolve_group_json(
             # reconcile is authoritative.  Proceed assuming the config is
             # current — the reconcile loop will fix it within minutes if not.
             _litellm_ok = True
+    return _litellm_ok, _litellm_url, _litellm_skip_reasons
+
+
+def _resolve_group_json(
+    group: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+) -> dict:
+    """Return full routing info for *group* as a JSON-ready dict.
+
+    Reads the registry directly (bypasses the Router's cooldown state).
+    Prefers the LiteLLM proxy when healthy (port resolved from
+    ``KREPIS_LITELLM_PROXY_URL`` env var or :data:`LITELLM_PROXY_URL`
+    constant) — it handles format translation for all providers, making
+    every registry model CLI-compatible.  Falls back to per-provider
+    resolution when LiteLLM is unavailable.
+
+    Parameters
+    ----------
+    group
+        The model group name (``low``, ``med``, ``high``, ``ultra``).
+    exec_context
+        The caller's execution context — one of :data:`EXEC_CONTEXTS`.
+        Declared, never inferred (R29). Defaults to ``KREPIS_EXEC_CONTEXT``
+        and then to :data:`DEFAULT_EXEC_CONTEXT`. Entries the registry does
+        not declare ``reachable_from`` this context are skipped, and each
+        lands in ``skipped_entries`` naming the context — so "unreachable
+        from here" is never confused with "unhealthy".
+    wire
+        The wire format the caller speaks: :data:`WIRE_ANTHROPIC` (the
+        Claude CLI's Messages format, the default) or :data:`WIRE_OPENAI`.
+        An entry that declares no endpoint for this format is skipped with
+        that as the stated reason.
+
+    Produces a dict with every field a shell script needs to configure
+    the Claude CLI environment: endpoint URL, auth type, provider, route,
+    deployment ID, registry ID, capabilities (prompt_caching, etc.), and
+    cache pricing.
+
+    The ``api_base_url`` is the CLI-compatible endpoint.  The LiteLLM proxy
+    is the preferred path — it translates between CLI wire format and
+    provider-native formats.  DeepSeek and OpenRouter are direct-fallback
+    paths when LiteLLM is unavailable.  Every endpoint is resolvable via
+    an env override (config#4923), so box-level bootstraps can export the
+    override alongside their ``--port`` from a single configuration value.
+
+    Raises :exc:`ValueError` if NO model in the group is CLI-compatible.
+    """
+
+    # `exclude_route` used to be accepted here. It let a caller narrow the
+    # fallback chain — which is holding a routing table at layer 5, whatever
+    # the mechanism (model-router-policy §2). Both callers that passed it were
+    # expressing "this route is not reachable from where I am running", which
+    # is `exec_context` plus the registry's `reachable_from` (R28/R29). It was
+    # deprecated in 0.27.0, both call sites migrated (crucible-evaluator #170;
+    # the clauder wrapper's degraded path), and this is the R19 removal.
+    #
+    # It is worth remembering WHY it is gone rather than merely deprecated: it
+    # was added to make the Director Lambda succeed while the path to the
+    # LiteLLM proxy was down, and it worked — resolution fell through to
+    # `glm-5.2` at openrouter.ai, DLP-unscanned, logging a healthy route for
+    # weeks. Nothing failed when the proxy path was never restored. An argument
+    # that lets a consumer route around an unreachable control is a control the
+    # consumer can turn off.
+    exec_context = _resolve_exec_context(exec_context)
+    if wire not in WIRE_FORMATS:
+        raise ValueError(
+            f"Unknown wire format {wire!r}; declared formats are "
+            f"{list(WIRE_FORMATS)}"
+        )
+
+    reg_path = _find_registry()
+    if not reg_path:
+        raise FileNotFoundError(
+            "LLM_MODEL_REGISTRY.yaml not found — set "
+            "LLM_MODEL_REGISTRY_PATH or run from within a repo "
+            "whose private-docs/ directory contains the file."
+        )
+
+    from . import model_registry as _mr
+
+    registry = _mr.load_registry(reg_path)
+    models_by_id: dict[str, dict] = registry.models
+    group_ids: list[str] = registry.groups.get(group, [])
+
+    if not group_ids:
+        raise ValueError(
+            f"Model group {group!r} not found in registry. "
+            f"Available groups: {list(registry.groups)}"
+        )
+
+    # ── Prefer LiteLLM proxy (format-translating central router) ──────────
+    # When the LiteLLM proxy is healthy, it is ALWAYS the best endpoint for
+    # the Claude CLI: it translates between CLI wire format and provider-native
+    # formats, making every provider in the registry CLI-compatible regardless
+    # of its native API format.  It also handles fallback chains with cooldown
+    # and passes through caching hints.  All traffic still flows through egress
+    # proxies for DLP scanning (placeholder key → real key injection).
+    #
+    # Admission (health probe + this consumer's router credential) lives in
+    # `_litellm_edge_admission`, shared with `_resolve_model_json` so the two
+    # resolvers cannot disagree about whether the edge is usable (R6).
+    # Admission failing -> fall through to per-provider resolution below.
+    _litellm_ok, _litellm_url, _litellm_skip_reasons = _litellm_edge_admission()
 
     if _litellm_ok:
         # Caching capability comes from the PRIMARY entry — the model that
@@ -2002,48 +2014,26 @@ def route_is_degraded(route: dict) -> bool:
     return primary != serving
 
 
-def resolve_group_spec(
-    group: str,
+def _route_to_spec(
+    route: dict,
     *,
-    exec_context: str | None = None,
-    wire: str = DEFAULT_WIRE,
+    requested: str,
     max_tokens: int | None = None,
     structured_outputs: bool | None = None,
-) -> tuple:
-    """Resolve *group* and adapt it to a ``(ModelSpec, route)`` pair.
+):
+    """Adapt a resolution *route* to a ``ModelSpec``. The ONE adapter.
 
-    The supported way for a consumer to go from "I want the ``med`` tier,
-    and I am running in a Lambda" to a client it can call.  The consumer
-    states its capability tier, where it runs and what wire format it speaks;
-    everything else — model, endpoint, credential, params — is a registry
-    decision resolved above it (model-router-policy §2 layer 5).
+    Shared by :func:`resolve_group_spec` and :func:`resolve_model_spec`.  It
+    holds the ``auth_token_type`` -> secret-name mapping, the router-edge
+    provider substitution and the fail-closed check on an unauthenticatable
+    pair.  A second copy of any of those at a call site is the layer-5
+    duplication that has already mis-authenticated once (I7031), so both
+    public entry points go through here rather than each doing it again.
 
-    *max_tokens* and *structured_outputs* override the registry's params when
-    given.  Passing neither takes the registry values, which is what a caller
-    with no specific requirement should do.
-
-    Returns
-    -------
-    tuple
-        ``(ModelSpec, route)``.  The route dict is returned alongside because
-        it carries the degradation and cost fields a caller must not have to
-        re-resolve — see :func:`route_is_degraded`.
-
-    Raises
-    ------
-    RuntimeError
-        The resolver returned a schema version this function was not written
-        against, or an ``auth_token_type`` it does not know.  Both refuse
-        rather than guess: guessing a field meaning misroutes, and guessing a
-        credential sends a real key to an unintended endpoint.
+    *requested* is what the caller asked for — a group name or a registry
+    model id — and is used only for the log line.
     """
     from krepis.llm_config import ModelSpec
-
-    route = resolve_group_structured(
-        group,
-        exec_context=exec_context,
-        wire=wire,
-    )
 
     if route.get("schema_version") != RESOLVE_SCHEMA_VERSION:
         raise RuntimeError(
@@ -2142,11 +2132,296 @@ def resolve_group_spec(
         ),
     )
     logger.info(
-        "resolved group=%s -> model=%s provider=%s route=%s exec_context=%s "
+        "resolved %s -> model=%s provider=%s route=%s exec_context=%s "
         "wire=%s degraded=%s (primary=%s)",
-        group, route["deployment_id"], route["provider"], route.get("route"),
+        requested, route["deployment_id"], route["provider"], route.get("route"),
         route.get("exec_context"), route.get("wire"), route_is_degraded(route),
         route.get("primary_registry_id") or route.get("primary_model"),
+    )
+    return spec
+
+
+def resolve_group_spec(
+    group: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+    max_tokens: int | None = None,
+    structured_outputs: bool | None = None,
+) -> tuple:
+    """Resolve *group* and adapt it to a ``(ModelSpec, route)`` pair.
+
+    The supported way for a consumer to go from "I want the ``med`` tier,
+    and I am running in a Lambda" to a client it can call.  The consumer
+    states its capability tier, where it runs and what wire format it speaks;
+    everything else — model, endpoint, credential, params — is a registry
+    decision resolved above it (model-router-policy §2 layer 5).
+
+    *max_tokens* and *structured_outputs* override the registry's params when
+    given.  Passing neither takes the registry values, which is what a caller
+    with no specific requirement should do.
+
+    Returns
+    -------
+    tuple
+        ``(ModelSpec, route)``.  The route dict is returned alongside because
+        it carries the degradation and cost fields a caller must not have to
+        re-resolve — see :func:`route_is_degraded`.
+
+    Raises
+    ------
+    RuntimeError
+        The resolver returned a schema version this function was not written
+        against, or an ``auth_token_type`` it does not know.  Both refuse
+        rather than guess: guessing a field meaning misroutes, and guessing a
+        credential sends a real key to an unintended endpoint.
+    """
+    route = resolve_group_structured(
+        group,
+        exec_context=exec_context,
+        wire=wire,
+    )
+    spec = _route_to_spec(
+        route,
+        requested=f"group={group}",
+        max_tokens=max_tokens,
+        structured_outputs=structured_outputs,
+    )
+    return spec, route
+
+
+
+# ── Single registered model (the pinned-model path) ───────────────────────
+
+
+def _resolve_model_json(
+    model_id: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+) -> dict:
+    """Return full routing info for ONE registry model id, through the edge.
+
+    The companion to :func:`_resolve_group_json` for the call sites whose
+    subject IS a named model rather than a capability tier — a concordance or
+    replay harness measuring agreement against a *specific* model, where a
+    group would silently vary the thing being measured from run to run.
+
+    This is not a consumer holding a routing table (model-router-policy §2
+    layer 5).  ``model_id`` is a **registry entry id** — a layer-1 fact — and
+    every routing decision it implies (which provider, which upstream slug,
+    which endpoint, which credential, whether it is still admissible at all)
+    stays in the registry and is resolved here.  The registry already models
+    exactly this: entries deliberately kept ``active`` and out of every
+    ``model_groups`` list are annotated "callable BY NAME only" (e.g.
+    ``claude-haiku-4-5``, Brian ruling 2026-07-29; ``deepseek-v4-flash``,
+    alpha-engine-config-I6908), and the derivation layer emits each active
+    entry as its own ``model_name`` deployment on the proxy for precisely that
+    purpose (``alpha-engine-config/scripts/generate_litellm_proxy_config.py``,
+    "Individual model entries (for direct calls by name)").  Until this
+    function existed there was no supported way to reach one WITHOUT building
+    a provider client at the call site, which is why the two remaining direct
+    OpenRouter linkages in the fleet were both pinned-model call sites
+    (alpha-engine-config-I7878).
+
+    **Fails closed on the edge, with no per-provider fallback.**  Group
+    resolution may fall through to a direct provider entry when the router is
+    unreachable, because a group carries a declared chain and every member is
+    a registry-sanctioned substitute.  A pinned model has no chain: the only
+    "fallback" available would be to build a direct provider client for that
+    same model, which is the DLP-unscanned direct linkage this path exists to
+    remove (R26, Brian's 2026-08-03 ruling / alpha-engine-config-I6367).  So
+    an unreachable edge raises here (R20) rather than quietly reaching for the
+    provider.
+
+    Raises
+    ------
+    FileNotFoundError
+        No registry file could be located.
+    ValueError
+        *model_id* is not a registry entry, or its status excludes it from
+        runtime reachability (R4), or *wire* is not a declared format.
+    RuntimeError
+        The router edge did not admit this process — the reasons are carried
+        into the message because for a weekly unattended caller this exception
+        is frequently the only artifact left behind.
+    """
+    exec_context = _resolve_exec_context(exec_context)
+    if wire not in WIRE_FORMATS:
+        raise ValueError(
+            f"Unknown wire format {wire!r}; declared formats are "
+            f"{list(WIRE_FORMATS)}"
+        )
+
+    reg_path = _find_registry()
+    if not reg_path:
+        raise FileNotFoundError(
+            "LLM_MODEL_REGISTRY.yaml not found — set "
+            "LLM_MODEL_REGISTRY_PATH or run from within a repo "
+            "whose private-docs/ directory contains the file."
+        )
+
+    from . import model_registry as _mr
+
+    registry = _mr.load_registry(reg_path)
+    entry = registry.models.get(model_id)
+    if entry is None:
+        # Name what IS addressable. A pinned-model caller that typo'd a slug
+        # otherwise gets a bare "not found" and no way to discover the id —
+        # and a hand-written model id has already silently killed a live
+        # consumer once (morning-signal, 2026-07-15).
+        addressable = sorted(
+            mid for mid, e in registry.models.items()
+            if e.get("status") not in _mr.EXCLUDED_STATUSES
+        )
+        raise ValueError(
+            f"Model id {model_id!r} is not in the registry. This function "
+            f"addresses REGISTRY ENTRY IDS, not provider slugs — "
+            f"'deepseek/deepseek-v4-flash' is an OpenRouter slug, "
+            f"'deepseek-v4-flash' is a registry id. Addressable ids: "
+            f"{addressable}"
+        )
+
+    status = entry.get("status")
+    if status in _mr.EXCLUDED_STATUSES:
+        # R4: the derivation layer filters these out of the proxy config, so
+        # the deployment does not exist at the edge. Saying so here beats a
+        # 400 from the router that names nothing.
+        raise ValueError(
+            f"Model id {model_id!r} has status {status!r} and is deliberately "
+            f"not reachable at runtime (model-router-policy R4). It remains in "
+            f"the registry as documentation only."
+        )
+
+    admitted, url, skip_reasons = _litellm_edge_admission()
+    if not admitted:
+        raise RuntimeError(
+            f"Router edge at {url} did not admit this process, so registry "
+            f"model {model_id!r} cannot be reached: "
+            f"{'; '.join(skip_reasons) or 'no reason reported'}. Refusing to "
+            f"fall through to a direct provider endpoint — a pinned model has "
+            f"no registry-declared substitute, and the only reachable "
+            f"alternative would be a DLP-unscanned direct call "
+            f"(model-router-policy R20/R26)."
+        )
+
+    # `group` is emitted ONLY when this id is genuinely a member of a
+    # model_groups chain. Several entries carry a vestigial top-level `group`
+    # field that the registry's own notes describe as "not read while the id is
+    # absent from model_groups" (claude-haiku-4-5). Copying that here would
+    # report a group membership the registry denies.
+    _group = ""
+    for _g, _ids in registry.groups.items():
+        if model_id in _ids:
+            _group = _g
+            break
+
+    _pc, _apc = _caching_flags(entry)
+    _cache_pricing = {}
+    for _key in ("cost_per_1m_input", "cost_per_1m_output",
+                 "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
+        if _key in entry:
+            _cache_pricing[_key] = entry[_key]
+
+    _params = dict(entry.get("params", {}) or {})
+    if "max_tokens" not in _params:
+        _params["max_tokens"] = 8192
+
+    _upstream_model = entry.get("model", model_id)
+
+    # The wire name is the REGISTRY ID, matching the individual-model
+    # deployment the derivation layer emits (`model_name: <mid>`). Unlike the
+    # group path there is no qualified `{group}-{mid}` form and no chain, so
+    # litellm's requested-model stamping cannot masquerade: the model that was
+    # asked for is the only model that can serve.
+    return _with_compat_aliases({
+        "schema_version": RESOLVE_SCHEMA_VERSION,
+        "model": model_id,
+        "display_name": f"{_upstream_model} ({model_id})",
+        "provider": "litellm",
+        "route": "litellm_proxy",
+        "api_base_url": url,
+        "deployment_id": model_id,
+        "auth_token_type": "litellm_master_key",
+        "group": _group,
+        "registry_id": model_id,
+        "primary_model": _upstream_model,
+        "primary_registry_id": model_id,
+        "capabilities": {
+            "web_search": bool(
+                (entry.get("capabilities") or {}).get("web_search", False)),
+            "tool_choice": bool(
+                (entry.get("capabilities") or {}).get("tool_choice", False)),
+            "prompt_caching": _pc,
+            "automatic_prefix_caching": _apc,
+            "batches": bool(
+                (entry.get("capabilities") or {}).get("batches", False)),
+        },
+        "params": _params,
+        "cache_pricing": _cache_pricing,
+        "supports_prompt_caching": _pc,
+        "automatic_prefix_caching": _apc,
+        "exec_context": exec_context,
+        "wire": wire,
+        "skipped_entries": [],
+    })
+
+
+def resolve_model_structured(
+    model_id: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+) -> dict:
+    """Resolve a single registry model id — the PUBLIC contract.
+
+    Same versioned ``resolve_schema.json`` answer as
+    :func:`resolve_group_structured`, for the pinned-model path.  See
+    :func:`_resolve_model_json` for why a pinned model is a registry fact
+    rather than a routing decision at the call site, and why this path fails
+    closed instead of falling through to the provider.
+    """
+    return _resolve_model_json(
+        model_id,
+        exec_context=exec_context,
+        wire=wire,
+    )
+
+
+def resolve_model_spec(
+    model_id: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+    max_tokens: int | None = None,
+    structured_outputs: bool | None = None,
+) -> tuple:
+    """Resolve *model_id* and adapt it to a ``(ModelSpec, route)`` pair.
+
+    The pinned-model sibling of :func:`resolve_group_spec`, for the call sites
+    whose subject is a named model — a concordance or replay harness, a
+    champion/challenger arm — rather than a capability tier.  The consumer
+    states a REGISTRY ENTRY ID, where it runs and what wire format it speaks;
+    provider, upstream slug, endpoint, credential and params all remain
+    registry decisions resolved above it.
+
+    Returns
+    -------
+    tuple
+        ``(ModelSpec, route)`` — the same shape :func:`resolve_group_spec`
+        returns, so a caller can hand either to :class:`krepis.llm.LLMClient`
+        and read degradation from the route with :func:`route_is_degraded`.
+    """
+    route = resolve_model_structured(
+        model_id,
+        exec_context=exec_context,
+        wire=wire,
+    )
+    spec = _route_to_spec(
+        route,
+        requested=f"model={model_id}",
+        max_tokens=max_tokens,
+        structured_outputs=structured_outputs,
     )
     return spec, route
 

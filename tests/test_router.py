@@ -2590,3 +2590,344 @@ class TestStatusFilterOnResolution:
         assert "unavailable" in skips["dead-leader"]
         assert "R4" in skips["dead-leader"]
         assert "reachable_from" not in skips["dead-leader"]
+
+
+# ── Single registered model: the pinned-model path (config-I7878) ─────────
+
+_PINNED_REGISTRY = """
+schema_version: 1
+model_groups:
+  low: [in-a-group, other-member]
+models:
+  - id: in-a-group
+    model: vendor/in-a-group
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    params:
+      max_tokens: 8192
+      structured_outputs: false
+    capabilities:
+      web_search: false
+      tool_choice: false
+      prompt_caching: false
+      batches: false
+      automatic_prefix_caching: true
+    cost_per_1m_input: 0.14
+    cost_per_1m_output: 0.28
+    status: active
+    upstream_host: api.deepseek.com
+  - id: other-member
+    model: vendor/other-member
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    status: active
+    upstream_host: openrouter.ai
+  - id: by-name-only
+    model: vendor/by-name-only
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    group: low
+    group_role: fallback
+    params:
+      max_tokens: 4096
+    status: active
+    upstream_host: openrouter.ai
+  - id: retired-row
+    model: vendor/retired-row
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    status: deprecated
+    upstream_host: openrouter.ai
+"""
+
+
+@pytest.fixture
+def pinned_registry(tmp_path):
+    p = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+    p.write_text(_PINNED_REGISTRY, encoding="utf-8")
+    return p
+
+
+class TestResolveModel:
+    """`resolve_model_structured` / `resolve_model_spec` — the pinned-model
+    path (alpha-engine-config-I7878).
+
+    It exists for the call sites whose SUBJECT is a named model rather than a
+    capability tier: a concordance harness measuring agreement against a
+    specific model, where a group would silently vary the thing being
+    measured between runs. Addressing a REGISTRY ENTRY ID keeps that a
+    layer-1 fact — before this existed, the only way to pin a model was to
+    build a provider client at the call site, which is why both of the
+    fleet's remaining direct-OpenRouter linkages were pinned-model sites.
+    """
+
+    def _resolve(self, monkeypatch, registry_path, model_id, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                kw.setdefault("exec_context", "lambda")
+                kw.setdefault("wire", "openai")
+                return _router.resolve_model_structured(model_id, **kw)
+        finally:
+            _router._router = None
+
+    def test_addresses_the_registry_id_on_the_wire(
+        self, monkeypatch, pinned_registry
+    ):
+        """The derivation layer emits every ACTIVE entry as its own
+        `model_name: <mid>` deployment ("Individual model entries (for direct
+        calls by name)"), so the registry id IS the wire name. Unlike the
+        group path there is no `{group}-{mid}` qualification and no chain."""
+        info = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert info["deployment_id"] == "by-name-only"
+        assert info["model"] == "by-name-only"
+        assert info["route"] == "litellm_proxy"
+        assert info["api_base_url"] == "https://router.example:8443"
+        assert info["auth_token_type"] == "litellm_master_key"
+
+    def test_registry_id_names_the_entry_that_served(
+        self, monkeypatch, pinned_registry
+    ):
+        """Unlike the group route — whose `registry_id` is the synthetic
+        `litellm:group:{group}` naming no entry — a pinned resolution can name
+        the exact row, so a cost record attributes to something real."""
+        info = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert info["registry_id"] == "by-name-only"
+        assert info["primary_registry_id"] == "by-name-only"
+        assert info["primary_model"] == "vendor/by-name-only"
+
+    def test_group_is_emitted_only_for_a_real_member(
+        self, monkeypatch, pinned_registry
+    ):
+        """`by-name-only` carries a vestigial top-level `group: low` that the
+        registry's own notes describe as not read while the id is absent from
+        `model_groups` (claude-haiku-4-5, Brian ruling 2026-07-29). Copying it
+        into the route would report a membership the registry denies."""
+        member = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        assert member["group"] == "low"
+        by_name = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert by_name["group"] == ""
+
+    def test_params_and_pricing_come_from_the_entry(
+        self, monkeypatch, pinned_registry
+    ):
+        info = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        assert info["params"]["max_tokens"] == 8192
+        assert info["params"]["structured_outputs"] is False
+        assert info["cache_pricing"]["cost_per_1m_input"] == 0.14
+        assert info["automatic_prefix_caching"] is True
+
+    def test_conforms_to_the_resolve_schema(
+        self, monkeypatch, pinned_registry
+    ):
+        """Same versioned layer-4 contract as the group path — a consumer must
+        not have to learn a second shape to pin a model."""
+        jsonschema = pytest.importorskip("jsonschema")
+        schema = _load_resolve_schema()
+        info = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        jsonschema.validate(info, schema)
+
+    def test_unknown_id_names_what_is_addressable(
+        self, monkeypatch, pinned_registry
+    ):
+        """A hand-written model id has already silently killed a live consumer
+        (morning-signal, 2026-07-15). A bare "not found" leaves the caller no
+        way to discover the id, and the provider-slug-vs-registry-id confusion
+        is the exact mistake a migrating call site makes."""
+        with pytest.raises(ValueError) as exc:
+            self._resolve(
+                monkeypatch, pinned_registry, "deepseek/deepseek-v4-flash")
+        msg = str(exc.value)
+        assert "registry" in msg.lower()
+        assert "in-a-group" in msg and "by-name-only" in msg
+        assert "retired-row" not in msg, (
+            "a status-excluded row is not addressable and must not be "
+            "advertised as an alternative"
+        )
+
+    def test_a_status_excluded_row_is_refused(
+        self, monkeypatch, pinned_registry
+    ):
+        """R4: the derivation layer filters these out of the proxy config, so
+        the deployment does not exist at the edge. Saying so here beats a 400
+        from the router that names nothing."""
+        with pytest.raises(ValueError) as exc:
+            self._resolve(monkeypatch, pinned_registry, "retired-row")
+        assert "deprecated" in str(exc.value)
+
+    def test_an_unadmitted_edge_raises_rather_than_reaching_for_the_provider(
+        self, monkeypatch, pinned_registry
+    ):
+        """THE point of this path. Group resolution may fall through to a
+        direct provider entry because a group carries a declared chain of
+        registry-sanctioned substitutes. A pinned model has no chain, so the
+        only available "fallback" is a direct provider client for the same
+        model — the DLP-unscanned linkage Brian's 2026-08-03 ruling forbids
+        (alpha-engine-config-I6367). Fail closed (R20/R26)."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(pinned_registry))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (False, "https://router.example:8443",
+                             ["LITELLM_MASTER_KEY not resolvable"]),
+                )
+                with pytest.raises(RuntimeError) as exc:
+                    _router.resolve_model_structured(
+                        "in-a-group", exec_context="lambda", wire="openai")
+        finally:
+            _router._router = None
+        msg = str(exc.value)
+        assert "LITELLM_MASTER_KEY not resolvable" in msg, (
+            "the skip reason is frequently the only artifact a weekly "
+            "unattended caller leaves behind"
+        )
+        assert "router.example" in msg
+
+    def test_unknown_wire_format_is_refused(
+        self, monkeypatch, pinned_registry
+    ):
+        with pytest.raises(ValueError) as exc:
+            self._resolve(
+                monkeypatch, pinned_registry, "in-a-group", wire="grpc")
+        assert "wire format" in str(exc.value)
+
+    def test_exec_context_is_recorded_on_the_route(
+        self, monkeypatch, pinned_registry
+    ):
+        """R29: declared by the caller, never inferred. The edge itself is
+        never gated by context (R28's carve-out / R27a.4), so a pinned model
+        resolves from `lambda` exactly as it does from `laptop` — but the
+        route must still say which context asked."""
+        for ctx in ("laptop", "ec2", "lambda"):
+            info = self._resolve(
+                monkeypatch, pinned_registry, "in-a-group", exec_context=ctx)
+            assert info["exec_context"] == ctx
+            assert info["route"] == "litellm_proxy"
+
+
+class TestResolveModelSpec:
+    def _spec(self, monkeypatch, registry_path, model_id, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                kw.setdefault("exec_context", "lambda")
+                kw.setdefault("wire", "openai")
+                return _router.resolve_model_spec(model_id, **kw)
+        finally:
+            _router._router = None
+
+    def test_returns_a_router_edge_spec_not_an_in_process_router(
+        self, monkeypatch, pinned_registry
+    ):
+        """Same trap as the group path: `provider: litellm` binds to
+        TRANSPORT_LITELLM, an in-process Router that calls each provider
+        DIRECTLY from the consumer reading OPENROUTER_API_KEY from the
+        environment. Emitting it verbatim would egress unscanned."""
+        from krepis.llm_config import PROVIDER_REGISTRY, TRANSPORT_OPENAI
+
+        spec, route = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.provider == _router.ROUTER_EDGE_PROVIDER
+        assert spec.provider not in PROVIDER_REGISTRY
+        assert spec.transport == TRANSPORT_OPENAI
+        assert spec.model == "by-name-only"
+        assert spec.base_url == "https://router.example:8443"
+        assert spec.api_key_env and route["route"] == "litellm_proxy"
+
+    def test_spec_carries_the_real_registry_id_for_cost_attribution(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.registry_id == "by-name-only"
+
+    def test_caller_overrides_beat_the_registry_params(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(
+            monkeypatch, pinned_registry, "in-a-group",
+            max_tokens=1234, structured_outputs=True,
+        )
+        assert spec.max_tokens == 1234
+        assert spec.structured_outputs is True
+
+    def test_registry_params_apply_when_the_caller_states_none(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(monkeypatch, pinned_registry, "in-a-group")
+        assert spec.max_tokens == 8192
+        assert spec.structured_outputs is False
+
+    def test_no_provider_credential_reaches_the_call_site(
+        self, monkeypatch, pinned_registry
+    ):
+        """The whole deliverable: a migrated call site holds no provider name,
+        no base URL and no provider key. `by-name-only` is an OpenRouter-
+        upstream entry, and the spec it produces must name the router edge —
+        never OPENROUTER_API_KEY, never openrouter.ai."""
+        spec, _ = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.api_key_env != "OPENROUTER_API_KEY"
+        assert "openrouter.ai" not in (spec.base_url or "")
+        assert spec.provider != "openrouter"
+
+
+class TestOneAdapterAndOneAdmission:
+    """R6, applied to this module's own internals: the group path and the
+    pinned path share ONE edge-admission decision and ONE route->ModelSpec
+    adapter. Two copies of either would be a second derivation of the same
+    routing fact, and that has already mis-authenticated once (I7031)."""
+
+    def test_both_public_spec_helpers_go_through_the_one_adapter(
+        self, monkeypatch
+    ):
+        seen = []
+        monkeypatch.setattr(
+            _router, "_route_to_spec",
+            lambda route, **kw: seen.append(kw.get("requested")) or "SPEC",
+        )
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: {"x": 1})
+        monkeypatch.setattr(
+            _router, "resolve_model_structured", lambda *a, **k: {"x": 1})
+        _router.resolve_group_spec("med")
+        _router.resolve_model_spec("some-id")
+        assert seen == ["group=med", "model=some-id"]
+
+    def test_the_admission_helper_is_the_only_edge_probe(self):
+        """A second inline `_resolve_litellm_proxy_url()` + health-probe block
+        would drift from this one. The probe that could only speak one scheme
+        reported a live router as unreachable for weeks — one copy is what
+        makes fixing that fix it everywhere."""
+        import inspect
+
+        src = inspect.getsource(_router)
+        assert src.count("_resolve_litellm_proxy_url()") == 2, (
+            "expected exactly the definition and its single call inside "
+            "_litellm_edge_admission"
+        )
