@@ -45,12 +45,23 @@ without paging the operator (PR165 paged Brian with a synthetic ERROR
 because ``publish()`` previously only suppressed fan-out under
 ``PYTEST_CURRENT_TEST``).
 
-**Severity tiering.** ``severity`` is a free-form string that is
-prepended to the message (``[ERROR] ...`` / ``[WARNING] ...``) for both
-channels. Telegram pushes (``disable_notification=False``) for
-``error``/``critical``; in-channel silent for ``info``/``warning``. SNS
-delivery is identical regardless of severity — downstream subscribers
-choose how to fan out.
+**Severity tiering controls the phone buzz only — every severity is
+delivered.** ``severity`` is a free-form string that is prepended to the
+message (``[ERROR] ...`` / ``[WARNING] ...``) for both channels. Both SNS
+and Telegram fan-out happen at **every** severity: SNS delivery is
+byte-identical regardless of severity, and Telegram always posts the
+message into the chat. The only thing ``severity`` changes is whether the
+Telegram send also triggers a phone-push notification
+(``disable_notification=False`` for ``error``/``critical``,
+``disable_notification=True`` — no buzz, message still posted — for
+everything else, per :data:`SEVERITY_PHONE_PUSH`). **A severity outside
+:data:`SEVERITY_PHONE_PUSH` is NOT suppressed, muted, or dropped** — it
+reaches both the SNS-subscribed inbox and the Telegram chat exactly like
+``error``/``critical`` does; it just doesn't buzz the phone. Do not choose
+``info``/``warning`` believing the finding will be invisible — see
+alpha-engine-config-I7857, filed after this exact belief let a fleet of
+publishers assume a non-``error`` severity was unseen when the message was
+landing in the channel the whole time.
 
 **SNS topic resolution.** Defaults to
 ``arn:aws:sns:{region}:{account_id}:alpha-engine-alerts``, with
@@ -88,7 +99,27 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_SNS_TOPIC_NAME: Final[str] = "alpha-engine-alerts"
 DEFAULT_REGION: Final[str] = "us-east-1"
-SEVERITY_PUSH: Final[frozenset[str]] = frozenset({"error", "critical"})
+
+# Severities that trigger a Telegram PHONE-PUSH notification
+# (``disable_notification=False``). Membership here is NOT a delivery gate —
+# every severity is published to both SNS and Telegram; this set only
+# decides whether the Telegram send also buzzes the phone. Read the module
+# docstring's "Severity tiering" paragraph before writing a new call site
+# that picks a severity believing it will be unseen — it will not be.
+SEVERITY_PHONE_PUSH: Final[frozenset[str]] = frozenset({"error", "critical"})
+
+# Deprecated alias — kept additive-only per CONTRIBUTING.md ("renaming or
+# removing an exported name breaks consumers at import time"). No known
+# fleet call site imports this name directly (alpha-engine-config-I7857
+# audit, 2026-08-20 — every fleet reference was a comment, not an import);
+# it is kept anyway in case an external consumer does. The OLD name is
+# exactly the naming defect this rename fixes: a reader can misparse
+# "SEVERITY_PUSH" as "severities that get pushed [and everything else is
+# not]" rather than its true meaning, "severities that get a phone buzz on
+# top of the delivery every severity already gets." Prefer
+# :data:`SEVERITY_PHONE_PUSH` in new code. Remove once a migration window
+# has passed with no external usage confirmed.
+SEVERITY_PUSH: Final[frozenset[str]] = SEVERITY_PHONE_PUSH
 
 # ── Dedup (v0.24.0; marker mechanism lifted to krepis._dedup in v0.NEXT) ────
 # When the caller passes a ``dedup_key``, ``publish`` writes a marker at
@@ -215,9 +246,12 @@ def _publish_telegram(message: str, severity: str) -> ChannelResult:
     try:
         from krepis.telegram import send_message
 
-        # Push for error/critical, silent in-channel for info/warning.
-        silent = severity.lower() not in SEVERITY_PUSH
-        ok = send_message(message, disable_notification=silent)
+        # Every severity reaches the chat. `disable_push` only controls
+        # whether THIS send also triggers a phone buzz (error/critical do;
+        # everything else still posts, just without the buzz) — it is never
+        # a delivery gate. See SEVERITY_PHONE_PUSH and the module docstring.
+        disable_push = severity.lower() not in SEVERITY_PHONE_PUSH
+        ok = send_message(message, disable_notification=disable_push)
         return ChannelResult(ok=bool(ok), detail="sent" if ok else "send_message returned False")
     except Exception as exc:  # send_message itself never raises, but defensive
         logger.warning("alerts.publish: Telegram fan-out failed: %s", exc)
@@ -406,9 +440,11 @@ def publish(
 
     :param message: The alert body. Severity tag + source prefix are
         prepended automatically (e.g. ``"[ERROR] spot_backtest.sh: <body>"``).
-    :param severity: Free-form severity string (``error`` / ``critical``
-        push on Telegram; everything else is silent in-channel). The tag
-        is uppercased in the rendered message.
+    :param severity: Free-form severity string. Delivered to both channels
+        at every severity — ``error`` / ``critical`` additionally trigger a
+        Telegram phone push; everything else still posts to the chat, only
+        without the buzz (NOT suppressed; see :data:`SEVERITY_PHONE_PUSH`).
+        The tag is uppercased in the rendered message.
     :param source: Optional source identifier (script path, repo, Lambda
         name) inserted between the tag and the message body. Helps the
         operator triage at a glance.
@@ -612,8 +648,10 @@ def main(argv: list[str] | None = None) -> int:
         "--severity",
         default="error",
         help=(
-            "Severity tag (default: error). 'error' and 'critical' push on "
-            "Telegram; all others are silent in-channel."
+            "Severity tag (default: error). Delivered at every severity — "
+            "'error' and 'critical' additionally trigger a Telegram phone "
+            "push; all others still post to the channel, just without the "
+            "buzz (never suppressed)."
         ),
     )
     pub.add_argument(
