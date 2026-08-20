@@ -1455,6 +1455,20 @@ class TestResolveExecContext:
         with pytest.raises(ValueError, match="Unknown execution context"):
             _router._resolve_exec_context("fargate")
 
+    def test_ci_is_a_declared_context(self, monkeypatch):
+        """alpha-engine-config-I7853 — a GitHub-hosted Actions runner.
+
+        Before this existed, crucible-research's judge smoke declared
+        `lambda` because there was no truer word, which R29 names as a
+        vocabulary gap rather than a consumer defect.
+        """
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        assert _router.EXEC_CONTEXT_CI == "ci"
+        assert _router.EXEC_CONTEXT_CI in _router.EXEC_CONTEXTS
+        assert _router._resolve_exec_context("ci") == "ci"
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        assert _router._resolve_exec_context() == "ci"
+
     def test_context_is_never_inferred_from_lambda_env(self, monkeypatch):
         """R29 — declared, not inferred. AWS_LAMBDA_FUNCTION_NAME being set
         must not make krepis believe it is in a Lambda; a wrong guess makes a
@@ -1768,6 +1782,48 @@ class TestRouterIsNeverContextFiltered:
                     "ultra", exec_context="lambda", wire="openai")
             assert info["route"] == "litellm_proxy"
             assert info["exec_context"] == "lambda"
+        finally:
+            _router._router = None
+
+    def test_router_serves_ci_where_no_direct_entry_can(
+        self, reachability_registry, monkeypatch
+    ):
+        """alpha-engine-config-I7853 — the CI shape, asserted from both sides.
+
+        A GitHub-hosted runner has no egress proxy and no private-subnet
+        route, so ZERO direct entries are reachable from `ci` and none may
+        ever be (llm-egress-proxy-policy §2a CI row: custodial — one router
+        credential, no provider key). What makes that a workable shape rather
+        than a dead context is R27a: the router route carries no
+        `reachable_from` and is offered here exactly as it is everywhere else.
+        """
+        self._healthy_litellm(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="ci", wire="openai")
+            assert info["route"] == "litellm_proxy"
+            assert info["exec_context"] == "ci"
+        finally:
+            _router._router = None
+
+    def test_ci_without_the_router_fails_closed_naming_the_context(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """The other side of the same shape: with the edge unreachable there is
+        nothing left, and that MUST raise rather than fall through to a direct
+        provider — a CI-reachable provider endpoint would be uncompelled egress
+        with nothing observing it."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="ci", wire="openai")
+            assert "ci" in str(exc.value)
         finally:
             _router._router = None
 
