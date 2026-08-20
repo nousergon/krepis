@@ -2841,9 +2841,11 @@ class TestResolveModel:
     ):
         """R29: declared by the caller, never inferred. The edge itself is
         never gated by context (R28's carve-out / R27a.4), so a pinned model
-        resolves from `lambda` exactly as it does from `laptop` — but the
-        route must still say which context asked."""
-        for ctx in ("laptop", "ec2", "lambda"):
+        resolves from EVERY declared context — but the route must still say
+        which context asked. Iterating `EXEC_CONTEXTS` rather than a literal
+        list means a context added later (krepis-PR171 added `ci`) is covered
+        the day it is declared, not the day someone remembers this test."""
+        for ctx in _router.EXEC_CONTEXTS:
             info = self._resolve(
                 monkeypatch, pinned_registry, "in-a-group", exec_context=ctx)
             assert info["exec_context"] == ctx
