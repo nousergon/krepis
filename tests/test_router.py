@@ -494,9 +494,31 @@ class TestServedModelForDeployment:
             == "moonshotai/kimi-k3"
         )
 
-    def test_non_deployment_name_returns_none(self):
-        assert _router.served_model_for_deployment("deepseek-v4-flash") is None
-        assert _router.served_model_for_deployment("low") is None
+    def test_a_bare_registry_id_resolves_to_its_upstream_model(self):
+        """A call pinned with `resolve_model_spec` addresses the BARE
+        registry id, and litellm echoes it back as `resp.model`. Before this
+        resolved, every pinned call raised the alias-masquerade error in
+        `krepis.llm._resolve_group_served_model` — the same failure shape as
+        the {group}-{mid} half of config-I6543, which aborted the Think Tank
+        challenger arm for ten days. A bare id names a real entry with a real
+        price card; it is not a masquerade (alpha-engine-config-I7878)."""
+        assert (
+            _router.served_model_for_deployment("deepseek-v4-flash")
+            == "deepseek-v4-flash"
+        )
+        assert (
+            _router.served_model_for_deployment("kimi-k3")
+            == "moonshotai/kimi-k3"
+        )
+
+    def test_a_bare_group_name_still_returns_none(self):
+        """The masquerade this guard exists to reject. A group alias is not
+        a model id, carries no price card, and must never resolve."""
+        for group in ("low", "med", "high", "ultra"):
+            assert _router.served_model_for_deployment(group) is None
+
+    def test_an_unknown_name_returns_none(self):
+        assert _router.served_model_for_deployment("no-such-model") is None
 
     def test_mid_not_in_the_named_group_returns_none(self):
         # "kimi-k3" is an ultra member, not a low member.

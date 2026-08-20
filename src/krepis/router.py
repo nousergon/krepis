@@ -1249,11 +1249,24 @@ def served_model_for_deployment(deployment_name: str) -> Optional[str]:
     (e.g. ``deepseek-v4-flash``) — and price cards are per (model, ROUTE),
     never shared between the two.
 
-    Returns ``None`` when *deployment_name* is not a derived deployment
-    name for any group in the registry. Raises ``FileNotFoundError`` when
-    no registry can be found — a caller holding a ``{group}-{mid}``-shaped
-    name resolved it through this registry in the first place, so an
-    unreadable registry here is a real defect, not a soft miss.
+    **A BARE registry id resolves too**, and must. The derivation layer
+    emits every active entry as its own ``model_name`` deployment for direct
+    calls by name, so a call pinned with :func:`resolve_model_spec` addresses
+    the bare id and litellm echoes that id back as ``resp.model``. Without
+    this branch every pinned call raised the alias-masquerade error in
+    :func:`krepis.llm._resolve_group_served_model` — the same shape as the
+    ``{group}-{mid}`` half of config-I6543, where the addressing change
+    shipped without the accounting one and aborted the Think Tank challenger
+    arm for ten days. A bare id is not a masquerade: it names a real registry
+    entry with a real price card. Bare GROUP names still do not resolve —
+    "low"/"med"/"high"/"ultra" are not model ids — so genuine masquerade
+    still raises.
+
+    Returns ``None`` when *deployment_name* is neither a derived deployment
+    name for any group nor a registry entry id. Raises ``FileNotFoundError``
+    when no registry can be found — a caller holding such a name resolved it
+    through this registry in the first place, so an unreadable registry here
+    is a real defect, not a soft miss.
     """
     reg_path = _find_registry()
     if not reg_path:
@@ -1275,6 +1288,9 @@ def served_model_for_deployment(deployment_name: str) -> Optional[str]:
         mid = deployment_name[len(prefix):]
         if mid in group_ids and mid in models:
             return models[mid].get("model") or None
+    entry = models.get(deployment_name)
+    if entry is not None:
+        return entry.get("model") or None
     return None
 
 
