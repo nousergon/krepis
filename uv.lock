@@ -2037,7 +2037,7 @@ wheels = [
 
 [[package]]
 name = "krepis"
-version = "0.59.10"
+version = "0.59.14"
 source = { editable = "." }
 dependencies = [
     { name = "boto3", version = "1.42.97", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.10'" },
@@ -2082,7 +2082,7 @@ requires-dist = [
     { name = "anthropic", marker = "extra == 'anthropic'", specifier = ">=0.40" },
     { name = "boto3", specifier = ">=1.34" },
     { name = "eval-type-backport", marker = "python_full_version < '3.10'", specifier = ">=0.2.0" },
-    { name = "flow-doctor", extras = ["diagnosis", "s3"], marker = "extra == 'flow-doctor'", specifier = ">=0.8.1,<0.10" },
+    { name = "flow-doctor", extras = ["diagnosis", "s3"], marker = "extra == 'flow-doctor'", specifier = ">=0.8.1,<0.14" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "litellm", marker = "python_full_version >= '3.11' and extra == 'dev'", specifier = ">=1.0" },
     { name = "litellm", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=1.0,<1.97" },
