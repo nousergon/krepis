@@ -141,7 +141,8 @@ class TestPublish:
 
     def test_severity_push_mapping(self, fake_boto3):
         """error/critical → disable_notification=False (push);
-        info/warning → disable_notification=True (silent)."""
+        info/warning → disable_notification=True (no push — still sent,
+        see test_non_push_severity_still_delivers_to_telegram below)."""
         fake, _sts, _sns = fake_boto3
         from krepis import telegram as tg_mod
 
@@ -156,6 +157,37 @@ class TestPublish:
                     alerts.publish("x", severity=sev)
                     silent_kwarg = send.call_args.kwargs.get("disable_notification")
                     assert silent_kwarg is expect_silent, f"severity={sev}: expected silent={expect_silent} got {silent_kwarg}"
+
+    def test_non_push_severity_still_delivers_to_telegram(self, fake_boto3):
+        """Pins the corrected contract (alpha-engine-config-I7857): a
+        severity outside SEVERITY_PHONE_PUSH is NOT a delivery gate. Both
+        SNS and Telegram must still be invoked — the message reaches the
+        chat and the SNS-subscribed inbox exactly as at 'error', only
+        without a phone buzz. Regressing this back to "info/warning don't
+        publish" is the exact bug this issue fixed."""
+        fake, _sts, sns = fake_boto3
+        from krepis import telegram as tg_mod
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            for sev in ("info", "warning"):
+                sns.publish.reset_mock()
+                with patch.object(tg_mod, "send_message", return_value=True) as send:
+                    result = alerts.publish("x", severity=sev, source="test")
+
+                sns.publish.assert_called_once()
+                send.assert_called_once()
+                assert result.sns.ok is True
+                assert result.telegram.ok is True
+                # No-push, not no-send: disable_notification=True, message sent.
+                assert send.call_args.kwargs.get("disable_notification") is True
+                sent_text = send.call_args.args[0] if send.call_args.args else send.call_args.kwargs.get("message")
+                assert sent_text == f"[{sev.upper()}] test: x"
+
+    def test_severity_phone_push_alias_matches_canonical(self):
+        """SEVERITY_PUSH is a deprecated alias (CONTRIBUTING.md additive-only
+        API rule) for SEVERITY_PHONE_PUSH — same object, same members."""
+        assert alerts.SEVERITY_PUSH is alerts.SEVERITY_PHONE_PUSH
+        assert alerts.SEVERITY_PHONE_PUSH == frozenset({"error", "critical"})
 
     def test_sns_subject_truncated_and_sanitized(self, fake_boto3):
         fake, _sts, sns = fake_boto3
