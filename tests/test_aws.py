@@ -394,6 +394,33 @@ class TestRemoveLambdaEnvironmentKeys:
         assert order == ["write", "publish", "update_alias"]
         assert client.aliases[0]["FunctionVersion"] == "518"
 
+    def test_defer_publish_permits_a_latest_only_edit_on_a_pinned_function(self):
+        """A deploy script publishes and moves the alias itself a few steps
+        later. That is a claim about the CALLER, so it is spelled out rather
+        than inferred from an empty promote list."""
+        client = FakeLambda({"GITHUB_TOKEN": "dead", "FMP_API_KEY": "x"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, defer_publish=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] in {"publish", "update_alias"} for c in client.calls)
+        assert client.aliases[0]["FunctionVersion"] == "517"
+
+    def test_defer_publish_and_promote_together_are_refused(self):
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaEnvMergeError, match="mutually exclusive"):
+            remove_lambda_environment_keys(
+                "f",
+                ["GITHUB_TOKEN"],
+                client=client,
+                promote_aliases=["live"],
+                defer_publish=True,
+            )
+        assert not any(c[0] == "write" for c in client.calls)
+
     def test_promoting_an_alias_that_does_not_exist_is_refused(self):
         client = FakeLambda({"GITHUB_TOKEN": "dead"})
         client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
@@ -427,7 +454,7 @@ class TestRemoveLambdaEnvCli:
     def test_values_are_never_printed_and_keys_are(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "krepis.aws.remove_lambda_environment_keys",
-            lambda fn, keys, region=None, promote_aliases=None, missing_ok=False: (
+            lambda fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False: (
                 13,
                 "518" if promote_aliases else None,
             ),
@@ -445,7 +472,7 @@ class TestRemoveLambdaEnvCli:
         assert "13 remain" in out
 
     def test_a_refusal_exits_non_zero(self, capsys, monkeypatch):
-        def _boom(fn, keys, region=None, promote_aliases=None, missing_ok=False):
+        def _boom(fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False):
             raise LambdaAliasPinnedError("alias live is pinned")
 
         monkeypatch.setattr("krepis.aws.remove_lambda_environment_keys", _boom)

@@ -347,6 +347,7 @@ def remove_lambda_environment_keys(
     client: "object | None" = None,
     promote_aliases: "Iterable[str] | None" = None,
     missing_ok: bool = False,
+    defer_publish: bool = False,
 ) -> "tuple[int, str | None]":
     """Delete *keys* from a Lambda's environment. Returns ``(remaining, version)``.
 
@@ -373,6 +374,10 @@ def remove_lambda_environment_keys(
       → ``update-alias`` for each named alias — and the new version is
       returned. Without it, :class:`LambdaAliasPinnedError` is raised naming
       the pinned aliases, rather than returning a success that changed nothing.
+      ``defer_publish=True`` is the third case: a deploy script that will
+      publish and move the alias itself a few steps later, which must edit
+      ``$LATEST`` only. It is a claim about the CALLER, so it is spelled out
+      rather than inferred from an empty ``promote_aliases``.
 
     Reverting is ``update-alias <name> --function-version <prior>``; the prior
     version is not deleted here, so the rollback target always exists.
@@ -428,9 +433,14 @@ def remove_lambda_environment_keys(
     for key in names:
         variables.pop(key, None)
 
+    if promote_aliases is not None and defer_publish:
+        raise LambdaEnvMergeError(
+            "promote_aliases and defer_publish are mutually exclusive — "
+            "either this call moves the alias or the caller does"
+        )
     pinned = _pinned_aliases(client, function_name)
     wanted = sorted(set(promote_aliases or ()))
-    if pinned and promote_aliases is None:
+    if pinned and promote_aliases is None and not defer_publish:
         raise LambdaAliasPinnedError(
             f"{function_name} serves traffic through alias(es) "
             f"{', '.join(sorted(pinned))} pinned to a published version. "
@@ -636,6 +646,15 @@ def main(argv: "list[str] | None" = None) -> int:
         ),
     )
     rm.add_argument(
+        "--defer-publish",
+        action="store_true",
+        help=(
+            "Edit $LATEST only, because the CALLER publishes a version and "
+            "moves the alias itself (a deploy script). Mutually exclusive "
+            "with --promote-alias."
+        ),
+    )
+    rm.add_argument(
         "--missing-ok",
         action="store_true",
         help="Treat an already-absent key as done instead of an error.",
@@ -685,6 +704,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 region=args.region,
                 promote_aliases=args.promote_alias or None,
                 missing_ok=args.missing_ok,
+                defer_publish=args.defer_publish,
             )
         except LambdaEnvMergeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
