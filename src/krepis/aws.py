@@ -348,6 +348,7 @@ def remove_lambda_environment_keys(
     promote_aliases: "Iterable[str] | None" = None,
     missing_ok: bool = False,
     defer_publish: bool = False,
+    assert_unaliased: bool = False,
 ) -> "tuple[int, str | None]":
     """Delete *keys* from a Lambda's environment. Returns ``(remaining, version)``.
 
@@ -378,6 +379,12 @@ def remove_lambda_environment_keys(
       publish and move the alias itself a few steps later, which must edit
       ``$LATEST`` only. It is a claim about the CALLER, so it is spelled out
       rather than inferred from an empty ``promote_aliases``.
+      ``assert_unaliased=True`` is the fourth: the function serves traffic
+      from ``$LATEST`` and has no alias at all, so the edit reaches traffic
+      the moment it lands and there is nothing to promote. Both are claims the
+      caller can make and this helper cannot verify without an API call it may
+      not be permitted to make; both therefore skip the enumeration, and
+      neither is inferred.
 
     Reverting is ``update-alias <name> --function-version <prior>``; the prior
     version is not deleted here, so the rollback target always exists.
@@ -438,6 +445,12 @@ def remove_lambda_environment_keys(
             "promote_aliases and defer_publish are mutually exclusive — "
             "either this call moves the alias or the caller does"
         )
+    if assert_unaliased and (defer_publish or promote_aliases is not None):
+        raise LambdaEnvMergeError(
+            "assert_unaliased says the function has no alias; defer_publish "
+            "and promote_aliases both say it has one. At most one of these "
+            "can be true, so stating two is a caller bug, not a preference"
+        )
     # `defer_publish` is a statement about what the CALLER does next, so the
     # alias state cannot change the outcome — and enumerating it anyway cost
     # the crucible-predictor deploy a PARTIAL run on 2026-08-21 (run
@@ -446,7 +459,21 @@ def remove_lambda_environment_keys(
     # the live alias served a stale image while main had moved on. Asking for
     # an IAM action to answer a question the caller already answered is the
     # wrong trade (alpha-engine-config-I7925).
-    if defer_publish:
+    # `assert_unaliased` is the same trade for the other true case, added for
+    # alpha-engine-config-I8037. `crucible-research`'s alerts Lambda has NO
+    # alias and no version promotion, so its deploy deliberately does not pass
+    # `--defer-publish` — its own comment says why: there is no later publish
+    # step to carry a deferred edit. 0.59.24 therefore did not help it, and
+    # two deploys failed on the same AccessDenied with 0.59.24 installed (runs
+    # 32512239555 and 32514368875). A caller that is correct had no
+    # expressible path: it cannot claim a publish it does not perform, and it
+    # cannot enumerate aliases it is not permitted to read.
+    #
+    # `_pinned_aliases` still raises for anyone who claims NEITHER — guessing
+    # "no aliases" on an enumeration failure is the silent no-op this whole
+    # helper exists to prevent, and that stays true for every caller that has
+    # not asserted otherwise.
+    if defer_publish or assert_unaliased:
         pinned: "list[str]" = []
     else:
         pinned = _pinned_aliases(client, function_name)
@@ -666,6 +693,18 @@ def main(argv: "list[str] | None" = None) -> int:
         ),
     )
     rm.add_argument(
+        "--no-alias",
+        dest="assert_unaliased",
+        action="store_true",
+        help=(
+            "Assert this function has NO alias and serves traffic from "
+            "$LATEST, so the edit reaches traffic immediately and there is "
+            "nothing to promote. Skips the alias enumeration, which the "
+            "deploy role may not be permitted to perform. Mutually exclusive "
+            "with --defer-publish and --promote-alias."
+        ),
+    )
+    rm.add_argument(
         "--missing-ok",
         action="store_true",
         help="Treat an already-absent key as done instead of an error.",
@@ -716,6 +755,7 @@ def main(argv: "list[str] | None" = None) -> int:
                 promote_aliases=args.promote_alias or None,
                 missing_ok=args.missing_ok,
                 defer_publish=args.defer_publish,
+                assert_unaliased=args.assert_unaliased,
             )
         except LambdaEnvMergeError as exc:
             print(f"ERROR: {exc}", file=sys.stderr)
