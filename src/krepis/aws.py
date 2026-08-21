@@ -438,7 +438,18 @@ def remove_lambda_environment_keys(
             "promote_aliases and defer_publish are mutually exclusive — "
             "either this call moves the alias or the caller does"
         )
-    pinned = _pinned_aliases(client, function_name)
+    # `defer_publish` is a statement about what the CALLER does next, so the
+    # alias state cannot change the outcome — and enumerating it anyway cost
+    # the crucible-predictor deploy a PARTIAL run on 2026-08-21 (run
+    # 32509752554): `github-actions-lambda-deploy` holds no `lambda:ListAliases`,
+    # so this raised, `publish-version` and the alias move never happened, and
+    # the live alias served a stale image while main had moved on. Asking for
+    # an IAM action to answer a question the caller already answered is the
+    # wrong trade (alpha-engine-config-I7925).
+    if defer_publish:
+        pinned: "list[str]" = []
+    else:
+        pinned = _pinned_aliases(client, function_name)
     wanted = sorted(set(promote_aliases or ()))
     if pinned and promote_aliases is None and not defer_publish:
         raise LambdaAliasPinnedError(

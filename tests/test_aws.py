@@ -408,6 +408,39 @@ class TestRemoveLambdaEnvironmentKeys:
         assert not any(c[0] in {"publish", "update_alias"} for c in client.calls)
         assert client.aliases[0]["FunctionVersion"] == "517"
 
+    def test_defer_publish_needs_no_permission_to_list_aliases(self):
+        """The crucible-predictor deploy role holds no `lambda:ListAliases`.
+        Enumerating anyway raised, so `publish-version` and the alias move
+        never ran and the deploy finished PARTIAL — the live alias serving a
+        stale image while main had moved on (run 32509752554, 2026-08-21,
+        alpha-engine-config-I7925). `defer_publish` is a claim about what the
+        CALLER does next, so the alias state cannot change the outcome."""
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale", "FMP_API_KEY": "x"})
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, defer_publish=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] == "list_aliases" for c in client.calls)
+
+    def test_without_defer_publish_a_listing_failure_still_fails_loud(self):
+        """The refusal itself stays: without the caller's claim, whether the
+        edit reaches traffic is unknowable and must not be guessed."""
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale"})
+        with pytest.raises(LambdaEnvMergeError, match="could not list aliases"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
     def test_defer_publish_and_promote_together_are_refused(self):
         client = FakeLambda({"GITHUB_TOKEN": "dead"})
         client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
