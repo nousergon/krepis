@@ -1002,6 +1002,31 @@ class LLMClient:
             )
         return self._client
 
+    def _call_transport(self, fn, /, **kwargs):
+        """Issue one provider call, classifying its failure before anyone retries.
+
+        A 4xx that refuses the REQUEST is permanent: no attempt count and no
+        fallback chain can satisfy it, and letting one travel as an ordinary
+        transport error is how the eval judge spent three attempts and a
+        fallback on a rejected `tool_choice`, then reported a rate limit on a
+        model that was never the problem (alpha-engine-config-I7904).
+
+        Availability failures pass through untouched — this may only ever
+        remove a retry, never add one. See :mod:`krepis.llm_errors` for the
+        calibration, including which 4xx codes stay in the availability class.
+        """
+        from .llm_errors import raise_if_permanent_contract_error
+
+        try:
+            return fn(**kwargs)
+        except Exception as exc:
+            raise_if_permanent_contract_error(
+                exc,
+                deployment=self.spec.model,
+                model_group=self.spec.registry_id,
+            )
+            raise
+
     def _is_openrouter(self) -> bool:
         if self.spec.provider == "openrouter":
             return True
@@ -1286,7 +1311,7 @@ class LLMClient:
                 extra=extra,
             )
             self._dlp_scan_request(payload, context=f"complete anthropic model={self.spec.model}")
-            msg = self._transport_client().messages.create(**payload)
+            msg = self._call_transport(self._transport_client().messages.create, **payload)
             text = "\n\n".join(
                 getattr(b, "text", "")
                 for b in getattr(msg, "content", []) or []
@@ -1316,7 +1341,7 @@ class LLMClient:
         if extra:
             kwargs.update(extra)
         self._dlp_scan_request(kwargs, context=f"complete openai model={self.spec.model}")
-        resp = self._transport_client().chat.completions.create(**kwargs)
+        resp = self._call_transport(self._transport_client().chat.completions.create, **kwargs)
         text = self._choice_text_or_llm_error(resp)
         served_model = (
             _resolve_group_served_model(resp, spec=self.spec)
@@ -1468,7 +1493,7 @@ class LLMClient:
             payload["messages"] = messages
             if attempt == 0:
                 self._dlp_scan_request(payload, context=f"structured anthropic model={self.spec.model}")
-            msg = client.messages.create(**payload)
+            msg = self._call_transport(client.messages.create, **payload)
             self._usage_from_anthropic(msg, into=usage)
             tool_input = self._extract_tool_input(msg, schema_name)
             # Same fault, Anthropic's spelling of it: the forced tool never
@@ -1604,7 +1629,7 @@ class LLMClient:
                 if attempt == 0:
                     scan_payload: dict = {"messages": messages, **kwargs}
                     self._dlp_scan_request(scan_payload, context=f"structured openai model={self.spec.model}")
-                resp = client.chat.completions.create(messages=messages, **kwargs)
+                resp = self._call_transport(client.chat.completions.create, messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 raw_text = _choice_text(resp, caller_raises_on_empty=True)
                 # Deliberately OUTSIDE the retry classification below: a
@@ -1834,7 +1859,7 @@ class LLMClient:
                 extra=extra,
             )
             self._dlp_scan_request(payload, context=f"grounded anthropic model={self.spec.model}")
-            msg = self._transport_client().messages.create(**payload)
+            msg = self._call_transport(self._transport_client().messages.create, **payload)
             return GroundedResult(
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
                 model=getattr(msg, "model", self.spec.model),
@@ -1890,7 +1915,7 @@ class LLMClient:
             try:
                 if attempt == 0:
                     self._dlp_scan_request(kwargs, context=f"grounded openrouter model={self.spec.model}")
-                resp = self._transport_client().chat.completions.create(**kwargs)
+                resp = self._call_transport(self._transport_client().chat.completions.create, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 choice = _first_choice(resp)
             except (json.JSONDecodeError, NullChoicesError) as exc:
