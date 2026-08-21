@@ -441,6 +441,74 @@ class TestRemoveLambdaEnvironmentKeys:
             remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
         assert not any(c[0] == "write" for c in client.calls)
 
+    def test_assert_unaliased_needs_no_permission_to_list_aliases(self):
+        """The other true case, and the one 0.59.24 did not cover.
+
+        `crucible-research`'s alerts Lambda has NO alias and no version
+        promotion, so its deploy deliberately does not pass `--defer-publish`
+        — there is no later publish step to carry a deferred edit. Two deploys
+        failed on the same AccessDenied with 0.59.24 installed (runs
+        32512239555 and 32514368875, alpha-engine-config-I8037). A caller that
+        is correct had no expressible path: it cannot claim a publish it does
+        not perform, and it cannot read aliases it is not permitted to list.
+        """
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale", "FMP_API_KEY": "x"})
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, assert_unaliased=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] == "list_aliases" for c in client.calls)
+        assert not any(c[0] in {"publish", "update_alias"} for c in client.calls)
+
+    def test_assert_unaliased_is_refused_alongside_either_alias_claim(self):
+        """At most one of the three can be true of a given function, so
+        stating two is a caller bug rather than a preference."""
+        for kwargs in (
+            {"defer_publish": True},
+            {"promote_aliases": ["live"]},
+        ):
+            client = FakeLambda({"GITHUB_TOKEN": "dead"})
+            client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+            with pytest.raises(LambdaEnvMergeError, match="caller bug"):
+                remove_lambda_environment_keys(
+                    "f", ["GITHUB_TOKEN"], client=client,
+                    assert_unaliased=True, **kwargs,
+                )
+            assert not any(c[0] == "write" for c in client.calls)
+
+    def test_claiming_neither_still_enumerates_and_still_refuses(self):
+        """The carve-outs are per-caller, never a weakening of the default.
+
+        A caller that asserts nothing gets the original behaviour: enumerate,
+        and raise rather than guess. Guessing "no aliases" on an enumeration
+        failure is the silent no-op the helper exists to prevent, and adding a
+        second carve-out must not soften it for anyone who has not claimed it.
+        """
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale"})
+        with pytest.raises(LambdaEnvMergeError, match="could not list aliases"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_assert_unaliased_does_not_suppress_a_real_pin_for_others(self):
+        """A genuinely alias-pinned function, with a caller claiming nothing,
+        still raises LambdaAliasPinnedError."""
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaAliasPinnedError):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
     def test_defer_publish_and_promote_together_are_refused(self):
         client = FakeLambda({"GITHUB_TOKEN": "dead"})
         client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
@@ -487,7 +555,7 @@ class TestRemoveLambdaEnvCli:
     def test_values_are_never_printed_and_keys_are(self, capsys, monkeypatch):
         monkeypatch.setattr(
             "krepis.aws.remove_lambda_environment_keys",
-            lambda fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False: (
+            lambda fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False, assert_unaliased=False: (
                 13,
                 "518" if promote_aliases else None,
             ),
@@ -505,7 +573,7 @@ class TestRemoveLambdaEnvCli:
         assert "13 remain" in out
 
     def test_a_refusal_exits_non_zero(self, capsys, monkeypatch):
-        def _boom(fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False):
+        def _boom(fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False, assert_unaliased=False):
             raise LambdaAliasPinnedError("alias live is pinned")
 
         monkeypatch.setattr("krepis.aws.remove_lambda_environment_keys", _boom)
