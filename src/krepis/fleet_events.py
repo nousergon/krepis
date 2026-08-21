@@ -134,6 +134,8 @@ def _build_detail(
     dedup_key: Optional[str],
     channels: Optional[Dict[str, Optional[bool]]],
     disable_notification: Optional[bool],
+    state: Optional[str] = None,
+    identity_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     hostname: Optional[str]
     try:
@@ -155,6 +157,12 @@ def _build_detail(
         "severity_raw": severity_raw,
         "body": body[:MAX_BODY_CHARS],
         "dedup_key": dedup_key,
+        # Condition lifecycle (alpha-engine-config-I8105). Optional and
+        # additive: origins with no lifecycle concept (direct Telegram sends)
+        # carry null, which is exactly "this producer does not track a
+        # condition", not "the condition is open".
+        "state": state,
+        "identity_key": identity_key,
         "channels": channels,
         "disable_notification": disable_notification,
         "runtime": {
@@ -213,6 +221,8 @@ def emit_alert_event(
     dedup_key: Optional[str] = None,
     channels: Optional[Dict[str, Optional[bool]]] = None,
     disable_notification: Optional[bool] = None,
+    state: Optional[str] = None,
+    identity_key: Optional[str] = None,
 ) -> bool:
     """Emit one structured alert event to the Overseer intake. Never raises.
 
@@ -234,6 +244,12 @@ def emit_alert_event(
         ``{"sns": True, "telegram": False}``; ``None`` values mean the
         channel was not attempted.
     :param disable_notification: Telegram silent-delivery flag when known.
+    :param state: Condition lifecycle — ``opened`` / ``still_open`` /
+        ``cleared``, or ``None`` when the origin tracks no condition. This is
+        what lets a consumer tell a live outage from a page whose condition
+        already ended (alpha-engine-config-I8105).
+    :param identity_key: Stable identity of the condition, carried by both a
+        page and its later clear so the two correlate onto one incident.
     """
     # Same defense-in-depth as alerts.publish: a consumer test that reaches
     # this path un-stubbed must not feed the production intake queue.
@@ -250,6 +266,8 @@ def emit_alert_event(
         dedup_key=dedup_key,
         channels=channels,
         disable_notification=disable_notification,
+        state=state,
+        identity_key=identity_key,
     )
 
     try:
