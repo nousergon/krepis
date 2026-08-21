@@ -56,5 +56,5 @@ jobs:
     needs: [analyze]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     permissions: {}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@87765003b9cdda605db698f96879f8b1117ec864
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@313d910b152547902877e675873a00fdc1ecd95f
     secrets: inherit
