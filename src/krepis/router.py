@@ -1066,7 +1066,93 @@ def _parse_registry(
             fallbacks.append({group_name: fallback_chain})
             fallbacks.append({primary_name: fallback_chain})
 
+    # ── Capability-scoped chains ────────────────────────────────────────
+    #
+    # A fallback chain may only contain members that can serve the same call
+    # shapes as the deployment they back. A chain that degrades a forced-tool
+    # -call request from a tool-capable member onto one the registry says
+    # refuses `tool_choice` converts an availability blip into a permanent 400
+    # — which is the same wrong answer as I7904, arrived at from the other
+    # direction.
+    #
+    # So for every group and every routable capability, the qualified name of
+    # the capability-filtered PRIMARY gets a chain built only from the other
+    # capability-filtered members. When that primary is also the group's
+    # unfiltered primary the two keys collide, and the narrower chain wins:
+    # the alternative is a chain whose own members cannot serve the request the
+    # primary just failed.
+    for group_name in registry.groups:
+        for capability in _mr.ROUTABLE_CAPABILITIES:
+            capable = registry.live_group_ids(group_name, requires=(capability,))
+            if len(capable) < 2:
+                continue
+            key = f"{group_name}-{capable[0]}"
+            chain = [f"{group_name}-{mid}" for mid in capable[1:]]
+            existing = next((f for f in fallbacks if key in f), None)
+            if existing is not None:
+                if existing[key] != chain:
+                    logger.info(
+                        "narrowing the fallback chain for %r to its %s-capable "
+                        "members: %s -> %s",
+                        key, capability, existing[key], chain,
+                    )
+                existing[key] = chain
+            else:
+                fallbacks.append({key: chain})
+
     return model_list, fallbacks, group_aliases
+
+
+# ── Contract-aware Router ────────────────────────────────────────────────
+
+def _contract_aware_router_class() -> Any:
+    """Return a :class:`litellm.Router` subclass that never fails a 4xx over.
+
+    litellm's fallback layer catches ``Exception`` and tries the next
+    deployment for ANY failure (``router.py::async_function_with_fallbacks``,
+    measured against the installed release). There is no configuration key
+    that narrows it, so the narrowing is done here, at the one seam both the
+    sync and async paths pass through — ``function_with_fallbacks`` delegates
+    to ``async_function_with_fallbacks``, which delegates its whole error
+    handling to ``async_function_with_fallbacks_common_utils``.
+
+    That seam is an internal name, so :mod:`tests.test_router_contract_errors`
+    asserts the override actually fires. If a future litellm renames it, that
+    test goes red — which is the loud failure. A silently-restored
+    fallback-on-400 would be the quiet one, and it is the condition
+    alpha-engine-config-I7904 was filed for.
+
+    Built as a factory rather than a module-level class so importing
+    :mod:`krepis.router` does not import litellm.
+    """
+    from litellm import Router as _BaseRouter
+
+    from .llm_errors import raise_if_permanent_contract_error
+
+    class ContractAwareRouter(_BaseRouter):  # type: ignore[misc, valid-type]
+        """A Router whose fallback chains serve AVAILABILITY only."""
+
+        #: Read by the contract test — proves the override is installed on the
+        #: object actually serving calls, not merely defined in this module.
+        krepis_contract_aware = True
+
+        async def async_function_with_fallbacks_common_utils(  # type: ignore[override]
+            self, e, disable_fallbacks, *args, **kwargs
+        ):
+            # litellm calls this helper BOTH all-keyword and all-positional
+            # (two call sites, one of each, in the installed release), so the
+            # model group is read from whichever form arrived. Only used to
+            # NAME the group in the error; a miss costs a label, never the
+            # classification.
+            model_group = kwargs.get("model_group")
+            if model_group is None and len(args) > 3 and isinstance(args[3], str):
+                model_group = args[3]
+            raise_if_permanent_contract_error(e, model_group=model_group)
+            return await super().async_function_with_fallbacks_common_utils(
+                e, disable_fallbacks, *args, **kwargs
+            )
+
+    return ContractAwareRouter
 
 
 # ── Router singleton ─────────────────────────────────────────────────────
@@ -1089,7 +1175,8 @@ def get_router() -> Any:
         return _router
 
     from threading import Lock as _Lock
-    from litellm import Router as _Router
+
+    _Router = _contract_aware_router_class()
 
     _router_lock = _Lock()
     with _router_lock:
@@ -1433,6 +1520,7 @@ def _resolve_group_json(
     *,
     exec_context: str | None = None,
     wire: str = DEFAULT_WIRE,
+    requires: tuple[str, ...] = (),
 ) -> dict:
     """Return full routing info for *group* as a JSON-ready dict.
 
@@ -1459,6 +1547,16 @@ def _resolve_group_json(
         Claude CLI's Messages format, the default) or :data:`WIRE_OPENAI`.
         An entry that declares no endpoint for this format is skipped with
         that as the stated reason.
+    requires
+        Capabilities the caller's REQUEST SHAPE needs, from
+        :data:`krepis.model_registry.ROUTABLE_CAPABILITIES`. A group is a cost
+        and quality tier; its members can still differ on which call shapes
+        they accept, and the registry has always recorded that in
+        ``capabilities``. Declaring the requirement is how that record reaches
+        routing. Members that do not declare every named capability are
+        excluded BEFORE a primary is chosen, and a group with none raises
+        :exc:`~krepis.model_registry.CapabilityUnavailableError` — a registry
+        gap no retry or fallback can close (alpha-engine-config-I7904).
 
     Produces a dict with every field a shell script needs to configure
     the Claude CLI environment: endpoint URL, auth type, provider, route,
@@ -1509,12 +1607,46 @@ def _resolve_group_json(
 
     registry = _mr.load_registry(reg_path)
     models_by_id: dict[str, dict] = registry.models
-    group_ids: list[str] = registry.groups.get(group, [])
 
-    if not group_ids:
+    if group not in registry.groups:
         raise ValueError(
             f"Model group {group!r} not found in registry. "
             f"Available groups: {list(registry.groups)}"
+        )
+
+    for _cap in requires:
+        if _cap not in _mr.ROUTABLE_CAPABILITIES:
+            raise ValueError(
+                f"{_cap!r} is not a routable capability; declared capabilities "
+                f"are {list(_mr.ROUTABLE_CAPABILITIES)}. A flag that does not "
+                "decide whether a request is ACCEPTED must not narrow a chain."
+            )
+
+    # The DECLARED chain drives the per-provider walk below, so every rejected
+    # member still lands in `skipped_entries` with its own stated reason (R29:
+    # "excluded by status", "lacks a required capability", "not reachable from
+    # here" and "unhealthy" are four different answers).
+    group_ids: list[str] = registry.groups.get(group, [])
+
+    # The derivation's own filters, applied BEFORE a primary is chosen — status
+    # (R4) and then the caller's required capabilities. The status filter used
+    # to be applied only on the per-provider branch below, so the proxy branch
+    # could name a `status: unavailable` row as the group's primary; both
+    # branches now read the same list.
+    live_ids: list[str] = registry.live_group_ids(group, requires=requires)
+
+    if not live_ids:
+        if requires:
+            raise _mr.CapabilityUnavailableError(
+                group, ", ".join(requires),
+                registry.capability_rejections(group, requires=requires),
+            )
+        raise ValueError(
+            f"Model group {group!r} has no live members. Declared members: "
+            f"{registry.groups.get(group)}; rejected — "
+            + "; ".join(
+                f"{mid}: {why}" for mid, why in registry.capability_rejections(group)
+            )
         )
 
     # ── Prefer LiteLLM proxy (format-translating central router) ──────────
@@ -1547,7 +1679,7 @@ def _resolve_group_json(
         # Cache pricing below was already primary-derived, so the two are
         # now consistent: everything describing "what serves this group"
         # comes from one entry.
-        _primary_entry = models_by_id.get(group_ids[0], {}) if group_ids else {}
+        _primary_entry = models_by_id.get(live_ids[0], {})
         _group_pc, _group_apc = _caching_flags(_primary_entry)
         _cache_pricing = {}
         for _key in ("cost_per_1m_input", "cost_per_1m_output",
@@ -1648,6 +1780,26 @@ def _resolve_group_json(
                     "the permanent exit; unavailable means the entry exists but "
                     "cannot serve, and emitting it would report depth the group "
                     "does not have."
+                ),
+            })
+            continue
+
+        _missing = [
+            cap for cap in requires
+            if not _mr.entry_declares_capability(entry, cap)
+        ]
+        if _missing:
+            # A capability rejection is PERMANENT for this call shape, which is
+            # what makes it worth a reason of its own: unlike a cooldown or an
+            # unreachable endpoint, waiting changes nothing.
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": (
+                    "Does not declare "
+                    + ", ".join(f"capabilities.{c}: true" for c in _missing)
+                    + ", which this caller requires. The registry's own record "
+                    "of what this model accepts — not a health signal."
                 ),
             })
             continue
@@ -1781,6 +1933,7 @@ def resolve_group_structured(
     *,
     exec_context: str | None = None,
     wire: str = DEFAULT_WIRE,
+    requires: tuple[str, ...] = (),
 ) -> dict:
     """Resolve *group* to a full routing decision — the PUBLIC contract.
 
@@ -1820,6 +1973,7 @@ def resolve_group_structured(
         group,
         exec_context=exec_context,
         wire=wire,
+        requires=requires,
     )
 
 
@@ -2164,6 +2318,7 @@ def resolve_group_spec(
     wire: str = DEFAULT_WIRE,
     max_tokens: int | None = None,
     structured_outputs: bool | None = None,
+    requires: tuple[str, ...] = (),
 ) -> tuple:
     """Resolve *group* and adapt it to a ``(ModelSpec, route)`` pair.
 
@@ -2176,6 +2331,13 @@ def resolve_group_spec(
     *max_tokens* and *structured_outputs* override the registry's params when
     given.  Passing neither takes the registry values, which is what a caller
     with no specific requirement should do.
+
+    *requires* states what the caller's REQUEST SHAPE needs of whichever model
+    serves it. A caller that forces a tool call passes
+    ``requires=("tool_choice",)``; the group then resolves to a member the
+    registry says will accept one, instead of to a member it says will not
+    (alpha-engine-config-I7904). An empty tuple keeps the pre-existing
+    behaviour exactly.
 
     Returns
     -------
@@ -2196,10 +2358,11 @@ def resolve_group_spec(
         group,
         exec_context=exec_context,
         wire=wire,
+        requires=requires,
     )
     spec = _route_to_spec(
         route,
-        requested=f"group={group}",
+        requested=f"group={group}" + (f" requires={list(requires)}" if requires else ""),
         max_tokens=max_tokens,
         structured_outputs=structured_outputs,
     )

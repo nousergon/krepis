@@ -100,6 +100,27 @@ API_KEY_STYLES = ("value", "reference")
 #: honoured, and why no default is invented for an undeclared one.
 MIN_ADMISSIBLE_TPM = 1_000_000
 
+#: Capabilities a CONSUMER may require of a group at resolve time.
+#:
+#: A group is a capability tier, not a call shape. Two members of one tier can
+#: differ on whether they will accept a given request at all — `low`'s primary
+#: (`deepseek-v4-flash-low`) refuses a forced `tool_choice` outright while
+#: thinking mode is on, and `glm-4.7-flash` accepts it (both measured
+#: 2026-08-20, alpha-engine-config-I7897). The registry has recorded that
+#: difference in `capabilities.tool_choice` since the schema was written; what
+#: did not exist was any way for the difference to reach ROUTING. It did not,
+#: and the eval judge addressed `low`, got the member the registry itself says
+#: cannot serve a forced tool call, and took a permanent 400 on every attempt
+#: (alpha-engine-config-I7904).
+#:
+#: Listed here rather than derived from the union of `capabilities` keys on
+#: purpose: `prompt_caching` / `cache_min_tokens` / `automatic_prefix_caching`
+#: are COST facts a consumer reads off the resolved route, and `batches` names
+#: a different API surface entirely. Only a flag that decides whether a request
+#: is ACCEPTED belongs here — requiring anything else would silently narrow a
+#: chain for a preference rather than a contract.
+ROUTABLE_CAPABILITIES = ("tool_choice",)
+
 _MAX_WALK_DEPTH = 8
 
 
@@ -110,6 +131,33 @@ class RegistryNotFoundError(FileNotFoundError):
     behaviour and callers must be able to distinguish "no registry" from any
     other ``FileNotFoundError`` raised while reading one.
     """
+
+
+class CapabilityUnavailableError(RuntimeError):
+    """No live member of a group declares a capability the caller requires.
+
+    Raised at RESOLVE time, before any request is built. Fail-closed (R20) is
+    the required behaviour: the alternative is to hand back a deployment the
+    registry itself says cannot accept the call, which is a permanent 400 the
+    caller then re-reads as an availability problem.
+
+    Carries the rejected members and the reason each was rejected, because the
+    surfaced error is frequently the only artifact a weekly unattended caller
+    leaves behind.
+    """
+
+    def __init__(self, group: str, capability: str, rejected: List[Tuple[str, str]]) -> None:
+        self.group = group
+        self.capability = capability
+        self.rejected = rejected
+        detail = "; ".join(f"{mid}: {why}" for mid, why in rejected) or "the group has no live members at all"
+        super().__init__(
+            f"model group {group!r} has no live member declaring "
+            f"capabilities.{capability} — {detail}. This is a REGISTRY gap, not "
+            f"an availability event: no retry and no fallback can satisfy it. "
+            f"Add a member that declares capabilities.{capability}: true, or "
+            f"move the call site to a group that has one."
+        )
 
 
 def find_registry(explicit: Optional[Path] = None) -> Path:
@@ -160,6 +208,19 @@ def find_registry(explicit: Optional[Path] = None) -> Path:
     )
 
 
+def entry_declares_capability(entry: dict, capability: str) -> bool:
+    """True only when *entry* declares *capability* as literal ``True``.
+
+    Absence is NOT capability. An undeclared flag means nobody measured it, and
+    treating "unknown" as "supported" is how a group ends up routing a forced
+    tool call at a model that refuses one. The registry schema requires the
+    flag on every entry; a row missing it is a registry defect the validator
+    catches, and until it does, this returns False and the member is skipped
+    with a stated reason rather than gambled on.
+    """
+    return (entry.get("capabilities") or {}).get(capability) is True
+
+
 class Registry:
     """A parsed registry: the derivation's shared intermediate representation.
 
@@ -190,7 +251,9 @@ class Registry:
             if entry.get("status") not in EXCLUDED_STATUSES
         }
 
-    def live_group_ids(self, group: str) -> List[str]:
+    def live_group_ids(
+        self, group: str, *, requires: Tuple[str, ...] = ()
+    ) -> List[str]:
         """Live members of *group*, in declared order, with each drop logged.
 
         Filtering happens BEFORE the caller enumerates, never inside its loop.
@@ -199,30 +262,75 @@ class Registry:
         alias at all and ``completion(model="low")`` fails with "model not
         found" — a worse outcome than the dead member the filter exists to
         remove.
+
+        *requires* narrows further to members declaring EVERY named capability
+        (:data:`ROUTABLE_CAPABILITIES`). Status and capability are two different
+        rejections and are logged as two different reasons: a member excluded
+        for status may come back, a member excluded for capability never will
+        for this call shape.
         """
         live: List[str] = []
+        for mid, _reason in self._group_members(group, requires=requires):
+            if _reason is None:
+                live.append(mid)
+        if not live:
+            logger.warning(
+                "group %r has no live members%s — no alias will be generated",
+                group,
+                f" declaring {list(requires)}" if requires else "",
+            )
+        return live
+
+    def _group_members(
+        self, group: str, *, requires: Tuple[str, ...] = ()
+    ) -> Iterator[Tuple[str, Optional[str]]]:
+        """Yield ``(member_id, rejection_reason_or_None)`` in declared order."""
         for mid in self.groups.get(group, []):
             entry = self.models.get(mid)
             if entry is None:
                 logger.warning(
                     "model %r referenced in group %r is not in the models list", mid, group
                 )
+                yield mid, "not present in the models list"
                 continue
-            if entry.get("status") in EXCLUDED_STATUSES:
+            status = entry.get("status")
+            if status in EXCLUDED_STATUSES:
                 logger.info(
                     "model %r in group %r is status=%s — excluded from derivation",
-                    mid, group, entry.get("status"),
+                    mid, group, status,
+                )
+                yield mid, f"status is {status!r}"
+                continue
+            missing = [cap for cap in requires if not entry_declares_capability(entry, cap)]
+            if missing:
+                logger.info(
+                    "model %r in group %r does not declare %s — excluded from a "
+                    "capability-scoped derivation",
+                    mid, group, missing,
+                )
+                yield mid, (
+                    "does not declare "
+                    + ", ".join(f"capabilities.{c}: true" for c in missing)
                 )
                 continue
-            live.append(mid)
-        if not live:
-            logger.warning("group %r has no live members — no alias will be generated", group)
-        return live
+            yield mid, None
 
-    def iter_live_groups(self) -> Iterator[Tuple[str, List[str]]]:
+    def capability_rejections(
+        self, group: str, *, requires: Tuple[str, ...] = ()
+    ) -> List[Tuple[str, str]]:
+        """Every member of *group* that was rejected, with the reason."""
+        return [
+            (mid, reason)
+            for mid, reason in self._group_members(group, requires=requires)
+            if reason is not None
+        ]
+
+    def iter_live_groups(
+        self, *, requires: Tuple[str, ...] = ()
+    ) -> Iterator[Tuple[str, List[str]]]:
         """Yield ``(group, live_member_ids)`` for every group with a live member."""
         for group in self.groups:
-            live = self.live_group_ids(group)
+            live = self.live_group_ids(group, requires=requires)
             if live:
                 yield group, live
 
