@@ -446,6 +446,25 @@ def extra_body(entry: dict) -> Optional[dict]:
     reasoning = params.get("reasoning")
     if reasoning and reasoning != "null":
         result["reasoning"] = reasoning
+    # `thinking` is a SEPARATE upstream control from `reasoning`, not a synonym,
+    # and the difference decides whether a forced tool call is accepted at all.
+    # Measured against api.deepseek.com through the egress proxy, 2026-08-21,
+    # `deepseek-v4-flash` + forced `tool_choice`:
+    #
+    #   no thinking field            -> 400 Thinking mode does not support this tool_choice
+    #   reasoning: {exclude: true}   -> 400 (identical)
+    #   thinking: {type: disabled}   -> 200 with tool_calls
+    #
+    # `reasoning` asks the provider not to BILL or RETURN a reasoning trace;
+    # `thinking` turns the mode off. Only the second one changes what the
+    # request is allowed to contain. Until this passthrough existed the
+    # registry could not express the one setting that works, which is why the
+    # group's answer to a tool-calling consumer had to be a different vendor
+    # (alpha-engine-config-I7897) rather than a different parameter
+    # (alpha-engine-config-I7904).
+    thinking = params.get("thinking")
+    if thinking and thinking != "null":
+        result["thinking"] = thinking
     targets_openrouter = (
         entry.get("route") == "openrouter"
         or entry.get("upstream_host") == "openrouter.ai"

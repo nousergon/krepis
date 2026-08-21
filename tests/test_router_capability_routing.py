@@ -247,3 +247,34 @@ class TestFallbackChainsAreCapabilityHomogeneous:
         chains = {k: v for f in fallbacks for k, v in f.items()}
         assert chains["low-accepts-tools"] == ["low-also-accepts-tools"]
         assert "low-refuses-tools" not in chains["low-accepts-tools"]
+
+
+class TestThinkingPassthrough:
+    """`thinking` and `reasoning` are two different upstream controls.
+
+    Measured against api.deepseek.com through the egress proxy, 2026-08-21,
+    `deepseek-v4-flash` with a forced `tool_choice`: no thinking field -> 400,
+    `reasoning: {exclude: true}` -> the identical 400, `thinking:
+    {type: disabled}` -> 200 with tool_calls. Until the registry could emit the
+    third, the only answer a tool-calling consumer had was a different vendor.
+    """
+
+    def test_thinking_reaches_extra_body(self):
+        assert _mr.extra_body(
+            {"route": "egress_proxy", "params": {"thinking": {"type": "disabled"}}}
+        ) == {"thinking": {"type": "disabled"}}
+
+    def test_thinking_and_reasoning_are_carried_independently(self):
+        got = _mr.extra_body({
+            "route": "egress_proxy",
+            "params": {"reasoning": {"effort": "low"}, "thinking": {"type": "disabled"}},
+        })
+        assert got == {"reasoning": {"effort": "low"}, "thinking": {"type": "disabled"}}
+
+    def test_the_yaml_null_string_is_treated_as_absent(self):
+        """Same rule `reasoning` already has: a YAML author writing the literal
+        four characters means "off", and forwarding them upstream sends a
+        string where an object belongs."""
+        assert _mr.extra_body(
+            {"route": "egress_proxy", "params": {"thinking": "null"}}
+        ) is None
