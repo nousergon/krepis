@@ -354,6 +354,13 @@ def remove_lambda_environment_keys(
     The removal counterpart of :func:`merge_lambda_environment`, and subject to
     the same two rules.
 
+    Written for a credential that had been **duplicated into a Lambda
+    environment and left to drift from its source of truth**: measured
+    2026-08-21, `/alpha-engine/GITHUB_TOKEN` itself authenticated fine while the
+    copy in `alpha-engine-predictor-inference`'s environment was rejected with a
+    401 — same name, different value, nothing detecting the divergence. The 401
+    halted the preopen trading pipeline (alpha-engine-config-I7924).
+
     **Read-modify-write, never replace.** Only the named keys are removed;
     every other variable on the live function — provider keys, database URLs,
     operator-set flags that are codified nowhere — survives untouched.

@@ -331,10 +331,11 @@ class TestMergeLambdaEnvCli:
 
 
 class TestRemoveLambdaEnvironmentKeys:
-    """alpha-engine-config-I7925: an expired /alpha-engine/GITHUB_TOKEN sat in
-    the predictor Lambda's environment, was read from site-packages by a
-    first-party dependency, and halted the 2026-08-21 preopen. Removing a
-    credential from a live function is the removal counterpart of
+    """alpha-engine-config-I7925: a STALE COPY of /alpha-engine/GITHUB_TOKEN sat
+    in the predictor Lambda's environment — the parameter's own value
+    authenticated, the environment's copy did not — was read from site-packages
+    by a first-party dependency, and its 401 halted the 2026-08-21 preopen.
+    Removing a credential from a live function is the removal counterpart of
     I7179's merge, and carries the same two invariants plus the L4497
     alias-pinning footgun."""
 
