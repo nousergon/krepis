@@ -158,6 +158,13 @@ STATUS_UNMEASURED: Final[str] = "UNMEASURED"
 #: finding with an interpreter error or an unhandled traceback.
 EXIT_COVERAGE_FAILURE: Final[int] = 3
 
+#: Process exit code used by the CLI when ``--run-date`` resolves empty.
+#: Distinct from :data:`EXIT_COVERAGE_FAILURE` so a launcher's ``|| echo`` can
+#: tell "this stage did not write what it declared" from "this launcher was
+#: not given the execution's identity", which are different defects with
+#: different owners (`alpha-engine-config-I8155`).
+EXIT_NO_RUN_DATE: Final[int] = 4
+
 #: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
 #: Three namespaces, of which only the first is this module's own: verdicts are
 #: written under :data:`VERDICT_PREFIX`; the registry mirror is read from
@@ -176,6 +183,45 @@ S3_SURFACE = (
     ),
 )
 
+
+class StageCoverageContractError(ValueError):
+    """A caller violated the module's contract — never an environment fault.
+
+    Raised only for a missing or blank ``run_date``. It is deliberately a
+    distinct type from every UNMEASURED cause: an unreadable registry, an
+    unresolvable cycle date and a non-404 probe failure are conditions of the
+    world, degrade to :data:`STATUS_UNMEASURED`, and must never kill the stage
+    being observed. Supplying no execution identity is not a condition of the
+    world — it is a defect in the call site, and the one thing this module
+    refuses to paper over (`alpha-engine-config-I8155`).
+    """
+
+
+def _require_run_date(run_date: Any) -> str:
+    """Return ``run_date`` as a non-empty string, or raise loudly.
+
+    **The grouping key is the SF execution's ``run_date``, always.** It is the
+    only thing tying one execution's verdicts together, so a fall-back that
+    silently substitutes something else does not degrade the answer — it
+    destroys the question. Measured 2026-08-22: one weekly execution's verdicts
+    landed under TWO date prefixes and eight carried ``run_date: ""``, because
+    three call sites derived the date three different ways and
+    :func:`verdict_key` fell back to ``cycle_date`` when handed nothing. Read
+    from ``_stage_coverage/2026-08-22/``, that run had 11 of ~25 stages and the
+    remainder were indistinguishable from the previous day's.
+    """
+    text = "" if run_date is None else str(run_date).strip()
+    if not text:
+        raise StageCoverageContractError(
+            "stage_coverage: run_date is REQUIRED and must be non-empty — it "
+            "is the Step Functions execution's own run_date and the only key "
+            "grouping one execution's verdicts. Pass the SF's $.run_date "
+            "explicitly (CLI: --run-date; Lambda: run_date=). It is NOT the "
+            "cycle date: cycle_date is derived here from "
+            "last_closed_trading_day() and legitimately differs on a weekend "
+            "(alpha-engine-config-I8155)."
+        )
+    return text
 
 
 # ── Verdict record ───────────────────────────────────────────────────────────
@@ -202,8 +248,19 @@ class StageVerdict:
             alarming direction.
         reason: Human-readable explanation, always populated for
             ``UNMEASURED``.
-        run_date: The execution's ``run_date``, as supplied.
-        cycle_date: The date substituted into ``{date}`` / ``{trading_day}``.
+        run_date: The Step Functions execution's own ``run_date`` — the
+            GROUPING KEY, and the sole determinant of the verdict's S3
+            prefix. **Required and non-empty**: constructing a verdict
+            without it raises :class:`StageCoverageContractError`
+            (`alpha-engine-config-I8155`). It keeps its default position in
+            the field order only so that no keyword construction reorders;
+            it is not optional.
+        cycle_date: The date substituted into ``{date}`` / ``{trading_day}``
+            — a SEPARATE question ("which trading session does this run's
+            data describe"), derived from
+            :func:`krepis.trading_calendar.last_closed_trading_day` and
+            legitimately different from ``run_date`` on a weekend. It is
+            never a fall-back for ``run_date``.
         window_start: ISO-8601 UTC instant before which an artifact counts
             as ``stale``. ``None`` disables the staleness half — absence is
             still measurable without a window, so ``MISSING`` still fires.
@@ -226,6 +283,14 @@ class StageVerdict:
     window_start: str | None = None
     recorded_at: str = ""
     enforce: bool = False
+
+    def __post_init__(self) -> None:
+        # Refuse to CONSTRUCT a verdict with no execution identity. The check
+        # sits here rather than only at the key-building step so that every
+        # path producing a verdict — evaluate_stage's happy path, its six
+        # UNMEASURED early returns, and assert_stage_coverage's own outer
+        # except — is covered by one rule instead of six.
+        object.__setattr__(self, "run_date", _require_run_date(self.run_date))
 
     @property
     def is_finding(self) -> bool:
@@ -368,16 +433,21 @@ def evaluate_stage(
     *,
     s3_client: Any,
     now: datetime,
-    run_date: str = "",
+    run_date: str,
     cycle_date: date | None = None,
     window_start: datetime | None = None,
     enforce: bool = False,
 ) -> StageVerdict:
     """Return the verdict for ``stage``. Pure but for the injected S3 probes.
 
-    Never raises. Every failure to establish an answer is
+    ``run_date`` is a REQUIRED keyword — the SF execution's own, never the
+    cycle date. Omitting it is a :class:`TypeError` at the call site and
+    passing it blank is a :class:`StageCoverageContractError`.
+
+    Otherwise never raises: every failure to establish an answer is
     :data:`STATUS_UNMEASURED` with a populated ``reason``.
     """
+    run_date = _require_run_date(run_date)
     recorded_at = now.astimezone(timezone.utc).isoformat()
     window_iso = (
         window_start.astimezone(timezone.utc).isoformat() if window_start else None
@@ -523,9 +593,16 @@ def evaluate_stage(
 
 
 def verdict_key(verdict: StageVerdict, *, prefix: str = VERDICT_PREFIX) -> str:
-    """S3 key the verdict record is written to."""
-    stamp = verdict.run_date or verdict.cycle_date or "unknown"
-    return f"{prefix}/{stamp}/{verdict.stage}.json"
+    """S3 key the verdict record is written to.
+
+    The date component is the execution's ``run_date`` and nothing else.
+    There is deliberately no fall-back to ``cycle_date``: on a weekend the two
+    differ, so the fall-back scattered one execution's verdicts across two
+    prefixes and left the question "did every stage of THIS run report?" with
+    no answerable form (`alpha-engine-config-I8155`). ``StageVerdict`` cannot
+    be constructed without a ``run_date``, so this cannot be reached blank.
+    """
+    return f"{prefix}/{_require_run_date(verdict.run_date)}/{verdict.stage}.json"
 
 
 def record_verdict(
@@ -593,7 +670,7 @@ def record_verdict(
 def assert_stage_coverage(
     stage: str,
     *,
-    run_date: str = "",
+    run_date: str,
     window_start: datetime | None = None,
     enforce: bool = False,
     now: datetime | None = None,
@@ -613,7 +690,20 @@ def assert_stage_coverage(
     ``enforce=True`` does not raise either; it sets ``is_finding`` in the
     returned dict. Acting on that remains the caller's decision, made in the
     caller's own failure route, per §2.1's one-stage-one-failure-route rule.
+
+    **The one thing that DOES raise: a missing or blank ``run_date``.** The
+    never-raises contract protects the observed stage from the observer's
+    encounters with the world — an unreadable registry, a dead region
+    resolver, an S3 that will not answer. It was never a promise to absorb a
+    defect in the call site. A stage that cannot say which execution it
+    belongs to cannot have its verdict grouped with its siblings, and the
+    fail-soft alternative already ran for a week: eight stages wrote
+    ``run_date: ""`` into the wrong day's prefix and nothing anywhere said so
+    (`alpha-engine-config-I8155`). The check runs BEFORE the guard below, so
+    the error reaches the call site unwrapped rather than being flattened into
+    an UNMEASURED verdict nobody reads.
     """
+    run_date = _require_run_date(run_date)
     now = now or datetime.now(timezone.utc)
     try:
         if s3_client is None:
@@ -729,7 +819,11 @@ def build_parser() -> argparse.ArgumentParser:
     assert_cmd.add_argument(
         "--run-date",
         default=os.environ.get("RUN_DATE", ""),
-        help="execution run_date (defaults to $RUN_DATE)",
+        help=(
+            "REQUIRED — the Step Functions execution's own run_date, the key "
+            "grouping this run's verdicts (defaults to $RUN_DATE; an empty "
+            f"resolution exits {EXIT_NO_RUN_DATE} and writes nothing)"
+        ),
     )
     assert_cmd.add_argument(
         "--window-start",
@@ -767,10 +861,27 @@ def main(argv: list[str] | None = None) -> int:
     - ``0`` — observe mode always, and enforcing mode on anything that is not
       a real ``MISSING``.
     - :data:`EXIT_COVERAGE_FAILURE` — enforcing mode on a real ``MISSING``.
+    - :data:`EXIT_NO_RUN_DATE` — ``--run-date`` resolved empty. Nothing is
+      written: a verdict filed under the wrong prefix is worse than no
+      verdict, because it is counted.
     - ``2`` — argparse usage error (argparse's own convention).
     """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     args = build_parser().parse_args(argv)
+
+    # Loud, non-zero, and NOT a traceback: every launcher invokes this behind
+    # `|| echo WARNING ... >&2`, so a raise here would be swallowed by the
+    # very `||` that keeps observe mode from killing the stage. A distinct
+    # exit code with a message naming the fix is what actually reaches an
+    # operator (alpha-engine-config-I8155).
+    try:
+        _require_run_date(getattr(args, "run_date", ""))
+    except StageCoverageContractError as exc:
+        print(
+            f"ERROR: stage-coverage {args.stage}: NO VERDICT RECORDED — {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_NO_RUN_DATE
 
     window_raw = getattr(args, "window_start", "") or ""
     window = _parse_window(window_raw)
