@@ -242,6 +242,16 @@ class StageVerdict:
         missing: Declared artifacts whose key does not exist.
         stale: Declared artifacts present but older than ``window_start``.
         covered: Declared artifacts present and inside the window.
+        stale_conditional: The subset of ``stale`` whose row in
+            ``artifacts:`` (``ARTIFACT_REGISTRY.yaml``) carries a VALID
+            ``refresh: conditional`` declaration — ``refresh: conditional``
+            with a non-empty ``refresh_reason``. ``refresh: conditional``
+            with no ``refresh_reason`` is not a valid declaration and the
+            artifact stays OUT of this list, exactly the
+            ``COVERED_NO_OUTPUT`` convention: a stage (here, an artifact) may
+            declare an exception to the default rule, but it must *say so*
+            (`alpha-engine-config-I8166`). Populated only while walking
+            ``stale``; empty for every other status.
         unmeasured: ``[(artifact_id, reason)]`` — probes that could not be
             evaluated. Kept apart from ``missing`` deliberately: a harness
             fault reported as a producer finding is always wrong in the
@@ -276,6 +286,7 @@ class StageVerdict:
     missing: list[str] = field(default_factory=list)
     stale: list[str] = field(default_factory=list)
     covered: list[str] = field(default_factory=list)
+    stale_conditional: list[str] = field(default_factory=list)
     unmeasured: list[tuple[str, str]] = field(default_factory=list)
     reason: str = ""
     run_date: str = ""
@@ -294,15 +305,43 @@ class StageVerdict:
 
     @property
     def is_finding(self) -> bool:
-        """True only for a real MISSING — the one status enforcement acts on.
+        """True for a real MISSING, and for a STALE that is not excused.
 
-        ``STALE`` is deliberately excluded: staleness is a genuine defect but
-        its distribution has never been measured on a live run, and the first
-        enforcement of an unmeasured floor is how a correct detector gets
-        switched off in week one. ``UNMEASURED`` is excluded because it is not
-        a claim about the producer at all.
+        ``STALE`` was blanket-excluded until ``alpha-engine-config-I8166``:
+        the 2026-08-22 weekly run reported ``ReplayConcordance`` as
+        ``STALE``/``is_finding: false`` while it had refreshed **zero** of
+        the one artifact it declares — the stage produced nothing and the
+        coverage surface said so was fine. That is `principles.md` §2.7 (*no
+        data* rendered as green) inverted at the row level, inside the exact
+        mechanism built to catch it.
+
+        Two STALE shapes are not the same claim:
+
+        - **Wholly stale** (``not covered and stale``) — nothing the stage
+          declares was refreshed this run. Indistinguishable from the stage
+          not having run at all. Always a finding; no declaration can excuse
+          it, because there is nothing left for a producer to have chosen
+          conditionally.
+        - **Partially stale** (``covered and stale``) — some declared
+          artifacts refreshed, others did not. Often legitimate (no new
+          grades this week, no promotion this week) — but legitimate only
+          when the artifact's own registry row says so via a VALID
+          ``refresh: conditional`` + ``refresh_reason`` declaration
+          (:attr:`stale_conditional`). A finding unless *every* stale
+          artifact carries that declaration; a single unexcused stale
+          artifact still fires.
+
+        ``UNMEASURED`` stays excluded — it is not a claim about the producer
+        at all, and enforcing an unmeasured floor is how a correct detector
+        gets switched off in week one (Brian ruling 2026-08-11).
         """
-        return self.status == STATUS_MISSING
+        if self.status == STATUS_MISSING:
+            return True
+        if self.status == STATUS_STALE:
+            if not self.covered:
+                return True
+            return not set(self.stale).issubset(set(self.stale_conditional))
+        return False
 
     def to_dict(self) -> dict[str, Any]:
         """JSON-serialisable form (tuples flattened to lists)."""
@@ -515,6 +554,14 @@ def evaluate_stage(
     missing: list[str] = []
     stale: list[str] = []
     covered: list[str] = []
+    stale_conditional: list[str] = []
+    # Stale artifacts whose row declares `refresh: conditional` but omits the
+    # REQUIRED `refresh_reason` — an invalid declaration that does not join
+    # `stale_conditional` and must not silently suppress the finding either.
+    # Named here, not just dropped, per the `COVERED_NO_OUTPUT` convention:
+    # an exception to the default must be SAID, and a malformed attempt at
+    # one must say it was rejected, not disappear (alpha-engine-config-I8166).
+    stale_invalid_declaration: list[str] = []
     unmeasured_pairs: list[tuple[str, str]] = []
 
     for artifact_id in expected:
@@ -547,6 +594,13 @@ def evaluate_stage(
                 last_modified = last_modified.replace(tzinfo=timezone.utc)
             if last_modified < window_start:
                 stale.append(artifact_id)
+                refresh_mode = str(spec.get("refresh", ""))
+                refresh_reason = str(spec.get("refresh_reason", "")).strip()
+                if refresh_mode == "conditional":
+                    if refresh_reason:
+                        stale_conditional.append(artifact_id)
+                    else:
+                        stale_invalid_declaration.append(artifact_id)
             else:
                 covered.append(artifact_id)
 
@@ -559,7 +613,34 @@ def evaluate_stage(
         reason = f"{len(missing)} declared artifact(s) absent: {', '.join(missing)}"
     elif stale:
         status = STATUS_STALE
-        reason = f"{len(stale)} declared artifact(s) predate this run's window: {', '.join(stale)}"
+        if not covered:
+            # Wholly stale: the stage refreshed NOTHING it declares. Never
+            # excusable — there is no artifact left for a producer to have
+            # conditionally skipped — and always a finding regardless of any
+            # `refresh: conditional` row (alpha-engine-config-I8166).
+            reason = (
+                f"WHOLLY STALE — 0 of {len(expected)} declared artifact(s) "
+                f"refreshed this run: {', '.join(stale)}. This is "
+                "indistinguishable from the stage not having run and is "
+                "always a finding, unconditionally."
+            )
+        else:
+            reason = (
+                f"{len(stale)} declared artifact(s) predate this run's "
+                f"window: {', '.join(stale)}"
+            )
+            if stale_conditional:
+                reason += (
+                    "; suppressed by a valid `refresh: conditional` "
+                    f"declaration: {', '.join(stale_conditional)}"
+                )
+            if stale_invalid_declaration:
+                reason += (
+                    "; `refresh: conditional` on "
+                    f"{', '.join(stale_invalid_declaration)} is missing the "
+                    "required `refresh_reason` — INVALID, does NOT suppress "
+                    "the finding"
+                )
     elif unmeasured_pairs and not covered:
         status = STATUS_UNMEASURED
         reason = "no declared artifact could be measured"
@@ -579,6 +660,7 @@ def evaluate_stage(
         missing=missing,
         stale=stale,
         covered=covered,
+        stale_conditional=stale_conditional,
         unmeasured=unmeasured_pairs,
         reason=reason,
         run_date=run_date,

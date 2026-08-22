@@ -220,11 +220,113 @@ def test_stale_when_the_artifact_predates_this_runs_window() -> None:
     assert verdict.stale == ["daily_closes_parquet"]
 
 
-def test_stale_is_not_a_finding_enforcement_acts_on() -> None:
-    """Enforcing a floor whose distribution nobody has measured is how a
-    correct detector gets switched off in week one (Brian, 2026-08-11)."""
+def test_wholly_stale_is_always_a_finding() -> None:
+    """`ReplayConcordance` shape, measured 2026-08-22: it declares exactly
+    ONE artifact and that artifact is stale — zero covered. STALE with zero
+    covered is indistinguishable from the stage not having run at all and is
+    a finding unconditionally, full stop (`alpha-engine-config-I8166`)."""
     verdict = _evaluate(FakeS3({KEY: WINDOW - timedelta(days=7)}))
+    assert verdict.status == sc.STATUS_STALE
+    assert verdict.covered == []
+    assert verdict.stale == ["daily_closes_parquet"]
+    assert verdict.is_finding is True
+    assert "WHOLLY STALE" in verdict.reason
+
+
+_MULTI_KEY_COVERED = "champions/2026-08-14/covered.json"
+_MULTI_KEY_STALE = "champions/2026-08-14/predictor_meta_champion_weights.json"
+
+
+def _multi_registry(*, refresh: str | None = None, refresh_reason: str | None = None) -> dict[str, Any]:
+    """`PredictorTraining` shape, measured 2026-08-22: 7 covered, 1 stale
+    (`predictor_meta_champion_weights` — the artifact champion selection
+    writes)."""
+    artifact_row: dict[str, Any] = {
+        "artifact_id": "predictor_meta_champion_weights",
+        "s3_bucket": "alpha-engine-research",
+        "s3_key_template": "champions/{date}/predictor_meta_champion_weights.json",
+    }
+    if refresh is not None:
+        artifact_row["refresh"] = refresh
+    if refresh_reason is not None:
+        artifact_row["refresh_reason"] = refresh_reason
+    return registry(
+        stage_rows=[
+            {
+                "stage": "PredictorTraining",
+                "stage_class": "product",
+                "output": "registered",
+                "artifacts": ["covered_champion", "predictor_meta_champion_weights"],
+            }
+        ],
+        artifacts=[
+            {
+                "artifact_id": "covered_champion",
+                "s3_bucket": "alpha-engine-research",
+                "s3_key_template": "champions/{date}/covered.json",
+            },
+            artifact_row,
+        ],
+    )
+
+
+def test_partially_stale_with_no_conditional_declaration_is_a_finding() -> None:
+    """`PredictorTraining` shape, measured 2026-08-22: `covered=7, stale=1`
+    (`predictor_meta_champion_weights`), no `refresh: conditional` row — a
+    promotion decision nobody can confirm happened. A finding."""
+    s3 = FakeS3(
+        {
+            _MULTI_KEY_COVERED: WINDOW + timedelta(minutes=30),
+            _MULTI_KEY_STALE: WINDOW - timedelta(days=7),
+        }
+    )
+    verdict = _evaluate(s3, registry=_multi_registry(), stage="PredictorTraining")
+    assert verdict.status == sc.STATUS_STALE
+    assert verdict.covered == ["covered_champion"]
+    assert verdict.stale == ["predictor_meta_champion_weights"]
+    assert verdict.stale_conditional == []
+    assert verdict.is_finding is True
+
+
+def test_partially_stale_with_valid_conditional_declaration_is_not_a_finding() -> None:
+    """A stale artifact whose registry row declares `refresh: conditional`
+    with a `refresh_reason` is the legitimate case: no new grades this week,
+    no promotion this week. Suppressed, and the suppression is named."""
+    s3 = FakeS3(
+        {
+            _MULTI_KEY_COVERED: WINDOW + timedelta(minutes=30),
+            _MULTI_KEY_STALE: WINDOW - timedelta(days=7),
+        }
+    )
+    reg = _multi_registry(
+        refresh="conditional", refresh_reason="only refreshed on a promotion week"
+    )
+    verdict = _evaluate(s3, registry=reg, stage="PredictorTraining")
+    assert verdict.status == sc.STATUS_STALE
+    assert verdict.stale_conditional == ["predictor_meta_champion_weights"]
     assert verdict.is_finding is False
+    assert "suppressed by a valid `refresh: conditional`" in verdict.reason
+    assert "predictor_meta_champion_weights" in verdict.reason
+
+
+def test_conditional_without_refresh_reason_does_not_suppress() -> None:
+    """`refresh: conditional` with no `refresh_reason` is NOT a valid
+    declaration — same shape as `COVERED_NO_OUTPUT`: an exception to the
+    default must be SAID. It must not suppress, and the reason must name the
+    invalid attempt rather than silently drop it."""
+    s3 = FakeS3(
+        {
+            _MULTI_KEY_COVERED: WINDOW + timedelta(minutes=30),
+            _MULTI_KEY_STALE: WINDOW - timedelta(days=7),
+        }
+    )
+    reg = _multi_registry(refresh="conditional")  # no refresh_reason
+    verdict = _evaluate(s3, registry=reg, stage="PredictorTraining")
+    assert verdict.status == sc.STATUS_STALE
+    assert verdict.stale_conditional == []
+    assert verdict.is_finding is True
+    assert "INVALID" in verdict.reason
+    assert "predictor_meta_champion_weights" in verdict.reason
 
 
 def test_a_naive_last_modified_is_treated_as_utc_not_as_stale() -> None:
