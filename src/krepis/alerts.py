@@ -27,8 +27,18 @@ CLI convention.
   Each channel is independently best-effort — failure in one does not
   block the other. Returns a :class:`PublishResult` dataclass with the
   per-channel outcome for caller observability.
+- :func:`publish_clear` — the OTHER half of the pair (I8105). A publisher
+  that tracks a set of currently-true conditions calls this for each
+  condition that has left the set, passing the same ``identity_key`` its
+  page carried. Delivered at ``info`` severity, silent (no phone push),
+  ``state="cleared"``, no dedup key. Before this existed every alert in the
+  fleet was WRITE-ONCE: a condition that cleared emitted nothing, so no page
+  could be told from a live outage.
+- :func:`diff_conditions` — the set arithmetic a publisher runs between two
+  observations to get ``(opened, still_open, cleared)``.
 - CLI: ``python -m krepis.alerts publish --message "..."
-  --severity error --source "..."``. Designed for Bash failure-trap
+  --severity error --source "..."`` and ``python -m krepis.alerts clear
+  --message "..." --identity-key "..."``. Designed for Bash failure-trap
   callers (``cleanup()`` in spot dispatchers, ``deploy.sh`` rollback
   branches). Exit code is ``0`` if *either* channel succeeded, ``1`` if
   *both* failed.
@@ -90,6 +100,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -148,6 +159,64 @@ DEFAULT_DEDUP_WINDOW_MIN: Final[int] = 60
 # JSON list so an operator edits one value instead of one-param-per-mute.
 DEFAULT_MUTE_SSM_PARAM: Final[str] = "/alpha-engine/alerts/source_mutes"
 
+# ── Condition lifecycle: the open/clear pair (alpha-engine-config-I8105) ────
+# Every alert this module publishes used to be WRITE-ONCE: a publisher emitted
+# on detection and emitted nothing when the condition ended, so a page and a
+# live outage were indistinguishable to every downstream consumer — a human
+# reading a digest, the Overseer alert-drain (which ingests events as evidence
+# of a CURRENT condition), and the console (whose last known state stayed the
+# failure forever). `principles.md` §2.7 asks what the ABSENCE of a signal
+# looks like on the surface; the absence of a terminator rendered as an
+# ongoing outage, indefinitely.
+#
+# The fix is a first-class LIFECYCLE on the record rather than a second prose
+# email. A publisher that tracks a condition set declares which of three
+# things this emission is:
+#
+#   opened      the condition was not present at the previous observation
+#   still_open  the condition was present then and is present now
+#   cleared     the condition was present then and is ABSENT now
+#
+# `state` rides on the `nousergon.alert.v1` event (additive, optional) so
+# `alert_drain_ingest.py` and the console adapter can pair a page to its clear
+# WITHOUT string-matching prose. `identity_key` is what they pair ON: the
+# publisher's own stable identity for the condition (for box-health's timer
+# findings, unit name + the failing run's InactiveExitTimestamp — see
+# alpha-engine-config-I7677), deliberately NOT a computed relative age and not
+# the message text.
+#
+# WHY identity_key IS SEPARATE FROM dedup_key EVEN WHEN THEY CARRY THE SAME
+# STRING. dedup_key is a SUPPRESSION input: passing it makes `publish` check
+# the S3 marker and skip. A clear that reused the page's dedup_key would be
+# suppressed by the page's own still-live marker — the terminator swallowed by
+# the mechanism that rate-limits the thing it terminates. So the clear carries
+# `identity_key` (correlation, never suppression) and no `dedup_key`, and the
+# drain's `compute_corr_key` reads `identity_key` first so both land on one
+# incident anyway.
+ALERT_STATE_OPENED: Final[str] = "opened"
+ALERT_STATE_STILL_OPEN: Final[str] = "still_open"
+ALERT_STATE_CLEARED: Final[str] = "cleared"
+ALERT_STATES: Final[tuple[str, ...]] = (
+    ALERT_STATE_OPENED,
+    ALERT_STATE_STILL_OPEN,
+    ALERT_STATE_CLEARED,
+)
+
+# Severity a recovery is published at. `info`, never `error`/`critical`:
+# alpha-engine-config-I7857 established that severity does NOT gate delivery
+# here (every severity reaches SNS and the Telegram chat) — it gates only the
+# phone push. A clear that buzzes Brian's phone at 8pm is a second alert, not
+# a resolution, so the recovery is delivered and silent. `publish_clear` also
+# forces `silent=True` explicitly rather than leaning on `info` being outside
+# SEVERITY_PHONE_PUSH, so a future widening of that set cannot turn every
+# all-clear in the fleet into a push.
+CLEAR_SEVERITY: Final[str] = "info"
+
+# Human-facing prefix on a cleared emission. A reader scanning a channel must
+# be able to tell a resolution from a fresh page in the first two words,
+# without parsing the JSON that machines read.
+CLEAR_MESSAGE_PREFIX: Final[str] = "RESOLVED"
+
 
 @dataclass
 class ChannelResult:
@@ -185,6 +254,13 @@ class PublishResult:
     dedup_reason: str = ""
     muted: bool = False
     mute_reason: str = ""
+    #: Condition lifecycle this publish carried (I8105). Echoed back so a
+    #: caller that computed it from a set difference can assert on it without
+    #: re-deriving, and so a test can tell an ``opened`` from a ``cleared``.
+    state: str = "opened"
+    #: The condition identity a consumer pairs page-to-clear on; falls back to
+    #: ``dedup_key`` when the caller passed one and no explicit identity.
+    identity_key: str | None = None
 
     @property
     def any_ok(self) -> bool:
@@ -216,12 +292,26 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
     return f"arn:aws:sns:{region}:{account_id}:{DEFAULT_SNS_TOPIC_NAME}"
 
 
-def _format_message(message: str, severity: str, source: str | None) -> str:
-    """Prepend severity tag + source prefix to the message body."""
+def _format_message(
+    message: str,
+    severity: str,
+    source: str | None,
+    state: str = ALERT_STATE_OPENED,
+) -> str:
+    """Prepend severity tag + source prefix (+ RESOLVED marker) to the body.
+
+    ``opened`` and ``still_open`` render exactly as before — the lifecycle is
+    carried on the event, not spelled into every page. Only ``cleared`` adds a
+    visible marker, because a human scanning the channel has to tell a
+    resolution from a fresh page without reading the JSON.
+    """
     tag = f"[{severity.upper()}]"
+    body = message
+    if state == ALERT_STATE_CLEARED:
+        body = f"{CLEAR_MESSAGE_PREFIX} — {message}"
     if source:
-        return f"{tag} {source}: {message}"
-    return f"{tag} {message}"
+        return f"{tag} {source}: {body}"
+    return f"{tag} {body}"
 
 
 def _publish_sns(arn: str, message: str, subject: str | None = None) -> ChannelResult:
@@ -242,7 +332,9 @@ def _publish_sns(arn: str, message: str, subject: str | None = None) -> ChannelR
         return ChannelResult(ok=False, detail=f"sns error: {exc!r}")
 
 
-def _publish_telegram(message: str, severity: str) -> ChannelResult:
+def _publish_telegram(
+    message: str, severity: str, silent: bool | None = None
+) -> ChannelResult:
     try:
         from krepis.telegram import send_message
 
@@ -250,7 +342,15 @@ def _publish_telegram(message: str, severity: str) -> ChannelResult:
         # whether THIS send also triggers a phone buzz (error/critical do;
         # everything else still posts, just without the buzz) — it is never
         # a delivery gate. See SEVERITY_PHONE_PUSH and the module docstring.
+        #
+        # `silent` is an explicit caller override of that severity-derived
+        # decision, in ONE direction only: True forces the silent delivery,
+        # None keeps the severity default. It exists so `publish_clear` does
+        # not depend on `info` staying outside SEVERITY_PHONE_PUSH forever
+        # (I8105) — a recovery must never push, whatever that set becomes.
         disable_push = severity.lower() not in SEVERITY_PHONE_PUSH
+        if silent:
+            disable_push = True
         ok = send_message(message, disable_notification=disable_push)
         return ChannelResult(ok=bool(ok), detail="sent" if ok else "send_message returned False")
     except Exception as exc:  # send_message itself never raises, but defensive
@@ -406,6 +506,9 @@ def publish(
     dedup_bucket: str | None = None,
     mute_ssm_param: str | None = None,
     dry_run: bool = False,
+    state: str = ALERT_STATE_OPENED,
+    identity_key: str | None = None,
+    silent: bool | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -483,14 +586,45 @@ def publish(
         with ``ok=True, detail="dry-run: would send"`` per attempted
         channel so callers verifying a delivery call site's shape exit
         ``0`` without paging the operator (config-I6759).
+    :param state: Condition lifecycle for this emission — one of
+        :data:`ALERT_STATES` (``opened`` / ``still_open`` / ``cleared``).
+        Defaults to ``opened``, which is what every pre-I8105 call site
+        means. Rides on the ``nousergon.alert.v1`` event so a consumer can
+        pair a page to its terminator without string-matching prose. An
+        unrecognised value raises :class:`ValueError` — a lifecycle field
+        nobody validates is a field consumers cannot trust, and the
+        fail-loud default applies (``~/Development/CLAUDE.md``).
+    :param identity_key: The publisher's own stable identity for the
+        CONDITION (not for this emission): a page and its later clear carry
+        the same one. Correlation only — unlike ``dedup_key`` it never
+        suppresses, which is what lets a clear reference a page whose dedup
+        marker is still live. Defaults to ``dedup_key`` when that is set and
+        this is not, so existing dedup-keyed publishers become pairable
+        without touching their call sites.
+    :param silent: Force silent Telegram delivery (delivered to the chat, no
+        phone push) regardless of severity. ``None`` (default) keeps the
+        severity-derived behaviour. ``False`` is NOT an escalation — it is
+        treated as "no override".
     :returns: :class:`PublishResult` — caller can inspect per-channel
         outcomes. :attr:`PublishResult.any_ok` is the typical success
         gate; :attr:`PublishResult.all_ok` is the strict variant.
         On dedup-skip, :attr:`PublishResult.dedup_skipped` is True and
         :attr:`PublishResult.dedup_reason` explains why.
     """
+    if state not in ALERT_STATES:
+        raise ValueError(
+            f"alerts.publish: unknown state {state!r}; expected one of {ALERT_STATES}"
+        )
+    # An emission that carries a dedup_key already has a stable condition
+    # identity; reuse it so pre-existing publishers pair for free. The reverse
+    # is NEVER done — identity_key is not fed back into the dedup check, or a
+    # clear would suppress itself against its own page's marker.
+    effective_identity = identity_key or dedup_key
+
     result = PublishResult()
-    formatted = _format_message(message, severity, source)
+    result.state = state
+    result.identity_key = effective_identity
+    formatted = _format_message(message, severity, source, state)
 
     # ── Dry-run short-circuit (config-I6759) ─────────────────────────────
     # Fires before the dedup check and before any boto3 client construction
@@ -592,7 +726,9 @@ def publish(
         # one rich event itself below; without the guard every publish
         # would land twice on the Overseer intake bus.
         with fleet_events.suppress_emission():
-            result.telegram = _publish_telegram(formatted, severity=severity)
+            result.telegram = _publish_telegram(
+                formatted, severity=severity, silent=silent
+            )
 
     # ── Dedup marker write (post-publish, only if any channel succeeded) ─
     if marker_key and (result.sns.ok or result.telegram.ok):
@@ -615,9 +751,96 @@ def publish(
             "sns": result.sns.ok if sns else None,
             "telegram": result.telegram.ok if telegram else None,
         },
+        state=state,
+        identity_key=effective_identity,
     )
 
     return result
+
+
+def publish_clear(
+    message: str,
+    *,
+    identity_key: str,
+    source: str | None = None,
+    sns: bool = True,
+    telegram: bool = True,
+    sns_topic_arn: str | None = None,
+    mute_ssm_param: str | None = None,
+    dry_run: bool = False,
+) -> PublishResult:
+    """Publish the terminator for a condition previously alerted on.
+
+    The other half of the open/clear pair (alpha-engine-config-I8105). A
+    publisher that keeps a set of currently-true conditions calls this for
+    each condition that has left the set, passing the SAME ``identity_key``
+    the page carried.
+
+    Three things are fixed here rather than left to the caller, because each
+    of them was got wrong at least once by a call site that tried:
+
+    - **``severity="info"``.** A recovery is not an incident. It is still
+      delivered on both channels — severity has never been a delivery gate
+      here (alpha-engine-config-I7857).
+    - **``silent=True``.** Explicitly, not by relying on ``info`` sitting
+      outside :data:`SEVERITY_PHONE_PUSH`. A clear that buzzes a phone is a
+      second alert.
+    - **no ``dedup_key``.** The identity travels as ``identity_key``, which
+      correlates without suppressing. Passing the page's dedup key here would
+      let the page's own live marker swallow its terminator.
+
+    :param message: What cleared, in the publisher's own words. The
+        ``RESOLVED — `` marker is prepended by :func:`_format_message`.
+    :param identity_key: The originating page's condition identity. Required
+        — a clear nobody can pair to a page is prose, which is the thing this
+        primitive exists to stop emitting.
+    :returns: :class:`PublishResult`, same contract as :func:`publish`.
+    """
+    if not identity_key:
+        raise ValueError(
+            "alerts.publish_clear: identity_key is required — an unpairable "
+            "clear is prose, not a terminator (alpha-engine-config-I8105)"
+        )
+    return publish(
+        message,
+        severity=CLEAR_SEVERITY,
+        source=source,
+        sns=sns,
+        telegram=telegram,
+        sns_topic_arn=sns_topic_arn,
+        dedup_key=None,
+        mute_ssm_param=mute_ssm_param,
+        dry_run=dry_run,
+        state=ALERT_STATE_CLEARED,
+        identity_key=identity_key,
+        silent=True,
+    )
+
+
+def diff_conditions(
+    previous: "Iterable[str]", current: "Iterable[str]"
+) -> tuple[list[str], list[str], list[str]]:
+    """Classify two observations of a condition set into the three states.
+
+    The set arithmetic behind the open/clear pair, in one place so every
+    publisher that grows a lifecycle computes it identically rather than
+    re-deriving the direction of the difference (the ``cleared`` set is the
+    one call sites get backwards, because the alerting path only ever needed
+    the other direction).
+
+    :param previous: Conditions true at the previous observation.
+    :param current: Conditions true now.
+    :returns: ``(opened, still_open, cleared)``, each sorted for a stable
+        emission order — an unordered emission makes two identical ticks
+        produce different journals and defeats diffing them.
+    """
+    prev_set = set(previous)
+    cur_set = set(current)
+    return (
+        sorted(cur_set - prev_set),
+        sorted(cur_set & prev_set),
+        sorted(prev_set - cur_set),
+    )
 
 
 # ─── CLI entry ──────────────────────────────────────────────────────────────
@@ -716,8 +939,82 @@ def main(argv: list[str] | None = None) -> int:
             f"{DEFAULT_DEDUP_BUCKET!r}."
         ),
     )
+    pub.add_argument(
+        "--state",
+        default=ALERT_STATE_OPENED,
+        choices=list(ALERT_STATES),
+        help=(
+            "Condition lifecycle for this emission (default: opened). "
+            "Rides on the nousergon.alert.v1 event so a consumer can pair a "
+            "page to its terminator. Prefer the `clear` subcommand over "
+            "`publish --state cleared`: it also forces info severity and "
+            "silent delivery."
+        ),
+    )
+    pub.add_argument(
+        "--identity-key",
+        default=None,
+        help=(
+            "Stable identity of the CONDITION (not this emission), carried "
+            "by both the page and its later clear. Correlation only — never "
+            "suppression. Defaults to --dedup-key when that is given."
+        ),
+    )
+
+    clr = subparsers.add_parser(
+        "clear",
+        help=(
+            "Publish the terminator for a condition previously alerted on: "
+            "info severity, silent delivery (no phone push), state=cleared, "
+            "no dedup. Bash callers that track a condition set call this for "
+            "each condition that has LEFT the set."
+        ),
+    )
+    clr.add_argument(
+        "--message", required=True,
+        help="What cleared, in the publisher's own words. 'RESOLVED — ' is prepended.",
+    )
+    clr.add_argument(
+        "--identity-key", required=True,
+        help=(
+            "The originating page's condition identity. Required: an "
+            "unpairable clear is prose, not a terminator."
+        ),
+    )
+    clr.add_argument(
+        "--source", default=None,
+        help="Source identifier, matching the page's --source.",
+    )
+    clr.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
+    clr.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
+    clr.add_argument(
+        "--sns-topic-arn", default=None, help="Override the SNS topic ARN.",
+    )
+    clr.add_argument(
+        "--dry-run", action="store_true",
+        help="Verify the call site's argument shape without sending anything.",
+    )
 
     args = parser.parse_args(argv)
+
+    if args.cmd == "clear":
+        logging.basicConfig(level=logging.WARNING)
+        clear_result = publish_clear(
+            args.message,
+            identity_key=args.identity_key,
+            source=args.source,
+            sns=not args.no_sns,
+            telegram=not args.no_telegram,
+            sns_topic_arn=args.sns_topic_arn,
+            dry_run=args.dry_run,
+        )
+        print(
+            f"alerts.clear: identity_key={args.identity_key!r} "
+            f"sns.ok={clear_result.sns.ok} ({clear_result.sns.detail}); "
+            f"telegram.ok={clear_result.telegram.ok} ({clear_result.telegram.detail})",
+            file=sys.stderr,
+        )
+        return 0 if clear_result.any_ok else 1
 
     logging.basicConfig(level=logging.WARNING)
 
@@ -740,6 +1037,8 @@ def main(argv: list[str] | None = None) -> int:
         dedup_window_min=window_min,
         dedup_bucket=args.dedup_bucket,
         dry_run=args.dry_run,
+        state=args.state,
+        identity_key=args.identity_key,
     )
 
     # One-line status to stderr (stdout reserved for structured output if

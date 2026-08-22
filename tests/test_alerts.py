@@ -1087,3 +1087,279 @@ class TestPublishSourceMute:
         captured = capsys.readouterr()
         assert rc == 0
         assert "muted=True" in captured.err
+
+
+# ── Condition lifecycle: the open/clear pair (alpha-engine-config-I8105) ─────
+#
+# Before this, every publisher here was write-once: it emitted on detection and
+# emitted nothing when the condition ended, so a page and a live outage were
+# indistinguishable downstream. These tests pin the three things that make a
+# clear usable rather than decorative — it is PAIRABLE (identity_key), it is
+# MACHINE-READABLE (state on the event), and it NEVER PUSHES.
+
+
+class TestDiffConditions:
+    def test_three_way_split(self):
+        opened, still_open, cleared = alerts.diff_conditions(
+            ["a", "b"], ["b", "c"]
+        )
+        assert opened == ["c"]
+        assert still_open == ["b"]
+        assert cleared == ["a"]
+
+    def test_empty_previous_opens_everything(self):
+        assert alerts.diff_conditions([], ["x", "y"]) == (["x", "y"], [], [])
+
+    def test_empty_current_clears_everything(self):
+        assert alerts.diff_conditions(["x", "y"], []) == ([], [], ["x", "y"])
+
+    def test_both_empty(self):
+        assert alerts.diff_conditions([], []) == ([], [], [])
+
+    def test_sorted_for_stable_emission_order(self):
+        opened, _still, cleared = alerts.diff_conditions(["z", "m"], ["q", "b"])
+        assert opened == ["b", "q"]
+        assert cleared == ["m", "z"]
+
+    def test_direction_is_not_symmetric(self):
+        # The regression this guards: a call site reading the difference
+        # backwards emits a clear for a condition that just STARTED.
+        _opened, _still, cleared = alerts.diff_conditions(["was"], ["now"])
+        assert cleared == ["was"]
+
+
+class TestFormatMessageState:
+    def test_cleared_carries_visible_marker(self):
+        out = alerts._format_message("disk high", "info", "box-health", "cleared")
+        assert out == "[INFO] box-health: RESOLVED — disk high"
+
+    def test_opened_renders_exactly_as_before(self):
+        assert (
+            alerts._format_message("boom", "error", "src", "opened")
+            == "[ERROR] src: boom"
+        )
+
+    def test_still_open_renders_exactly_as_before(self):
+        assert (
+            alerts._format_message("boom", "error", "src", "still_open")
+            == "[ERROR] src: boom"
+        )
+
+    def test_default_state_is_opened(self):
+        assert alerts._format_message("boom", "error", "src") == "[ERROR] src: boom"
+
+
+class TestPublishState:
+    def test_unknown_state_raises(self, fake_boto3):
+        with pytest.raises(ValueError, match="unknown state"):
+            alerts.publish("boom", state="resolved")
+
+    def test_state_and_identity_reach_the_event(self, fake_boto3, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return True
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(
+                    alerts, "_publish_telegram",
+                    return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                ):
+                    with patch.object(alerts.fleet_events, "emit_alert_event", _capture):
+                        result = alerts.publish(
+                            "boom", source="box-health",
+                            state="still_open", identity_key="unit-x-1234",
+                        )
+        assert captured["state"] == "still_open"
+        assert captured["identity_key"] == "unit-x-1234"
+        assert result.state == "still_open"
+        assert result.identity_key == "unit-x-1234"
+
+    def test_identity_key_defaults_to_dedup_key(self, fake_boto3, monkeypatch):
+        # Pre-existing dedup-keyed publishers become pairable without touching
+        # their call sites.
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(alerts, "_check_dedup_marker", return_value=(False, "")):
+                    with patch.object(alerts, "_write_dedup_marker"):
+                        with patch.object(
+                            alerts, "_publish_telegram",
+                            return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                        ):
+                            with patch.object(
+                                alerts.fleet_events, "emit_alert_event",
+                                lambda **kw: captured.update(kw),
+                            ):
+                                result = alerts.publish("boom", dedup_key="dk-1")
+        assert captured["identity_key"] == "dk-1"
+        assert result.identity_key == "dk-1"
+
+    def test_default_state_is_opened_on_the_event(self, fake_boto3, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(
+                    alerts, "_publish_telegram",
+                    return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                ):
+                    with patch.object(
+                        alerts.fleet_events, "emit_alert_event",
+                        lambda **kw: captured.update(kw),
+                    ):
+                        alerts.publish("boom")
+        assert captured["state"] == "opened"
+
+
+class TestPublishTelegramSilent:
+    def test_silent_true_forces_no_push_at_pushing_severity(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="critical", silent=True)
+        assert sent["disable_notification"] is True
+
+    def test_silent_none_keeps_severity_default(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="critical", silent=None)
+        assert sent["disable_notification"] is False
+
+    def test_silent_false_is_not_an_escalation(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="info", silent=False)
+        assert sent["disable_notification"] is True
+
+
+class TestPublishClear:
+    def test_requires_identity_key(self):
+        with pytest.raises(ValueError, match="identity_key is required"):
+            alerts.publish_clear("all good", identity_key="")
+
+    def test_clear_is_info_cleared_silent_and_undeduped(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured["message"] = message
+            captured.update(kwargs)
+            return alerts.PublishResult()
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        alerts.publish_clear(
+            "timer job failing: x", identity_key="key-1", source="box-health"
+        )
+        assert captured["severity"] == alerts.CLEAR_SEVERITY == "info"
+        assert captured["state"] == "cleared"
+        assert captured["identity_key"] == "key-1"
+        assert captured["silent"] is True
+        # The load-bearing one: a clear must NOT carry the page's dedup key,
+        # or the page's own still-live marker swallows its terminator.
+        assert captured["dedup_key"] is None
+
+    def test_clear_never_pushes_even_if_info_starts_pushing(
+        self, fake_boto3, monkeypatch
+    ):
+        # Guards the future change that would otherwise make every all-clear
+        # in the fleet buzz a phone: widening SEVERITY_PHONE_PUSH.
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.setattr(
+            alerts, "SEVERITY_PHONE_PUSH",
+            frozenset({"info", "warning", "error", "critical"}),
+        )
+        fake, _sts, _sns = fake_boto3
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            sent["text"] = msg
+            return True
+
+        with patch.dict("sys.modules", {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(alerts.fleet_events, "emit_alert_event", lambda **kw: True):
+                    alerts.publish_clear(
+                        "disk high: root >=80% used",
+                        identity_key="k", source="box-health",
+                    )
+        assert sent["disable_notification"] is True
+        assert sent["text"].startswith("[INFO] box-health: RESOLVED — ")
+
+    def test_clear_dry_run_sends_nothing_and_reports_state(self):
+        result = alerts.publish_clear("x", identity_key="k", dry_run=True)
+        assert result.any_ok is True
+        assert result.state == "cleared"
+        assert result.identity_key == "k"
+
+
+class TestCliLifecycle:
+    def test_clear_subcommand_dry_run_exits_zero(self, capsys):
+        rc = alerts.main(
+            ["clear", "--message", "ok now", "--identity-key", "k-1", "--dry-run"]
+        )
+        assert rc == 0
+        assert "identity_key='k-1'" in capsys.readouterr().err
+
+    def test_clear_subcommand_requires_identity_key(self):
+        with pytest.raises(SystemExit):
+            alerts.main(["clear", "--message", "ok now"])
+
+    def test_publish_state_flag_rejects_unknown_value(self):
+        with pytest.raises(SystemExit):
+            alerts.main(["publish", "--message", "m", "--state", "resolved"])
+
+    def test_publish_forwards_state_and_identity(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured.update(kwargs)
+            return alerts.PublishResult(
+                sns=alerts.ChannelResult(ok=True, detail="ok")
+            )
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        rc = alerts.main(
+            [
+                "publish", "--message", "m",
+                "--state", "still_open", "--identity-key", "id-9",
+            ]
+        )
+        assert rc == 0
+        assert captured["state"] == "still_open"
+        assert captured["identity_key"] == "id-9"

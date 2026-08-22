@@ -4,29 +4,51 @@
   "title": "nousergon.alert.v1",
   "description": "Structured fleet alert event emitted by the krepis alert chokepoints onto the nousergon-alerts EventBridge bus (EventBridge entry Detail payload). Additive-only evolution: new fields must be optional; breaking changes require a v2 DetailType alongside v1.",
   "type": "object",
-  "required": ["schema_version", "occurred_at", "origin", "severity", "body"],
+  "required": [
+    "schema_version",
+    "occurred_at",
+    "origin",
+    "severity",
+    "body"
+  ],
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": {
+      "const": 1
+    },
     "occurred_at": {
       "type": "string",
       "description": "ISO-8601 UTC timestamp of emission."
     },
     "origin": {
       "type": "string",
-      "enum": ["alerts.publish", "telegram.send_message"],
+      "enum": [
+        "alerts.publish",
+        "telegram.send_message"
+      ],
       "description": "The krepis chokepoint that emitted the event."
     },
     "source": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "Caller-supplied source identifier, or env attribution (KREPIS_EVENT_SOURCE / AWS_LAMBDA_FUNCTION_NAME), or null."
     },
     "severity": {
       "type": "string",
-      "enum": ["info", "warning", "error", "critical"],
+      "enum": [
+        "info",
+        "warning",
+        "error",
+        "critical"
+      ],
       "description": "Normalized severity; unrecognized raw strings map to warning."
     },
     "severity_raw": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "The caller's free-form severity string before normalization; null when the origin has no severity concept (direct Telegram sends)."
     },
     "body": {
@@ -35,28 +57,77 @@
       "description": "Alert text, truncated to 4000 chars (human channels carry the full text)."
     },
     "dedup_key": {
-      "type": ["string", "null"],
+      "type": [
+        "string",
+        "null"
+      ],
       "description": "The alert's dedup key when the caller used one; the Overseer drain groups incidents by it."
     },
+    "state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "opened",
+        "still_open",
+        "cleared",
+        null
+      ],
+      "description": "Condition lifecycle for this emission (alpha-engine-config-I8105). 'opened' = the condition was absent at the previous observation; 'still_open' = present then and now; 'cleared' = present then, absent now \u2014 the terminator. null when the origin tracks no condition (direct Telegram sends, one-shot event producers); null is NOT 'open'."
+    },
+    "identity_key": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Stable identity of the CONDITION, carried by both a page and its later clear so a consumer pairs them without string-matching prose. Correlation only, never suppression (unlike dedup_key). Defaults to dedup_key when the publisher passed one and no explicit identity."
+    },
     "channels": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "description": "Per-channel delivery outcomes; null values mean the channel was not attempted.",
       "properties": {
-        "sns": { "type": ["boolean", "null"] },
-        "telegram": { "type": ["boolean", "null"] }
+        "sns": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "telegram": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
     },
     "disable_notification": {
-      "type": ["boolean", "null"],
+      "type": [
+        "boolean",
+        "null"
+      ],
       "description": "Telegram silent-delivery flag when known (silent=true proxies info-tier for direct sends)."
     },
     "runtime": {
       "type": "object",
       "description": "Best-effort runtime attribution.",
       "properties": {
-        "lambda_function_name": { "type": ["string", "null"] },
-        "hostname": { "type": ["string", "null"] }
+        "lambda_function_name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hostname": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
     }
