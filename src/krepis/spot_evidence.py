@@ -62,6 +62,7 @@ import logging
 import sys
 from datetime import datetime, timezone
 from typing import Final, Optional
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,19 @@ logger = logging.getLogger(__name__)
 #: preserving into a sibling of the thing being deleted is how this defect
 #: would come back.
 DURABLE_PREFIX: Final[str] = "_spot_evidence"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Evidence is COPIED out of a caller-named staging prefix into
+#: ``_spot_evidence/...`` and the staging copy is then deleted, so this module
+#: needs readwrite on its own namespace and readwrite on whichever staging
+#: prefix the caller nominates.
+S3_SURFACE = (
+    s3_surface.literal("_spot_evidence", s3_surface.MODE_READWRITE),
+    s3_surface.caller_supplied(
+        "the staging prefix copied FROM and deleted is supplied per call "
+        "(--prefix); the caller owns that namespace's grant"
+    ),
+)
 
 #: Days a preserved failure record is kept. Long enough that a Saturday
 #: failure is still diagnosable after the following weekend's re-run and a

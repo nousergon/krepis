@@ -33,10 +33,22 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Final
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEDUP_BUCKET: Final[str] = "alpha-engine-research"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: The marker prefix is a REQUIRED keyword of every entry point here
+#: (``marker_prefix=``); this module never chooses a namespace of its own, so
+#: the grant obligation belongs to whichever consumer picks the prefix.
+S3_SURFACE = (
+    s3_surface.caller_supplied(
+        "every entry point takes marker_prefix= from the caller; this module "
+        "names no namespace of its own"
+    ),
+)
 
 
 def marker_key(dedup_key: str, *, marker_prefix: str) -> str:

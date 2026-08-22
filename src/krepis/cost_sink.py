@@ -58,6 +58,7 @@ import threading
 import uuid
 from collections import defaultdict
 from typing import Any, Callable, Optional
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,15 @@ __all__ = [
 #: Both must be set; either alone is a misconfiguration and raises.
 BUCKET_ENV_VAR = "KREPIS_COST_SINK_BUCKET"
 PREFIX_ENV_VAR = "KREPIS_COST_SINK_PREFIX"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Opting in is an environment fact, not a code fact, so the declaration names
+#: the VARIABLE rather than a prefix: a consumer resolves it against its own
+#: deploy configuration and checks the value that will actually run. An unset
+#: variable resolves to nothing, which is correct — the sink writes nowhere.
+S3_SURFACE = (
+    s3_surface.from_env_var(PREFIX_ENV_VAR, s3_surface.MODE_READWRITE),
+)
 
 _DEFAULT_SINK: "Optional[S3JsonlCostSink]" = None
 _DEFAULT_SINK_KEY: "Optional[tuple[str, str, str]]" = None

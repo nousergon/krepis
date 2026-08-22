@@ -99,6 +99,7 @@ import re
 import statistics
 from datetime import datetime, timezone
 from typing import Any, Final, Optional
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,12 @@ logger = logging.getLogger(__name__)
 # surface for this (`console-policy` §2.6).
 CHECKS_PREFIX: Final[str] = "ops/checks"
 CHECK_ID_PREFIX: Final[str] = "ae-rss"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Headroom envelopes are written to ``ops/checks/{check_id}/latest.json`` and
+#: the prior envelope is read back to compute the trend, so the top-level
+#: ``ops`` namespace is readwrite.
+S3_SURFACE = (s3_surface.literal("ops", s3_surface.MODE_READWRITE),)
 
 #: The envelope's own status vocabulary. Anything outside it renders
 #: UNREPORTED, which is why the mapping below is explicit rather than a str()

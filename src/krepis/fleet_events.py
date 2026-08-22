@@ -50,6 +50,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, Final, Iterator, Optional
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,12 @@ DEFAULT_BUS_NAME: Final[str] = "nousergon-alerts"
 FALLBACK_BUCKET_ENV: Final[str] = "NOUSERGON_ALERTS_FALLBACK_BUCKET"
 DEFAULT_FALLBACK_BUCKET: Final[str] = "alpha-engine-research"
 FALLBACK_PREFIX: Final[str] = "overseer/intake-fallback"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: The EventBridge-intake fallback writes ``overseer/intake-fallback/...``
+#: whenever the bus put fails, so any process emitting fleet events needs
+#: ``overseer`` granted readwrite even though the happy path never touches S3.
+S3_SURFACE = (s3_surface.literal("overseer", s3_surface.MODE_READWRITE),)
 
 #: Kept for back-compat (public module constant) — the real default, and the
 #: full fallback chain, now live in :mod:`krepis.aws_region`.
