@@ -117,7 +117,7 @@ import time
 from datetime import datetime, timezone
 from typing import Final, Optional
 
-from . import resource_kill, rss_budget
+from . import resource_kill, rss_budget, s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +152,18 @@ SSM_INLINE_OUTPUT_CAP_BYTES: Final[int] = 24 * 1024
 # signature without consuming the full SSM inline cap); the full log
 # lives in --output-bucket when configured.
 DIAGNOSTICS_TAIL_BYTES: Final[int] = 4 * 1024
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Both namespaces this module touches are named by the caller: SSM's own
+#: command output is read back from ``--output-key-prefix`` and the terminal
+#: diagnostics JSON is written to ``--diagnostics-prefix``. krepis picks
+#: neither, so the grant obligation sits with the dispatching consumer.
+S3_SURFACE = (
+    s3_surface.caller_supplied(
+        "--output-key-prefix (read back) and --diagnostics-prefix (written) "
+        "are both supplied by the dispatching caller"
+    ),
+)
 
 # alpha-engine-config-I7258: this module is where the REMOTE process's exit
 # status is actually read — `get_command_invocation`'s `ResponseCode` field

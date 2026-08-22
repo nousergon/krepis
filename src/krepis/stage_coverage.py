@@ -106,6 +106,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Final
 
+from krepis import s3_surface
 from krepis.trading_calendar import last_closed_trading_day
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,25 @@ STATUS_UNMEASURED: Final[str] = "UNMEASURED"
 #: is a real MISSING. Distinct from 1 so a shell cannot confuse a coverage
 #: finding with an interpreter error or an unhandled traceback.
 EXIT_COVERAGE_FAILURE: Final[int] = 3
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Three namespaces, of which only the first is this module's own: verdicts are
+#: written under :data:`VERDICT_PREFIX`; the registry mirror is read from
+#: :data:`REGISTRY_KEY`'s top-level namespace; and the declared artifacts
+#: themselves are probed at keys the REGISTRY names, which krepis does not
+#: choose and cannot enumerate — the consuming role must already grant those,
+#: since they are the prefixes its own pipeline writes.
+S3_SURFACE = (
+    s3_surface.literal(VERDICT_PREFIX, s3_surface.MODE_READWRITE),
+    s3_surface.literal("_freshness_monitor", s3_surface.MODE_READ),
+    s3_surface.caller_supplied(
+        "declared artifacts are head_object-probed at keys the artifact "
+        "registry names; the consumer already owns those prefixes because "
+        "they are the ones its own stages write",
+        s3_surface.MODE_READ,
+    ),
+)
+
 
 
 # ── Verdict record ───────────────────────────────────────────────────────────

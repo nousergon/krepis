@@ -83,11 +83,25 @@ import socket
 import time
 from contextlib import contextmanager
 from typing import Iterator
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_LOCK_KEY = "locks/universe-writer.lock"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Conditional-put mutex objects live under the default key's top-level
+#: ``locks`` namespace; acquire and release both write, and a stale-lock probe
+#: reads. Callers passing their own ``key=`` own that prefix themselves, which
+#: is why the caller-supplied entry sits alongside the literal one.
+S3_SURFACE = (
+    s3_surface.literal("locks", s3_surface.MODE_READWRITE),
+    s3_surface.caller_supplied(
+        "bucket= and key= are overridable per call site; a caller naming its "
+        "own lock key owns that prefix's grant"
+    ),
+)
 DEFAULT_TTL_SECONDS = 3600
 
 

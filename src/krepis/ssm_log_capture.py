@@ -146,11 +146,17 @@ from pathlib import Path
 from typing import Final, Optional
 
 from . import resource_kill
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET: Final[str] = "alpha-engine-research"
 S3_PREFIX: Final[str] = "_ssm_logs"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: Captured stdout/stderr is uploaded to ``_ssm_logs/{slug}/{date}/...`` on
+#: every wrapped command, success or failure.
+S3_SURFACE = (s3_surface.literal("_ssm_logs", s3_surface.MODE_READWRITE),)
 
 # Env var consulted for correlation-id when ``--correlation-id`` is not
 # explicitly passed. Set by the groom spot dispatcher (``GROOM_RUN_TOKEN``)
