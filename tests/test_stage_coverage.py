@@ -342,7 +342,7 @@ def test_assert_stage_coverage_never_raises_on_a_dead_registry() -> None:
             return {}
 
     out = sc.assert_stage_coverage(
-        "MorningEnrich", s3_client=Dead(), cloudwatch_client=FakeCW(), now=NOW
+        "MorningEnrich", run_date="2026-08-15", s3_client=Dead(), cloudwatch_client=FakeCW(), now=NOW
     )
     assert out["status"] == sc.STATUS_UNMEASURED
     assert "registry unreadable" in out["reason"]
@@ -354,7 +354,7 @@ def test_assert_stage_coverage_never_raises_when_everything_fails() -> None:
             raise RuntimeError("boom")
 
     out = sc.assert_stage_coverage(
-        "MorningEnrich", s3_client=Hostile(), cloudwatch_client=Hostile(), now=NOW
+        "MorningEnrich", run_date="2026-08-15", s3_client=Hostile(), cloudwatch_client=Hostile(), now=NOW
     )
     assert out["status"] == sc.STATUS_UNMEASURED
 
@@ -397,6 +397,7 @@ def test_assert_stage_coverage_builds_clients_with_no_region_in_env(
 
     out = sc.assert_stage_coverage(
         "SaturdayHealthCheck",
+        run_date="2026-08-15",
         now=NOW,
         registry_local_path=None,
     )
@@ -426,7 +427,7 @@ def test_a_genuine_no_region_error_is_marked_as_a_resolver_bug(
 
     monkeypatch.setattr("boto3.client", _boom)
 
-    out = sc.assert_stage_coverage("SaturdayHealthCheck", now=NOW)
+    out = sc.assert_stage_coverage("SaturdayHealthCheck", run_date="2026-08-15", now=NOW)
 
     assert out["status"] == sc.STATUS_UNMEASURED
     assert out["reason"].startswith("REGION_RESOLVER_BUG:")
@@ -507,7 +508,7 @@ def test_cli_exits_zero_in_observe_mode_on_a_real_miss(
         monkeypatch,
         {"status": sc.STATUS_MISSING, "reason": "absent", "is_finding": True},
     )
-    assert sc.main(["assert", "--stage", "MorningEnrich"]) == 0
+    assert sc.main(["assert", "--stage", "MorningEnrich", "--run-date", "2026-08-15"]) == 0
 
 
 def test_cli_exits_three_only_under_enforce_and_only_on_a_finding(
@@ -517,7 +518,7 @@ def test_cli_exits_three_only_under_enforce_and_only_on_a_finding(
         monkeypatch,
         {"status": sc.STATUS_MISSING, "reason": "absent", "is_finding": True},
     )
-    assert sc.main(["assert", "--stage", "X", "--enforce"]) == sc.EXIT_COVERAGE_FAILURE
+    assert sc.main(["assert", "--stage", "X", "--run-date", "2026-08-15", "--enforce"]) == sc.EXIT_COVERAGE_FAILURE
 
 
 def test_cli_enforce_exits_zero_on_a_clean_run(
@@ -530,7 +531,7 @@ def test_cli_enforce_exits_zero_on_a_clean_run(
         monkeypatch,
         {"status": sc.STATUS_COVERED, "reason": "ok", "is_finding": False},
     )
-    assert sc.main(["assert", "--stage", "X", "--enforce"]) == 0
+    assert sc.main(["assert", "--stage", "X", "--run-date", "2026-08-15", "--enforce"]) == 0
 
 
 def test_cli_enforce_does_not_act_on_stale_or_unmeasured(
@@ -540,7 +541,7 @@ def test_cli_enforce_does_not_act_on_stale_or_unmeasured(
         _patch_assert(
             monkeypatch, {"status": status, "reason": "r", "is_finding": False}
         )
-        assert sc.main(["assert", "--stage", "X", "--enforce"]) == 0
+        assert sc.main(["assert", "--stage", "X", "--run-date", "2026-08-15", "--enforce"]) == 0
 
 
 def test_cli_enforce_defaults_off_and_reads_the_env_knob(
@@ -582,7 +583,7 @@ def test_cli_an_unparseable_window_does_not_abort_the_assertion(
     seen = _patch_assert(
         monkeypatch, {"status": sc.STATUS_MISSING, "reason": "", "is_finding": True}
     )
-    assert sc.main(["assert", "--stage", "X", "--window-start", "not-a-date"]) == 0
+    assert sc.main(["assert", "--stage", "X", "--run-date", "2026-08-15", "--window-start", "not-a-date"]) == 0
     assert seen[0]["window_start"] is None
 
 
@@ -593,7 +594,7 @@ def test_cli_writes_a_warning_to_stderr_for_every_non_covered_status(
         monkeypatch,
         {"status": sc.STATUS_MISSING, "reason": "absent", "is_finding": True},
     )
-    sc.main(["assert", "--stage", "MorningEnrich"])
+    sc.main(["assert", "--stage", "MorningEnrich", "--run-date", "2026-08-15"])
     assert "WARNING: stage-coverage MorningEnrich: MISSING" in capsys.readouterr().err
 
 
@@ -628,3 +629,98 @@ def test_the_registry_mirror_key_is_the_one_config_syncs_on_merge() -> None:
     declaration; a hand-copied registry drifts invisibly."""
     assert sc.REGISTRY_KEY == "_freshness_monitor/ARTIFACT_REGISTRY.yaml"
     assert sc.DEFAULT_BUCKET == "alpha-engine-research"
+
+
+# ── run_date is the grouping key, and it is REQUIRED (config-I8155) ──────────
+
+
+def test_a_verdict_cannot_be_constructed_without_a_run_date() -> None:
+    """Refusing at construction covers every path that produces a verdict."""
+    with pytest.raises(sc.StageCoverageContractError, match="REQUIRED"):
+        sc.StageVerdict(stage="Scanner", status=sc.STATUS_COVERED)
+
+
+def test_a_blank_or_whitespace_run_date_is_refused_too() -> None:
+    for blank in ("", "   ", None):
+        with pytest.raises(sc.StageCoverageContractError):
+            sc.StageVerdict(stage="Scanner", status=sc.STATUS_COVERED, run_date=blank)
+
+
+def test_a_run_date_is_normalised_on_construction() -> None:
+    verdict = sc.StageVerdict(
+        stage="Scanner", status=sc.STATUS_COVERED, run_date="  2026-08-22 "
+    )
+    assert verdict.run_date == "2026-08-22"
+
+
+def test_evaluate_stage_requires_run_date_as_a_keyword() -> None:
+    with pytest.raises(TypeError):
+        sc.evaluate_stage(registry(), "MorningEnrich", s3_client=FakeS3(), now=NOW)
+
+
+def test_evaluate_stage_refuses_a_blank_run_date() -> None:
+    with pytest.raises(sc.StageCoverageContractError, match="REQUIRED"):
+        _evaluate(FakeS3(), run_date="")
+
+
+def test_the_verdict_key_never_falls_back_to_the_cycle_date() -> None:
+    """The 2026-08-22 split: run_date and cycle_date genuinely differ on a
+    weekend, and the fall-back scattered one execution across two prefixes."""
+    verdict = sc.StageVerdict(
+        stage="Backtester",
+        status=sc.STATUS_COVERED,
+        run_date="2026-08-22",
+        cycle_date="2026-08-21",
+    )
+    assert sc.verdict_key(verdict) == "_stage_coverage/2026-08-22/Backtester.json"
+
+
+def test_one_executions_verdicts_share_one_prefix_across_a_weekend() -> None:
+    saturday = datetime(2026, 8, 22, 12, 0, tzinfo=timezone.utc)
+    s3 = FakeS3({KEY: NOW})
+    verdicts = [
+        _evaluate(s3, stage=stage, now=saturday, run_date="2026-08-22", cycle_date=date(2026, 8, 21))
+        for stage in ("MorningEnrich", "WeeklyPreflight")
+    ]
+    prefixes = {sc.verdict_key(v).split("/")[1] for v in verdicts}
+    assert prefixes == {"2026-08-22"}
+    assert {v.cycle_date for v in verdicts} == {"2026-08-21"}
+
+
+def test_assert_stage_coverage_raises_on_a_missing_run_date() -> None:
+    """The ONE thing the front door raises on: a defect in the call site, not
+    an encounter with the world. Everything else still degrades to UNMEASURED."""
+    with pytest.raises(TypeError):
+        sc.assert_stage_coverage("Scanner")
+    with pytest.raises(sc.StageCoverageContractError, match="REQUIRED"):
+        sc.assert_stage_coverage("Scanner", run_date="")
+
+
+def test_assert_stage_coverage_still_never_raises_once_run_date_is_supplied() -> None:
+    out = sc.assert_stage_coverage(
+        "Scanner",
+        run_date="2026-08-22",
+        s3_client=object(),
+        cloudwatch_client=FakeCW(),
+    )
+    assert out["status"] == sc.STATUS_UNMEASURED
+    assert out["run_date"] == "2026-08-22"
+
+
+def test_the_cli_exits_four_and_writes_nothing_without_a_run_date(
+    monkeypatch: Any, capsys: Any
+) -> None:
+    """A verdict filed under the wrong prefix is worse than none: it is counted."""
+    monkeypatch.delenv("RUN_DATE", raising=False)
+    called: list[Any] = []
+    monkeypatch.setattr(
+        sc, "assert_stage_coverage", lambda *a, **k: called.append(k) or {}
+    )
+    rc = sc.main(["assert", "--stage", "DataPhase1"])
+    assert rc == sc.EXIT_NO_RUN_DATE
+    assert called == []
+    assert "NO VERDICT RECORDED" in capsys.readouterr().err
+
+
+def test_the_cli_run_date_exit_code_is_distinct_from_a_coverage_finding() -> None:
+    assert sc.EXIT_NO_RUN_DATE != sc.EXIT_COVERAGE_FAILURE
