@@ -24,6 +24,30 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
+      # tests/test_spot_bootstrap.py parity-checks the rendered bootstrap
+      # script against the two live Bash copies it replaces. Both sibling
+      # repos are public; sparse-checkout just the one file each into
+      # FLEET_DIR so the guard runs for real on CI instead of skipping
+      # forever (alpha-engine-config-I7619 — a bare `pytest.skip` on an
+      # absent sibling was a silent green on every CI run).
+      - name: Checkout sibling repos for spot_bootstrap parity (I7619)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/nousergon-data
+          sparse-checkout: |
+            infrastructure/_spot_common.sh
+          sparse-checkout-cone-mode: false
+          path: .fleet/nousergon-data
+
+      - name: Checkout sibling repos for spot_bootstrap parity (I7619, predictor)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/alpha-engine-predictor
+          sparse-checkout: |
+            infrastructure/_spot_common.sh
+          sparse-checkout-cone-mode: false
+          path: .fleet/alpha-engine-predictor
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
@@ -36,7 +60,27 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Install gitleaks (for session_dlp tests)
+        run: |
+          set -euo pipefail
+          GITLEAKS_VERSION="8.30.1"
+          GITLEAKS_SHA256="551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+          # Minimal config so session_dlp scan-integration tests don't skip.
+          # The fleet's real gitleaks-egress.toml chain (with custom Anthropic
+          # key rules) is NOT committed here — session_dlp's test_secret_in_body
+          # _is_blocked gracefully skips when the fake key doesn't match any rule.
+          sudo mkdir -p /opt/groom-llm-routing
+          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
+
       - name: Run pytest
+        env:
+          FLEET_DIR: ${{ github.workspace }}/.fleet
         run: python -m pytest -q --cov=krepis --cov-report=term-missing --cov-fail-under=90
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
@@ -45,5 +89,5 @@ jobs:
   notify-main-failure:
     needs: [test]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@341ca29e7753334df35b9a7eb4e9664c52f327a7
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@313d910b152547902877e675873a00fdc1ecd95f
     secrets: inherit

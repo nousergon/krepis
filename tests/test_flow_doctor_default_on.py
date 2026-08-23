@@ -58,15 +58,35 @@ def _yaml(tmp_path):
 # --- activation precedence ---------------------------------------------
 
 
-def test_default_on_activates_with_yaml_when_allowed_in_tests(monkeypatch, tmp_path):
+def test_default_on_activates_with_yaml_when_deployed_and_allowed_in_tests(
+    monkeypatch, tmp_path,
+):
     monkeypatch.setenv("FLOW_DOCTOR_ALLOW_IN_TESTS", "1")  # bypass the pytest guard
+    monkeypatch.setenv("ALPHA_ENGINE_DEPLOYED", "1")  # operated substrate
     fake = _fake_fd_module()
     with mock.patch.dict("sys.modules", {"flow_doctor": fake}):
         setup_logging("test", flow_doctor_yaml=_yaml(tmp_path))
     assert get_flow_doctor() is not None
-    # Not deployed + no explicit enable -> strict=False (dev-lenient).
+    # Deployed + no explicit enable -> strict=True (see deployed/strict block
+    # below); default-on activation itself is what this test asserts.
     _, kwargs = fake.FlowDoctor.from_config.call_args
-    assert kwargs["strict"] is False
+    assert kwargs["strict"] is True
+
+
+def test_default_on_stays_off_in_a_dev_shell_even_with_yaml(monkeypatch, tmp_path):
+    """alpha-engine-config-I8196: a laptop dev shell must NOT page by default.
+
+    Not deployed, no explicit FLOW_DOCTOR_ENABLED — a yaml alone used to be
+    sufficient to activate (every alpha-engine repo ships one), which let a
+    plain diagnostic run in a worktree dispatch a real SES email, GitHub
+    issue and Telegram page. The yaml is now the deployed-runtime opt-in
+    only; a dev shell needs FLOW_DOCTOR_ENABLED=1 explicitly.
+    """
+    monkeypatch.setenv("FLOW_DOCTOR_ALLOW_IN_TESTS", "1")  # bypass the pytest guard
+    fake = _fake_fd_module()
+    with mock.patch.dict("sys.modules", {"flow_doctor": fake}):
+        setup_logging("test", flow_doctor_yaml=_yaml(tmp_path))
+    assert get_flow_doctor() is None
 
 
 def test_default_on_suppressed_under_pytest_without_optin(tmp_path):
@@ -94,10 +114,18 @@ def test_kill_switch_overrides_everything(monkeypatch, tmp_path):
 def test_should_activate_precedence():
     assert _flow_doctor_should_activate("x.yaml") is False  # pytest guard, no opt-in
     with mock.patch.dict("os.environ", {"FLOW_DOCTOR_ALLOW_IN_TESTS": "1"}):
-        assert _flow_doctor_should_activate("x.yaml") is True
+        # Not deployed -> case 4 requires _is_deployed() too (I8196): a dev
+        # shell does not activate on the yaml's mere presence.
+        assert _flow_doctor_should_activate("x.yaml") is False
         assert _flow_doctor_should_activate(None) is False  # no yaml
+    with mock.patch.dict(
+        "os.environ",
+        {"FLOW_DOCTOR_ALLOW_IN_TESTS": "1", "ALPHA_ENGINE_DEPLOYED": "1"},
+    ):
+        assert _flow_doctor_should_activate("x.yaml") is True  # deployed -> default-on
+        assert _flow_doctor_should_activate(None) is False  # no yaml, still off
     with mock.patch.dict("os.environ", {"FLOW_DOCTOR_ENABLED": "1"}):
-        assert _flow_doctor_should_activate("x.yaml") is True  # explicit wins pytest
+        assert _flow_doctor_should_activate("x.yaml") is True  # explicit wins pytest AND deploy gate
     with mock.patch.dict("os.environ", {"FLOW_DOCTOR_DISABLED": "1"}):
         assert _flow_doctor_should_activate("x.yaml") is False
 
@@ -113,6 +141,10 @@ def test_collection_time_import_suppressed_without_pytest_env(monkeypatch):
     # so sys.modules alone must suppress the default-on path.
     assert _flow_doctor_should_activate("x.yaml") is False
     monkeypatch.setenv("FLOW_DOCTOR_ALLOW_IN_TESTS", "1")
+    # Bypassing the pytest guard alone is not enough post-I8196 — case 4 also
+    # requires _is_deployed().
+    assert _flow_doctor_should_activate("x.yaml") is False
+    monkeypatch.setenv("ALPHA_ENGINE_DEPLOYED", "1")
     assert _flow_doctor_should_activate("x.yaml") is True
 
 
@@ -128,12 +160,26 @@ def test_is_deployed_detection(monkeypatch):
     assert _is_deployed() is True
 
 
-def test_dev_default_on_missing_package_is_graceful(monkeypatch, tmp_path):
-    """Default-on in dev must NEVER crash a developer over a missing extra."""
-    monkeypatch.setenv("FLOW_DOCTOR_ALLOW_IN_TESTS", "1")  # default-on path, not deployed
+def test_dev_shell_missing_package_never_crashes(monkeypatch, tmp_path):
+    """A dev shell (not deployed, no explicit opt-in) must NEVER crash a
+    developer over a missing extra — post-I8196 it doesn't even attempt
+    activation (case 4 requires _is_deployed()), which is the stronger
+    guarantee: no activation attempt at all, not just a graceful one."""
+    monkeypatch.setenv("FLOW_DOCTOR_ALLOW_IN_TESTS", "1")  # bypass the pytest guard only
     with mock.patch.dict("sys.modules", {"flow_doctor": None}):
         setup_logging("test", flow_doctor_yaml=_yaml(tmp_path))  # no raise
     assert get_flow_doctor() is None
+
+
+# NOTE: there is no longer a reachable (activates AND non-strict) state.
+# Activation now requires either _is_deployed() (case 4, -> strict=True
+# because _attach_flow_doctor computes strict = _is_deployed() or explicit
+# FLOW_DOCTOR_ENABLED=="1") or an explicit FLOW_DOCTOR_ENABLED=1 (case 2,
+# which itself forces strict=True). The graceful/non-strict degrade branch in
+# _attach_flow_doctor is therefore unreachable via default-on post-I8196 by
+# design — see test_deployed_missing_package_fails_loud below for the
+# strict-on-deploy coverage, and test_dev_shell_missing_package_never_crashes
+# above for the (never even attempts activation) dev-shell guarantee.
 
 
 def test_deployed_missing_package_fails_loud(monkeypatch, tmp_path):

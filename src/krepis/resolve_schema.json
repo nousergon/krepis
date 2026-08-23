@@ -26,7 +26,7 @@
     },
     "model": {
       "type": "string",
-      "description": "Model identifier for the resolved route. For the litellm_proxy route this is the GROUP name (the proxy resolves the chain); otherwise the concrete registry model string."
+      "description": "Model identifier for the resolved route. On the litellm_proxy route from resolve_group_structured() this is the qualified primary deployment name ({group}-{registry_id}); from resolve_model_structured() it is the registry entry id, which the derivation layer emits as its own deployment for direct calls by name. Otherwise the concrete registry model string."
     },
     "display_name": {
       "type": "string",
@@ -57,7 +57,7 @@
     },
     "deployment_id": {
       "type": "string",
-      "description": "The model identifier to send on the wire (bare name for egress_proxy, full slug for openrouter, group name for litellm_proxy)."
+      "description": "The model identifier to send on the wire (bare name for egress_proxy, full slug for openrouter; on litellm_proxy the qualified primary deployment name for a group resolution, or the registry entry id for a single-model resolution)."
     },
     "auth_token_type": {
       "type": "string",
@@ -71,19 +71,19 @@
     },
     "group": {
       "type": "string",
-      "description": "The model group that was resolved (low|med|high|ultra)."
+      "description": "The model group that was resolved (low|med|high|ultra). EMPTY STRING on a single-model resolution whose id is not a member of any model_groups chain -- several entries carry a vestigial top-level `group` field the registry itself does not read, and reporting it would claim a membership the registry denies."
     },
     "registry_id": {
       "type": "string",
-      "description": "Registry entry id that served this resolution, or 'litellm:group:<group>'."
+      "description": "Registry entry id that served this resolution, or 'litellm:group:<group>' for a group resolution on the router edge (which names no entry -- see primary_registry_id). A single-model resolution always names the real entry."
     },
     "primary_model": {
       "type": "string",
-      "description": "The group's declared primary model. Present on the litellm_proxy route; the model actually served may differ if the proxy fell back."
+      "description": "The group's declared primary model. Present on the litellm_proxy route; the model actually served may differ if the proxy fell back. On a single-model resolution there is no chain, so this is the pinned entry's own upstream model string and cannot differ from what served."
     },
     "primary_registry_id": {
       "type": "string",
-      "description": "Registry id of the group's declared primary."
+      "description": "Registry id of the group's declared primary; on a single-model resolution, the pinned entry's own id."
     },
     "capabilities": {
       "type": "object",

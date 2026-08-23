@@ -1,0 +1,93 @@
+# ADOPTED FOR krepis 2026-08-13 (alpha-engine-config-I7197). Mirrors
+# nousergon-lib, where this has run since config-I2716 (2026-07-16); the
+# fleet's rule is to mirror an existing SOTA pattern rather than invent a
+# parallel one.
+#
+# The krepis instance: PR#141 and PR#142 merged FIVE SECONDS apart, both
+# declaring 0.58.0. #142 published; #141's publish failed the byte-identity
+# check, so the telegram escape fix it carried sat on main installable by
+# nothing until a human noticed the old behaviour in a scratch venv. krepis
+# already had `strict: true` (branches up to date) and it did not help —
+# GitHub recomputes mergeability asynchronously and a five-second window slips
+# through. A guard cannot win that race; removing the racing resource from the
+# PR surface ends it.
+#
+# Merge-time version bump (config-I2716, 2026-07-16).
+#
+# PRs do not bump the version — version-bump-check.yml FORBIDS version edits
+# in PRs (except under the release:manual label). This workflow is the single
+# version writer: on every push to main whose src/** diff since the last
+# release tag is non-empty, it bumps the patch version in pyproject.toml +
+# src/krepis/__init__.py and pushes the bump commit directly to main
+# using the AUTOBUMP_DEPLOY_KEY deploy key, which carries an always-bypass on
+# the main-protection ruleset. That push then triggers auto-tag.yml (tags
+# v<new>) and publish.yml (PyPI) exactly as a manual bump used to.
+#
+# Root cause this removes: per-PR bumps made every pair of open PRs conflict
+# on the version line (the "version-bump conflict treadmill").
+#
+# Loop safety: the bump commit's own push re-runs this workflow, which then
+# no-ops — either the new version is not yet tagged (auto-tag in flight →
+# "manual/pending bump" branch) or it is tagged at this same SHA (empty
+# src diff). Manual minor/major releases: PR labeled release:manual editing
+# the version lines directly; this workflow no-ops on it the same way.
+name: auto-version-bump
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: auto-version-bump-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read  # writes go through the deploy key, not GITHUB_TOKEN
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+          ssh-key: ${{ secrets.AUTOBUMP_DEPLOY_KEY }}
+
+      - name: Bump patch version if src/ changed since last release
+        run: |
+          set -euo pipefail
+          git fetch --tags --quiet origin
+          VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')"
+          if ! git rev-parse -q --verify "refs/tags/v${VERSION}" >/dev/null; then
+            echo "version ${VERSION} has no tag yet — a bump (manual or auto) is already in flight; auto-tag.yml owns it. No-op."
+            exit 0
+          fi
+          if git diff --quiet "v${VERSION}..HEAD" -- src/; then
+            echo "no src/ changes since v${VERSION} — nothing to release. No-op."
+            exit 0
+          fi
+          NEW="$(python3 scripts/autobump.py)"
+          git config user.name "nousergon-autobump"
+          git config user.email "autobump@users.noreply.github.com"
+          git commit -am "chore(release): v${NEW} (merge-time auto bump)"
+          # A merge can land between our checkout and this push; rebase-retry
+          # up to 3 times rather than failing the release. The ruleset's
+          # deploy-key bypass admits the push; non-fast-forward is still
+          # rejected by git itself, which is what the retry handles.
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "pushed v${NEW} (attempt ${attempt})"
+              exit 0
+            fi
+            git fetch --quiet origin main
+            git rebase origin/main
+          done
+          echo "autobump: push failed after 3 rebase attempts" >&2
+          exit 1
+
+  notify-main-failure:
+    needs: [bump]
+    if: failure() && github.ref == 'refs/heads/main'
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@313d910b152547902877e675873a00fdc1ecd95f # main
+    secrets: inherit

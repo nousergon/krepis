@@ -321,10 +321,21 @@ def _flow_doctor_should_activate(yaml_path: Optional[str]) -> bool:
        yet set. 2026-06-11: an alpha-engine-data test run leaked real alert
        emails + GitHub issues for synthetic fixture tickers through exactly
        this import-time gap.
-    4. Default (unset): on **iff** a ``flow_doctor_yaml`` was provided — passing
-       a yaml IS the opt-in. This inverts the old opt-in-per-runtime default
-       whose failure mode was silently-dark runtimes (predictor/backtester/
-       research were wired but never exported FLOW_DOCTOR_ENABLED=1).
+    4. Default (unset): on **iff** a ``flow_doctor_yaml`` was provided AND the
+       process is running on the operated substrate (``_is_deployed()``) —
+       passing a yaml is the opt-in for a DEPLOYED runtime; a local dev shell
+       needs the explicit ``FLOW_DOCTOR_ENABLED=1`` (case 2) to activate.
+       This inverts the old opt-in-per-runtime default whose failure mode was
+       silently-dark DEPLOYED runtimes (predictor/backtester/research were
+       wired but never exported FLOW_DOCTOR_ENABLED=1) — it does not, and
+       must not, make every laptop dev shell a paging surface. Corrected
+       2026-08-22 (alpha-engine-config-I8196): a `--mode smoke-pit-parity`
+       diagnostic run in a worktree dispatched a real SES email, GitHub issue
+       and Telegram page from a laptop shell that had never set
+       FLOW_DOCTOR_ENABLED, because this branch activated on the yaml's mere
+       presence — every alpha-engine repo ships one. ``_is_deployed()``
+       already existed and was already the correct instance-identity signal
+       (governing ``strict``); it now also gates activation itself.
     """
     if os.environ.get("FLOW_DOCTOR_DISABLED", "0") == "1":
         return False
@@ -340,7 +351,7 @@ def _flow_doctor_should_activate(yaml_path: Optional[str]) -> bool:
         os.environ.get("FLOW_DOCTOR_ALLOW_IN_TESTS", "0") != "1"
     ):
         return False
-    return bool(yaml_path)
+    return bool(yaml_path) and _is_deployed()
 
 
 def _attach_flow_doctor(
@@ -376,8 +387,14 @@ def _attach_flow_doctor(
         import flow_doctor
     except ImportError as exc:
         msg = (
+            # HYPHENATED deliberately (alpha-engine-config-I6963). This message
+            # is the one an operator copies, and pip <23.3 — which is what
+            # Amazon Linux 2023 ships (23.2.1) — does not normalise `_` to `-`
+            # in a REQUESTED extra, so `nousergon-lib[flow_doctor]` silently
+            # resolves to nothing and exits 0. Following the old wording
+            # reproduced the very failure this message is reporting.
             "flow-doctor is not installed but a flow_doctor_yaml was provided. "
-            "Install via nousergon-lib[flow_doctor] or add flow-doctor[diagnosis] "
+            "Install via nousergon-lib[flow-doctor] or add flow-doctor[diagnosis] "
             f"to requirements: {exc}"
         )
         if strict:

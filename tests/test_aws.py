@@ -10,8 +10,13 @@ import pytest
 from krepis.aws import (
     DEFAULT_RETRYABLE_INVOKE_CODES,
     InvokeResult,
+    LambdaEnvMergeError,
     LambdaInvokeError,
     invoke_lambda_with_retry,
+    main,
+    merge_lambda_environment,
+    remove_lambda_environment_keys,
+    LambdaAliasPinnedError,
 )
 
 _NOSLEEP = lambda _d: None  # noqa: E731
@@ -194,3 +199,388 @@ def _passthrough_using(fake_client):
         )
 
     return _inner
+
+
+class FakeWaiter:
+    def __init__(self, log, name):
+        self.log, self.name = log, name
+
+    def wait(self, **kw):
+        self.log.append(("wait", self.name, kw.get("FunctionName")))
+
+
+class FakeLambda:
+    """Duck-typed boto3 lambda client with a declared starting environment."""
+
+    def __init__(self, variables=None, read_error=None, write_error=None):
+        self.variables = dict(variables or {})
+        self.read_error = read_error
+        self.write_error = write_error
+        self.calls = []
+        self.aliases: "list[dict]" = []
+        self.next_version = "518"
+
+    def get_waiter(self, name):
+        return FakeWaiter(self.calls, name)
+
+    def get_function_configuration(self, FunctionName):  # noqa: N803
+        if self.read_error:
+            raise self.read_error
+        self.calls.append(("read", FunctionName))
+        return {"Environment": {"Variables": dict(self.variables)}}
+
+    def update_function_configuration(self, FunctionName, Environment):  # noqa: N803
+        if self.write_error:
+            raise self.write_error
+        self.calls.append(("write", FunctionName))
+        self.variables = dict(Environment["Variables"])
+
+    # ── alias / version surface (remove_lambda_environment_keys) ──────────
+    def list_aliases(self, FunctionName):  # noqa: N803
+        self.calls.append(("list_aliases", FunctionName))
+        return {"Aliases": list(self.aliases)}
+
+    def publish_version(self, FunctionName):  # noqa: N803
+        self.calls.append(("publish", FunctionName))
+        return {"Version": self.next_version}
+
+    def update_alias(self, FunctionName, Name, FunctionVersion):  # noqa: N803
+        self.calls.append(("update_alias", Name, FunctionVersion))
+        for a in self.aliases:
+            if a["Name"] == Name:
+                a["FunctionVersion"] = FunctionVersion
+
+
+class TestMergeLambdaEnvironment:
+    """alpha-engine-config-I7179: turning cost telemetry on is an environment
+    edit across three repos' Lambdas, and the merge that does it may not
+    delete the live-only variables it does not know about."""
+
+    def test_existing_variables_survive(self):
+        client = FakeLambda({"ANTHROPIC_API_KEY": "live-only", "RAG_DATABASE_URL": "x"})
+        total = merge_lambda_environment(
+            "alpha-engine-replay-concordance",
+            {"KREPIS_COST_SINK_BUCKET": "alpha-engine-research"},
+            client=client,
+        )
+        assert client.variables["ANTHROPIC_API_KEY"] == "live-only"
+        assert client.variables["RAG_DATABASE_URL"] == "x"
+        assert client.variables["KREPIS_COST_SINK_BUCKET"] == "alpha-engine-research"
+        assert total == 3
+
+    def test_merge_overwrites_only_the_named_keys(self):
+        client = FakeLambda({"KREPIS_COST_SINK_PREFIX": "old"})
+        merge_lambda_environment("f", {"KREPIS_COST_SINK_PREFIX": "new"}, client=client)
+        assert client.variables == {"KREPIS_COST_SINK_PREFIX": "new"}
+
+    def test_absent_environment_block_is_not_a_crash(self):
+        class Bare(FakeLambda):
+            def get_function_configuration(self, FunctionName):  # noqa: N803
+                return {}
+
+        client = Bare()
+        merge_lambda_environment("f", {"A": "1"}, client=client)
+        assert client.variables == {"A": "1"}
+
+    @pytest.mark.parametrize("value", ["", None])
+    def test_empty_value_is_refused(self, value):
+        """An empty variable reads as unset at the consumer and silently
+        disables whatever it gates — the failure this whole issue is
+        about, one layer down."""
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"K": value}, client=FakeLambda())
+
+    def test_no_updates_is_refused(self):
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {}, client=FakeLambda())
+
+    def test_read_failure_fails_loud_and_does_not_write(self):
+        client = FakeLambda(read_error=RuntimeError("denied"))
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"A": "1"}, client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_write_failure_fails_loud(self):
+        client = FakeLambda(write_error=RuntimeError("conflict"))
+        with pytest.raises(LambdaEnvMergeError):
+            merge_lambda_environment("f", {"A": "1"}, client=client)
+
+
+class TestMergeLambdaEnvCli:
+    def test_values_are_never_printed(self, capsys, monkeypatch):
+        client = FakeLambda()
+        monkeypatch.setattr(
+            "krepis.aws.merge_lambda_environment",
+            lambda fn, updates, region=None: len(updates),
+        )
+        rc = main([
+            "merge-lambda-env",
+            "--function-name", "alpha-engine-evaluator-director",
+            "--set", "KREPIS_COST_SINK_BUCKET=alpha-engine-research",
+        ])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "KREPIS_COST_SINK_BUCKET" in out
+        assert "alpha-engine-research" not in out
+        assert client.calls == []
+
+    def test_malformed_pair_is_rejected(self):
+        assert main([
+            "merge-lambda-env", "--function-name", "f", "--set", "NOEQUALS",
+        ]) == 2
+
+
+class TestRemoveLambdaEnvironmentKeys:
+    """alpha-engine-config-I7925: an expired /alpha-engine/GITHUB_TOKEN sat in
+    the predictor Lambda's environment, was read from site-packages by a
+    first-party dependency, and halted the 2026-08-21 preopen. Removing a
+    credential from a live function is the removal counterpart of
+    I7179's merge, and carries the same two invariants plus the L4497
+    alias-pinning footgun."""
+
+    def _unpinned(self, variables):
+        client = FakeLambda(variables)
+        client.aliases = [{"Name": "live", "FunctionVersion": "$LATEST"}]
+        return client
+
+    def test_only_the_named_keys_are_removed(self):
+        client = self._unpinned(
+            {"GITHUB_TOKEN": "dead", "ANTHROPIC_API_KEY": "live-only", "FMP_API_KEY": "x"}
+        )
+        remaining, published = remove_lambda_environment_keys(
+            "alpha-engine-predictor-inference", ["GITHUB_TOKEN"], client=client
+        )
+        assert "GITHUB_TOKEN" not in client.variables
+        assert client.variables["ANTHROPIC_API_KEY"] == "live-only"
+        assert client.variables["FMP_API_KEY"] == "x"
+        assert (remaining, published) == (2, None)
+
+    def test_absent_key_is_refused(self):
+        """A no-op reported as a removal is how a credential stays live
+        somewhere nobody is looking."""
+        client = self._unpinned({"FMP_API_KEY": "x"})
+        with pytest.raises(LambdaEnvMergeError, match="not set"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_absent_key_is_allowed_when_missing_ok(self):
+        client = self._unpinned({"FMP_API_KEY": "x"})
+        remaining, _ = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, missing_ok=True
+        )
+        assert remaining == 1
+
+    def test_no_keys_is_refused(self):
+        with pytest.raises(LambdaEnvMergeError):
+            remove_lambda_environment_keys("f", [], client=FakeLambda())
+
+    def test_pinned_alias_without_promotion_raises_instead_of_no_op(self):
+        """L4497: update-function-configuration mutates $LATEST only. An edit
+        that cannot reach traffic is a failure, not a success."""
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaAliasPinnedError, match="live"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_pinned_alias_with_promotion_runs_the_full_procedure(self):
+        client = FakeLambda({"GITHUB_TOKEN": "dead", "FMP_API_KEY": "x"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, promote_aliases=["live"]
+        )
+        assert (remaining, published) == (1, "518")
+        order = [c[0] for c in client.calls if c[0] in {"write", "publish", "update_alias"}]
+        assert order == ["write", "publish", "update_alias"]
+        assert client.aliases[0]["FunctionVersion"] == "518"
+
+    def test_defer_publish_permits_a_latest_only_edit_on_a_pinned_function(self):
+        """A deploy script publishes and moves the alias itself a few steps
+        later. That is a claim about the CALLER, so it is spelled out rather
+        than inferred from an empty promote list."""
+        client = FakeLambda({"GITHUB_TOKEN": "dead", "FMP_API_KEY": "x"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, defer_publish=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] in {"publish", "update_alias"} for c in client.calls)
+        assert client.aliases[0]["FunctionVersion"] == "517"
+
+    def test_defer_publish_needs_no_permission_to_list_aliases(self):
+        """The crucible-predictor deploy role holds no `lambda:ListAliases`.
+        Enumerating anyway raised, so `publish-version` and the alias move
+        never ran and the deploy finished PARTIAL — the live alias serving a
+        stale image while main had moved on (run 32509752554, 2026-08-21,
+        alpha-engine-config-I7925). `defer_publish` is a claim about what the
+        CALLER does next, so the alias state cannot change the outcome."""
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale", "FMP_API_KEY": "x"})
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, defer_publish=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] == "list_aliases" for c in client.calls)
+
+    def test_without_defer_publish_a_listing_failure_still_fails_loud(self):
+        """The refusal itself stays: without the caller's claim, whether the
+        edit reaches traffic is unknowable and must not be guessed."""
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale"})
+        with pytest.raises(LambdaEnvMergeError, match="could not list aliases"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_assert_unaliased_needs_no_permission_to_list_aliases(self):
+        """The other true case, and the one 0.59.24 did not cover.
+
+        `crucible-research`'s alerts Lambda has NO alias and no version
+        promotion, so its deploy deliberately does not pass `--defer-publish`
+        — there is no later publish step to carry a deferred edit. Two deploys
+        failed on the same AccessDenied with 0.59.24 installed (runs
+        32512239555 and 32514368875, alpha-engine-config-I8037). A caller that
+        is correct had no expressible path: it cannot claim a publish it does
+        not perform, and it cannot read aliases it is not permitted to list.
+        """
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale", "FMP_API_KEY": "x"})
+        remaining, published = remove_lambda_environment_keys(
+            "f", ["GITHUB_TOKEN"], client=client, assert_unaliased=True
+        )
+        assert (remaining, published) == (1, None)
+        assert "GITHUB_TOKEN" not in client.variables
+        assert not any(c[0] == "list_aliases" for c in client.calls)
+        assert not any(c[0] in {"publish", "update_alias"} for c in client.calls)
+
+    def test_assert_unaliased_is_refused_alongside_either_alias_claim(self):
+        """At most one of the three can be true of a given function, so
+        stating two is a caller bug rather than a preference."""
+        for kwargs in (
+            {"defer_publish": True},
+            {"promote_aliases": ["live"]},
+        ):
+            client = FakeLambda({"GITHUB_TOKEN": "dead"})
+            client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+            with pytest.raises(LambdaEnvMergeError, match="caller bug"):
+                remove_lambda_environment_keys(
+                    "f", ["GITHUB_TOKEN"], client=client,
+                    assert_unaliased=True, **kwargs,
+                )
+            assert not any(c[0] == "write" for c in client.calls)
+
+    def test_claiming_neither_still_enumerates_and_still_refuses(self):
+        """The carve-outs are per-caller, never a weakening of the default.
+
+        A caller that asserts nothing gets the original behaviour: enumerate,
+        and raise rather than guess. Guessing "no aliases" on an enumeration
+        failure is the silent no-op the helper exists to prevent, and adding a
+        second carve-out must not soften it for anyone who has not claimed it.
+        """
+
+        class NoListAliases(FakeLambda):
+            def list_aliases(self, FunctionName):  # noqa: N803
+                raise RuntimeError("AccessDeniedException: lambda:ListAliases")
+
+        client = NoListAliases({"GITHUB_TOKEN": "stale"})
+        with pytest.raises(LambdaEnvMergeError, match="could not list aliases"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_assert_unaliased_does_not_suppress_a_real_pin_for_others(self):
+        """A genuinely alias-pinned function, with a caller claiming nothing,
+        still raises LambdaAliasPinnedError."""
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaAliasPinnedError):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_defer_publish_and_promote_together_are_refused(self):
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaEnvMergeError, match="mutually exclusive"):
+            remove_lambda_environment_keys(
+                "f",
+                ["GITHUB_TOKEN"],
+                client=client,
+                promote_aliases=["live"],
+                defer_publish=True,
+            )
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_promoting_an_alias_that_does_not_exist_is_refused(self):
+        client = FakeLambda({"GITHUB_TOKEN": "dead"})
+        client.aliases = [{"Name": "live", "FunctionVersion": "517"}]
+        with pytest.raises(LambdaEnvMergeError, match="do not exist"):
+            remove_lambda_environment_keys(
+                "f", ["GITHUB_TOKEN"], client=client, promote_aliases=["staging"]
+            )
+
+    def test_a_client_that_cannot_list_aliases_refuses_to_claim_success(self):
+        class NoAliases(FakeLambda):
+            list_aliases = None
+
+        client = NoAliases({"GITHUB_TOKEN": "dead"})
+        with pytest.raises(LambdaEnvMergeError, match="unknowable"):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+
+    def test_read_failure_fails_loud_and_does_not_write(self):
+        client = FakeLambda({"GITHUB_TOKEN": "dead"}, read_error=RuntimeError("denied"))
+        with pytest.raises(LambdaEnvMergeError):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+        assert not any(c[0] == "write" for c in client.calls)
+
+    def test_write_failure_fails_loud(self):
+        client = self._unpinned({"GITHUB_TOKEN": "dead"})
+        client.write_error = RuntimeError("conflict")
+        with pytest.raises(LambdaEnvMergeError):
+            remove_lambda_environment_keys("f", ["GITHUB_TOKEN"], client=client)
+
+
+class TestRemoveLambdaEnvCli:
+    def test_values_are_never_printed_and_keys_are(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "krepis.aws.remove_lambda_environment_keys",
+            lambda fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False, assert_unaliased=False: (
+                13,
+                "518" if promote_aliases else None,
+            ),
+        )
+        rc = main([
+            "remove-lambda-env",
+            "--function-name", "alpha-engine-predictor-inference",
+            "--unset", "GITHUB_TOKEN",
+            "--promote-alias", "live",
+        ])
+        out = capsys.readouterr().out
+        assert rc == 0
+        assert "GITHUB_TOKEN" in out
+        assert "518" in out
+        assert "13 remain" in out
+
+    def test_a_refusal_exits_non_zero(self, capsys, monkeypatch):
+        def _boom(fn, keys, region=None, promote_aliases=None, missing_ok=False, defer_publish=False, assert_unaliased=False):
+            raise LambdaAliasPinnedError("alias live is pinned")
+
+        monkeypatch.setattr("krepis.aws.remove_lambda_environment_keys", _boom)
+        rc = main([
+            "remove-lambda-env",
+            "--function-name", "f",
+            "--unset", "GITHUB_TOKEN",
+        ])
+        assert rc == 1
+        assert "pinned" in capsys.readouterr().err

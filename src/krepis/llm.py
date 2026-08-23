@@ -63,6 +63,10 @@ from krepis.llm_search import (
     extract_openrouter_citations,
     final_text_after_last_tool,
 )
+from krepis.session_dlp import (
+    check_request,
+    dlp_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +207,69 @@ _JSON_INSTRUCTION = (
     "\n\nRespond with ONLY a single JSON object matching this JSON Schema — "
     "no prose, no markdown fences:\n{schema}"
 )
+
+# ── structured-output degradation ladder (model-portability-policy §7) ────
+#
+# The policy declares one ladder for structured output:
+#
+#   native (strict ``response_format=json_schema``)
+#     → tool_emulation (forced single-tool call whose input IS the object)
+#     → prompt_only (instruct + tolerant extraction + bounded repair)
+#
+# "The caller always receives a validated object or an exception. Which rung
+# ran is recorded on the result, because rung affects reliability and belongs
+# in the artifact." ``StructuredResult.structured_output_rung`` is that record,
+# and it is populated on EVERY structured call — including the undegraded ones,
+# so a healthy call publishes ``native``/``tool_emulation`` rather than nothing
+# (``principles.md`` §2.7: a component emitting nothing is not healthy, it is
+# unobserved).
+_STRUCTURED_RUNG_NATIVE = "native"
+_STRUCTURED_RUNG_TOOL_EMULATION = "tool_emulation"
+_STRUCTURED_RUNG_PROMPT_ONLY = "prompt_only"
+
+# A provider REFUSING ``response_format`` at request time — distinct from a
+# registry model that never declared support (I4 handles that declaratively,
+# via ``spec.structured_outputs``). This is the case the declaration cannot
+# cover: the registry says the deployment can serve it, or a caller overrode
+# ``params.structured_outputs``, and the endpoint answers 400.
+#
+# Live incident (alpha-engine-config-I7232): the Think Tank's ``sweep`` tier
+# overrides ``structured_outputs=True`` onto a DeepSeek deployment whose
+# registry params default it False; DeepSeek answered
+# ``400 This response_format type is unavailable now``. The exception escaped
+# ``_structured_openai`` entirely — it is neither a decode failure nor a
+# validation failure — and aborted every Think Tank run from 2026-08-11.
+# Descending one rung is the DECLARED path for exactly this, and it is what
+# turns a whole-run abort into a recorded degradation.
+#
+# Deliberately matched on the refusal WORDING and not on provider identity or
+# an HTTP status: I4 forbids branching request construction on provider name,
+# and the status alone (400) cannot distinguish "this parameter is unavailable"
+# from "your schema is malformed" — descending on the latter would hide a real
+# caller bug behind a weaker rung.
+_RESPONSE_FORMAT_REFUSAL_RE = re.compile(
+    r"response[_ ]?format",
+    re.IGNORECASE,
+)
+_RESPONSE_FORMAT_REFUSAL_CAUSE_RE = re.compile(
+    r"unavailable|unsupported|not supported|not available|not enabled",
+    re.IGNORECASE,
+)
+
+
+def _is_response_format_refusal(exc: BaseException) -> bool:
+    """True when *exc* is a provider refusing ``response_format`` itself.
+
+    Both halves must match: the message has to name the parameter AND say it
+    cannot be served. A 400 naming ``response_format`` because the SCHEMA was
+    rejected is a caller defect and must keep raising — degrading it would
+    swap a loud, correct failure for a quietly weaker rung.
+    """
+    text = str(exc)
+    return bool(
+        _RESPONSE_FORMAT_REFUSAL_RE.search(text)
+        and _RESPONSE_FORMAT_REFUSAL_CAUSE_RE.search(text)
+    )
 
 # Bounded jittered backoff between attempts of the retry loops below. The
 # SDK's own ``max_retries`` backs off for status/connection failures, but it
@@ -559,6 +626,13 @@ class StructuredResult(LLMResult):
     data: dict = field(default_factory=dict)
     # Pydantic instance when ``schema`` was a BaseModel subclass.
     parsed: Any = None
+    # Which rung of the model-portability-policy §7 structured-output ladder
+    # actually produced this payload: "native" (strict response_format=
+    # json_schema), "tool_emulation" (forced tool call — the anthropic
+    # transport's idiom), or "prompt_only" (JSON instruction + tolerant
+    # extraction). Always populated, including on undegraded calls, so the
+    # rung is a value in the artifact rather than an inference from silence.
+    structured_output_rung: str = ""
 
 
 @dataclass
@@ -598,8 +672,9 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
-def _emits_cost(method):
-    """Emit a priced cost record for whatever result *method* returns.
+def _finalize_result(method):
+    """Stamp the call's degradation record onto the result, then emit a priced
+    cost record for it.
 
     Applied at the PUBLIC method boundary rather than at each ``return``
     site, deliberately. ``complete`` / ``structured`` / ``complete_grounded``
@@ -608,11 +683,28 @@ def _emits_cost(method):
     return path would be invisible — no error, no log, just a call site that
     quietly stops being accounted for — which is precisely the failure class
     this arc exists to close (alpha-engine-config-I5206).
+
+    ``dropped_params`` is stamped for the same reason and was missing for the
+    same reason: the field existed on :class:`LLMResult` and documented itself
+    as the surface making a degraded call visible in the artifact, and NO
+    return site ever assigned it — so every degraded call read as fully
+    honored to every consumer of the artifact (alpha-engine-config-I7232).
+    Snapshot-and-clear, not just snapshot: ``self.dropped_params`` lives on the
+    client, so without the reset a drop on one call would ride along on every
+    later result from the same client and misreport it as degraded.
     """
 
     @functools.wraps(method)
     def _wrapped(self, *args, **kwargs):
-        result = method(self, *args, **kwargs)
+        self.dropped_params = []
+        try:
+            result = method(self, *args, **kwargs)
+        finally:
+            # Cleared even when the call RAISES: a drop recorded on a failed
+            # call must not attach itself to the next successful one.
+            dropped = self.dropped_params
+            self.dropped_params = []
+        result.dropped_params = dropped
         self._emit_cost_record(result)
         return result
 
@@ -649,9 +741,25 @@ class LLMClient:
     ``cost_sink`` is an optional ``callable(record: dict) -> None``. When
     set, each completed call builds a priced record via
     :func:`krepis.cost.record_llm_call` — carrying token counts, cache
-    read/write splits and USD — and hands it to the sink. Default ``None``
-    means no emission, so public consumers pay nothing for a feature they
-    have not asked for.
+    read/write splits and USD — and hands it to the sink.
+
+    **When it is NOT set, the sink is resolved from the environment**
+    (:func:`krepis.cost_sink.default_sink_from_env`): if
+    ``KREPIS_COST_SINK_BUCKET`` and ``KREPIS_COST_SINK_PREFIX`` are both
+    exported, every client built in that process emits, whether or not
+    its author thought about cost telemetry. With neither set the default
+    is ``None`` and a public consumer pays nothing for a feature it has
+    not asked for.
+
+    That inversion is the point. While emission required a constructor
+    argument, coverage equalled *the set of authors who remembered*, and
+    on 2026-08-13 that set was one process: every per-call cost record in
+    the Alpha Engine research bucket came from the Think Tank, while the
+    weekly pipeline's own LLM stages — each holding a correct
+    ``callsite_id`` and passing no sink — were attributed to nothing
+    (``alpha-engine-config-I7179``). Emission is now a property of the
+    execution environment, which is where a fleet operator can actually
+    set it once, rather than a property of each call site.
     """
 
     def __init__(
@@ -677,6 +785,14 @@ class LLMClient:
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        if cost_sink is None:
+            # Deliberately NOT wrapped in try/except. A half-configured
+            # sink environment raises CostSinkConfigError here, before the
+            # first billable call — see default_sink_from_env for why
+            # falling through to silence is the worse failure.
+            from krepis.cost_sink import default_sink_from_env
+
+            cost_sink = default_sink_from_env()
         self._cost_sink = cost_sink
         self._client: Any = None
         if spec.supports_automatic_prefix_caching:
@@ -691,6 +807,61 @@ class LLMClient:
         self.dropped_params: list[str] = []
 
     # ── cost emission ─────────────────────────────────────────────────
+
+    def _dlp_scan_request(self, payload: dict, *, context: str = "") -> None:
+        """Scan *payload* (the exact dict about to be sent) for secrets.
+
+        Raises :exc:`LLMError` on a block or scan failure (fail-closed).
+        No-op when DLP is administratively disabled
+        (``KREPIS_DLP_DISABLED=1``).
+
+        Called by every public method before forwarding to the transport —
+        one chokepoint, called at each of the three methods rather than via
+        a reusable decorator, because the payload dict is constructed
+        differently per transport (Anthropic vs OpenAI-kwargs vs LiteLLM).
+        A future consolidation may unify the payload shape; until then this
+        explicit call at each site is the unambiguous single-point hook the
+        Lambda-path DLP gap requires (``alpha-engine-config-I4927``).
+        """
+        if not dlp_enabled():
+            return
+        try:
+            body = json.dumps(payload, default=str).encode("utf-8")
+        except (TypeError, ValueError, UnicodeEncodeError) as exc:
+            logger.warning(
+                "dlp: could not serialize request payload for scanning (%s) — "
+                "failing closed (the request will NOT be forwarded)",
+                exc,
+            )
+            raise LLMError(
+                f"DLP scan could not serialize request payload: {exc}"
+            ) from exc
+        try:
+            verdict = check_request(body)
+        except Exception as exc:
+            logger.error(
+                "dlp: scan raised for %s request: %s", context, exc
+            )
+            raise LLMError(
+                f"DLP scan failed (fail-closed): {exc}"
+            ) from exc
+        if verdict.should_block:
+            logger.warning(
+                "dlp: BLOCKED %s request — %s (scan=%.0fms cache=%.0f%%)",
+                context,
+                verdict.reason,
+                verdict.scan_ms,
+                verdict.cache_ratio,
+            )
+            raise LLMError(
+                f"DLP scan blocked outbound request: {verdict.reason}"
+            )
+        logger.debug(
+            "dlp: ok %s request (scan=%.0fms cache=%.0f%%)",
+            context,
+            verdict.scan_ms,
+            verdict.cache_ratio,
+        )
 
     def _emit_cost_record(self, result: Any) -> None:
         """Build a priced cost record for *result* and hand it to the sink.
@@ -772,6 +943,22 @@ class LLMClient:
 
             key = resolve_router_credential(env_name)
         if not key:
+            # `EGRESS_PROXY_PLACEHOLDER` is exported into the LOCAL egress
+            # proxy process's own environment (nous-ergon-ops
+            # litellm-proxy-shim.sh), not into every consumer's — the proxy
+            # injects the real upstream key server-side and ignores whatever
+            # this client sends, so the client needs any non-empty string,
+            # not a shared secret. `krepis.model_registry.api_key_for()`
+            # already encodes that ("unset placeholder env -> literal
+            # default") for the config-generation path; this mirrors it for
+            # the runtime call path so a consumer with no reason to export
+            # the proxy's own placeholder variable is not blocked by its
+            # absence (alpha-engine-config-I7031).
+            from krepis import model_registry as _mr
+
+            if env_name == _mr.EGRESS_PLACEHOLDER_ENV:
+                key = _mr.EGRESS_PLACEHOLDER_DEFAULT
+        if not key:
             if self.spec.provider == ROUTER_EDGE_PROVIDER:
                 # Naming only the environment variable sends an operator to the
                 # wrong place on the path whose supported source is SSM.
@@ -814,6 +1001,31 @@ class LLMClient:
                 timeout=self._timeout,
             )
         return self._client
+
+    def _call_transport(self, fn, /, **kwargs):
+        """Issue one provider call, classifying its failure before anyone retries.
+
+        A 4xx that refuses the REQUEST is permanent: no attempt count and no
+        fallback chain can satisfy it, and letting one travel as an ordinary
+        transport error is how the eval judge spent three attempts and a
+        fallback on a rejected `tool_choice`, then reported a rate limit on a
+        model that was never the problem (alpha-engine-config-I7904).
+
+        Availability failures pass through untouched — this may only ever
+        remove a retry, never add one. See :mod:`krepis.llm_errors` for the
+        calibration, including which 4xx codes stay in the availability class.
+        """
+        from .llm_errors import raise_if_permanent_contract_error
+
+        try:
+            return fn(**kwargs)
+        except Exception as exc:
+            raise_if_permanent_contract_error(
+                exc,
+                deployment=self.spec.model,
+                model_group=self.spec.registry_id,
+            )
+            raise
 
     def _is_openrouter(self) -> bool:
         if self.spec.provider == "openrouter":
@@ -1066,7 +1278,7 @@ class LLMClient:
 
     # ── plain completion ──────────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete(
         self,
         *,
@@ -1098,7 +1310,8 @@ class LLMClient:
                 cache_system=cache_system,
                 extra=extra,
             )
-            msg = self._transport_client().messages.create(**payload)
+            self._dlp_scan_request(payload, context=f"complete anthropic model={self.spec.model}")
+            msg = self._call_transport(self._transport_client().messages.create, **payload)
             text = "\n\n".join(
                 getattr(b, "text", "")
                 for b in getattr(msg, "content", []) or []
@@ -1127,7 +1340,8 @@ class LLMClient:
             kwargs["extra_body"] = extra_body
         if extra:
             kwargs.update(extra)
-        resp = self._transport_client().chat.completions.create(**kwargs)
+        self._dlp_scan_request(kwargs, context=f"complete openai model={self.spec.model}")
+        resp = self._call_transport(self._transport_client().chat.completions.create, **kwargs)
         text = self._choice_text_or_llm_error(resp)
         served_model = (
             _resolve_group_served_model(resp, spec=self.spec)
@@ -1147,7 +1361,7 @@ class LLMClient:
 
     # ── structured completion ─────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def structured(
         self,
         *,
@@ -1184,6 +1398,18 @@ class LLMClient:
         ``response_format=json_schema`` when ``spec.structured_outputs``,
         else a JSON-instruction suffix + fence/preamble-tolerant extraction
         (Think Tank pattern).
+
+        **Degradation ladder** (``model-portability-policy`` §7). Which rung
+        served is on the result as ``structured_output_rung``, always — the
+        undegraded calls publish theirs too. On the openai transport, an
+        endpoint that REFUSES ``response_format`` (as opposed to a registry
+        entry that never claimed it) drops one rung to ``prompt_only`` for that
+        call, records ``response_format`` in ``dropped_params``, and logs at
+        ERROR. It is a recorded degradation, never a silent one, and it is
+        bounded: one descent per call, and the descent does not spend an
+        ``attempts`` retry. A refusal naming the SCHEMA rather than the
+        parameter's availability still raises — see
+        :func:`_is_response_format_refusal`.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
@@ -1265,7 +1491,9 @@ class LLMClient:
         for attempt in range(attempts):
             payload = dict(base_payload)
             payload["messages"] = messages
-            msg = client.messages.create(**payload)
+            if attempt == 0:
+                self._dlp_scan_request(payload, context=f"structured anthropic model={self.spec.model}")
+            msg = self._call_transport(client.messages.create, **payload)
             self._usage_from_anthropic(msg, into=usage)
             tool_input = self._extract_tool_input(msg, schema_name)
             # Same fault, Anthropic's spelling of it: the forced tool never
@@ -1291,6 +1519,12 @@ class LLMClient:
                     model=getattr(msg, "model", self.spec.model),
                     provider=self.spec.provider,
                     registry_id=self.spec.registry_id,
+                    # The anthropic transport's structured-output idiom IS the
+                    # §7 ladder's tool_emulation rung (forced tool_choice on a
+                    # tool whose input_schema is the schema). Stamped so the
+                    # rung is present on every transport's result, not only the
+                    # one that can degrade.
+                    structured_output_rung=_STRUCTURED_RUNG_TOOL_EMULATION,
                     usage=usage,
                     raw_request=payload,
                     raw_response=msg,
@@ -1338,38 +1572,64 @@ class LLMClient:
         attempts: int,
         max_tokens: int,
     ) -> StructuredResult:
-        messages: List[dict] = [{"role": "system", "content": system}]
-        kwargs: dict = {"model": self.spec.model, "max_tokens": max_tokens}
-        if self.spec.structured_outputs:
-            messages.append({"role": "user", "content": user_content})
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema": schema_dict,
-                },
-            }
-        else:
-            messages.append(
-                {
-                    "role": "user",
-                    "content": user_content
-                    + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
-                }
-            )
         extra_body = self._openai_extra_body()
-        if extra_body:
-            kwargs["extra_body"] = extra_body
+
+        def _build(rung: str) -> tuple[List[dict], dict]:
+            """Request for one rung of the §7 ladder. The openai transport has
+            two reachable rungs (``tool_emulation`` is the anthropic idiom), and
+            building both here — rather than at one branch on entry — is what
+            lets the descent re-issue instead of aborting the caller's run."""
+            msgs: List[dict] = [{"role": "system", "content": system}]
+            kw: dict = {"model": self.spec.model, "max_tokens": max_tokens}
+            if rung == _STRUCTURED_RUNG_NATIVE:
+                msgs.append({"role": "user", "content": user_content})
+                kw["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema": schema_dict,
+                    },
+                }
+            else:
+                msgs.append(
+                    {
+                        "role": "user",
+                        "content": user_content
+                        + _JSON_INSTRUCTION.format(schema=json.dumps(schema_dict)),
+                    }
+                )
+            if extra_body:
+                kw["extra_body"] = extra_body
+            return msgs, kw
+
+        rung = (
+            _STRUCTURED_RUNG_NATIVE
+            if self.spec.structured_outputs
+            else _STRUCTURED_RUNG_PROMPT_ONLY
+        )
+        messages, kwargs = _build(rung)
 
         usage = LLMUsage()
         last_error: Any = None  # Exception (validation) or str (transport decode)
         raw_text = ""
         client = self._transport_client()
 
-        for attempt in range(attempts):
+        # ``budget`` rather than ``range(attempts)``: a rung descent is not a
+        # failed attempt, it is a different request, so it must not consume the
+        # caller's retry budget. It can happen at most once (there is exactly
+        # one rung below ``native`` on this transport), so the budget is bounded
+        # at ``attempts + 1``.
+        descended = False
+        budget = attempts
+        attempt = -1
+        while attempt + 1 < budget:
+            attempt += 1
             try:
-                resp = client.chat.completions.create(messages=messages, **kwargs)
+                if attempt == 0:
+                    scan_payload: dict = {"messages": messages, **kwargs}
+                    self._dlp_scan_request(scan_payload, context=f"structured openai model={self.spec.model}")
+                resp = self._call_transport(client.chat.completions.create, messages=messages, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 raw_text = _choice_text(resp, caller_raises_on_empty=True)
                 # Deliberately OUTSIDE the retry classification below: a
@@ -1421,11 +1681,42 @@ class LLMClient:
                     self.spec.provider,
                     self.spec.model,
                     attempt + 1,
-                    attempts,
+                    budget,
                     last_error,
                 )
-                if attempt < attempts - 1:
+                if attempt < budget - 1:
                     _retry_backoff_sleep(attempt)
+                continue
+            except Exception as exc:  # noqa: BLE001 — re-raised unless it is a refusal
+                # §7 ladder descent, the ONLY case handled here. Anything else
+                # re-raises unchanged: this clause must not become a general
+                # transport catch-all.
+                if not (
+                    rung == _STRUCTURED_RUNG_NATIVE
+                    and not descended
+                    and _is_response_format_refusal(exc)
+                ):
+                    raise
+                descended = True
+                budget += 1
+                rung = _STRUCTURED_RUNG_PROMPT_ONLY
+                self.dropped_params.append("response_format")
+                messages, kwargs = _build(rung)
+                logger.error(
+                    "llm structured provider=%s model=%s: the endpoint REFUSED "
+                    "response_format (%s: %s). Descending the "
+                    "model-portability-policy §7 ladder native -> prompt_only "
+                    "for this call and recording the drop on the result "
+                    "(dropped_params, structured_output_rung). The registry "
+                    "declares this deployment can serve strict structured "
+                    "output and the endpoint disagrees — that contradiction is "
+                    "a registry defect to fix, not a condition to live on "
+                    "(alpha-engine-config-I7232).",
+                    self.spec.provider,
+                    self.spec.model,
+                    exc.__class__.__name__,
+                    exc,
+                )
                 continue
             try:
                 parsed = parse_and_validate(_extract_json(raw_text))
@@ -1434,6 +1725,7 @@ class LLMClient:
                     model=served_model,
                     provider=self.spec.provider,
                     served_provider=getattr(resp, "provider", None),
+                    structured_output_rung=rung,
                     usage=usage,
                     raw_request={"messages": messages, **kwargs},
                     raw_response=resp,
@@ -1463,8 +1755,8 @@ class LLMClient:
 
         raise LLMError(
             f"provider={self.spec.provider} model={self.spec.model}: "
-            f"structured output failed validation after {attempts} "
-            f"attempt(s): {last_error}",
+            f"structured output failed validation after {budget} "
+            f"attempt(s) at rung={rung}: {last_error}",
             usage=usage,
         )
 
@@ -1482,7 +1774,7 @@ class LLMClient:
 
     # ── grounded completion ───────────────────────────────────────────
 
-    @_emits_cost
+    @_finalize_result
     def complete_grounded(
         self,
         *,
@@ -1566,7 +1858,8 @@ class LLMClient:
                 cache_system=cache_system,
                 extra=extra,
             )
-            msg = self._transport_client().messages.create(**payload)
+            self._dlp_scan_request(payload, context=f"grounded anthropic model={self.spec.model}")
+            msg = self._call_transport(self._transport_client().messages.create, **payload)
             return GroundedResult(
                 text=final_text_after_last_tool(getattr(msg, "content", [])),
                 model=getattr(msg, "model", self.spec.model),
@@ -1620,7 +1913,9 @@ class LLMClient:
         last_error: Optional[str] = None
         for attempt in range(attempts):
             try:
-                resp = self._transport_client().chat.completions.create(**kwargs)
+                if attempt == 0:
+                    self._dlp_scan_request(kwargs, context=f"grounded openrouter model={self.spec.model}")
+                resp = self._call_transport(self._transport_client().chat.completions.create, **kwargs)
                 self._usage_from_openai(resp, into=usage)
                 choice = _first_choice(resp)
             except (json.JSONDecodeError, NullChoicesError) as exc:

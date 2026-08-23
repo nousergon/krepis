@@ -50,6 +50,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Any, Dict, Final, Iterator, Optional
+from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,14 @@ FALLBACK_BUCKET_ENV: Final[str] = "NOUSERGON_ALERTS_FALLBACK_BUCKET"
 DEFAULT_FALLBACK_BUCKET: Final[str] = "alpha-engine-research"
 FALLBACK_PREFIX: Final[str] = "overseer/intake-fallback"
 
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156).
+#: The EventBridge-intake fallback writes ``overseer/intake-fallback/...``
+#: whenever the bus put fails, so any process emitting fleet events needs
+#: ``overseer`` granted readwrite even though the happy path never touches S3.
+S3_SURFACE = (s3_surface.literal("overseer", s3_surface.MODE_READWRITE),)
+
+#: Kept for back-compat (public module constant) — the real default, and the
+#: full fallback chain, now live in :mod:`krepis.aws_region`.
 DEFAULT_REGION: Final[str] = "us-east-1"
 MAX_BODY_CHARS: Final[int] = 4000
 
@@ -117,11 +126,10 @@ def _resolve_source(explicit: Optional[str]) -> Optional[str]:
 
 
 def _region() -> str:
-    return (
-        os.environ.get("AWS_REGION")
-        or os.environ.get("AWS_DEFAULT_REGION")
-        or DEFAULT_REGION
-    )
+    """Thin back-compat wrapper. Real resolution: :func:`krepis.aws_region.resolve_region`."""
+    from krepis.aws_region import resolve_region
+
+    return resolve_region()
 
 
 def _build_detail(
@@ -133,6 +141,8 @@ def _build_detail(
     dedup_key: Optional[str],
     channels: Optional[Dict[str, Optional[bool]]],
     disable_notification: Optional[bool],
+    state: Optional[str] = None,
+    identity_key: Optional[str] = None,
 ) -> Dict[str, Any]:
     hostname: Optional[str]
     try:
@@ -154,6 +164,12 @@ def _build_detail(
         "severity_raw": severity_raw,
         "body": body[:MAX_BODY_CHARS],
         "dedup_key": dedup_key,
+        # Condition lifecycle (alpha-engine-config-I8105). Optional and
+        # additive: origins with no lifecycle concept (direct Telegram sends)
+        # carry null, which is exactly "this producer does not track a
+        # condition", not "the condition is open".
+        "state": state,
+        "identity_key": identity_key,
         "channels": channels,
         "disable_notification": disable_notification,
         "runtime": {
@@ -212,6 +228,8 @@ def emit_alert_event(
     dedup_key: Optional[str] = None,
     channels: Optional[Dict[str, Optional[bool]]] = None,
     disable_notification: Optional[bool] = None,
+    state: Optional[str] = None,
+    identity_key: Optional[str] = None,
 ) -> bool:
     """Emit one structured alert event to the Overseer intake. Never raises.
 
@@ -233,6 +251,12 @@ def emit_alert_event(
         ``{"sns": True, "telegram": False}``; ``None`` values mean the
         channel was not attempted.
     :param disable_notification: Telegram silent-delivery flag when known.
+    :param state: Condition lifecycle — ``opened`` / ``still_open`` /
+        ``cleared``, or ``None`` when the origin tracks no condition. This is
+        what lets a consumer tell a live outage from a page whose condition
+        already ended (alpha-engine-config-I8105).
+    :param identity_key: Stable identity of the condition, carried by both a
+        page and its later clear so the two correlate onto one incident.
     """
     # Same defense-in-depth as alerts.publish: a consumer test that reaches
     # this path un-stubbed must not feed the production intake queue.
@@ -249,6 +273,8 @@ def emit_alert_event(
         dedup_key=dedup_key,
         channels=channels,
         disable_notification=disable_notification,
+        state=state,
+        identity_key=identity_key,
     )
 
     try:

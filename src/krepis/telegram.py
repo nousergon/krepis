@@ -115,10 +115,34 @@ def _truncate_for_telegram(text: str) -> str:
 def _escape_markdown(text: str) -> str:
     """Escape Telegram Markdown v1 special characters.
 
-    Replaces characters that Telegram interprets as formatting markers
+    Escapes characters Telegram interprets as formatting markers
     (``_``, `````, ``[``, ``]``) to prevent 400 Bad Request parse errors.
     Preserves ``*`` for bold markers which callers control via message
     templates.
+
+    **This SUBSTITUTED rather than escaped until 2026-08-13, and a substitution
+    emits a fact that is false** (`alpha-engine-config-I7168`). ``_`` became
+    ``-``, ``[`` became ``(``, and a backtick became an apostrophe — so every
+    identifier in every fleet alert was rewritten on the way to the operator.
+
+    Live instance: a box-health WARNING named an undeclared database as
+    ``/home/ec2-user/flow-doctor/flow-doctor.db``. That path does not exist. The
+    real file is ``flow_doctor.db``, and the box carries two OTHER files
+    genuinely named ``flow-doctor.db`` under ``morning-signal/``, already
+    declared, with different dispositions. So the alert did not merely look
+    wrong — it named a real, different file than the one it had found. The
+    detector's own output was correct throughout.
+
+    A path, a unit name, an S3 key and an ArcticDB symbol are identifiers: the
+    reader is expected to copy them into a command. Escaping preserves them;
+    substitution silently hands over something else. ``\\_`` renders as a
+    literal underscore under Markdown v1, so nothing about the original reason
+    for this function is given up.
+
+    The residual risk is a v1 parse error from an escape sequence Telegram
+    dislikes, and it is already covered: :func:`send_message` retries once
+    without ``parse_mode`` on exactly that 400, which sends the identical body
+    as plain text. Formatting degrades; the identifier survives either way.
 
     **``*`` is knowingly left unescaped, and that is not sufficient on its
     own.** The premise — that callers control every asterisk — holds for a
@@ -136,12 +160,15 @@ def _escape_markdown(text: str) -> str:
     :func:`send_message` retries once as plain text on this specific 400.
     Formatting is what degrades; delivery is not.
     """
+    # Backslash FIRST, or an escape this function adds could be neutralised by
+    # a backslash the caller's text already carried.
     return (
         text
-        .replace("_", "-")
-        .replace("`", "'")
-        .replace("[", "(")
-        .replace("]", ")")
+        .replace("\\", "\\\\")
+        .replace("_", "\\_")
+        .replace("`", "\\`")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
     )
 
 

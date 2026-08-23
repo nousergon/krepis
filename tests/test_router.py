@@ -494,9 +494,31 @@ class TestServedModelForDeployment:
             == "moonshotai/kimi-k3"
         )
 
-    def test_non_deployment_name_returns_none(self):
-        assert _router.served_model_for_deployment("deepseek-v4-flash") is None
-        assert _router.served_model_for_deployment("low") is None
+    def test_a_bare_registry_id_resolves_to_its_upstream_model(self):
+        """A call pinned with `resolve_model_spec` addresses the BARE
+        registry id, and litellm echoes it back as `resp.model`. Before this
+        resolved, every pinned call raised the alias-masquerade error in
+        `krepis.llm._resolve_group_served_model` — the same failure shape as
+        the {group}-{mid} half of config-I6543, which aborted the Think Tank
+        challenger arm for ten days. A bare id names a real entry with a real
+        price card; it is not a masquerade (alpha-engine-config-I7878)."""
+        assert (
+            _router.served_model_for_deployment("deepseek-v4-flash")
+            == "deepseek-v4-flash"
+        )
+        assert (
+            _router.served_model_for_deployment("kimi-k3")
+            == "moonshotai/kimi-k3"
+        )
+
+    def test_a_bare_group_name_still_returns_none(self):
+        """The masquerade this guard exists to reject. A group alias is not
+        a model id, carries no price card, and must never resolve."""
+        for group in ("low", "med", "high", "ultra"):
+            assert _router.served_model_for_deployment(group) is None
+
+    def test_an_unknown_name_returns_none(self):
+        assert _router.served_model_for_deployment("no-such-model") is None
 
     def test_mid_not_in_the_named_group_returns_none(self):
         # "kimi-k3" is an ultra member, not a low member.
@@ -1106,6 +1128,138 @@ class TestCLIResolveGroup:
             assert exc.value.code == 1
 
 
+# ── CLI resolve-shell-env ─────────────────────────────────────────────────
+# alpha-engine-config-I7373/G16: five runners each carried a byte-identical
+# `python3 -c` heredoc parsing `resolve --json`'s output into `KEY=value`
+# lines for `eval`. This pins the replacement's output shape so any of the
+# five bash call sites can regression-test their old-heredoc-vs-new-CLI
+# behavior against the same fixture.
+
+class TestCLIResolveShellEnv:
+    def test_output_shape(self, registry_file, monkeypatch, capsys):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys, "argv", ["krepis.router", "resolve-shell-env", "med"]
+                ):
+                    _router._cli()
+            captured = capsys.readouterr()
+            lines = [ln for ln in captured.out.splitlines() if ln]
+            keys = [ln.split("=", 1)[0] for ln in lines]
+            assert keys == [
+                "RESOLVED_MODEL",
+                "ROUTE",
+                "PROVIDER",
+                "ANTHROPIC_BASE_URL",
+                "DEPLOYMENT_ID",
+                "AUTH_TYPE",
+            ], (
+                "resolve-shell-env's KEY=value lines are a cross-repo shell "
+                "contract (alpha-engine-config's five *_run.sh scripts `eval` "
+                "them) — order and names must match the retired heredoc's"
+            )
+            values = dict(ln.split("=", 1) for ln in lines)
+            assert values["RESOLVED_MODEL"] == "deepseek-v4-flash"
+            assert values["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8971"
+            assert values["AUTH_TYPE"] == "placeholder"
+            assert values["DEPLOYMENT_ID"]
+            assert values["PROVIDER"]
+            assert values["ROUTE"]
+        finally:
+            _router._router = None
+
+    def test_output_is_eval_safe(self, registry_file, monkeypatch, capsys):
+        """The exact property the five runners depend on: `eval "$out"` sets
+        the named variables and nothing else, in a fresh shell."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys, "argv", ["krepis.router", "resolve-shell-env", "high"]
+                ):
+                    _router._cli()
+            captured = capsys.readouterr()
+            import subprocess
+
+            script = (
+                captured.out
+                + 'echo "RESOLVED_MODEL=$RESOLVED_MODEL"\n'
+                + 'echo "AUTH_TYPE=$AUTH_TYPE"\n'
+            )
+            proc = subprocess.run(
+                ["/bin/sh", "-c", script], capture_output=True, text=True, timeout=10
+            )
+            assert proc.returncode == 0, proc.stderr
+            assert "RESOLVED_MODEL=deepseek-v4-pro" in proc.stdout
+            assert "AUTH_TYPE=placeholder" in proc.stdout
+        finally:
+            _router._router = None
+
+    def test_no_group_exits_1(self, capsys):
+        with mock.patch.object(
+            sys, "argv", ["krepis.router", "resolve-shell-env"]
+        ):
+            with pytest.raises(SystemExit) as exc:
+                _router._cli()
+            assert exc.value.code == 1
+
+    def test_unresolvable_group_prints_nothing_to_stdout(
+        self, registry_file, monkeypatch, capsys
+    ):
+        """A caller doing `out="$(... ) " || true; [ -z "$out" ]` must still
+        detect the failure — no partial `KEY=value` output on a resolution
+        failure."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    sys,
+                    "argv",
+                    ["krepis.router", "resolve-shell-env", "not-a-real-group"],
+                ):
+                    with pytest.raises(Exception):
+                        _router._cli()
+            captured = capsys.readouterr()
+            assert captured.out == ""
+        finally:
+            _router._router = None
+
+    def test_missing_field_fails_closed(self, registry_file, monkeypatch, capsys):
+        """The I4453 failure mode: a resolved dict missing a required field
+        must abort with nothing printed to stdout, not silently emit a
+        partial environment that leaves e.g. AUTH_TYPE unset."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                with mock.patch.object(
+                    _router,
+                    "resolve_group_structured",
+                    return_value={"model": "x", "route": "y"},
+                ):
+                    with mock.patch.object(
+                        sys,
+                        "argv",
+                        ["krepis.router", "resolve-shell-env", "med"],
+                    ):
+                        with pytest.raises(SystemExit) as exc:
+                            _router._cli()
+                        assert exc.value.code == 1
+            captured = capsys.readouterr()
+            assert captured.out == ""
+            assert "missing fields" in captured.err
+        finally:
+            _router._router = None
+
+
 # ── resolve contract: schema + versioning ────────────────────────────────
 # Regression cover for alpha-engine-config-I4453 (the anthropic_base_url ->
 # api_base_url rename that broke all four consumers) and I4454 (groom_driver
@@ -1322,6 +1476,20 @@ class TestResolveExecContext:
         monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
         with pytest.raises(ValueError, match="Unknown execution context"):
             _router._resolve_exec_context("fargate")
+
+    def test_ci_is_a_declared_context(self, monkeypatch):
+        """alpha-engine-config-I7853 — a GitHub-hosted Actions runner.
+
+        Before this existed, crucible-research's judge smoke declared
+        `lambda` because there was no truer word, which R29 names as a
+        vocabulary gap rather than a consumer defect.
+        """
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        assert _router.EXEC_CONTEXT_CI == "ci"
+        assert _router.EXEC_CONTEXT_CI in _router.EXEC_CONTEXTS
+        assert _router._resolve_exec_context("ci") == "ci"
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ci")
+        assert _router._resolve_exec_context() == "ci"
 
     def test_context_is_never_inferred_from_lambda_env(self, monkeypatch):
         """R29 — declared, not inferred. AWS_LAMBDA_FUNCTION_NAME being set
@@ -1639,6 +1807,48 @@ class TestRouterIsNeverContextFiltered:
         finally:
             _router._router = None
 
+    def test_router_serves_ci_where_no_direct_entry_can(
+        self, reachability_registry, monkeypatch
+    ):
+        """alpha-engine-config-I7853 — the CI shape, asserted from both sides.
+
+        A GitHub-hosted runner has no egress proxy and no private-subnet
+        route, so ZERO direct entries are reachable from `ci` and none may
+        ever be (llm-egress-proxy-policy §2a CI row: custodial — one router
+        credential, no provider key). What makes that a workable shape rather
+        than a dead context is R27a: the router route carries no
+        `reachable_from` and is offered here exactly as it is everywhere else.
+        """
+        self._healthy_litellm(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                info = _router._resolve_group_json(
+                    "ultra", exec_context="ci", wire="openai")
+            assert info["route"] == "litellm_proxy"
+            assert info["exec_context"] == "ci"
+        finally:
+            _router._router = None
+
+    def test_ci_without_the_router_fails_closed_naming_the_context(
+        self, reachability_registry, monkeypatch, _no_litellm
+    ):
+        """The other side of the same shape: with the edge unreachable there is
+        nothing left, and that MUST raise rather than fall through to a direct
+        provider — a CI-reachable provider endpoint would be uncompelled egress
+        with nothing observing it."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reachability_registry))
+                with pytest.raises(ValueError) as exc:
+                    _router._resolve_group_json(
+                        "ultra", exec_context="ci", wire="openai")
+            assert "ci" in str(exc.value)
+        finally:
+            _router._router = None
+
     def test_no_registry_entry_may_declare_reachability_for_the_router(
         self, reachability_registry
     ):
@@ -1812,10 +2022,19 @@ class TestResolveGroupSpec:
         with pytest.raises(RuntimeError, match="auth_token_type"):
             _router.resolve_group_spec("med", exec_context="lambda")
 
-    def test_placeholder_auth_maps_to_no_credential_name(self, monkeypatch):
-        """`placeholder` means the local egress proxy holds the real key. It
-        is not a missing credential, and collapsing the two would break every
-        direct route from a context that can reach one."""
+    def test_placeholder_auth_maps_to_the_egress_placeholder_env(self, monkeypatch):
+        """`placeholder` means the local egress proxy holds the real key, and
+        the client sends a literal placeholder — NOT `None`.
+
+        `None` is not "no credential needed"; it means "fall back to
+        ModelSpec's built-in provider registry" (anthropic/openai/openrouter
+        only), which `deepseek` is not. A `None` here previously made
+        `ModelSpec.resolved_api_key_env()` raise "no api_key_env was
+        supplied" for every direct-provider egress_proxy fallback
+        (alpha-engine-config-I7031, morning-signal's canary 2026-08-12).
+        """
+        from krepis import model_registry as _mr
+
         self._patch(monkeypatch, self._route(
             auth_token_type="placeholder",
             provider="deepseek",
@@ -1826,7 +2045,10 @@ class TestResolveGroupSpec:
             primary_registry_id="deepseek-v4-flash-max",
         ))
         spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
-        assert spec.api_key_env is None
+        assert spec.api_key_env == _mr.EGRESS_PLACEHOLDER_ENV
+        # And the spec must actually construct — this is what raised before
+        # the fix (provider "deepseek" is not a krepis built-in).
+        assert spec.resolved_api_key_env() == _mr.EGRESS_PLACEHOLDER_ENV
 
     # ── per-consumer router credential ───────────────────────────────────
 
@@ -2185,3 +2407,551 @@ class TestAppConfigFailureIsObservable:
         with caplog.at_level("WARNING", logger="krepis.router"):
             assert _router._find_registry_from_appconfig() is None
         assert caplog.text == ""
+
+
+# ── the (url, credential) pair must be able to authenticate ────────────────
+
+
+class TestUnauthenticatablePairIsRefused:
+    """A per-consumer credential paired with the plaintext loopback URL cannot
+    authenticate, and `resolve_group_spec` used to return it as a SUCCESSFUL
+    resolution — `route == "litellm_proxy"`, `degraded == False`.
+
+    The credential is meaningful only AT the authenticated edge, which
+    exchanges it for the router's own key. The process behind that edge knows
+    the master key and nothing else, and has no database in which to resolve a
+    virtual key, so every call comes back
+    `400 {"error":{"message":"No connected db."}}`.
+
+    Measured (alpha-engine-config-I6965): morning-signal declared
+    KREPIS_ROUTER_CREDENTIAL_SECRET and not KREPIS_LITELLM_PROXY_URL, took the
+    loopback default, and aborted its configured primary on that 400 on EVERY
+    scheduled run from 2026-08-09 to 2026-08-12 — airing each episode from a
+    fallback that is direct-OpenRouter linkage, which
+    alpha-engine-config-I6367 forbids.
+
+    model-router-policy R20: a failed resolution fails CLOSED.
+    """
+
+    def _route(self, **over):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "med-deepseek-v4-flash-max",
+            "display_name": "deepseek-v4-flash-max (med)",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": _router.LITELLM_PROXY_URL,
+            "deployment_id": "med-deepseek-v4-flash-max",
+            "auth_token_type": "litellm_master_key",
+            "group": "med",
+            "registry_id": "litellm:group:med",
+            "primary_model": "deepseek-v4-flash",
+            "primary_registry_id": "deepseek-v4-flash-max",
+            "capabilities": {},
+            "params": {"max_tokens": 8192, "structured_outputs": True},
+        }
+        route.update(over)
+        return route
+
+    def _patch(self, monkeypatch, route):
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+
+    def test_consumer_credential_on_the_loopback_process_raises(self, monkeypatch):
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(monkeypatch, self._route())
+        with pytest.raises(RuntimeError) as exc:
+            _router.resolve_group_spec("med", exec_context="ec2")
+        msg = str(exc.value)
+        assert "cannot authenticate" in msg
+        # The message must carry BOTH halves and the remedy — a consumer author
+        # reading only "authentication failed" learns nothing about which of
+        # the two independently-resolved values to change.
+        assert _router.LITELLM_PROXY_URL in msg
+        assert "ROUTER_CONSUMER_MORNINGSIGNAL" in msg
+        assert _router.LITELLM_PROXY_URL_ENV in msg
+
+    def test_master_key_on_the_loopback_process_still_resolves(self, monkeypatch):
+        """R27d: a co-tenant consumer may address loopback. The master key is
+        what that process can actually validate, so this arrangement is
+        legitimate and must not be swept up."""
+        monkeypatch.delenv(_router.ROUTER_CREDENTIAL_SECRET_ENV, raising=False)
+        self._patch(monkeypatch, self._route())
+        spec, route = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "LITELLM_MASTER_KEY"
+        assert route["route"] == "litellm_proxy"
+
+    def test_consumer_credential_on_the_edge_resolves(self, monkeypatch):
+        """The whole point of a per-consumer credential — addressed to the edge
+        it is meaningful at."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(
+            monkeypatch,
+            self._route(api_base_url="https://router.nousergon.ai:8443"),
+        )
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.api_key_env == "ROUTER_CONSUMER_MORNINGSIGNAL"
+        assert spec.base_url == "https://router.nousergon.ai:8443"
+
+    def test_the_edge_may_itself_be_on_loopback_over_tls(self, monkeypatch):
+        """Scheme is half the predicate. An edge terminating TLS on loopback is
+        a legitimate deployment; refusing it would make the guard a rule about
+        WHERE the consumer runs, which is exactly what R27a forbids."""
+        monkeypatch.setenv(
+            _router.ROUTER_CREDENTIAL_SECRET_ENV, "ROUTER_CONSUMER_MORNINGSIGNAL"
+        )
+        self._patch(monkeypatch, self._route(api_base_url="https://127.0.0.1:8443"))
+        spec, _ = _router.resolve_group_spec("med", exec_context="ec2")
+        assert spec.base_url == "https://127.0.0.1:8443"
+
+    @pytest.mark.parametrize(
+        "url,loopback",
+        [
+            ("http://127.0.0.1:8980", True),
+            ("http://localhost:8980", True),
+            ("http://[::1]:8980", True),
+            ("http://127.1.2.3:8980", True),
+            ("https://127.0.0.1:8443", False),
+            ("https://router.nousergon.ai:8443", False),
+            ("http://router.nousergon.ai:8443", False),
+            ("", False),
+            ("not a url", False),
+        ],
+    )
+    def test_plaintext_loopback_detection(self, url, loopback):
+        assert _router._is_plaintext_loopback(url) is loopback
+
+
+# ── R4 on the resolution path (model-router-policy §3.1) ─────────────────
+#
+# _resolve_group_json filtered on execution-context reachability and on wire
+# format, but never on `status`. A dead entry standing AHEAD of a live one in
+# a group's chain was therefore resolved and handed to the caller as its route
+# — R4 ("not in a group and not callable by name") violated on the resolution
+# contract, which is the one surface every consumer applies verbatim.
+#
+# Today's registry happens to declare every dead member AFTER a live one, so
+# this changes nothing about what resolves right now. That is exactly why it
+# needs a test: the guard's whole value is for the ordering nobody has written
+# yet, and a fixture built from today's registry would pass without it.
+
+_DEAD_FIRST_REGISTRY = """
+schema_version: 1
+
+model_groups:
+  low:
+    - dead-leader
+    - live-follower
+
+models:
+  - id: dead-leader
+    provider: zhipu
+    route: egress_proxy
+    model: qwen3-max
+    api_base: http://127.0.0.1:8974/v1
+    reachable_from: [laptop, ec2]
+    status: unavailable
+  - id: live-follower
+    provider: deepseek
+    route: egress_proxy
+    model: deepseek-v4-flash
+    api_base: http://127.0.0.1:8971/v1
+    reachable_from: [laptop, ec2]
+    status: active
+"""
+
+
+@pytest.fixture()
+def dead_first_registry(tmp_path):
+    p = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+    p.write_text(_DEAD_FIRST_REGISTRY)
+    return p
+
+
+class TestStatusFilterOnResolution:
+    def _resolve(self, monkeypatch, registry_path):
+        """Resolve with the router route probed as DOWN, so the chain is walked.
+
+        Degraded mode is the only path that reaches the direct entries, and it
+        is where a dead leader would be handed out.
+        """
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(_router, "_probe_egress_proxy", lambda *a, **k: True)
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "http://127.0.0.1:1")
+                return _router.resolve_group_structured("low", exec_context="laptop")
+        finally:
+            _router._router = None
+
+    def test_a_dead_leader_is_skipped_and_the_live_follower_serves(
+        self, monkeypatch, dead_first_registry
+    ):
+        info = self._resolve(monkeypatch, dead_first_registry)
+        assert info["registry_id"] == "live-follower"
+        assert info["model"] == "deepseek-v4-flash"
+
+    def test_the_skip_names_status_so_it_is_not_read_as_unreachable(
+        self, monkeypatch, dead_first_registry
+    ):
+        """R29's first obligation: the three reasons must stay distinguishable.
+
+        "excluded by status", "not reachable from this context" and "unhealthy"
+        are three different answers, and a consumer reading skipped_entries has
+        to be able to tell which one it got.
+        """
+        info = self._resolve(monkeypatch, dead_first_registry)
+        skips = {s["registry_id"]: s["reason"] for s in info["skipped_entries"]}
+        assert "dead-leader" in skips
+        assert "unavailable" in skips["dead-leader"]
+        assert "R4" in skips["dead-leader"]
+        assert "reachable_from" not in skips["dead-leader"]
+
+
+# ── Single registered model: the pinned-model path (config-I7878) ─────────
+
+_PINNED_REGISTRY = """
+schema_version: 1
+model_groups:
+  low: [in-a-group, other-member]
+models:
+  - id: in-a-group
+    model: vendor/in-a-group
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    params:
+      max_tokens: 8192
+      structured_outputs: false
+    capabilities:
+      web_search: false
+      tool_choice: false
+      prompt_caching: false
+      batches: false
+      automatic_prefix_caching: true
+    cost_per_1m_input: 0.14
+    cost_per_1m_output: 0.28
+    status: active
+    upstream_host: api.deepseek.com
+  - id: other-member
+    model: vendor/other-member
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    status: active
+    upstream_host: openrouter.ai
+  - id: by-name-only
+    model: vendor/by-name-only
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    group: low
+    group_role: fallback
+    params:
+      max_tokens: 4096
+    status: active
+    upstream_host: openrouter.ai
+  - id: retired-row
+    model: vendor/retired-row
+    provider: openrouter
+    route: egress_proxy
+    api_base: http://127.0.0.1:8990
+    reachable_from: [laptop, ec2]
+    endpoints:
+      openai: http://127.0.0.1:8990
+    status: deprecated
+    upstream_host: openrouter.ai
+"""
+
+
+@pytest.fixture
+def pinned_registry(tmp_path):
+    p = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+    p.write_text(_PINNED_REGISTRY, encoding="utf-8")
+    return p
+
+
+class TestResolveModel:
+    """`resolve_model_structured` / `resolve_model_spec` — the pinned-model
+    path (alpha-engine-config-I7878).
+
+    It exists for the call sites whose SUBJECT is a named model rather than a
+    capability tier: a concordance harness measuring agreement against a
+    specific model, where a group would silently vary the thing being
+    measured between runs. Addressing a REGISTRY ENTRY ID keeps that a
+    layer-1 fact — before this existed, the only way to pin a model was to
+    build a provider client at the call site, which is why both of the
+    fleet's remaining direct-OpenRouter linkages were pinned-model sites.
+    """
+
+    def _resolve(self, monkeypatch, registry_path, model_id, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                kw.setdefault("exec_context", "lambda")
+                kw.setdefault("wire", "openai")
+                return _router.resolve_model_structured(model_id, **kw)
+        finally:
+            _router._router = None
+
+    def test_addresses_the_registry_id_on_the_wire(
+        self, monkeypatch, pinned_registry
+    ):
+        """The derivation layer emits every ACTIVE entry as its own
+        `model_name: <mid>` deployment ("Individual model entries (for direct
+        calls by name)"), so the registry id IS the wire name. Unlike the
+        group path there is no `{group}-{mid}` qualification and no chain."""
+        info = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert info["deployment_id"] == "by-name-only"
+        assert info["model"] == "by-name-only"
+        assert info["route"] == "litellm_proxy"
+        assert info["api_base_url"] == "https://router.example:8443"
+        assert info["auth_token_type"] == "litellm_master_key"
+
+    def test_registry_id_names_the_entry_that_served(
+        self, monkeypatch, pinned_registry
+    ):
+        """Unlike the group route — whose `registry_id` is the synthetic
+        `litellm:group:{group}` naming no entry — a pinned resolution can name
+        the exact row, so a cost record attributes to something real."""
+        info = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert info["registry_id"] == "by-name-only"
+        assert info["primary_registry_id"] == "by-name-only"
+        assert info["primary_model"] == "vendor/by-name-only"
+
+    def test_group_is_emitted_only_for_a_real_member(
+        self, monkeypatch, pinned_registry
+    ):
+        """`by-name-only` carries a vestigial top-level `group: low` that the
+        registry's own notes describe as not read while the id is absent from
+        `model_groups` (claude-haiku-4-5, Brian ruling 2026-07-29). Copying it
+        into the route would report a membership the registry denies."""
+        member = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        assert member["group"] == "low"
+        by_name = self._resolve(monkeypatch, pinned_registry, "by-name-only")
+        assert by_name["group"] == ""
+
+    def test_params_and_pricing_come_from_the_entry(
+        self, monkeypatch, pinned_registry
+    ):
+        info = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        assert info["params"]["max_tokens"] == 8192
+        assert info["params"]["structured_outputs"] is False
+        assert info["cache_pricing"]["cost_per_1m_input"] == 0.14
+        assert info["automatic_prefix_caching"] is True
+
+    def test_conforms_to_the_resolve_schema(
+        self, monkeypatch, pinned_registry
+    ):
+        """Same versioned layer-4 contract as the group path — a consumer must
+        not have to learn a second shape to pin a model."""
+        jsonschema = pytest.importorskip("jsonschema")
+        schema = _load_resolve_schema()
+        info = self._resolve(monkeypatch, pinned_registry, "in-a-group")
+        jsonschema.validate(info, schema)
+
+    def test_unknown_id_names_what_is_addressable(
+        self, monkeypatch, pinned_registry
+    ):
+        """A hand-written model id has already silently killed a live consumer
+        (morning-signal, 2026-07-15). A bare "not found" leaves the caller no
+        way to discover the id, and the provider-slug-vs-registry-id confusion
+        is the exact mistake a migrating call site makes."""
+        with pytest.raises(ValueError) as exc:
+            self._resolve(
+                monkeypatch, pinned_registry, "deepseek/deepseek-v4-flash")
+        msg = str(exc.value)
+        assert "registry" in msg.lower()
+        assert "in-a-group" in msg and "by-name-only" in msg
+        assert "retired-row" not in msg, (
+            "a status-excluded row is not addressable and must not be "
+            "advertised as an alternative"
+        )
+
+    def test_a_status_excluded_row_is_refused(
+        self, monkeypatch, pinned_registry
+    ):
+        """R4: the derivation layer filters these out of the proxy config, so
+        the deployment does not exist at the edge. Saying so here beats a 400
+        from the router that names nothing."""
+        with pytest.raises(ValueError) as exc:
+            self._resolve(monkeypatch, pinned_registry, "retired-row")
+        assert "deprecated" in str(exc.value)
+
+    def test_an_unadmitted_edge_raises_rather_than_reaching_for_the_provider(
+        self, monkeypatch, pinned_registry
+    ):
+        """THE point of this path. Group resolution may fall through to a
+        direct provider entry because a group carries a declared chain of
+        registry-sanctioned substitutes. A pinned model has no chain, so the
+        only available "fallback" is a direct provider client for the same
+        model — the DLP-unscanned linkage Brian's 2026-08-03 ruling forbids
+        (alpha-engine-config-I6367). Fail closed (R20/R26)."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(pinned_registry))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (False, "https://router.example:8443",
+                             ["LITELLM_MASTER_KEY not resolvable"]),
+                )
+                with pytest.raises(RuntimeError) as exc:
+                    _router.resolve_model_structured(
+                        "in-a-group", exec_context="lambda", wire="openai")
+        finally:
+            _router._router = None
+        msg = str(exc.value)
+        assert "LITELLM_MASTER_KEY not resolvable" in msg, (
+            "the skip reason is frequently the only artifact a weekly "
+            "unattended caller leaves behind"
+        )
+        assert "router.example" in msg
+
+    def test_unknown_wire_format_is_refused(
+        self, monkeypatch, pinned_registry
+    ):
+        with pytest.raises(ValueError) as exc:
+            self._resolve(
+                monkeypatch, pinned_registry, "in-a-group", wire="grpc")
+        assert "wire format" in str(exc.value)
+
+    def test_exec_context_is_recorded_on_the_route(
+        self, monkeypatch, pinned_registry
+    ):
+        """R29: declared by the caller, never inferred. The edge itself is
+        never gated by context (R28's carve-out / R27a.4), so a pinned model
+        resolves from EVERY declared context — but the route must still say
+        which context asked. Iterating `EXEC_CONTEXTS` rather than a literal
+        list means a context added later (krepis-PR171 added `ci`) is covered
+        the day it is declared, not the day someone remembers this test."""
+        for ctx in _router.EXEC_CONTEXTS:
+            info = self._resolve(
+                monkeypatch, pinned_registry, "in-a-group", exec_context=ctx)
+            assert info["exec_context"] == ctx
+            assert info["route"] == "litellm_proxy"
+
+
+class TestResolveModelSpec:
+    def _spec(self, monkeypatch, registry_path, model_id, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                kw.setdefault("exec_context", "lambda")
+                kw.setdefault("wire", "openai")
+                return _router.resolve_model_spec(model_id, **kw)
+        finally:
+            _router._router = None
+
+    def test_returns_a_router_edge_spec_not_an_in_process_router(
+        self, monkeypatch, pinned_registry
+    ):
+        """Same trap as the group path: `provider: litellm` binds to
+        TRANSPORT_LITELLM, an in-process Router that calls each provider
+        DIRECTLY from the consumer reading OPENROUTER_API_KEY from the
+        environment. Emitting it verbatim would egress unscanned."""
+        from krepis.llm_config import PROVIDER_REGISTRY, TRANSPORT_OPENAI
+
+        spec, route = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.provider == _router.ROUTER_EDGE_PROVIDER
+        assert spec.provider not in PROVIDER_REGISTRY
+        assert spec.transport == TRANSPORT_OPENAI
+        assert spec.model == "by-name-only"
+        assert spec.base_url == "https://router.example:8443"
+        assert spec.api_key_env and route["route"] == "litellm_proxy"
+
+    def test_spec_carries_the_real_registry_id_for_cost_attribution(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.registry_id == "by-name-only"
+
+    def test_caller_overrides_beat_the_registry_params(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(
+            monkeypatch, pinned_registry, "in-a-group",
+            max_tokens=1234, structured_outputs=True,
+        )
+        assert spec.max_tokens == 1234
+        assert spec.structured_outputs is True
+
+    def test_registry_params_apply_when_the_caller_states_none(
+        self, monkeypatch, pinned_registry
+    ):
+        spec, _ = self._spec(monkeypatch, pinned_registry, "in-a-group")
+        assert spec.max_tokens == 8192
+        assert spec.structured_outputs is False
+
+    def test_no_provider_credential_reaches_the_call_site(
+        self, monkeypatch, pinned_registry
+    ):
+        """The whole deliverable: a migrated call site holds no provider name,
+        no base URL and no provider key. `by-name-only` is an OpenRouter-
+        upstream entry, and the spec it produces must name the router edge —
+        never OPENROUTER_API_KEY, never openrouter.ai."""
+        spec, _ = self._spec(monkeypatch, pinned_registry, "by-name-only")
+        assert spec.api_key_env != "OPENROUTER_API_KEY"
+        assert "openrouter.ai" not in (spec.base_url or "")
+        assert spec.provider != "openrouter"
+
+
+class TestOneAdapterAndOneAdmission:
+    """R6, applied to this module's own internals: the group path and the
+    pinned path share ONE edge-admission decision and ONE route->ModelSpec
+    adapter. Two copies of either would be a second derivation of the same
+    routing fact, and that has already mis-authenticated once (I7031)."""
+
+    def test_both_public_spec_helpers_go_through_the_one_adapter(
+        self, monkeypatch
+    ):
+        seen = []
+        monkeypatch.setattr(
+            _router, "_route_to_spec",
+            lambda route, **kw: seen.append(kw.get("requested")) or "SPEC",
+        )
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: {"x": 1})
+        monkeypatch.setattr(
+            _router, "resolve_model_structured", lambda *a, **k: {"x": 1})
+        _router.resolve_group_spec("med")
+        _router.resolve_model_spec("some-id")
+        assert seen == ["group=med", "model=some-id"]
+
+    def test_the_admission_helper_is_the_only_edge_probe(self):
+        """A second inline `_resolve_litellm_proxy_url()` + health-probe block
+        would drift from this one. The probe that could only speak one scheme
+        reported a live router as unreachable for weeks — one copy is what
+        makes fixing that fix it everywhere."""
+        import inspect
+
+        src = inspect.getsource(_router)
+        assert src.count("_resolve_litellm_proxy_url()") == 2, (
+            "expected exactly the definition and its single call inside "
+            "_litellm_edge_admission"
+        )

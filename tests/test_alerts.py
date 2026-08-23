@@ -141,7 +141,8 @@ class TestPublish:
 
     def test_severity_push_mapping(self, fake_boto3):
         """error/critical → disable_notification=False (push);
-        info/warning → disable_notification=True (silent)."""
+        info/warning → disable_notification=True (no push — still sent,
+        see test_non_push_severity_still_delivers_to_telegram below)."""
         fake, _sts, _sns = fake_boto3
         from krepis import telegram as tg_mod
 
@@ -156,6 +157,37 @@ class TestPublish:
                     alerts.publish("x", severity=sev)
                     silent_kwarg = send.call_args.kwargs.get("disable_notification")
                     assert silent_kwarg is expect_silent, f"severity={sev}: expected silent={expect_silent} got {silent_kwarg}"
+
+    def test_non_push_severity_still_delivers_to_telegram(self, fake_boto3):
+        """Pins the corrected contract (alpha-engine-config-I7857): a
+        severity outside SEVERITY_PHONE_PUSH is NOT a delivery gate. Both
+        SNS and Telegram must still be invoked — the message reaches the
+        chat and the SNS-subscribed inbox exactly as at 'error', only
+        without a phone buzz. Regressing this back to "info/warning don't
+        publish" is the exact bug this issue fixed."""
+        fake, _sts, sns = fake_boto3
+        from krepis import telegram as tg_mod
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            for sev in ("info", "warning"):
+                sns.publish.reset_mock()
+                with patch.object(tg_mod, "send_message", return_value=True) as send:
+                    result = alerts.publish("x", severity=sev, source="test")
+
+                sns.publish.assert_called_once()
+                send.assert_called_once()
+                assert result.sns.ok is True
+                assert result.telegram.ok is True
+                # No-push, not no-send: disable_notification=True, message sent.
+                assert send.call_args.kwargs.get("disable_notification") is True
+                sent_text = send.call_args.args[0] if send.call_args.args else send.call_args.kwargs.get("message")
+                assert sent_text == f"[{sev.upper()}] test: x"
+
+    def test_severity_phone_push_alias_matches_canonical(self):
+        """SEVERITY_PUSH is a deprecated alias (CONTRIBUTING.md additive-only
+        API rule) for SEVERITY_PHONE_PUSH — same object, same members."""
+        assert alerts.SEVERITY_PUSH is alerts.SEVERITY_PHONE_PUSH
+        assert alerts.SEVERITY_PHONE_PUSH == frozenset({"error", "critical"})
 
     def test_sns_subject_truncated_and_sanitized(self, fake_boto3):
         fake, _sts, sns = fake_boto3
@@ -860,3 +892,474 @@ class TestDryRun:
                 ])
         assert rc == 0
         boom.assert_not_called()
+
+
+# ─── Source-mute (v0.57.0) ───────────────────────────────────────────────────
+
+
+@pytest.fixture
+def fake_boto3_with_ssm():
+    """boto3 stub extending fake_boto3 with an SSM client whose
+    ``get_parameter`` return value tests control via ``_ssm_value``."""
+    sts_client = MagicMock()
+    sts_client.get_caller_identity.return_value = {"Account": "711398986525"}
+    sns_client = MagicMock()
+    sns_client.publish.return_value = {"MessageId": "test-msg-id-abc123"}
+    ssm_client = MagicMock()
+
+    fake = MagicMock()
+
+    def _client(service: str, **kwargs):
+        if service == "sts":
+            return sts_client
+        if service == "sns":
+            return sns_client
+        if service == "ssm":
+            return ssm_client
+        raise AssertionError(f"unexpected boto3 client request: {service}")
+
+    fake.client.side_effect = _client
+    return fake, sts_client, sns_client, ssm_client
+
+
+def _ssm_value(ssm_client, value: str) -> None:
+    ssm_client.get_parameter.return_value = {"Parameter": {"Value": value}}
+
+
+class TestFetchSourceMutes:
+    def test_missing_parameter_returns_empty(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_malformed_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, "not json")
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_non_list_json_fails_open(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '{"not": "a list"}')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+    def test_valid_list_parsed(self, fake_boto3_with_ssm):
+        fake, _sts, _sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            entries = alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM)
+        assert entries == [
+            {"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}
+        ]
+
+    def test_boto3_unavailable_fails_open(self, monkeypatch):
+        with patch.dict("sys.modules", {"boto3": None}):
+            assert alerts._fetch_source_mutes(alerts.DEFAULT_MUTE_SSM_PARAM) == []
+
+
+class TestFindLiveMute:
+    def test_matches_prefix_and_live(self):
+        entries = [
+            {
+                "source_prefix": "metron",
+                "expires_at": "2099-01-01T00:00:00Z",
+                "reason": "x",
+            }
+        ]
+        assert alerts._find_live_mute("metron/deploy", entries) == entries[0]
+
+    def test_no_match_different_source(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("crucible-executor", entries) is None
+
+    def test_expired_entry_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_missing_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_unparseable_expires_at_does_not_match(self):
+        entries = [{"source_prefix": "metron", "expires_at": "not-a-date"}]
+        assert alerts._find_live_mute("metron/deploy", entries) is None
+
+    def test_none_source_never_matches(self):
+        entries = [{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]
+        assert alerts._find_live_mute(None, entries) is None
+
+    def test_non_dict_entries_skipped(self):
+        assert alerts._find_live_mute("metron/deploy", ["not-a-dict"]) is None
+
+
+class TestPublishSourceMute:
+    def test_suppressed_when_source_matches_live_mute(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(
+            ssm,
+            '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z", '
+            '"reason": "focus on crucible"}]',
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                side_effect=AssertionError("telegram reached despite live mute"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is True
+        assert "metron" in result.mute_reason
+        assert result.any_ok is True
+        sns.publish.assert_not_called()
+
+    def test_not_suppressed_when_mute_expired(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2000-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_not_suppressed_for_non_matching_source(self, fake_boto3_with_ssm):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("exec failed", source="crucible-executor")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_no_mute_list_does_not_suppress(self, fake_boto3_with_ssm):
+        from botocore.exceptions import ClientError
+
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        ssm.get_parameter.side_effect = ClientError(
+            {"Error": {"Code": "ParameterNotFound", "Message": "absent"}},
+            "GetParameter",
+        )
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(
+                alerts, "_publish_telegram",
+                return_value=alerts.ChannelResult(ok=True, detail="sent"),
+            ):
+                result = alerts.publish("deploy failed", source="metron/deploy")
+        assert result.muted is False
+        sns.publish.assert_called_once()
+
+    def test_mute_checked_before_dedup(self, fake_boto3_with_ssm):
+        """A muted source must not reach the (S3) dedup marker check —
+        the fixture only registers sts/sns/ssm clients, so an
+        unexpected boto3.client('s3') call raises."""
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            result = alerts.publish(
+                "deploy failed", source="metron/deploy",
+                dedup_key="metron-deploy-failed",
+            )
+        assert result.muted is True
+        assert result.dedup_skipped is False
+        ssm.get_parameter.assert_called_once()
+
+    def test_cli_stderr_reports_muted(self, fake_boto3_with_ssm, capsys):
+        fake, _sts, sns, ssm = fake_boto3_with_ssm
+        _ssm_value(ssm, '[{"source_prefix": "metron", "expires_at": "2099-01-01T00:00:00Z"}]')
+        with patch.dict("sys.modules", {"boto3": fake}):
+            rc = alerts.main([
+                "publish", "--message", "x", "--source", "metron/deploy",
+            ])
+        captured = capsys.readouterr()
+        assert rc == 0
+        assert "muted=True" in captured.err
+
+
+# ── Condition lifecycle: the open/clear pair (alpha-engine-config-I8105) ─────
+#
+# Before this, every publisher here was write-once: it emitted on detection and
+# emitted nothing when the condition ended, so a page and a live outage were
+# indistinguishable downstream. These tests pin the three things that make a
+# clear usable rather than decorative — it is PAIRABLE (identity_key), it is
+# MACHINE-READABLE (state on the event), and it NEVER PUSHES.
+
+
+class TestDiffConditions:
+    def test_three_way_split(self):
+        opened, still_open, cleared = alerts.diff_conditions(
+            ["a", "b"], ["b", "c"]
+        )
+        assert opened == ["c"]
+        assert still_open == ["b"]
+        assert cleared == ["a"]
+
+    def test_empty_previous_opens_everything(self):
+        assert alerts.diff_conditions([], ["x", "y"]) == (["x", "y"], [], [])
+
+    def test_empty_current_clears_everything(self):
+        assert alerts.diff_conditions(["x", "y"], []) == ([], [], ["x", "y"])
+
+    def test_both_empty(self):
+        assert alerts.diff_conditions([], []) == ([], [], [])
+
+    def test_sorted_for_stable_emission_order(self):
+        opened, _still, cleared = alerts.diff_conditions(["z", "m"], ["q", "b"])
+        assert opened == ["b", "q"]
+        assert cleared == ["m", "z"]
+
+    def test_direction_is_not_symmetric(self):
+        # The regression this guards: a call site reading the difference
+        # backwards emits a clear for a condition that just STARTED.
+        _opened, _still, cleared = alerts.diff_conditions(["was"], ["now"])
+        assert cleared == ["was"]
+
+
+class TestFormatMessageState:
+    def test_cleared_carries_visible_marker(self):
+        out = alerts._format_message("disk high", "info", "box-health", "cleared")
+        assert out == "[INFO] box-health: RESOLVED — disk high"
+
+    def test_opened_renders_exactly_as_before(self):
+        assert (
+            alerts._format_message("boom", "error", "src", "opened")
+            == "[ERROR] src: boom"
+        )
+
+    def test_still_open_renders_exactly_as_before(self):
+        assert (
+            alerts._format_message("boom", "error", "src", "still_open")
+            == "[ERROR] src: boom"
+        )
+
+    def test_default_state_is_opened(self):
+        assert alerts._format_message("boom", "error", "src") == "[ERROR] src: boom"
+
+
+class TestPublishState:
+    def test_unknown_state_raises(self, fake_boto3):
+        with pytest.raises(ValueError, match="unknown state"):
+            alerts.publish("boom", state="resolved")
+
+    def test_state_and_identity_reach_the_event(self, fake_boto3, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return True
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(
+                    alerts, "_publish_telegram",
+                    return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                ):
+                    with patch.object(alerts.fleet_events, "emit_alert_event", _capture):
+                        result = alerts.publish(
+                            "boom", source="box-health",
+                            state="still_open", identity_key="unit-x-1234",
+                        )
+        assert captured["state"] == "still_open"
+        assert captured["identity_key"] == "unit-x-1234"
+        assert result.state == "still_open"
+        assert result.identity_key == "unit-x-1234"
+
+    def test_identity_key_defaults_to_dedup_key(self, fake_boto3, monkeypatch):
+        # Pre-existing dedup-keyed publishers become pairable without touching
+        # their call sites.
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(alerts, "_check_dedup_marker", return_value=(False, "")):
+                    with patch.object(alerts, "_write_dedup_marker"):
+                        with patch.object(
+                            alerts, "_publish_telegram",
+                            return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                        ):
+                            with patch.object(
+                                alerts.fleet_events, "emit_alert_event",
+                                lambda **kw: captured.update(kw),
+                            ):
+                                result = alerts.publish("boom", dedup_key="dk-1")
+        assert captured["identity_key"] == "dk-1"
+        assert result.identity_key == "dk-1"
+
+    def test_default_state_is_opened_on_the_event(self, fake_boto3, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        fake, _sts, _sns = fake_boto3
+        captured = {}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(
+                    alerts, "_publish_telegram",
+                    return_value=alerts.ChannelResult(ok=True, detail="sent"),
+                ):
+                    with patch.object(
+                        alerts.fleet_events, "emit_alert_event",
+                        lambda **kw: captured.update(kw),
+                    ):
+                        alerts.publish("boom")
+        assert captured["state"] == "opened"
+
+
+class TestPublishTelegramSilent:
+    def test_silent_true_forces_no_push_at_pushing_severity(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="critical", silent=True)
+        assert sent["disable_notification"] is True
+
+    def test_silent_none_keeps_severity_default(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="critical", silent=None)
+        assert sent["disable_notification"] is False
+
+    def test_silent_false_is_not_an_escalation(self):
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="info", silent=False)
+        assert sent["disable_notification"] is True
+
+
+class TestPublishClear:
+    def test_requires_identity_key(self):
+        with pytest.raises(ValueError, match="identity_key is required"):
+            alerts.publish_clear("all good", identity_key="")
+
+    def test_clear_is_info_cleared_silent_and_undeduped(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured["message"] = message
+            captured.update(kwargs)
+            return alerts.PublishResult()
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        alerts.publish_clear(
+            "timer job failing: x", identity_key="key-1", source="box-health"
+        )
+        assert captured["severity"] == alerts.CLEAR_SEVERITY == "info"
+        assert captured["state"] == "cleared"
+        assert captured["identity_key"] == "key-1"
+        assert captured["silent"] is True
+        # The load-bearing one: a clear must NOT carry the page's dedup key,
+        # or the page's own still-live marker swallows its terminator.
+        assert captured["dedup_key"] is None
+
+    def test_clear_never_pushes_even_if_info_starts_pushing(
+        self, fake_boto3, monkeypatch
+    ):
+        # Guards the future change that would otherwise make every all-clear
+        # in the fleet buzz a phone: widening SEVERITY_PHONE_PUSH.
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.setattr(
+            alerts, "SEVERITY_PHONE_PUSH",
+            frozenset({"info", "warning", "error", "critical"}),
+        )
+        fake, _sts, _sns = fake_boto3
+        sent = {}
+
+        def _send(msg, disable_notification=False):
+            sent["disable_notification"] = disable_notification
+            sent["text"] = msg
+            return True
+
+        with patch.dict("sys.modules", {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)}):
+            with patch.object(alerts, "_fetch_source_mutes", return_value=[]):
+                with patch.object(alerts.fleet_events, "emit_alert_event", lambda **kw: True):
+                    alerts.publish_clear(
+                        "disk high: root >=80% used",
+                        identity_key="k", source="box-health",
+                    )
+        assert sent["disable_notification"] is True
+        assert sent["text"].startswith("[INFO] box-health: RESOLVED — ")
+
+    def test_clear_dry_run_sends_nothing_and_reports_state(self):
+        result = alerts.publish_clear("x", identity_key="k", dry_run=True)
+        assert result.any_ok is True
+        assert result.state == "cleared"
+        assert result.identity_key == "k"
+
+
+class TestCliLifecycle:
+    def test_clear_subcommand_dry_run_exits_zero(self, capsys):
+        rc = alerts.main(
+            ["clear", "--message", "ok now", "--identity-key", "k-1", "--dry-run"]
+        )
+        assert rc == 0
+        assert "identity_key='k-1'" in capsys.readouterr().err
+
+    def test_clear_subcommand_requires_identity_key(self):
+        with pytest.raises(SystemExit):
+            alerts.main(["clear", "--message", "ok now"])
+
+    def test_publish_state_flag_rejects_unknown_value(self):
+        with pytest.raises(SystemExit):
+            alerts.main(["publish", "--message", "m", "--state", "resolved"])
+
+    def test_publish_forwards_state_and_identity(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured.update(kwargs)
+            return alerts.PublishResult(
+                sns=alerts.ChannelResult(ok=True, detail="ok")
+            )
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        rc = alerts.main(
+            [
+                "publish", "--message", "m",
+                "--state", "still_open", "--identity-key", "id-9",
+            ]
+        )
+        assert rc == 0
+        assert captured["state"] == "still_open"
+        assert captured["identity_key"] == "id-9"

@@ -152,3 +152,22 @@ jobs:
             exit 1
           fi
           echo "OK: PyPI v${version} sdist sha256 matches this build (${local_sha})."
+
+  # A failed publish leaves main and PyPI DIVERGED, and says so only in a red
+  # workflow run — a surface nobody watches. Measured 2026-08-13
+  # (alpha-engine-config-I7197): #141 and #142 merged five seconds apart both
+  # declaring 0.58.0. #142 published; #141's publish failed on the byte-identity
+  # check, exactly as designed — and the telegram escape fix it carried sat on
+  # main, installable by nothing, until a human happened to install 0.58.0 in a
+  # scratch venv and notice the old behaviour.
+  #
+  # This is the same class as alpha-engine-config-I7169: publishing is
+  # deploy-class work, and a red deploy on main blocks nothing and is green to
+  # the next author. TELEGRAM_* are org secrets at ALL visibility, so
+  # `secrets: inherit` needs nothing new.
+  notify-main-failure:
+    needs: [build, publish]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@313d910b152547902877e675873a00fdc1ecd95f
+    secrets: inherit
+
