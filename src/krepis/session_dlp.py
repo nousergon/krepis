@@ -110,6 +110,52 @@ GITLEAKS_CONFIG = os.path.join(GITLEAKS_DIR, "gitleaks-egress.toml")
 GITLEAKS_BIN = shutil.which("gitleaks") or "gitleaks"
 GITLEAKS_TIMEOUT_S = 8
 
+_EXTEND_PATH_RE = re.compile(
+    r'^\s*\[extend\]\s*$.*?^\s*path\s*=\s*"([^"]+)"', re.M | re.S
+)
+
+
+def _verify_gitleaks_config_chain() -> Optional[str]:
+    """Verify ``GITLEAKS_CONFIG`` and its ``[extend]`` chain resolve.
+
+    ``gitleaks-egress.toml`` extends its parent by a path that is
+    **relative to the gitleaks process's CWD**, not to the referencing
+    config file's directory (see the module docstring and the toml's own
+    header). The caller invokes gitleaks with ``cwd=GITLEAKS_DIR``
+    (below), so the extend target must resolve relative to
+    ``GITLEAKS_DIR``. Checking that here — before shelling out — turns a
+    misconfigured chain into a message naming exactly the missing file,
+    instead of a bare ``gitleaks exited 1`` that a caller has to
+    re-derive from stderr.
+
+    Returns ``None`` if the chain resolves; otherwise an error string
+    naming the missing file.
+    """
+    if not os.path.isfile(GITLEAKS_CONFIG):
+        return f"gitleaks config not found: {GITLEAKS_CONFIG!r}"
+    try:
+        with open(GITLEAKS_CONFIG, encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except OSError as exc:
+        return f"gitleaks config unreadable: {GITLEAKS_CONFIG!r} ({exc})"
+    m = _EXTEND_PATH_RE.search(text)
+    if not m:
+        # No [extend] stanza — nothing further to resolve.
+        return None
+    extend_path = m.group(1)
+    resolved = (
+        extend_path
+        if os.path.isabs(extend_path)
+        else os.path.join(GITLEAKS_DIR, extend_path)
+    )
+    if not os.path.isfile(resolved):
+        return (
+            f"gitleaks [extend].path {extend_path!r} in {GITLEAKS_CONFIG!r} "
+            f"resolves to {resolved!r} (against GITLEAKS_DIR={GITLEAKS_DIR!r}), "
+            "which does not exist"
+        )
+    return None
+
 # ── content substitution (mirrors llm_egress_proxy.py) ────────────────────
 
 # Large base64 blobs dominate scan time; replaced in the scan copy only.
@@ -287,6 +333,12 @@ def scan_request(body: bytes) -> Tuple[str, str, float, float]:
         leaf_line_ranges.append((first, len(scan_lines)))
     scan_text = "\n".join(scan_lines).encode("utf-8", errors="replace")
 
+    config_chain_error = _verify_gitleaks_config_chain()
+    if config_chain_error:
+        return DLP_SCAN_ERROR, (
+            f"{config_chain_error} — failing closed"
+        ), (_time.monotonic() - t0) * 1000.0, cache_ratio
+
     report_path = None
     tmp_path = None
     try:
@@ -303,6 +355,14 @@ def scan_request(body: bytes) -> Tuple[str, str, float, float]:
                 "--report-format", "json", "--report-path", report_path,
             ],
             capture_output=True, text=True, timeout=GITLEAKS_TIMEOUT_S,
+            # gitleaks-egress.toml's [extend] target is a RELATIVE path,
+            # resolved against the process CWD — not against the config
+            # file's own directory. Every consumer must run gitleaks from
+            # the config's directory or the extend chain silently fails
+            # to load (alpha-engine-config-I8267; the exact condition
+            # that blocked 100% of outbound traffic on the dashboard box
+            # in alpha-engine-config-I4451 / -I4511).
+            cwd=GITLEAKS_DIR,
         )
     except subprocess.TimeoutExpired:
         return DLP_SCAN_ERROR, (

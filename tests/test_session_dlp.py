@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 
 import pytest
 
+import krepis.session_dlp as session_dlp
 from krepis.session_dlp import (
     DLP_BLOCKED,
     DLP_DISABLED,
@@ -166,6 +168,150 @@ class TestScanIntegration:
         assert isinstance(verdict, DLPVerdict)
         assert verdict.ok
         assert not verdict.should_block
+
+
+# ── CWD fragility (alpha-engine-config-I8267) ──────────────────────────────
+
+# Real gitleaks-egress.toml + gitleaks-custom.toml chains checked into the
+# fleet, in preference order. Used only if present on this machine — CI and
+# other laptops may have none of them, in which case the class skips.
+_REAL_CONFIG_DIRS = [
+    os.path.expanduser("~/Development/claude-code-config/llm-routing"),
+    os.path.expanduser(
+        "~/Development/alpha-engine-config/infrastructure/groom-llm-routing"
+    ),
+]
+
+
+def _find_real_config_dir():
+    for d in _REAL_CONFIG_DIRS:
+        if os.path.isfile(os.path.join(d, "gitleaks-egress.toml")):
+            return d
+    return None
+
+
+_REAL_CONFIG_DIR = _find_real_config_dir()
+_GITLEAKS_ON_PATH = shutil.which("gitleaks") is not None
+
+
+@pytest.mark.skipif(
+    not (_GITLEAKS_ON_PATH and _REAL_CONFIG_DIR),
+    reason="gitleaks binary or a real gitleaks-egress.toml chain not available",
+)
+class TestGitleaksCwdFragility:
+    """`gitleaks-egress.toml` extends `./gitleaks-custom.toml` by a path
+    resolved against the gitleaks PROCESS CWD, not the config file's own
+    directory. A scan invoked from any CWD other than the config directory
+    must still resolve the chain and scan cleanly — it must NOT depend on
+    the caller's ambient working directory.
+
+    Verified red against pre-fix code (no `cwd=` on the subprocess.run
+    call in `session_dlp.scan_request`):
+
+        $ PYTHONPATH=$PWD/src .venv/bin/python3 -m pytest \\
+            tests/test_session_dlp.py::TestGitleaksCwdFragility -q
+        FAILED ... verdict == 'scan_error' (gitleaks exited 1 but wrote no
+        readable report ... open ./gitleaks-custom.toml: no such file or
+        directory)
+
+    Green once `cwd=GITLEAKS_DIR` is passed to the subprocess.run call.
+    """
+
+    def test_scan_succeeds_from_arbitrary_cwd(self, monkeypatch, tmp_path):
+        monkeypatch.setattr(session_dlp, "GITLEAKS_DIR", _REAL_CONFIG_DIR)
+        monkeypatch.setattr(
+            session_dlp,
+            "GITLEAKS_CONFIG",
+            os.path.join(_REAL_CONFIG_DIR, "gitleaks-egress.toml"),
+        )
+        # Force a cache miss so this scan actually shells out to gitleaks
+        # rather than being served from the leaf cache.
+        session_dlp._cache._clean.clear()
+        session_dlp._cache._config_sig = None
+
+        # The CWD the test process happens to be running from (pytest's
+        # rootdir) is NOT the config directory — that mismatch is exactly
+        # the bug. tmp_path makes the mismatch explicit and unambiguous.
+        monkeypatch.chdir(tmp_path)
+        assert os.getcwd() != _REAL_CONFIG_DIR
+
+        body = _body(
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {
+                    "role": "user",
+                    "content": "arbitrary-cwd DLP regression probe, "
+                    "no secret material here",
+                },
+            ]
+        )
+        verdict, reason, _ms, _ratio = scan_request(body)
+        assert verdict == DLP_OK, (
+            f"scan from CWD={tmp_path} against config in {_REAL_CONFIG_DIR} "
+            f"failed: {verdict} — {reason}"
+        )
+
+
+# ── extend-chain resolution error (alpha-engine-config-I8267 deliverable 3) ─
+
+
+class TestExtendChainVerification:
+    """A missing `[extend]` target must be named explicitly, not surfaced
+    only as an opaque `gitleaks exited 1`."""
+
+    def test_missing_extend_target_is_named(self, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / "gitleaks-cfg"
+        cfg_dir.mkdir()
+        cfg = cfg_dir / "gitleaks-egress.toml"
+        cfg.write_text(
+            'title = "test"\n\n[extend]\npath = "./gitleaks-custom.toml"\n'
+        )
+        # Deliberately do NOT create gitleaks-custom.toml.
+
+        monkeypatch.setattr(session_dlp, "GITLEAKS_DIR", str(cfg_dir))
+        monkeypatch.setattr(session_dlp, "GITLEAKS_CONFIG", str(cfg))
+
+        err = session_dlp._verify_gitleaks_config_chain()
+        assert err is not None
+        assert "gitleaks-custom.toml" in err
+        assert str(cfg_dir) in err
+
+    def test_present_extend_target_resolves_clean(self, tmp_path, monkeypatch):
+        cfg_dir = tmp_path / "gitleaks-cfg"
+        cfg_dir.mkdir()
+        cfg = cfg_dir / "gitleaks-egress.toml"
+        cfg.write_text(
+            'title = "test"\n\n[extend]\npath = "./gitleaks-custom.toml"\n'
+        )
+        (cfg_dir / "gitleaks-custom.toml").write_text('title = "custom"\n')
+
+        monkeypatch.setattr(session_dlp, "GITLEAKS_DIR", str(cfg_dir))
+        monkeypatch.setattr(session_dlp, "GITLEAKS_CONFIG", str(cfg))
+
+        assert session_dlp._verify_gitleaks_config_chain() is None
+
+    def test_missing_extend_target_blocks_with_named_error(
+        self, tmp_path, monkeypatch
+    ):
+        """scan_request must fail closed AND surface the named cause, not
+        the bare 'gitleaks exited 1' symptom."""
+        cfg_dir = tmp_path / "gitleaks-cfg"
+        cfg_dir.mkdir()
+        cfg = cfg_dir / "gitleaks-egress.toml"
+        cfg.write_text(
+            'title = "test"\n\n[extend]\npath = "./gitleaks-custom.toml"\n'
+        )
+
+        monkeypatch.setattr(session_dlp, "GITLEAKS_DIR", str(cfg_dir))
+        monkeypatch.setattr(session_dlp, "GITLEAKS_CONFIG", str(cfg))
+        session_dlp._cache._clean.clear()
+        session_dlp._cache._config_sig = None
+
+        body = _body([{"role": "user", "content": "hello"}])
+        verdict, reason, _ms, _ratio = scan_request(body)
+        assert verdict == DLP_SCAN_ERROR
+        assert "gitleaks-custom.toml" in reason
+        assert "does not exist" in reason
 
 
 # ── administrative disable ────────────────────────────────────────────────
