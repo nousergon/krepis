@@ -1681,6 +1681,11 @@ def _resolve_group_json(
         # comes from one entry.
         _primary_entry = models_by_id.get(live_ids[0], {})
         _group_pc, _group_apc = _caching_flags(_primary_entry)
+        # Per-model fact, read off the PRIMARY — never an any() over the
+        # group (model-portability-policy §5): a group-level capability
+        # derived from its members declares support the served model may not
+        # have, and the client then builds a request it cannot honor.
+        _group_stream = _mr.entry_declares_capability(_primary_entry, "streaming")
         _cache_pricing = {}
         for _key in ("cost_per_1m_input", "cost_per_1m_output",
                       "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
@@ -1733,6 +1738,7 @@ def _resolve_group_json(
                 "prompt_caching": _group_pc,
                 "automatic_prefix_caching": _group_apc,
                 "batches": False,
+                "streaming": _group_stream,
             },
             "params": _params,
             "cache_pricing": _cache_pricing,
@@ -2289,6 +2295,14 @@ def _route_to_spec(
             else params.get("structured_outputs", True)
         ),
         reasoning=params.get("reasoning"),
+        # An UNDECLARED capability is not a capability: a route whose
+        # capability block says nothing about streaming resolves to False and
+        # a streamed call against it fails closed, naming the registry entry
+        # to fix. Absent-means-supported is how a request shape reaches a
+        # deployment that refuses it (alpha-engine-config-I7904, I8164).
+        supports_streaming=bool(
+            (route.get("capabilities") or {}).get("streaming", False)
+        ),
         # The route already knows which registry entry it picked; discarding it
         # here is what made a cost record unable to name it. For a proxy route
         # `registry_id` is `litellm:group:{group}` and the entry actually
@@ -2535,6 +2549,7 @@ def _resolve_model_json(
             "automatic_prefix_caching": _apc,
             "batches": bool(
                 (entry.get("capabilities") or {}).get("batches", False)),
+            "streaming": _mr.entry_declares_capability(entry, "streaming"),
         },
         "params": _params,
         "cache_pricing": _cache_pricing,

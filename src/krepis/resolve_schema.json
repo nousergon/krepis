@@ -103,6 +103,9 @@
         },
         "batches": {
           "type": "boolean"
+        },
+        "streaming": {
+          "type": "boolean"
         }
       }
     },

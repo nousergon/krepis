@@ -174,6 +174,22 @@ class ModelSpec:
         billed at all) while producing the longest content. Without this
         knob a reasoning model can silently produce a well-formed, fully
         billed, EMPTY response through this adapter.
+    supports_streaming
+        Whether the resolved route can serve ``stream=True``. Read by
+        :meth:`krepis.llm.LLMClient._require_streaming_route`; a streamed call
+        against a route that does not declare it raises
+        :exc:`krepis.llm.StreamingUnsupportedError` rather than quietly
+        issuing a non-streaming request — the fall back would restore the
+        request-deadline failure mode streaming exists to remove
+        (alpha-engine-config-I8164).
+
+        Defaults to ``True``, and the two sources of a spec mean different
+        things by that. A spec resolved through :mod:`krepis.router` carries
+        the registry's own ``capabilities.streaming`` declaration, so an
+        undeclared capability resolves to ``False`` and fails closed. A
+        hand-built spec keeps the default, which is the caller asserting it
+        about an endpoint they chose themselves — the same split
+        ``structured_outputs`` already has.
     supports_automatic_prefix_caching
         Whether the provider/model supports server-side automatic prefix
         caching (e.g. DeepSeek, Moonshot/Kimi, Zhipu/GLM). When ``True``,
@@ -196,6 +212,7 @@ class ModelSpec:
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
     supports_automatic_prefix_caching: bool = False
+    supports_streaming: bool = True
     # The registry entry this spec was resolved FROM, when it came from the
     # model registry (``route["registry_id"]``). ``None`` for a hand-built spec.
     #
@@ -304,6 +321,7 @@ _SPEC_JSON_FIELDS = {
     "api_key_env",
     "reasoning",
     "supports_automatic_prefix_caching",
+    "supports_streaming",
 }
 
 
