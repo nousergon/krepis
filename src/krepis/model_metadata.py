@@ -103,6 +103,16 @@ class ModelMetadata(BaseModel):
     # a number rather than as the next aborted run
     # (alpha-engine-config-I6917 deliverable 3).
     budget_escalations: int = Field(default=0, ge=0)
+    # attempts — transport calls the logical call made. 1 on a clean call, 0
+    # only on a record built from a path that never counted one. Without it
+    # every summed counter on this row is uninterpretable: a 4-attempt row and
+    # a 1-attempt row are indistinguishable (alpha-engine-config-I8334).
+    attempts: int = Field(default=0, ge=0)
+    # reasoning_tokens_max_attempt — largest reasoning draw of any SINGLE
+    # attempt, as distinct from `reasoning_tokens`, which is their sum.
+    # `max_tokens` bounds one attempt, so THIS is the figure a ceiling must
+    # clear; the sum is what was billed.
+    reasoning_tokens_max_attempt: int = Field(default=0, ge=0)
     # The registry entry the call ADDRESSED, when it was resolved from the
     # model registry. Distinct from ``model_name``, which is the upstream name
     # the provider reports.
