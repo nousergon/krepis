@@ -61,7 +61,22 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # `FlowDoctorHandler`'s constructor signature, the only surface krepis
 # touches (0.15.0 breaks `diagnosis.provider` defaults and the `anthropic`
 # transport, neither reachable from krepis's own glue).
-flow_doctor = ["flow-doctor>=0.8.1"]
+#
+# FLOOR RAISED TO 0.16.0 AND LOAD-BEARING (alpha-engine-config-I8298). Below
+# it, `TelegramNotifier.validate()` raises a transport failure as a config
+# error, and `TimeoutError` is not a `URLError` subclass so a read timeout
+# escaped its handler entirely and propagated out of `FlowDoctor.__init__`
+# under `strict`. `setup_logging` here is called at MODULE level by every
+# Lambda handler in the fleet and `_is_deployed()` makes `strict` True in
+# every deployed runtime, so on 2026-08-24 roughly 90 seconds of an
+# unresponsive api.telegram.org failed the IMPORT of
+# alpha-engine-predictor-inference five times and the postclose trading
+# pipeline ran with MarketHoursGate and DeployDriftCheck both degraded.
+# 0.16.0 splits verdict from transport and bounds the preflight. Do not
+# lower this floor: krepis is the layer that puts flow-doctor on the import
+# path, so krepis is the layer that owes consumers a version where being on
+# that path is safe.
+flow_doctor = ["flow-doctor>=0.16.0"]
 # krepis.llm transports. Both SDKs are lazy-imported at call time, so a
 # consumer installs only the transport(s) its ModelSpec can resolve to:
 # `krepis[anthropic]` for the native Anthropic transport, `krepis[openai]`
