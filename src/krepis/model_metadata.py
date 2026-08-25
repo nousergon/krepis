@@ -96,6 +96,13 @@ class ModelMetadata(BaseModel):
     # not read zero as evidence a reasoning model spent nothing.
     # Zero-defaulted and additive within the schema.
     reasoning_tokens: int = Field(default=0, ge=0)
+    # budget_escalations — how many times this logical call had its
+    # ``max_tokens`` ceiling doubled and re-issued because the budget was
+    # exhausted before any content was produced. 0 on every healthy call; a
+    # call site whose base ceiling is chronically undersized shows up here as
+    # a number rather than as the next aborted run
+    # (alpha-engine-config-I6917 deliverable 3).
+    budget_escalations: int = Field(default=0, ge=0)
     # The registry entry the call ADDRESSED, when it was resolved from the
     # model registry. Distinct from ``model_name``, which is the upstream name
     # the provider reports.

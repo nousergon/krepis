@@ -24,6 +24,7 @@ import pytest
 from pydantic import BaseModel
 
 from krepis.llm import (
+    BudgetExhaustedError,
     LLMClient,
     StreamIdleTimeoutError,
     StreamingUnsupportedError,
@@ -602,3 +603,150 @@ class TestAnthropicStreamAccumulation:
             )
         assert excinfo.value.partial_text == "partial"
         assert stream.closed
+
+
+# ── the escalation composes with streaming ────────────────────────────────
+
+
+class TestAnExhaustedBudgetEscalatesOnTheStreamedPathToo:
+    """A budget exhausted MID-STREAM escalates exactly as it does on the
+    non-streamed path (``alpha-engine-config-I6917`` + I8164).
+
+    The two changes met in ``structured()``, and the failure mode of getting
+    the meeting wrong is quiet in both directions: a streamed exhaustion that
+    escalated but should not have doubles the cost of a certain failure, and
+    one that did not escalate when it should have hands back a truncated body
+    dressed as a complete answer. What makes it compose rather than need its
+    own copy is that a streamed response is re-assembled into the same
+    ``ChatCompletion`` shape — so ``_reject_budget_exhausted`` reads the same
+    ``finish_reason='length'`` on an empty body it always did, raises the same
+    ``BudgetExhaustedError``, and the escalation wrapper above it never learns
+    that the transport streamed. These tests pin that, so a future change to
+    either half cannot quietly decouple them.
+    """
+
+    def _exhausted_stream(self):
+        """An empty generation that stopped because it hit the ceiling.
+
+        This is what an exhausted reasoning budget looks like ON THE WIRE: the
+        stream is well-formed, chunks arrive, ``finish_reason`` is ``length``
+        and not one content delta was ever produced.
+        """
+        usage = _usage(completion=50)
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=1024)
+        return [
+            _chunk(finish_reason="length"),
+            _chunk(usage=usage),
+        ]
+
+    def test_it_escalates_once_and_the_re_issue_is_also_streamed(self):
+        fake = FakeOpenAI([
+            self._exhausted_stream(),
+            _text_stream(['{"name": "a", "score": 1}']),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema=Probe, schema_name="Probe", stream=True,
+        )
+        assert result.parsed == Probe(name="a", score=1)
+        assert [k["max_tokens"] for k in fake.kwargs] == [1024, 2048], (
+            "exactly one re-issue, at a RAISED ceiling"
+        )
+        assert all(k["stream"] is True for k in fake.kwargs), (
+            "the escalated re-issue must not silently drop to a "
+            "non-streaming request — that would hand back the request-"
+            "deadline failure envelope on the retry that matters most"
+        )
+        assert result.streamed is True
+        assert result.usage.budget_escalations == 1
+
+    def test_a_truncated_body_is_never_returned_as_if_complete(self):
+        """The whole point of the guard. An empty, length-capped stream is a
+        budget fault, not a model that answered with nothing."""
+        fake = FakeOpenAI([self._exhausted_stream()] * 6)
+        with pytest.raises(BudgetExhaustedError) as excinfo:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u",
+                schema=Probe, schema_name="Probe", stream=True,
+            )
+        assert "max_tokens=2048" in str(excinfo.value), (
+            "the error names the budget that was ACTUALLY too small"
+        )
+        assert "reasoning_tokens=1024" in str(excinfo.value)
+        assert [k["max_tokens"] for k in fake.kwargs] == [1024, 2048], (
+            "a second exhaustion at double the budget is a pathological ask; "
+            "escalating forever is not the fix"
+        )
+
+    def test_the_exhausted_streams_spend_is_absorbed(self):
+        fake = FakeOpenAI([
+            self._exhausted_stream(),
+            _text_stream(['{"name": "a", "score": 1}']),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema=Probe, schema_name="Probe", stream=True,
+        )
+        assert result.usage.output_tokens == 100, "two billed streams"
+        assert result.usage.reasoning_tokens == 1024, (
+            "the exhausted attempt's reasoning draw is the whole diagnosis"
+        )
+
+    def test_an_unattributable_exhausted_stream_keeps_the_merged_call_unpriced(self):
+        """``usage_unknown`` is STICKY across the escalation.
+
+        The exhausted attempt's counters are absorbed into the escalated
+        one's. If the flag did not travel with them the merged total would be
+        priced as though every token in it had been reported — an
+        understatement arriving in a complete-looking cost row.
+        """
+        records = []
+        exhausted = [_chunk(finish_reason="length")]  # no usage chunk at all
+        fake = FakeOpenAI([
+            exhausted,
+            _text_stream(['{"name": "a", "score": 1}']),
+        ])
+        result = LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="director-plan",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=records.append,
+        ).structured(
+            system="s", user_content="u",
+            schema=Probe, schema_name="Probe", stream=True,
+        )
+        assert result.parsed == Probe(name="a", score=1)
+        assert result.usage.usage_unknown is True
+        assert records[0]["cost_usd"] is None
+        assert records[0]["cost_source"] == "usage_unreported"
+        assert records[0]["budget_escalations"] == 1, (
+            "an escalation nobody can count is indistinguishable from health"
+        )
+
+    def test_the_anthropic_stream_escalates_the_same_way(self):
+        """Transport-independent: the escalation lives in ``structured()``,
+        above the branch that chooses a wire."""
+        exhausted = _anthropic_text_events(
+            ["thinking..."], stop_reason="max_tokens"
+        )
+        fake = FakeAnthropic([
+            exhausted,
+            _anthropic_tool_events("Probe", ['{"name": "a", "score": 1}']),
+        ])
+        result = _client(ANTHROPIC_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema=Probe, schema_name="Probe", stream=True, attempts=1,
+        )
+        assert result.parsed == Probe(name="a", score=1)
+        assert [p["max_tokens"] for p in fake.payloads] == [1024, 2048]
+        assert all(p["stream"] is True for p in fake.payloads)
+        assert result.usage.budget_escalations == 1
+
+    def test_a_healthy_streamed_call_counts_zero_escalations(self):
+        fake = FakeOpenAI([_text_stream(['{"name": "a", "score": 1}'])])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema=Probe, schema_name="Probe", stream=True,
+        )
+        assert result.usage.budget_escalations == 0
+        assert len(fake.kwargs) == 1

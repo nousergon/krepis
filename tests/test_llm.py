@@ -1442,7 +1442,7 @@ class TestEmptyContentIsVisible:
 
 
 class TestBudgetExhaustedIsNotRetried:
-    """An exhausted budget is a certainty about every remaining attempt.
+    """An exhausted budget is a certainty about every attempt at the SAME ceiling.
 
     `no JSON object found in response: ''` says *the model returned something
     unparseable* — a prompt or model problem. The actual fault is *max_tokens
@@ -1460,32 +1460,44 @@ class TestBudgetExhaustedIsNotRetried:
         usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=7993)
         return _openai_resp("", usage=usage, finish_reason="length")
 
-    def test_it_raises_on_the_first_occurrence(self):
-        fake = FakeOpenAI([self._length_capped_empty()] * 2)
+    def test_it_never_re_issues_at_the_same_ceiling(self):
+        """The corrective-retry loop is not entered — only the escalation is.
+
+        ``attempts`` defaults to 2, so without the guard the exhausted call
+        would be re-issued at the IDENTICAL ceiling: a second ~100s billed
+        generation guaranteed to fail before the first returned. The one
+        re-issue that does happen carries a different, larger budget.
+        """
+        fake = FakeOpenAI([self._length_capped_empty()] * 4)
+        client = _client(OPENROUTER_SPEC, fake)
         with pytest.raises(BudgetExhaustedError) as exc:
-            _client(OPENROUTER_SPEC, fake).structured(
+            client.structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
             )
-        assert len(fake.kwargs) == 1, (
-            "the second attempt re-issues the identical ask under the "
-            "identical ceiling — it can only fail again, and it bills again"
+        budgets = [k["max_tokens"] for k in fake.kwargs]
+        assert budgets == [1024, 2048], (
+            "exactly one re-issue, and at a RAISED ceiling — never a repeat "
+            "of the ask that was already proven unfundable"
         )
         msg = str(exc.value)
-        assert "max_tokens=1024" in msg, "name the budget that was too small"
+        assert "max_tokens=2048" in msg, (
+            "the error names the budget that was ACTUALLY too small — the "
+            "escalated one, not the ceiling the caller declared"
+        )
         assert "reasoning_tokens=7993" in msg
         assert "no JSON object" not in msg, (
             "the old message points at the prompt; this fault is the budget"
         )
 
     def test_it_is_an_llm_error_so_callers_still_catch_it(self):
-        fake = FakeOpenAI([self._length_capped_empty()])
+        fake = FakeOpenAI([self._length_capped_empty()] * 2)
         with pytest.raises(LLMError):
             _client(OPENROUTER_SPEC, fake).structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
             )
 
     def test_it_carries_the_usage_of_the_billed_attempt(self):
-        fake = FakeOpenAI([self._length_capped_empty()])
+        fake = FakeOpenAI([self._length_capped_empty()] * 2)
         with pytest.raises(BudgetExhaustedError) as exc:
             _client(OPENROUTER_SPEC, fake).structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
@@ -1523,13 +1535,162 @@ class TestBudgetExhaustedIsNotRetried:
     def test_anthropic_max_tokens_before_the_tool_block(self):
         msg = _anthropic_msg([_text_block("thinking...")])
         msg.stop_reason = "max_tokens"
-        fake = FakeAnthropic([msg, msg])
+        fake = FakeAnthropic([msg, msg, msg, msg])
         with pytest.raises(BudgetExhaustedError) as exc:
             _client(ANTHROPIC_SPEC, fake).structured(
                 system="s", user_content="u", schema=Spec, schema_name="Spec",
             )
         assert "stop_reason='max_tokens'" in str(exc.value)
-        assert len(fake.payloads) == 1
+        assert [p["max_tokens"] for p in fake.payloads] == [1024, 2048], (
+            "the escalation is a transport-independent property of "
+            "structured(), not an openai-path detail"
+        )
+
+
+
+class TestExhaustedBudgetEscalatesOnce:
+    """A ceiling that proves too small is raised and re-issued — once.
+
+    Six instances of this class reached production between 2026-08-04 and
+    2026-08-25 (alpha-engine-config-I6917), every one remediated by raising a
+    per-caller literal that the next outlier then cleared. The distribution
+    cannot be measured out of the problem either: ``reasoning_tokens`` on a
+    SUCCESSFUL call is censored at the ceiling, so the draws that would set the
+    tail are exactly the ones truncation removes from the sample. Measured
+    2026-08-25 over 72 successful `thinktank-thesis` calls: p50 2213, p95 6033,
+    max 7514 — and that same day the tier drew >=16000 and aborted the run.
+
+    So the ceiling stops being a cliff. These tests pin that behaviour, its
+    bound, and its visibility.
+    """
+
+    def _exhausted(self):
+        usage = _openai_usage()
+        usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=1024)
+        return _openai_resp("", usage=usage, finish_reason="length")
+
+    def test_the_escalated_re_issue_succeeds_and_is_returned(self):
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp('{"name": "a", "score": 1}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.parsed.name == "a"
+        assert [k["max_tokens"] for k in fake.kwargs] == [1024, 2048]
+
+    def test_the_escalation_is_counted_on_the_usage(self):
+        """An escalation nobody can count is indistinguishable from health."""
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp('{"name": "a", "score": 1}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.budget_escalations == 1
+
+    def test_a_healthy_call_counts_zero(self):
+        fake = FakeOpenAI([_openai_resp('{"name": "a", "score": 1}')])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.budget_escalations == 0
+
+    def test_the_exhausted_attempts_spend_is_absorbed_not_lost(self):
+        """``_emit_cost_record`` runs off the RETURNED result only.
+
+        Without absorption the tokens burned by the exhausted attempt are
+        absent from the cost record entirely and every budget guard reading it
+        sits low by that much.
+        """
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp('{"name": "a", "score": 1}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        # two billed attempts at 50 completion tokens each
+        assert result.usage.output_tokens == 100
+        assert result.usage.reasoning_tokens == 1024, (
+            "the exhausted attempt's reasoning draw is the whole diagnosis — "
+            "it must survive into the record"
+        )
+
+    def test_the_escalation_does_not_spend_the_callers_retry_budget(self):
+        """``attempts`` bounds corrective retries against the SAME request."""
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp("not json"),
+            _openai_resp('{"name": "a", "score": 1}'),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+            attempts=2,
+        )
+        assert result.parsed.name == "a"
+        assert [k["max_tokens"] for k in fake.kwargs] == [1024, 2048, 2048]
+
+    def test_it_escalates_at_most_once(self):
+        fake = FakeOpenAI([self._exhausted()] * 6)
+        with pytest.raises(BudgetExhaustedError):
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert [k["max_tokens"] for k in fake.kwargs] == [1024, 2048], (
+            "a second exhaustion at double the budget is a pathological ask; "
+            "paging on it is correct, escalating forever is not"
+        )
+
+    def test_a_factor_of_one_disables_it(self):
+        fake = FakeOpenAI([self._exhausted()])
+        client = LLMClient(
+            OPENROUTER_SPEC, callsite_id="krepis-test",
+            client_factory=lambda _s, _k: fake,
+            budget_escalation_factor=1.0,
+        )
+        with pytest.raises(BudgetExhaustedError):
+            client.structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert len(fake.kwargs) == 1
+
+    def test_a_shrinking_factor_is_refused_at_construction(self):
+        with pytest.raises(ValueError, match="budget_escalation_factor"):
+            LLMClient(
+                OPENROUTER_SPEC, callsite_id="krepis-test",
+                client_factory=lambda _s, _k: FakeOpenAI([]),
+                budget_escalation_factor=0.5,
+            )
+
+    def test_a_caller_max_tokens_is_what_escalates(self):
+        """The escalation is off the budget on the WIRE, not the registry row."""
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp('{"name": "a", "score": 1}'),
+        ])
+        _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+            max_tokens=4000,
+        )
+        assert [k["max_tokens"] for k in fake.kwargs] == [4000, 8000]
+
+    def test_a_non_budget_failure_on_the_escalated_call_keeps_both_spends(self):
+        fake = FakeOpenAI([
+            self._exhausted(),
+            _openai_resp("not json"),
+            _openai_resp("still not json"),
+        ])
+        with pytest.raises(LLMError) as exc:
+            _client(OPENROUTER_SPEC, fake).structured(
+                system="s", user_content="u", schema=Spec, schema_name="Spec",
+            )
+        assert exc.value.usage is not None
+        assert exc.value.usage.output_tokens == 150, (
+            "three billed attempts — the exhausted one included"
+        )
 
 
 # ── Router-edge credential resolution at CALL time (config-I6373) ─────────
