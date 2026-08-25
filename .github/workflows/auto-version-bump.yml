@@ -31,6 +31,18 @@
 # "manual/pending bump" branch) or it is tagged at this same SHA (empty
 # src diff). Manual minor/major releases: PR labeled release:manual editing
 # the version lines directly; this workflow no-ops on it the same way.
+#
+# RELEASE TRIGGER INCLUDES pyproject.toml (alpha-engine-config-I8308).
+# Keying the trigger on `src/` alone made a DEPENDENCY change invisible to
+# the release: krepis-PR184 raised the flow-doctor floor to >=0.16.0, merged
+# green, and shipped to nobody — auto-tag never fired, publish.yml ran and
+# published nothing new, and the released artifact kept `flow-doctor>=0.8.1`.
+# That floor exists because below 0.16.0 a notifier preflight can crash the
+# process it instruments (alpha-engine-config-I8298). Accepted trade: a
+# tooling-only pyproject edit (a [tool.ruff] tweak) now costs one extra patch
+# release. Strictly better than shipping nothing and reporting success. Loop
+# safety is unchanged — the bump commit edits pyproject.toml too, but the
+# untagged-version guard above already no-ops that push.
 name: auto-version-bump
 
 on:
@@ -54,7 +66,7 @@ jobs:
           fetch-depth: 0
           ssh-key: ${{ secrets.AUTOBUMP_DEPLOY_KEY }}
 
-      - name: Bump patch version if src/ changed since last release
+      - name: Bump patch version if src/ or pyproject.toml changed since last release
         run: |
           set -euo pipefail
           git fetch --tags --quiet origin
@@ -63,8 +75,8 @@ jobs:
             echo "version ${VERSION} has no tag yet — a bump (manual or auto) is already in flight; auto-tag.yml owns it. No-op."
             exit 0
           fi
-          if git diff --quiet "v${VERSION}..HEAD" -- src/; then
-            echo "no src/ changes since v${VERSION} — nothing to release. No-op."
+          if git diff --quiet "v${VERSION}..HEAD" -- src/ pyproject.toml; then
+            echo "no src/ or pyproject.toml changes since v${VERSION} — nothing to release. No-op."
             exit 0
           fi
           NEW="$(python3 scripts/autobump.py)"
