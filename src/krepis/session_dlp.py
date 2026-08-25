@@ -197,6 +197,36 @@ class _LeafScanCache:
                 )
         except OSError:
             pass
+        # Resolve every extend target against GITLEAKS_DIR before stat-ing it.
+        #
+        # THE SECOND INSTANCE OF I8267's CLASS, IN THE SAME FILE, AND SILENT.
+        # `[extend].path` is relative BY CONTRACT (see the toml's header), and
+        # `os.stat` resolves a relative path against the process cwd exactly
+        # as gitleaks does. PR183 gave the SCAN its `cwd=GITLEAKS_DIR`; this
+        # read never got one, so off the routing directory every extend target
+        # fell into the `except OSError` below and was recorded as
+        # `(path, None, None)`.
+        #
+        # Measured 2026-08-25 from `/tmp` at v0.59.35, with the scan itself
+        # healthy: `('./gitleaks-custom.toml', None, None)`.
+        #
+        # It degrades in the one direction this cache must never degrade. The
+        # signature then cannot change when `gitleaks-custom.toml` does — and
+        # that is the file holding every fleet-specific secret shape — so
+        # TIGHTENING A RULE would not invalidate the leaf cache, and content
+        # already scanned clean under the looser ruleset would keep passing on
+        # a cached verdict. A stale ALLOW, reported by nothing: the scan goes
+        # on returning `ok`, quickly, which is exactly what a healthy cache
+        # looks like.
+        #
+        # The loud half of this class was fixed and the quiet half was left,
+        # which is the ordinary shape of a partial fix — the instance that
+        # announces itself gets the patch.
+        paths = [
+            path if os.path.isabs(path)
+            else os.path.normpath(os.path.join(GITLEAKS_DIR, path))
+            for path in paths
+        ]
         for p in paths:
             try:
                 st = os.stat(p)

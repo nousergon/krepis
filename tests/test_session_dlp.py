@@ -357,3 +357,133 @@ class TestCollectStrings:
         out = []
         _collect_strings(value, out)
         assert set(out) == {"top", "nested", "deep"}
+
+
+# ── extend-chain resolution in the CACHE SIGNATURE (I8329) ────────────────
+
+
+class TestConfigSignatureResolvesTheExtendChain:
+    """The leaf cache is invalidated by the gitleaks config chain changing on
+    disk — so the signature must actually be able to SEE the chain.
+
+    `[extend].path` is relative by contract, and `os.stat` resolves a relative
+    path against the process cwd exactly as gitleaks does. `krepis-PR183` gave
+    the scan subprocess its `cwd=GITLEAKS_DIR` and left this read without one,
+    which is the ordinary shape of a partial fix: the instance that announces
+    itself gets the patch.
+
+    Measured 2026-08-25 from `/tmp` at v0.59.35, with the scan itself already
+    healthy — `('./gitleaks-custom.toml', None, None)`.
+
+    It degrades in the one direction this cache must never degrade. With the
+    extend target unstat-able the signature cannot change when
+    `gitleaks-custom.toml` does — the file holding every fleet-specific secret
+    shape — so TIGHTENING A RULE would not clear the cache, and content
+    scanned clean under the looser ruleset would keep passing on a cached
+    verdict. A stale ALLOW that nothing reports: the scan goes on returning
+    `ok`, quickly, which is what a healthy cache looks like.
+
+    Hermetic — no gitleaks binary, no real routing directory.
+    """
+
+    def _chain(self, tmp_path, custom_body: str):
+        cfg_dir = tmp_path / "routing"
+        cfg_dir.mkdir()
+        (cfg_dir / "gitleaks-custom.toml").write_text(custom_body)
+        (cfg_dir / "gitleaks-egress.toml").write_text(
+            '[extend]\npath = "./gitleaks-custom.toml"\n'
+        )
+        return cfg_dir
+
+    def _point_at(self, monkeypatch, cfg_dir):
+        monkeypatch.setattr(session_dlp, "GITLEAKS_DIR", str(cfg_dir))
+        monkeypatch.setattr(
+            session_dlp,
+            "GITLEAKS_CONFIG",
+            str(cfg_dir / "gitleaks-egress.toml"),
+        )
+
+    def test_the_extend_target_is_stat_ed_from_a_foreign_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        cfg_dir = self._chain(tmp_path, "[extend]\nuseDefault = true\n")
+        self._point_at(monkeypatch, cfg_dir)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        sig = session_dlp._LeafScanCache._config_signature()
+
+        assert len(sig) == 2, "the egress config AND its extend target"
+        target = sig[1]
+        assert os.path.isabs(target[0]), (
+            "a relative extend target must be resolved against GITLEAKS_DIR "
+            "before it is stat-ed, or the cwd decides what gets watched"
+        )
+        assert target[1] is not None and target[2] is not None, (
+            "an unstat-able extend target records (None, None) — the "
+            "signature then cannot change when the rules do"
+        )
+
+    def test_tightening_a_rule_changes_the_signature_from_a_foreign_cwd(
+        self, monkeypatch, tmp_path
+    ):
+        """The property the cache actually depends on, stated directly."""
+        cfg_dir = self._chain(tmp_path, "[extend]\nuseDefault = true\n")
+        self._point_at(monkeypatch, cfg_dir)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        before = session_dlp._LeafScanCache._config_signature()
+        (cfg_dir / "gitleaks-custom.toml").write_text(
+            "[extend]\nuseDefault = true\n\n"
+            '[[rules]]\nid = "a-newly-added-rule"\nregex = "sk-live-[a-z0-9]+"\n'
+        )
+        after = session_dlp._LeafScanCache._config_signature()
+
+        assert before != after, (
+            "a rule added to the extend target must invalidate the leaf "
+            "cache — otherwise content cleared under the looser ruleset "
+            "keeps passing on a cached verdict (a stale ALLOW)"
+        )
+
+    def test_the_cache_actually_clears_on_that_change(self, monkeypatch, tmp_path):
+        """End of the chain: signature change -> `refresh_config` clears."""
+        cfg_dir = self._chain(tmp_path, "[extend]\nuseDefault = true\n")
+        self._point_at(monkeypatch, cfg_dir)
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        monkeypatch.chdir(elsewhere)
+
+        cache = session_dlp._LeafScanCache()
+        cache.refresh_config()
+        cache.mark_clean([session_dlp._LeafScanCache.digest("previously clean")])
+        assert cache.stats()["size"] == 1
+
+        (cfg_dir / "gitleaks-custom.toml").write_text(
+            "[extend]\nuseDefault = true\n\n"
+            '[[rules]]\nid = "a-newly-added-rule"\nregex = "sk-live-[a-z0-9]+"\n'
+        )
+        cache.refresh_config()
+
+        assert cache.stats()["size"] == 0, (
+            "the leaf scanned clean under the OLD ruleset must be re-scanned "
+            "under the new one"
+        )
+
+    def test_an_absolute_extend_target_is_left_alone(self, monkeypatch, tmp_path):
+        """Only a RELATIVE path means 'relative to the config directory'."""
+        cfg_dir = tmp_path / "routing"
+        cfg_dir.mkdir()
+        absolute_target = tmp_path / "somewhere-else.toml"
+        absolute_target.write_text("[extend]\nuseDefault = true\n")
+        (cfg_dir / "gitleaks-egress.toml").write_text(
+            f'[extend]\npath = "{absolute_target}"\n'
+        )
+        self._point_at(monkeypatch, cfg_dir)
+
+        sig = session_dlp._LeafScanCache._config_signature()
+
+        assert sig[1][0] == str(absolute_target)
+        assert sig[1][1] is not None
