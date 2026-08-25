@@ -10,6 +10,7 @@ from krepis.llm import (
     BudgetExhaustedError,
     LLMClient,
     LLMError,
+    LLMUsage,
     NullChoicesError,
     SearchOptions,
     _extract_json,
@@ -1691,6 +1692,86 @@ class TestExhaustedBudgetEscalatesOnce:
         assert exc.value.usage.output_tokens == 150, (
             "three billed attempts — the exhausted one included"
         )
+
+
+
+class TestAttemptsAndPerAttemptReasoningAreRecorded:
+    """A per-call SUM cannot answer what a per-attempt ceiling asks.
+
+    Every counter on `LLMUsage` is a sum over attempts, and one cost record is
+    emitted per LOGICAL call. Without an attempt count, a 4-attempt row and a
+    1-attempt row are indistinguishable — and on 2026-08-25 a summed
+    `reasoning_tokens` was read as a per-attempt draw and used to size a
+    ceiling, a claim that had to be corrected the same day
+    (alpha-engine-config-I8334). `max_tokens` bounds ONE attempt, so the MAX
+    is the figure a ceiling must clear; the SUM is what was billed.
+    """
+
+    def _resp(self, content, reasoning):
+        usage = _openai_usage(reasoning=reasoning)
+        return _openai_resp(content, usage=usage)
+
+    def test_a_clean_call_counts_one_attempt(self):
+        fake = FakeOpenAI([self._resp('{"name": "a", "score": 1}', 400)])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.attempts == 1
+        assert result.usage.reasoning_tokens == 400
+        assert result.usage.reasoning_tokens_max_attempt == 400
+
+    def test_the_sum_and_the_max_diverge_across_a_corrective_retry(self):
+        fake = FakeOpenAI([
+            self._resp("not json", 900),
+            self._resp('{"name": "a", "score": 1}', 300),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.attempts == 2
+        assert result.usage.reasoning_tokens == 1200, "the SUM is what was billed"
+        assert result.usage.reasoning_tokens_max_attempt == 900, (
+            "the MAX is what a max_tokens ceiling actually had to clear — no "
+            "single attempt drew 1200"
+        )
+
+    def test_an_escalation_takes_the_MAX_across_both_budgets(self):
+        """The absorbed exhausted attempt must not be summed into the max.
+
+        Adding it would report a per-attempt draw no attempt made, which is
+        exactly the confusion this field exists to end.
+        """
+        exhausted_usage = _openai_usage(reasoning=1024)
+        exhausted_usage.completion_tokens_details = SimpleNamespace(reasoning_tokens=1024)
+        fake = FakeOpenAI([
+            _openai_resp("", usage=exhausted_usage, finish_reason="length"),
+            self._resp('{"name": "a", "score": 1}', 700),
+        ])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.attempts == 2
+        assert result.usage.budget_escalations == 1
+        assert result.usage.reasoning_tokens == 1724, "billed across both"
+        assert result.usage.reasoning_tokens_max_attempt == 1024, (
+            "a MAX, never a sum, across the escalation boundary too"
+        )
+
+    def test_a_response_carrying_no_usage_still_counts_as_an_attempt(self):
+        """It was a call on the wire; the record must not lose it."""
+        usage = LLMUsage()
+        LLMClient._usage_from_openai(SimpleNamespace(usage=None), into=usage)
+        assert usage.attempts == 1
+        assert usage.reasoning_tokens_max_attempt == 0
+
+    def test_the_anthropic_transport_counts_the_same_way(self):
+        fake = FakeAnthropic([
+            _anthropic_msg([_tool_use_block("Spec", {"name": "a", "score": 1})]),
+        ])
+        result = _client(ANTHROPIC_SPEC, fake).structured(
+            system="s", user_content="u", schema=Spec, schema_name="Spec",
+        )
+        assert result.usage.attempts == 1
 
 
 # ── Router-edge credential resolution at CALL time (config-I6373) ─────────
