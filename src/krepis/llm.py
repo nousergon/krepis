@@ -452,12 +452,18 @@ class BudgetExhaustedError(LLMError):
     endpoint before anyone looked at ``finish_reason``
     (alpha-engine-config#6391).
 
-    **Never retried.** The second attempt cannot succeed under the same
-    budget: it re-issues the identical ask against the identical ceiling.
-    Measured on the Director's weekly call — two attempts, ~100s of generation
-    each, both fully billed, both guaranteed to fail before the first one
-    returned. Retrying does not merely fail to inform, it doubles the cost of
-    a certain failure.
+    **Never retried under the SAME budget.** A second attempt on the identical
+    ceiling cannot succeed: it re-issues the identical ask against the
+    identical bound. Measured on the Director's weekly call — two attempts,
+    ~100s of generation each, both fully billed, both guaranteed to fail
+    before the first one returned. Retrying *there* does not merely fail to
+    inform, it doubles the cost of a certain failure.
+
+    A retry under an ESCALATED budget is a different request, and it is the
+    one thing that can succeed. :meth:`LLMClient.structured` performs exactly
+    one, doubling the ceiling — see
+    :meth:`LLMClient._escalated_budget` for why a larger constant cannot
+    replace it.
 
     Empty content with ``finish_reason='stop'`` is a DIFFERENT fault and keeps
     the ordinary corrective-retry path — that one really is a model returning
@@ -484,6 +490,61 @@ def _budget_exhausted_error(
         f"prompt, and not the schema.",
         usage=usage,
     )
+
+
+#: Factor by which an exhausted ``max_tokens`` ceiling is raised for the ONE
+#: escalated retry :meth:`LLMClient.structured` performs. 2.0 — a doubling.
+#:
+#: WHY A FACTOR AND NOT A BIGGER CONSTANT. The reasoning draw of a
+#: reasoning-effort model is free-running: measured on `glm-5.2` against an
+#: identical trivial prompt it ranged 11..163 tokens across eight calls, a 15x
+#: spread (alpha-engine-config-I6858). No single ceiling is therefore "large
+#: enough" — it is only large enough *so far*, which is precisely how six
+#: instances of this class reached production between 2026-08-04 and
+#: 2026-08-25, each one remediated by raising a per-caller literal that the
+#: next outlier then cleared.
+#:
+#: Worse, the distribution cannot be measured out of the problem. The recorded
+#: ``reasoning_tokens`` on a SUCCESSFUL call is censored at the ceiling by
+#: construction: the draws that would set the tail are exactly the ones the
+#: ceiling truncates, and truncated calls return no usable sample. Measured
+#: 2026-08-25 over 72 successful `thinktank-thesis` calls: p50 2213, p95 6033,
+#: max 7514 — and that same day the tier drew >=16000 and aborted the run. A
+#: p95-derived floor would have sat at 6033 and prevented nothing.
+#:
+#: So the ceiling stops being a cliff instead of being guessed higher: when
+#: the budget is provably the binding constraint (empty content,
+#: ``finish_reason='length'``), re-issue once with twice the room. Bounded at
+#: ONE escalation — a second exhaustion at double the budget is a pathological
+#: ask, and paging on it is correct.
+_BUDGET_ESCALATION_FACTOR = 2.0
+
+
+def _absorb_usage(into: "LLMUsage", other: "Optional[LLMUsage]") -> None:
+    """Add *other*'s counters into *into*, in place.
+
+    The spend of an attempt that RAISED is real spend. ``_emit_cost_record``
+    runs off the returned result only, so without this the tokens burned by an
+    exhausted attempt are absent from the cost record entirely and every
+    budget guard reading it sits low by that much.
+    """
+    if other is None:
+        return
+    for name in (
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_create_tokens",
+        "cache_create_1h_tokens",
+        "prompt_cache_miss_tokens",
+        "reasoning_tokens",
+        "web_search_requests",
+        "web_fetch_requests",
+        "budget_escalations",
+    ):
+        setattr(into, name, getattr(into, name) + getattr(other, name, 0))
+    if other.provider_cost_usd is not None:
+        into.provider_cost_usd = (into.provider_cost_usd or 0.0) + other.provider_cost_usd
 
 
 def _reject_budget_exhausted(
@@ -558,6 +619,18 @@ class LLMUsage:
     # in this change, because the two candidate rules both fail against
     # measurement today (see that issue).
     reasoning_tokens: int = 0
+    # budget_escalations — how many times this logical call had its
+    # ``max_tokens`` ceiling raised and re-issued after the budget was
+    # exhausted before any content was produced. 0 on every healthy call.
+    #
+    # WHY THIS FIELD EXISTS. The escalation is what stops the exhaustion class
+    # being an outage, and an escalation nobody can count is indistinguishable
+    # from a healthy call: the run succeeds, the spend is ordinary, and the
+    # only trace is a WARNING in a log that dies with the box. Counted here it
+    # reaches the persisted cost record, so a call site whose base ceiling is
+    # chronically undersized shows up as a NUMBER before it shows up as the
+    # next aborted run (alpha-engine-config-I6917 deliverable 3).
+    budget_escalations: int = 0
     web_search_requests: int = 0
     web_fetch_requests: int = 0
     # Provider-reported USD cost when available (OpenRouter returns it in
@@ -772,6 +845,7 @@ class LLMClient:
         timeout: float = 180.0,
         max_retries: int = 3,
         cost_sink: Optional[Callable[[dict], None]] = None,
+        budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
     ):
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
@@ -785,6 +859,13 @@ class LLMClient:
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        if budget_escalation_factor < 1.0:
+            raise ValueError(
+                "budget_escalation_factor must be >= 1.0 "
+                "(1.0 disables escalation; below 1.0 would SHRINK the ceiling "
+                "on the one failure that proves it was already too small)"
+            )
+        self._budget_escalation_factor = float(budget_escalation_factor)
         if cost_sink is None:
             # Deliberately NOT wrapped in try/except. A half-configured
             # sink environment raises CostSinkConfigError here, before the
@@ -1204,6 +1285,18 @@ class LLMClient:
             usage.provider_cost_usd = (usage.provider_cost_usd or 0.0) + float(cost)
         return usage
 
+    def _escalated_budget(self, exhausted: int) -> Optional[int]:
+        """The ceiling for the ONE escalated retry, or ``None`` to give up.
+
+        ``None`` when escalation is disabled (factor 1.0) or the arithmetic
+        would not actually raise the ceiling — re-issuing at the same bound is
+        the doubled-cost certain failure ``BudgetExhaustedError`` documents.
+        """
+        if self._budget_escalation_factor <= 1.0:
+            return None
+        escalated = int(exhausted * self._budget_escalation_factor)
+        return escalated if escalated > exhausted else None
+
     def _effective_max_tokens(self, max_tokens: Optional[int]) -> int:
         """The budget actually sent, warning when a caller shrinks the row's.
 
@@ -1433,8 +1526,19 @@ class LLMClient:
                 validate(parsed)
             return parsed
 
-        if self.spec.transport == TRANSPORT_ANTHROPIC:
-            return self._structured_anthropic(
+        def _dispatch(budget: int) -> StructuredResult:
+            if self.spec.transport == TRANSPORT_ANTHROPIC:
+                return self._structured_anthropic(
+                    system=system,
+                    user_content=user_content,
+                    schema_dict=schema_dict,
+                    schema_name=schema_name,
+                    parse_and_validate=_parse_and_validate,
+                    is_pydantic=is_pydantic,
+                    attempts=attempts,
+                    max_tokens=budget,
+                )
+            return self._structured_openai(
                 system=system,
                 user_content=user_content,
                 schema_dict=schema_dict,
@@ -1442,18 +1546,40 @@ class LLMClient:
                 parse_and_validate=_parse_and_validate,
                 is_pydantic=is_pydantic,
                 attempts=attempts,
-                max_tokens=limit,
+                max_tokens=budget,
             )
-        return self._structured_openai(
-            system=system,
-            user_content=user_content,
-            schema_dict=schema_dict,
-            schema_name=schema_name,
-            parse_and_validate=_parse_and_validate,
-            is_pydantic=is_pydantic,
-            attempts=attempts,
-            max_tokens=limit,
-        )
+
+        try:
+            return _dispatch(limit)
+        except BudgetExhaustedError as exhausted:
+            escalated = self._escalated_budget(limit)
+            if escalated is None:
+                raise
+            # Deliberately outside ``attempts``: the caller's retry budget
+            # bounds CORRECTIVE retries against the same request, and this is
+            # a different request. The escalation is bounded by being outside
+            # the loop — one, and only one, per logical call.
+            logger.warning(
+                "llm structured provider=%s model=%s callsite=%s: the "
+                "completion budget was exhausted before any content "
+                "(max_tokens=%d) — re-issuing ONCE at max_tokens=%d. A "
+                "call site that escalates routinely has an undersized base "
+                "ceiling; the count is on the cost record as "
+                "budget_escalations (alpha-engine-config-I6917).",
+                self.spec.provider, self.spec.model, self.callsite_id,
+                limit, escalated,
+            )
+            try:
+                result = _dispatch(escalated)
+            except LLMError as exc:
+                # The exhausted attempt's spend is real and must not vanish
+                # because the escalated one also failed.
+                if exc.usage is not None:
+                    _absorb_usage(exc.usage, exhausted.usage)
+                raise
+            result.usage.budget_escalations += 1
+            _absorb_usage(result.usage, exhausted.usage)
+            return result
 
     def _structured_anthropic(
         self,
