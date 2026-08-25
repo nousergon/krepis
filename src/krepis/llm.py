@@ -544,8 +544,16 @@ def _absorb_usage(into: "LLMUsage", other: "Optional[LLMUsage]") -> None:
         "web_search_requests",
         "web_fetch_requests",
         "budget_escalations",
+        "attempts",
     ):
         setattr(into, name, getattr(into, name) + getattr(other, name, 0))
+    # A MAX, never a sum — see LLMUsage.reasoning_tokens_max_attempt. Adding
+    # it here would make an escalated call report a per-attempt draw no single
+    # attempt made, which is precisely the confusion this field exists to end.
+    into.reasoning_tokens_max_attempt = max(
+        into.reasoning_tokens_max_attempt,
+        getattr(other, "reasoning_tokens_max_attempt", 0),
+    )
     if other.provider_cost_usd is not None:
         into.provider_cost_usd = (into.provider_cost_usd or 0.0) + other.provider_cost_usd
     # OR'd, not summed — it is a boolean and it is STICKY. An exhausted
@@ -1075,6 +1083,27 @@ class LLMUsage:
     # chronically undersized shows up as a NUMBER before it shows up as the
     # next aborted run (alpha-engine-config-I6917 deliverable 3).
     budget_escalations: int = 0
+    # attempts — transport calls this logical call made (initial + corrective
+    # retries + a rung descent + an escalated re-issue). 1 on a clean call.
+    #
+    # WHY THIS FIELD EXISTS. Every other counter here is a SUM over attempts,
+    # and one number is emitted per logical call — so without an attempt count
+    # nothing downstream can tell a 1-attempt row from a 4-attempt one, and
+    # every per-call figure is uninterpretable. It was read as a per-attempt
+    # draw on 2026-08-25 and used to size a ceiling; the resulting claim had
+    # to be corrected the same day (alpha-engine-config-I8334).
+    attempts: int = 0
+    # reasoning_tokens_max_attempt — the largest reasoning draw of any SINGLE
+    # attempt, as distinct from ``reasoning_tokens``, which is their sum.
+    #
+    # These answer different questions and both are wanted. ``max_tokens``
+    # bounds ONE attempt, so the MAX is the quantity a ceiling must clear; the
+    # SUM is the quantity that gets billed and is what the budget guard reads.
+    # Recording only the sum meant the record could not express the thing the
+    # ceiling was being sized against — a second and independent reason a
+    # measured floor cannot be the guard, on top of the sample being censored
+    # at the ceiling (see ``budget_escalations``).
+    reasoning_tokens_max_attempt: int = 0
     web_search_requests: int = 0
     web_fetch_requests: int = 0
     # Provider-reported USD cost when available (OpenRouter returns it in
@@ -1779,6 +1808,11 @@ class LLMClient:
     @staticmethod
     def _usage_from_anthropic(msg: Any, into: Optional[LLMUsage] = None) -> LLMUsage:
         usage = into or LLMUsage()
+        # One response processed == one ATTEMPT on the wire. Every call site
+        # of this accumulator handles exactly one response, so counting here
+        # is exact (alpha-engine-config-I8334).
+        usage.attempts += 1
+        _reasoning_before = usage.reasoning_tokens
         u = getattr(msg, "usage", None)
         if u is None:
             return usage
@@ -1823,11 +1857,20 @@ class LLMClient:
         # OpenAI-shaped extras here (see the cache fields above) and a
         # provider that does report it should not be silently dropped.
         usage.reasoning_tokens += int(getattr(u, "reasoning_tokens", None) or 0)
+        usage.reasoning_tokens_max_attempt = max(
+            usage.reasoning_tokens_max_attempt,
+            usage.reasoning_tokens - _reasoning_before,
+        )
         return usage
 
     @staticmethod
     def _usage_from_openai(resp: Any, into: Optional[LLMUsage] = None) -> LLMUsage:
         usage = into or LLMUsage()
+        # One response processed == one ATTEMPT on the wire. Every call site
+        # of this accumulator handles exactly one response, so counting here
+        # is exact (alpha-engine-config-I8334).
+        usage.attempts += 1
+        _reasoning_before = usage.reasoning_tokens
         u = getattr(resp, "usage", None)
         if u is None:
             return usage
@@ -1889,6 +1932,10 @@ class LLMClient:
         cost = getattr(u, "cost", None)
         if cost is not None:
             usage.provider_cost_usd = (usage.provider_cost_usd or 0.0) + float(cost)
+        usage.reasoning_tokens_max_attempt = max(
+            usage.reasoning_tokens_max_attempt,
+            usage.reasoning_tokens - _reasoning_before,
+        )
         return usage
 
     def _escalated_budget(self, exhausted: int) -> Optional[int]:
