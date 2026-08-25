@@ -656,6 +656,43 @@ class StreamIdleTimeoutError(LLMError):
         self.finish_reason = finish_reason
 
 
+class StreamTotalTimeoutError(LLMError):
+    """A stream ran longer than its TOTAL wall-clock budget.
+
+    Sibling of :class:`StreamIdleTimeoutError`, not a variant of it — the two
+    name distinguishable failure modes and a consumer's retry classifier is
+    expected to type-match them differently. ``StreamIdleTimeoutError`` means
+    the route went silent; this means the route kept producing chunks the
+    entire time and simply took too long. Blurring them into one type would
+    make that distinction unrecoverable at the call site
+    (alpha-engine-config-I8348).
+
+    Carries the same evidence as :class:`StreamIdleTimeoutError` — the
+    partial generation, chunk count, and usage accumulated so far — so an
+    abort on this bound is exactly as diagnosable as an abort on the idle
+    one. ``elapsed`` on this exception is, by construction, at or just past
+    ``total_timeout``.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: "Optional[LLMUsage]" = None,
+        partial_text: str = "",
+        chunks: int = 0,
+        total_timeout: float = 0.0,
+        elapsed: float = 0.0,
+        finish_reason: Optional[str] = None,
+    ):
+        super().__init__(message, usage=usage)
+        self.partial_text = partial_text
+        self.chunks = chunks
+        self.total_timeout = total_timeout
+        self.elapsed = elapsed
+        self.finish_reason = finish_reason
+
+
 _STREAM_ITEM = "item"
 _STREAM_ERROR = "error"
 _STREAM_DONE = "done"
@@ -663,6 +700,10 @@ _STREAM_DONE = "done"
 
 class _StreamIdle(Exception):
     """Internal signal: the pump produced nothing within the idle budget."""
+
+
+class _StreamTotalExceeded(Exception):
+    """Internal signal: the stream ran past its total wall-clock budget."""
 
 
 def _close_stream(stream: Any) -> None:
@@ -685,8 +726,11 @@ def _close_stream(stream: Any) -> None:
         logger.debug("stream close raised while aborting: %s", exc)
 
 
-def _iter_with_idle_timeout(stream: Any, *, idle_timeout: float):
-    """Yield items from *stream*, bounding the SILENCE BETWEEN them.
+def _iter_with_idle_timeout(
+    stream: Any, *, idle_timeout: float, total_timeout: Optional[float] = None
+):
+    """Yield items from *stream*, bounding the SILENCE BETWEEN them and,
+    when *total_timeout* is given, the TOTAL wall-clock time spent iterating.
 
     A blocking ``next()`` on a synchronous provider stream cannot be
     interrupted from the outside, so the iteration runs on a daemon worker and
@@ -695,10 +739,20 @@ def _iter_with_idle_timeout(stream: Any, *, idle_timeout: float):
     happens to sit underneath — the transport's own read timeout still applies
     beneath it, and whichever is smaller binds first.
 
-    The worker is a daemon and is not joined: after an idle abort the caller
-    closes the stream (see :func:`_close_stream`), the pending read fails, and
-    the thread exits on its own. Joining it would reintroduce exactly the
-    unbounded wait this function exists to bound.
+    The total bound is enforced HERE, on the consumer side of the queue, for
+    the identical reason the idle bound is: the pump thread runs a blocking
+    provider iterator that cannot be interrupted from outside. Each wait on
+    the queue is capped at ``min(idle_timeout, remaining_total)`` rather than
+    ``idle_timeout`` alone — a stream that keeps producing chunks right up to
+    (and past) the total budget must still be caught even though it never
+    goes idle (alpha-engine-config-I8348: "the transport timeout becomes
+    per-chunk" is exactly this — an idle-only bound never fires against
+    continuous, on-time chunks).
+
+    The worker is a daemon and is not joined: after an abort — idle or total —
+    the caller closes the stream (see :func:`_close_stream`), the pending read
+    fails, and the thread exits on its own. Joining it would reintroduce
+    exactly the unbounded wait this function exists to bound.
     """
     q: "queue.Queue" = queue.Queue()
 
@@ -715,10 +769,21 @@ def _iter_with_idle_timeout(stream: Any, *, idle_timeout: float):
         target=_pump, name="krepis-llm-stream", daemon=True
     ).start()
 
+    started = _time.monotonic()
     while True:
+        wait = idle_timeout
+        if total_timeout is not None:
+            remaining = total_timeout - (_time.monotonic() - started)
+            if remaining <= 0:
+                raise _StreamTotalExceeded() from None
+            wait = min(idle_timeout, remaining)
         try:
-            kind, payload = q.get(timeout=idle_timeout)
+            kind, payload = q.get(timeout=wait)
         except queue.Empty:
+            if total_timeout is not None and (
+                _time.monotonic() - started
+            ) >= total_timeout:
+                raise _StreamTotalExceeded() from None
             raise _StreamIdle() from None
         if kind == _STREAM_ITEM:
             yield payload
@@ -831,7 +896,11 @@ class _StreamedMessage:
 
 
 def _accumulate_openai_stream(
-    stream: Any, *, idle_timeout: float, spec: "ModelSpec"
+    stream: Any,
+    *,
+    idle_timeout: float,
+    total_timeout: Optional[float] = None,
+    spec: "ModelSpec",
 ) -> _StreamedChatCompletion:
     """Drain an OpenAI-wire stream into a ``ChatCompletion``-shaped object."""
     parts: List[str] = []
@@ -842,7 +911,9 @@ def _accumulate_openai_stream(
     chunks = 0
     started = _time.monotonic()
     try:
-        for chunk in _iter_with_idle_timeout(stream, idle_timeout=idle_timeout):
+        for chunk in _iter_with_idle_timeout(
+            stream, idle_timeout=idle_timeout, total_timeout=total_timeout
+        ):
             chunks += 1
             model = getattr(chunk, "model", None) or model
             served_provider = getattr(chunk, "provider", None) or served_provider
@@ -875,6 +946,22 @@ def _accumulate_openai_stream(
             idle_timeout=idle_timeout,
             elapsed=elapsed,
         ) from None
+    except _StreamTotalExceeded:
+        _close_stream(stream)
+        elapsed = _time.monotonic() - started
+        partial = "".join(parts)
+        raise StreamTotalTimeoutError(
+            f"provider={spec.provider} model={spec.model}: the stream ran for "
+            f"{elapsed:.0f}s, past its total_timeout={total_timeout:.0f}s "
+            f"budget, after {chunks} chunk(s) and {len(partial)} character(s) "
+            f"— aborting on TOTAL duration, not on inter-chunk silence (the "
+            f"stream kept producing chunks). The partial generation is on "
+            f"this exception as ``partial_text``.",
+            partial_text=partial,
+            chunks=chunks,
+            total_timeout=total_timeout or 0.0,
+            elapsed=elapsed,
+        ) from None
     return _StreamedChatCompletion(
         text="".join(parts),
         finish_reason=finish_reason,
@@ -887,7 +974,11 @@ def _accumulate_openai_stream(
 
 
 def _accumulate_anthropic_stream(
-    stream: Any, *, idle_timeout: float, spec: "ModelSpec"
+    stream: Any,
+    *,
+    idle_timeout: float,
+    total_timeout: Optional[float] = None,
+    spec: "ModelSpec",
 ) -> _StreamedMessage:
     """Drain an Anthropic event stream into a ``Message``-shaped object.
 
@@ -911,7 +1002,9 @@ def _accumulate_anthropic_stream(
         )
 
     try:
-        for event in _iter_with_idle_timeout(stream, idle_timeout=idle_timeout):
+        for event in _iter_with_idle_timeout(
+            stream, idle_timeout=idle_timeout, total_timeout=total_timeout
+        ):
             chunks += 1
             etype = getattr(event, "type", None)
             if etype == "message_start":
@@ -966,6 +1059,22 @@ def _accumulate_anthropic_stream(
             partial_text=partial,
             chunks=chunks,
             idle_timeout=idle_timeout,
+            elapsed=elapsed,
+        ) from None
+    except _StreamTotalExceeded:
+        _close_stream(stream)
+        elapsed = _time.monotonic() - started
+        partial = _partial_text()
+        raise StreamTotalTimeoutError(
+            f"provider={spec.provider} model={spec.model}: the stream ran for "
+            f"{elapsed:.0f}s, past its total_timeout={total_timeout:.0f}s "
+            f"budget, after {chunks} event(s) and {len(partial)} character(s) "
+            f"— aborting on TOTAL duration, not on inter-chunk silence (the "
+            f"stream kept producing events). The partial generation is on "
+            f"this exception as ``partial_text``.",
+            partial_text=partial,
+            chunks=chunks,
+            total_timeout=total_timeout or 0.0,
             elapsed=elapsed,
         ) from None
 
@@ -1364,6 +1473,22 @@ class LLMClient:
     (``alpha-engine-config-I7179``). Emission is now a property of the
     execution environment, which is where a fleet operator can actually
     set it once, rather than a property of each call site.
+
+    **``timeout=`` is a per-read bound, not a total-duration bound, on a
+    streamed call.** The OpenAI SDK turns a bare float into
+    ``httpx.Timeout(all=<float>)``, whose ``read`` component bounds the gap
+    between reads. On a non-streamed call there is exactly one read, so
+    read-bound and total-bound coincide. On a **streamed** call there are
+    thousands of reads and every chunk resets the clock, so ``timeout=``
+    stops bounding total duration at all — a route that emits one token
+    every ``timeout - epsilon`` seconds runs forever
+    (alpha-engine-config-I8348). ``stream_idle_timeout`` (client-level) /
+    ``idle_timeout`` (per-call) bounds SILENCE between chunks and is on by
+    default (:data:`DEFAULT_STREAM_IDLE_TIMEOUT_S`); ``stream_total_timeout``
+    (client-level) / ``total_timeout`` (per-call) bounds the TOTAL wall-clock
+    life of a streamed call and is ``None`` (unbounded) by default — opt in
+    per call site, since a call site that never asked for a wall-clock
+    ceiling must not silently acquire one on upgrade.
     """
 
     def __init__(
@@ -1377,6 +1502,7 @@ class LLMClient:
         max_retries: int = 3,
         cost_sink: Optional[Callable[[dict], None]] = None,
         stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
+        stream_total_timeout: Optional[float] = None,
         budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
     ):
         if not isinstance(callsite_id, str) or not callsite_id.strip():
@@ -1399,6 +1525,18 @@ class LLMClient:
                 "mode streaming exists to remove."
             )
         self._stream_idle_timeout = float(stream_idle_timeout)
+        # ``None`` = unbounded, deliberately. Unlike ``stream_idle_timeout``
+        # (which has no "unbounded" setting — see the ValueError above), a
+        # streamed call that never asked for a total-duration ceiling must
+        # not silently acquire one on upgrade: every existing caller of a
+        # streaming krepis consumer built before this parameter existed
+        # keeps its exact current behaviour (idle-bounded, total-unbounded)
+        # unless it opts in (alpha-engine-config-I8348 requirement 4).
+        if stream_total_timeout is not None and stream_total_timeout <= 0:
+            raise ValueError("stream_total_timeout must be > 0 when set")
+        self._stream_total_timeout: Optional[float] = (
+            float(stream_total_timeout) if stream_total_timeout is not None else None
+        )
         if budget_escalation_factor < 1.0:
             raise ValueError(
                 "budget_escalation_factor must be >= 1.0 "
@@ -1747,6 +1885,52 @@ class LLMClient:
             )
         return value
 
+    #: Sanity factor for :meth:`_effective_total_timeout`'s "this is probably
+    #: a units mistake" warning — e.g. seconds where milliseconds were meant.
+    #: Not a functional bound: unlike the idle-vs-transport-timeout check
+    #: (which names a value that literally cannot fire), nothing stops a
+    #: legitimately huge ``total_timeout`` from working exactly as configured.
+    _TOTAL_TIMEOUT_SANITY_FACTOR = 100.0
+
+    def _effective_total_timeout(
+        self, total_timeout: Optional[float], *, idle_timeout: float
+    ) -> Optional[float]:
+        """The total wall-clock budget actually enforced, or ``None``.
+
+        ``None`` (the default at both the client and per-call level) means
+        unbounded — the pre-existing, idle-only behaviour. When a value is
+        given (or the client was built with ``stream_total_timeout=``), it
+        must exceed *idle_timeout*: a total bound at or below the idle bound
+        would always fire first, making the idle budget dead code — exactly
+        the "this knob can never fire" condition :meth:`_effective_idle_timeout`
+        already guards against for ``idle_timeout`` vs the transport timeout,
+        so it is raised here rather than only warned about.
+        """
+        value = (
+            self._stream_total_timeout if total_timeout is None else float(total_timeout)
+        )
+        if value is None:
+            return None
+        if value <= 0:
+            raise ValueError("total_timeout must be > 0")
+        if value <= idle_timeout:
+            raise ValueError(
+                f"total_timeout={value:.0f}s must be greater than "
+                f"idle_timeout={idle_timeout:.0f}s — at or below it, the total "
+                "bound always trips before the idle bound could, making "
+                "idle_timeout dead code."
+            )
+        if value >= self._timeout * self._TOTAL_TIMEOUT_SANITY_FACTOR:
+            logger.warning(
+                "llm stream: total_timeout=%.0fs is >= %.0fx the transport "
+                "timeout=%.0fs. This is not necessarily wrong — total_timeout "
+                "legitimately exceeds the per-read transport timeout on a "
+                "streamed call — but a value this far out is also the "
+                "signature of a units mistake (ms vs s). Confirm the units.",
+                value, self._TOTAL_TIMEOUT_SANITY_FACTOR, self._timeout,
+            )
+        return value
+
     @staticmethod
     def _openai_stream_kwargs(kwargs: dict) -> dict:
         """Add ``stream`` plus the usage opt-in the OpenAI wire requires.
@@ -1769,25 +1953,37 @@ class LLMClient:
     # parameter of the same name is a TypeError at the one call shape this
     # method exists for.
     def _openai_completion(
-        self, create: Any, kwargs: dict, *, stream: bool, idle_timeout: float
+        self,
+        create: Any,
+        kwargs: dict,
+        *,
+        stream: bool,
+        idle_timeout: float,
+        total_timeout: Optional[float] = None,
     ) -> Any:
         """One OpenAI-wire completion, streamed or not, same return shape."""
         raw = self._call_transport(create, **kwargs)
         if not stream:
             return raw
         return _accumulate_openai_stream(
-            raw, idle_timeout=idle_timeout, spec=self.spec
+            raw, idle_timeout=idle_timeout, total_timeout=total_timeout, spec=self.spec
         )
 
     def _anthropic_message(
-        self, create: Any, payload: dict, *, stream: bool, idle_timeout: float
+        self,
+        create: Any,
+        payload: dict,
+        *,
+        stream: bool,
+        idle_timeout: float,
+        total_timeout: Optional[float] = None,
     ) -> Any:
         """One Anthropic-wire message, streamed or not, same return shape."""
         raw = self._call_transport(create, **payload)
         if not stream:
             return raw
         return _accumulate_anthropic_stream(
-            raw, idle_timeout=idle_timeout, spec=self.spec
+            raw, idle_timeout=idle_timeout, total_timeout=total_timeout, spec=self.spec
         )
 
     def _reject_reasoning_on_anthropic(self) -> None:
@@ -2036,6 +2232,7 @@ class LLMClient:
         on_unsupported: str = "raise",
         stream: bool = False,
         idle_timeout: Optional[float] = None,
+        total_timeout: Optional[float] = None,
     ) -> LLMResult:
         """One plain text generation. Returns normalized :class:`LLMResult`.
 
@@ -2057,12 +2254,27 @@ class LLMClient:
         does not declare ``capabilities.streaming`` raises
         :exc:`StreamingUnsupportedError`; it never quietly becomes a
         non-streaming call.
+
+        ``total_timeout`` adds a SECOND, independent bound: the total
+        wall-clock life of the streamed call, enforced in addition to
+        ``idle_timeout``. ``None`` (the default, or the client's
+        ``stream_total_timeout`` when also unset) is unbounded — the
+        pre-existing behaviour. A route that keeps producing chunks right up
+        to and past ``total_timeout`` raises :exc:`StreamTotalTimeoutError` —
+        a distinct type from :exc:`StreamIdleTimeoutError` so a caller's
+        retry classifier can treat "went silent" and "ran too long"
+        differently — carrying the same partial-generation evidence.
         """
         self._reject_reasoning_on_anthropic()
         limit = self._effective_max_tokens(max_tokens)
         if stream:
             self._require_streaming_route()
         idle = self._effective_idle_timeout(idle_timeout) if stream else 0.0
+        total = (
+            self._effective_total_timeout(total_timeout, idle_timeout=idle)
+            if stream
+            else None
+        )
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             payload = build_messages_payload(
@@ -2081,6 +2293,7 @@ class LLMClient:
                 payload,
                 stream=stream,
                 idle_timeout=idle,
+                total_timeout=total,
             )
             text = "\n\n".join(
                 getattr(b, "text", "")
@@ -2120,6 +2333,7 @@ class LLMClient:
             kwargs,
             stream=stream,
             idle_timeout=idle,
+            total_timeout=total,
         )
         text = self._choice_text_or_llm_error(resp)
         served_model = (
@@ -2153,6 +2367,7 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         stream: bool = False,
         idle_timeout: Optional[float] = None,
+        total_timeout: Optional[float] = None,
     ) -> StructuredResult:
         """One schema-constrained call. Validates or raises :exc:`LLMError`.
 
@@ -2204,6 +2419,13 @@ class LLMClient:
         loop is streamed; the descent ladder, the budget-exhaustion guard and
         the served-model resolution are unchanged, because a streamed response
         is re-assembled into the same object shape they already read.
+
+        ``total_timeout`` adds a SECOND, independent bound — see
+        :meth:`complete` for the full contract. It applies per attempt of
+        the corrective-retry loop, identically to ``idle_timeout``: each
+        streamed attempt gets its own fresh ``total_timeout`` budget, not a
+        budget shared across ``attempts``. A route that keeps producing
+        chunks past ``total_timeout`` raises :exc:`StreamTotalTimeoutError`.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
@@ -2211,6 +2433,11 @@ class LLMClient:
         if stream:
             self._require_streaming_route()
         idle = self._effective_idle_timeout(idle_timeout) if stream else 0.0
+        total = (
+            self._effective_total_timeout(total_timeout, idle_timeout=idle)
+            if stream
+            else None
+        )
 
         is_pydantic = hasattr(schema, "model_json_schema")
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
@@ -2243,6 +2470,7 @@ class LLMClient:
                     max_tokens=budget,
                     stream=stream,
                     idle_timeout=idle,
+                    total_timeout=total,
                 )
             return self._structured_openai(
                 system=system,
@@ -2255,6 +2483,7 @@ class LLMClient:
                 max_tokens=budget,
                 stream=stream,
                 idle_timeout=idle,
+                total_timeout=total,
             )
 
         try:
@@ -2302,6 +2531,7 @@ class LLMClient:
         max_tokens: int,
         stream: bool = False,
         idle_timeout: float = 0.0,
+        total_timeout: Optional[float] = None,
     ) -> StructuredResult:
         tool = {
             "name": schema_name,
@@ -2336,6 +2566,7 @@ class LLMClient:
                 payload,
                 stream=stream,
                 idle_timeout=idle_timeout,
+                total_timeout=total_timeout,
             )
             self._usage_from_anthropic(msg, into=usage)
             # See the openai path: per ATTEMPT, because ``raw_response`` on the
@@ -2426,6 +2657,7 @@ class LLMClient:
         max_tokens: int,
         stream: bool = False,
         idle_timeout: float = 0.0,
+        total_timeout: Optional[float] = None,
     ) -> StructuredResult:
         extra_body = self._openai_extra_body()
 
@@ -2491,6 +2723,7 @@ class LLMClient:
                     {"messages": messages, **kwargs},
                     stream=stream,
                     idle_timeout=idle_timeout,
+                    total_timeout=total_timeout,
                 )
                 self._usage_from_openai(resp, into=usage)
                 # Per ATTEMPT, not per result: ``raw_response`` on the returned

@@ -28,6 +28,7 @@ from krepis.llm import (
     LLMClient,
     StreamIdleTimeoutError,
     StreamingUnsupportedError,
+    StreamTotalTimeoutError,
 )
 from krepis.llm_config import ModelSpec
 
@@ -108,6 +109,30 @@ class _StallingStream:
     def close(self):
         self.closed = True
         self.released.set()
+
+
+class _RelentlessStream:
+    """Yields a chunk every *interval* seconds, FOREVER — never idle.
+
+    This is alpha-engine-config-I8348's exact failure shape: a route that
+    keeps producing chunks fast enough to keep resetting the idle clock, so
+    an idle-only bound never fires and only a TOTAL bound can catch it.
+    """
+
+    def __init__(self, interval):
+        self.interval = interval
+        self.closed = False
+        self._stop = threading.Event()
+
+    def __iter__(self):
+        i = 0
+        while not self._stop.wait(self.interval):
+            i += 1
+            yield _chunk(content=f"c{i}")
+
+    def close(self):
+        self.closed = True
+        self._stop.set()
 
 
 class FakeOpenAI:
@@ -223,6 +248,86 @@ class TestInterChunkIdleTimeoutFires:
             LLMClient(
                 OPENROUTER_SPEC, callsite_id="x", stream_idle_timeout=0
             )
+
+
+# ── the TOTAL budget (alpha-engine-config-I8348) ──────────────────────────
+
+
+class TestTotalDurationBoundFires:
+    """The idle budget bounds SILENCE. A route that keeps emitting chunks
+    resets the idle clock forever, so only a TOTAL bound can stop it."""
+
+    def test_a_relentless_stream_aborts_on_the_total_budget(self):
+        stream = _RelentlessStream(0.02)
+        fake = FakeOpenAI([stream])
+        client = _client(OPENROUTER_SPEC, fake)
+
+        with pytest.raises(StreamTotalTimeoutError) as excinfo:
+            client.complete(
+                system="s", user_content="u", stream=True,
+                idle_timeout=0.25, total_timeout=0.5,
+            )
+
+        err = excinfo.value
+        assert err.total_timeout == 0.5
+        assert err.elapsed >= 0.5, (
+            "elapsed must be at or past the budget by construction — an "
+            "exception claiming it fired early would misreport the bound"
+        )
+        assert err.partial_text, (
+            "the partial generation must ride the exception, same contract "
+            "as the idle path — discarding it is what I8164 removed"
+        )
+        assert err.chunks > 0
+        assert stream.closed, "the abandoned stream must be closed, not leaked"
+
+    def test_the_idle_bound_still_fires_when_a_generous_total_is_set(self):
+        """Setting a total budget must not disarm the idle budget — they are
+        two independent bounds with different fixes."""
+        stream = _StallingStream(["par", "tial "])
+        fake = FakeOpenAI([stream])
+        client = _client(OPENROUTER_SPEC, fake)
+
+        with pytest.raises(StreamIdleTimeoutError):
+            client.complete(
+                system="s", user_content="u", stream=True,
+                idle_timeout=0.25, total_timeout=30,
+            )
+
+    def test_unset_total_timeout_leaves_the_stream_unbounded(self):
+        """The default must not hand an existing consumer a ceiling it never
+        asked for: with no total budget, a slow-but-alive stream completes."""
+        import time
+
+        def _dribble():
+            for piece in ("a", "b", "c", "d"):
+                time.sleep(0.05)
+                yield _chunk(content=piece)
+            yield _chunk(finish_reason="stop")
+            yield _chunk(usage=_usage())
+
+        fake = FakeOpenAI([_dribble()])
+        client = _client(OPENROUTER_SPEC, fake)
+        result = client.complete(
+            system="s", user_content="u", stream=True, idle_timeout=0.5
+        )
+        assert result.text == "abcd"
+
+    def test_a_total_budget_at_or_below_the_idle_budget_is_rejected(self):
+        """A total bound the idle bound always wins is a knob that does
+        nothing — reject it at the call rather than let it read as armed."""
+        fake = FakeOpenAI([_RelentlessStream(0.02)])
+        client = _client(OPENROUTER_SPEC, fake)
+        with pytest.raises(ValueError, match="total_timeout"):
+            client.complete(
+                system="s", user_content="u", stream=True,
+                idle_timeout=5, total_timeout=5,
+            )
+
+    def test_a_non_positive_client_level_total_is_rejected_at_construction(self):
+        with pytest.raises(ValueError, match="stream_total_timeout"):
+            _client(OPENROUTER_SPEC, FakeOpenAI([]), stream_total_timeout=0)
+
 
 
 # ── same shape as the non-streaming path ──────────────────────────────────
