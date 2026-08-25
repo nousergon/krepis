@@ -1186,7 +1186,18 @@ def record_llm_call(
     if provider is not None:
         metadata.provider = provider
 
-    if metadata.provider_reported_cost_usd is not None:
+    # UNKNOWN usage is never 0. A streamed call gets its token counts from a
+    # final chunk the client explicitly asks for; a route that omits it leaves
+    # the counts incomplete, and pricing what did arrive would file a real call
+    # at an understated cost with nothing on the row saying so. Refusing to
+    # price it puts the gap in the ledger instead of hiding it there
+    # (alpha-engine-config-I8164). Ahead of both pricing branches deliberately:
+    # a provider-reported cost derived from the same absent usage is no more
+    # trustworthy than a recomputed one.
+    if bool(getattr(getattr(result_or_msg, "usage", None), "usage_unknown", False)):
+        metadata.cost_usd = None
+        cost_source = "usage_unreported"
+    elif metadata.provider_reported_cost_usd is not None:
         metadata.cost_usd = metadata.provider_reported_cost_usd
         cost_source = "provider_reported"
     else:
@@ -1212,6 +1223,13 @@ def record_llm_call(
         "cost_usd": metadata.cost_usd,
         "cost_source": cost_source,
     }
+    if cost_source == "usage_unreported":
+        # An explicit column, not an inference from a null cost: a consumer
+        # summing spend must be able to COUNT the calls it could not price,
+        # and "cost_usd is None" is also what a future unrelated bug looks
+        # like. The token fields stay as-is — partial counts are real data,
+        # they are simply not a complete basis for a price.
+        record["usage_unknown"] = True
     if extra_fields:
         record.update(extra_fields)
     return _apply_contract_columns(record)

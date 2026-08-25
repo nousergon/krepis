@@ -119,7 +119,13 @@ MIN_ADMISSIBLE_TPM = 1_000_000
 #: a different API surface entirely. Only a flag that decides whether a request
 #: is ACCEPTED belongs here — requiring anything else would silently narrow a
 #: chain for a preference rather than a contract.
-ROUTABLE_CAPABILITIES = ("tool_choice",)
+#: `streaming` joined it 2026-08-25 (alpha-engine-config-I8164) and passes the
+#: same test: a route that cannot stream does not serve a streamed request more
+#: slowly, it does not serve it at all, so the flag decides ACCEPTANCE. It is
+#: also the one call shape whose absence cannot be discovered from a successful
+#: response — a client that fell back to a non-streaming request would get a
+#: valid completion and the original request-deadline failure envelope back.
+ROUTABLE_CAPABILITIES = ("tool_choice", "streaming")
 
 _MAX_WALK_DEPTH = 8
 

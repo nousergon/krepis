@@ -34,10 +34,13 @@ import functools
 import json
 import logging
 import os
+import queue
 import random as _random
 import re
+import threading
 import time as _time
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Callable, List, Optional
 
 from krepis.anthropic_payload import (
@@ -517,6 +520,438 @@ def _reject_budget_exhausted(
     )
 
 
+# ── streaming ─────────────────────────────────────────────────────────────
+
+#: Default inter-chunk idle budget for a streamed call, in seconds.
+#:
+#: A streamed call replaces "how long may the whole generation take" with "how
+#: long may the model be SILENT". The first is a wall the generation runs into
+#: — every Director plan failure this month was one, and each discarded a
+#: partial generation that was probably still in progress
+#: (alpha-engine-config-I8164). The second bounds the only condition a client
+#: can actually diagnose from the outside: a route that has stopped producing.
+#: A genuinely hung call is therefore detected FASTER than a merely slow one is
+#: under a total-duration deadline, which is the inversion this exists for.
+DEFAULT_STREAM_IDLE_TIMEOUT_S = 90.0
+
+
+class StreamingUnsupportedError(LLMConfigError):
+    """``stream=True`` on a route whose registry entry does not declare it.
+
+    A loud, named condition — never a quiet non-streaming call. Silently
+    honouring the request without the streaming semantics would hand back the
+    exact failure mode streaming was asked for to remove, wearing a result
+    shape that says it worked (``model-portability-policy`` §I9).
+
+    The fix is a registry declaration (``capabilities.streaming: true`` on the
+    entry, which is a MEASURED claim about the deployment), not a client flag.
+    """
+
+
+class StreamIdleTimeoutError(LLMError):
+    """A stream went silent for longer than its inter-chunk idle budget.
+
+    Carries the evidence the non-streaming deadline could never carry: the
+    partial generation, how many chunks arrived, the last ``finish_reason``
+    seen (usually ``None`` — that is the point), and the usage accumulated so
+    far. A failure that says "600 seconds elapsed" is indistinguishable from a
+    hundred other faults; one that says "1,842 characters arrived across 96
+    chunks and then nothing for 90 seconds" names its own cause.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        usage: "Optional[LLMUsage]" = None,
+        partial_text: str = "",
+        chunks: int = 0,
+        idle_timeout: float = 0.0,
+        elapsed: float = 0.0,
+        finish_reason: Optional[str] = None,
+    ):
+        super().__init__(message, usage=usage)
+        self.partial_text = partial_text
+        self.chunks = chunks
+        self.idle_timeout = idle_timeout
+        self.elapsed = elapsed
+        self.finish_reason = finish_reason
+
+
+_STREAM_ITEM = "item"
+_STREAM_ERROR = "error"
+_STREAM_DONE = "done"
+
+
+class _StreamIdle(Exception):
+    """Internal signal: the pump produced nothing within the idle budget."""
+
+
+def _close_stream(stream: Any) -> None:
+    """Best-effort release of an abandoned stream's underlying connection.
+
+    Bounded swallow, per the fail-loud rule: (a) the failure mode swallowed is
+    a transport ``close()`` raising while we are already unwinding a stream
+    abort; (b) the primary deliverable — the abort itself, with its partial
+    generation — is unaffected, and letting a close error replace the idle
+    timeout would hide the diagnosis behind the cleanup; (c) recorded on this
+    DEBUG line and, if the socket really leaked, in the pump thread's own
+    eventual read failure.
+    """
+    closer = getattr(stream, "close", None)
+    if closer is None:
+        return
+    try:
+        closer()
+    except Exception as exc:  # noqa: BLE001 — see the three-part rationale above
+        logger.debug("stream close raised while aborting: %s", exc)
+
+
+def _iter_with_idle_timeout(stream: Any, *, idle_timeout: float):
+    """Yield items from *stream*, bounding the SILENCE BETWEEN them.
+
+    A blocking ``next()`` on a synchronous provider stream cannot be
+    interrupted from the outside, so the iteration runs on a daemon worker and
+    the consumer waits on a queue with a deadline. That makes the idle budget a
+    property of THIS client rather than of whichever SDK, HTTP library or proxy
+    happens to sit underneath — the transport's own read timeout still applies
+    beneath it, and whichever is smaller binds first.
+
+    The worker is a daemon and is not joined: after an idle abort the caller
+    closes the stream (see :func:`_close_stream`), the pending read fails, and
+    the thread exits on its own. Joining it would reintroduce exactly the
+    unbounded wait this function exists to bound.
+    """
+    q: "queue.Queue" = queue.Queue()
+
+    def _pump() -> None:
+        try:
+            for item in stream:
+                q.put((_STREAM_ITEM, item))
+        except BaseException as exc:  # noqa: BLE001 — forwarded verbatim
+            q.put((_STREAM_ERROR, exc))
+        finally:
+            q.put((_STREAM_DONE, None))
+
+    threading.Thread(
+        target=_pump, name="krepis-llm-stream", daemon=True
+    ).start()
+
+    while True:
+        try:
+            kind, payload = q.get(timeout=idle_timeout)
+        except queue.Empty:
+            raise _StreamIdle() from None
+        if kind == _STREAM_ITEM:
+            yield payload
+        elif kind == _STREAM_ERROR:
+            raise payload
+        else:
+            return
+
+
+@dataclass
+class _StreamedChoice:
+    """``ChatCompletion.choices[0]``-shaped view of an accumulated stream."""
+
+    message: Any
+    finish_reason: Optional[str] = None
+    index: int = 0
+
+
+class _StreamedChatCompletion:
+    """An OpenAI-wire stream, accumulated back into the non-streaming shape.
+
+    The whole point: every helper downstream of the transport call —
+    :func:`_choice_text`, :func:`_reject_budget_exhausted`,
+    :func:`_resolve_group_served_model`, :meth:`LLMClient._usage_from_openai`
+    — reads a ``ChatCompletion``. Re-synthesizing that object means a streamed
+    call takes the identical path afterwards, so ``stream=True`` cannot quietly
+    return a different result shape, a different degradation ladder, or a
+    different set of guards. The alternative — a parallel post-processing path
+    for streamed responses — is two implementations of one contract, and the
+    second one is the one nobody re-reads.
+
+    ``krepis_*`` attributes are the streaming-only facts that have no place on
+    a ``ChatCompletion``; :func:`_finalize_result` stamps them onto the result.
+    """
+
+    def __init__(
+        self,
+        *,
+        text: str,
+        finish_reason: Optional[str],
+        model: Optional[str],
+        usage: Any,
+        served_provider: Optional[str],
+        chunks: int,
+        usage_reported: bool,
+    ) -> None:
+        self.choices = [
+            _StreamedChoice(
+                message=SimpleNamespace(content=text),
+                finish_reason=finish_reason,
+            )
+        ]
+        self.model = model
+        self.usage = usage
+        if served_provider is not None:
+            self.provider = served_provider
+        self.krepis_streamed = True
+        self.krepis_stream_chunks = chunks
+        self.krepis_usage_reported = usage_reported
+
+
+class _StreamedAnthropicUsage:
+    """``message_start`` usage with ``message_delta``'s final output count.
+
+    Anthropic reports the two halves in two events, and the second is
+    CUMULATIVE rather than incremental — summing them double-counts the
+    output. Merging by delegation rather than by copying fields keeps every
+    provider extension ``_usage_from_anthropic`` reads (DeepSeek's
+    Anthropic-compatible cache fields, ``server_tool_use``) reachable without
+    this class having to enumerate them.
+    """
+
+    def __init__(self, base: Any, *, output_tokens: int) -> None:
+        self._base = base
+        self.output_tokens = output_tokens
+
+    def __getattr__(self, name: str) -> Any:
+        base = self.__dict__.get("_base")
+        if base is None:
+            raise AttributeError(name)
+        return getattr(base, name)
+
+
+class _StreamedMessage:
+    """An Anthropic event stream accumulated back into ``Message`` shape.
+
+    Same contract as :class:`_StreamedChatCompletion` on the other wire: the
+    text-block join in :meth:`LLMClient.complete` and
+    :meth:`LLMClient._extract_tool_input` on the structured path both read a
+    ``Message``, and a streamed call must not get its own copy of either.
+    """
+
+    def __init__(
+        self,
+        *,
+        content: List[Any],
+        model: Optional[str],
+        usage: Any,
+        stop_reason: Optional[str],
+        chunks: int,
+        usage_reported: bool,
+    ) -> None:
+        self.content = content
+        self.model = model
+        self.usage = usage
+        self.stop_reason = stop_reason
+        self.krepis_streamed = True
+        self.krepis_stream_chunks = chunks
+        self.krepis_usage_reported = usage_reported
+
+
+def _accumulate_openai_stream(
+    stream: Any, *, idle_timeout: float, spec: "ModelSpec"
+) -> _StreamedChatCompletion:
+    """Drain an OpenAI-wire stream into a ``ChatCompletion``-shaped object."""
+    parts: List[str] = []
+    finish_reason: Optional[str] = None
+    model: Optional[str] = None
+    served_provider: Optional[str] = None
+    usage_obj: Any = None
+    chunks = 0
+    started = _time.monotonic()
+    try:
+        for chunk in _iter_with_idle_timeout(stream, idle_timeout=idle_timeout):
+            chunks += 1
+            model = getattr(chunk, "model", None) or model
+            served_provider = getattr(chunk, "provider", None) or served_provider
+            # The usage-bearing final chunk carries an EMPTY ``choices`` on
+            # every OpenAI-compatible route, so this must precede any choice
+            # read rather than living inside one.
+            chunk_usage = getattr(chunk, "usage", None)
+            if chunk_usage is not None:
+                usage_obj = chunk_usage
+            for choice in getattr(chunk, "choices", None) or []:
+                delta = getattr(choice, "delta", None)
+                piece = getattr(delta, "content", None) if delta is not None else None
+                if piece:
+                    parts.append(piece)
+                reason = getattr(choice, "finish_reason", None)
+                if reason:
+                    finish_reason = reason
+    except _StreamIdle:
+        _close_stream(stream)
+        elapsed = _time.monotonic() - started
+        partial = "".join(parts)
+        raise StreamIdleTimeoutError(
+            f"provider={spec.provider} model={spec.model}: the stream produced "
+            f"no chunk for {idle_timeout:.0f}s after {chunks} chunk(s) and "
+            f"{len(partial)} character(s) over {elapsed:.0f}s — aborting on the "
+            f"inter-chunk idle budget, not on total duration. The partial "
+            f"generation is on this exception as ``partial_text``.",
+            partial_text=partial,
+            chunks=chunks,
+            idle_timeout=idle_timeout,
+            elapsed=elapsed,
+        ) from None
+    return _StreamedChatCompletion(
+        text="".join(parts),
+        finish_reason=finish_reason,
+        model=model or spec.model,
+        usage=usage_obj,
+        served_provider=served_provider,
+        chunks=chunks,
+        usage_reported=usage_obj is not None,
+    )
+
+
+def _accumulate_anthropic_stream(
+    stream: Any, *, idle_timeout: float, spec: "ModelSpec"
+) -> _StreamedMessage:
+    """Drain an Anthropic event stream into a ``Message``-shaped object.
+
+    Text arrives as ``text_delta``; a forced-tool structured call arrives as
+    ``input_json_delta`` fragments that only become a JSON object once the
+    stream ends — which is why the block is assembled here and parsed at the
+    end rather than incrementally.
+    """
+    blocks: dict[int, dict] = {}
+    order: List[int] = []
+    model: Optional[str] = None
+    stop_reason: Optional[str] = None
+    start_usage: Any = None
+    output_tokens: Optional[int] = None
+    chunks = 0
+    started = _time.monotonic()
+
+    def _partial_text() -> str:
+        return "".join(
+            "".join(blocks[i]["parts"]) for i in order if blocks[i]["type"] == "text"
+        )
+
+    try:
+        for event in _iter_with_idle_timeout(stream, idle_timeout=idle_timeout):
+            chunks += 1
+            etype = getattr(event, "type", None)
+            if etype == "message_start":
+                message = getattr(event, "message", None)
+                model = getattr(message, "model", None) or model
+                start_usage = getattr(message, "usage", None)
+            elif etype == "content_block_start":
+                index = int(getattr(event, "index", 0) or 0)
+                block = getattr(event, "content_block", None)
+                if index not in blocks:
+                    order.append(index)
+                blocks[index] = {
+                    "type": getattr(block, "type", "text"),
+                    "name": getattr(block, "name", None),
+                    "id": getattr(block, "id", None),
+                    "parts": [],
+                }
+            elif etype == "content_block_delta":
+                index = int(getattr(event, "index", 0) or 0)
+                if index not in blocks:
+                    order.append(index)
+                    blocks[index] = {
+                        "type": "text", "name": None, "id": None, "parts": [],
+                    }
+                delta = getattr(event, "delta", None)
+                piece = (
+                    getattr(delta, "text", None)
+                    or getattr(delta, "partial_json", None)
+                )
+                if piece:
+                    blocks[index]["parts"].append(piece)
+            elif etype == "message_delta":
+                stop_reason = (
+                    getattr(getattr(event, "delta", None), "stop_reason", None)
+                    or stop_reason
+                )
+                delta_usage = getattr(event, "usage", None)
+                if delta_usage is not None:
+                    reported = getattr(delta_usage, "output_tokens", None)
+                    if reported is not None:
+                        output_tokens = int(reported)
+    except _StreamIdle:
+        _close_stream(stream)
+        elapsed = _time.monotonic() - started
+        partial = _partial_text()
+        raise StreamIdleTimeoutError(
+            f"provider={spec.provider} model={spec.model}: the stream produced "
+            f"no event for {idle_timeout:.0f}s after {chunks} event(s) and "
+            f"{len(partial)} character(s) over {elapsed:.0f}s — aborting on the "
+            f"inter-chunk idle budget, not on total duration. The partial "
+            f"generation is on this exception as ``partial_text``.",
+            partial_text=partial,
+            chunks=chunks,
+            idle_timeout=idle_timeout,
+            elapsed=elapsed,
+        ) from None
+
+    content: List[Any] = []
+    for index in order:
+        block = blocks[index]
+        joined = "".join(block["parts"])
+        if block["type"] == "tool_use":
+            try:
+                tool_input = json.loads(joined) if joined.strip() else {}
+            except json.JSONDecodeError as exc:
+                # NOT swallowed into an empty result: the caller's structured
+                # path classifies a missing tool input and retries, and a
+                # silently-empty dict would read as "the model returned {}".
+                logger.error(
+                    "llm stream: tool_use block %r did not assemble into JSON "
+                    "(%s) — %d character(s) accumulated",
+                    block["name"], exc, len(joined),
+                )
+                tool_input = None
+            content.append(
+                SimpleNamespace(
+                    type="tool_use",
+                    name=block["name"],
+                    id=block["id"],
+                    input=tool_input,
+                )
+            )
+        else:
+            content.append(SimpleNamespace(type=block["type"], text=joined))
+
+    usage_reported = start_usage is not None and output_tokens is not None
+    usage = (
+        _StreamedAnthropicUsage(start_usage, output_tokens=output_tokens or 0)
+        if start_usage is not None
+        else None
+    )
+    return _StreamedMessage(
+        content=content,
+        model=model or spec.model,
+        usage=usage,
+        stop_reason=stop_reason,
+        chunks=chunks,
+        usage_reported=usage_reported,
+    )
+
+
+def _finish_reason_of(resp: Any) -> Optional[str]:
+    """The provider's stop signal, on either wire, or ``None``.
+
+    Surfaced on every :class:`LLMResult` — streamed or not. It is the field
+    that separates "the model finished" from "the budget ran out" from "the
+    stream died", and until now it was read only inside the error paths, so a
+    call that succeeded left no record of how it ended.
+    """
+    stop_reason = getattr(resp, "stop_reason", None)
+    if stop_reason:
+        return str(stop_reason)
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        return None
+    reason = getattr(choices[0], "finish_reason", None)
+    return str(reason) if reason else None
+
 # ── Result types ──────────────────────────────────────────────────────────
 
 
@@ -565,6 +1000,20 @@ class LLMUsage:
     # recompute by :func:`krepis.cost.record_llm_call` — the aggregator
     # knows the actually-routed backend's price; our cards are ceilings.
     provider_cost_usd: Optional[float] = None
+    # True when the provider returned NO usage block for at least one attempt
+    # of this call — the token counts here are therefore incomplete and any
+    # cost derived from them would be an understatement dressed as a number.
+    #
+    # It exists because streaming makes the absence possible at all. A
+    # non-streaming response always carries usage; a streamed one carries it
+    # only in a final chunk the client has to ask for
+    # (``stream_options.include_usage`` on the OpenAI wire, ``message_delta``
+    # on the Anthropic wire), and a route that drops that chunk would
+    # otherwise price the call at zero. ``krepis.cost.record_llm_call`` reads
+    # this flag and refuses to price such a call: ``cost_usd`` is ``None`` and
+    # ``cost_source`` is ``"usage_unreported"``. UNKNOWN, never 0
+    # (alpha-engine-config-I8164).
+    usage_unknown: bool = False
 
 
 @dataclass
@@ -617,6 +1066,22 @@ class LLMResult:
     # ``LLMClient._emit_cost_record`` — so this field is how a telemetry
     # loss stays visible in the artifact rather than only in a log line.
     cost_emission_error: Optional[str] = None
+    # The provider's stop signal — ``stop``/``length``/``tool_calls`` on the
+    # OpenAI wire, ``end_turn``/``max_tokens``/``tool_use`` on the Anthropic
+    # one. Stamped on EVERY result, streamed or not: it separates "the model
+    # finished" from "the budget ran out", and it was previously read only
+    # inside the failure paths, so a successful call recorded nothing about
+    # how it ended. ``None`` when the route reported none.
+    finish_reason: Optional[str] = None
+    # True when this generation arrived as a stream. With it, the binding
+    # constraint on the call was inter-chunk silence rather than total
+    # duration — a materially different failure envelope, and one a reader of
+    # the artifact cannot infer from anything else on it.
+    streamed: bool = False
+    # Chunks (OpenAI wire) or events (Anthropic wire) received. Zero on a
+    # non-streamed call. Together with the duration this is the tokens-per-
+    # second signal that a non-streamed call can only ever reconstruct.
+    stream_chunks: int = 0
 
 
 @dataclass
@@ -705,10 +1170,38 @@ def _finalize_result(method):
             dropped = self.dropped_params
             self.dropped_params = []
         result.dropped_params = dropped
+        _stamp_response_facts(result)
         self._emit_cost_record(result)
         return result
 
     return _wrapped
+
+
+def _stamp_response_facts(result: Any) -> None:
+    """Copy the transport-level facts off the raw response onto the result.
+
+    Stamped in :func:`_finalize_result`, at the ONE public-method boundary,
+    for the reason that decorator already exists: ``complete`` /``structured``
+    / ``complete_grounded`` construct results at seven different points, and a
+    field assigned at six of them is the ``dropped_params`` defect again
+    (alpha-engine-config-I7232) — a result that reads as undegraded because no
+    return site said otherwise.
+
+    ``usage_unknown`` is only ever set, never cleared: on the structured path
+    ``raw_response`` is the LAST attempt's, and an earlier attempt that
+    reported no usage must not be forgotten because a later one did.
+    """
+    resp = getattr(result, "raw_response", None)
+    if resp is None:
+        return
+    reason = _finish_reason_of(resp)
+    if reason is not None:
+        result.finish_reason = reason
+    if getattr(resp, "krepis_streamed", False):
+        result.streamed = True
+        result.stream_chunks = getattr(resp, "krepis_stream_chunks", 0)
+        if not getattr(resp, "krepis_usage_reported", True):
+            result.usage.usage_unknown = True
 
 
 class LLMClient:
@@ -772,6 +1265,7 @@ class LLMClient:
         timeout: float = 180.0,
         max_retries: int = 3,
         cost_sink: Optional[Callable[[dict], None]] = None,
+        stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
     ):
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
@@ -785,6 +1279,14 @@ class LLMClient:
         self._client_factory = client_factory
         self._timeout = timeout
         self._max_retries = max_retries
+        if stream_idle_timeout <= 0:
+            raise ValueError(
+                "stream_idle_timeout must be > 0 — it is the inter-chunk "
+                "silence a streamed call is allowed before it is declared "
+                "hung; there is no 'unbounded' setting, that is the failure "
+                "mode streaming exists to remove."
+            )
+        self._stream_idle_timeout = float(stream_idle_timeout)
         if cost_sink is None:
             # Deliberately NOT wrapped in try/except. A half-configured
             # sink environment raises CostSinkConfigError here, before the
@@ -1074,6 +1576,101 @@ class LLMClient:
             f"record the drop on the result."
         )
 
+    # ── streaming gates ───────────────────────────────────────────────
+
+    def _require_streaming_route(self) -> None:
+        """Refuse ``stream=True`` on a route that does not declare streaming.
+
+        Deliberately NOT routed through :meth:`_capability_gate`: that gate
+        offers ``on_unsupported='drop'``, and dropping ``stream`` is precisely
+        the silent fall back to a non-streaming call this must never do. There
+        is one legal outcome here.
+
+        A route resolved from the registry carries the declaration; a
+        hand-built :class:`~krepis.llm_config.ModelSpec` defaults to ``True``,
+        which is the caller asserting it about their own endpoint — the same
+        split ``structured_outputs`` already has.
+        """
+        if not getattr(self.spec, "supports_streaming", True):
+            raise StreamingUnsupportedError(
+                f"stream=True was requested for model {self.spec.model!r} "
+                f"(provider={self.spec.provider}, "
+                f"registry_id={self.spec.registry_id!r}) but the resolved "
+                "route does not declare capabilities.streaming. An undeclared "
+                "capability is not a capability — nobody measured it. Declare "
+                "it on the registry entry (and address the group with "
+                "resolve_group_spec(..., requires=('streaming',)) so the chain "
+                "is filtered to members that can serve this call shape), or "
+                "call without stream=True. This will NOT silently fall back "
+                "to a non-streaming request: that is the request-deadline "
+                "failure mode streaming exists to remove."
+            )
+
+    def _effective_idle_timeout(self, idle_timeout: Optional[float]) -> float:
+        """The inter-chunk budget actually enforced, warning when it is moot.
+
+        The transport's own read timeout (``LLMClient(timeout=...)``, handed to
+        the SDK) also bounds a silent socket. Whichever is smaller binds first,
+        so an idle budget at or above it can never fire and the caller would be
+        reasoning about a number that does nothing — the config knob that
+        quietly has no effect (``feedback_no_silent_fails``).
+        """
+        value = self._stream_idle_timeout if idle_timeout is None else float(idle_timeout)
+        if value <= 0:
+            raise ValueError("idle_timeout must be > 0")
+        if value >= self._timeout:
+            logger.warning(
+                "llm stream: idle_timeout=%.0fs is at or above the transport "
+                "timeout=%.0fs, so the transport's read deadline binds first "
+                "and the inter-chunk budget can never fire. Lower "
+                "idle_timeout, or raise LLMClient(timeout=...).",
+                value, self._timeout,
+            )
+        return value
+
+    @staticmethod
+    def _openai_stream_kwargs(kwargs: dict) -> dict:
+        """Add ``stream`` plus the usage opt-in the OpenAI wire requires.
+
+        ``stream_options.include_usage`` is not optional for us: without it a
+        streamed OpenAI-compatible response carries no usage at all and the
+        call becomes unattributable. Requesting it makes an absent usage block
+        a provider-contract violation we can name, rather than an expected
+        condition we would have to price at zero.
+        """
+        kw = dict(kwargs)
+        kw["stream"] = True
+        options = dict(kw.get("stream_options") or {})
+        options.setdefault("include_usage", True)
+        kw["stream_options"] = options
+        return kw
+
+    # The wire payload is passed as a DICT rather than **kwargs: it legitimately
+    # contains a key named ``stream``, and splatting it alongside a control
+    # parameter of the same name is a TypeError at the one call shape this
+    # method exists for.
+    def _openai_completion(
+        self, create: Any, kwargs: dict, *, stream: bool, idle_timeout: float
+    ) -> Any:
+        """One OpenAI-wire completion, streamed or not, same return shape."""
+        raw = self._call_transport(create, **kwargs)
+        if not stream:
+            return raw
+        return _accumulate_openai_stream(
+            raw, idle_timeout=idle_timeout, spec=self.spec
+        )
+
+    def _anthropic_message(
+        self, create: Any, payload: dict, *, stream: bool, idle_timeout: float
+    ) -> Any:
+        """One Anthropic-wire message, streamed or not, same return shape."""
+        raw = self._call_transport(create, **payload)
+        if not stream:
+            return raw
+        return _accumulate_anthropic_stream(
+            raw, idle_timeout=idle_timeout, spec=self.spec
+        )
+
     def _reject_reasoning_on_anthropic(self) -> None:
         """``ModelSpec.reasoning`` has no anthropic-transport equivalent.
 
@@ -1288,6 +1885,8 @@ class LLMClient:
         cache_system: bool = True,
         extra: Optional[dict] = None,
         on_unsupported: str = "raise",
+        stream: bool = False,
+        idle_timeout: Optional[float] = None,
     ) -> LLMResult:
         """One plain text generation. Returns normalized :class:`LLMResult`.
 
@@ -1297,9 +1896,24 @@ class LLMClient:
         OpenAI-compatible providers cache prompt prefixes implicitly (the
         discount shows up in ``usage.prompt_tokens_details.cached_tokens``)
         — there is nothing to forward and nothing is lost.
+
+        ``stream=True`` accumulates the generation from the wire and returns
+        the SAME :class:`LLMResult` a non-streamed call returns. What changes
+        is which condition can fail the call: the bound becomes ``idle_timeout``
+        seconds of inter-chunk SILENCE (default
+        :data:`DEFAULT_STREAM_IDLE_TIMEOUT_S`, or the client's
+        ``stream_idle_timeout``) rather than the total duration of the request,
+        so a slow generation completes and a dead one raises
+        :exc:`StreamIdleTimeoutError` carrying the partial text. A route that
+        does not declare ``capabilities.streaming`` raises
+        :exc:`StreamingUnsupportedError`; it never quietly becomes a
+        non-streaming call.
         """
         self._reject_reasoning_on_anthropic()
         limit = self._effective_max_tokens(max_tokens)
+        if stream:
+            self._require_streaming_route()
+        idle = self._effective_idle_timeout(idle_timeout) if stream else 0.0
 
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             payload = build_messages_payload(
@@ -1310,8 +1924,15 @@ class LLMClient:
                 cache_system=cache_system,
                 extra=extra,
             )
+            if stream:
+                payload["stream"] = True
             self._dlp_scan_request(payload, context=f"complete anthropic model={self.spec.model}")
-            msg = self._call_transport(self._transport_client().messages.create, **payload)
+            msg = self._anthropic_message(
+                self._transport_client().messages.create,
+                payload,
+                stream=stream,
+                idle_timeout=idle,
+            )
             text = "\n\n".join(
                 getattr(b, "text", "")
                 for b in getattr(msg, "content", []) or []
@@ -1340,8 +1961,17 @@ class LLMClient:
             kwargs["extra_body"] = extra_body
         if extra:
             kwargs.update(extra)
+        if stream:
+            kwargs = self._openai_stream_kwargs(kwargs)
+        # Scanned AFTER the streaming flags are applied so the DLP chokepoint
+        # sees the exact payload that goes on the wire, not a near-copy.
         self._dlp_scan_request(kwargs, context=f"complete openai model={self.spec.model}")
-        resp = self._call_transport(self._transport_client().chat.completions.create, **kwargs)
+        resp = self._openai_completion(
+            self._transport_client().chat.completions.create,
+            kwargs,
+            stream=stream,
+            idle_timeout=idle,
+        )
         text = self._choice_text_or_llm_error(resp)
         served_model = (
             _resolve_group_served_model(resp, spec=self.spec)
@@ -1372,6 +2002,8 @@ class LLMClient:
         validate: Optional[Callable[[Any], None]] = None,
         attempts: int = 2,
         max_tokens: Optional[int] = None,
+        stream: bool = False,
+        idle_timeout: Optional[float] = None,
     ) -> StructuredResult:
         """One schema-constrained call. Validates or raises :exc:`LLMError`.
 
@@ -1410,10 +2042,26 @@ class LLMClient:
         ``attempts`` retry. A refusal naming the SCHEMA rather than the
         parameter's availability still raises — see
         :func:`_is_response_format_refusal`.
+
+        **Streaming** (``stream=True``). The schema constraint and the stream
+        are not in tension: chunks are accumulated and the assembled body is
+        parsed against the schema at stream END, exactly as the non-streaming
+        path parses the assembled body it was handed. What changes is the
+        failure envelope — the bound becomes ``idle_timeout`` seconds of
+        inter-chunk silence rather than the request's total duration, so a
+        generation longer than any request deadline completes, and a stream
+        that dies raises :exc:`StreamIdleTimeoutError` with the partial body on
+        it rather than discarding it. Every attempt of the corrective-retry
+        loop is streamed; the descent ladder, the budget-exhaustion guard and
+        the served-model resolution are unchanged, because a streamed response
+        is re-assembled into the same object shape they already read.
         """
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
+        if stream:
+            self._require_streaming_route()
+        idle = self._effective_idle_timeout(idle_timeout) if stream else 0.0
 
         is_pydantic = hasattr(schema, "model_json_schema")
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
@@ -1443,6 +2091,8 @@ class LLMClient:
                 is_pydantic=is_pydantic,
                 attempts=attempts,
                 max_tokens=limit,
+                stream=stream,
+                idle_timeout=idle,
             )
         return self._structured_openai(
             system=system,
@@ -1453,6 +2103,8 @@ class LLMClient:
             is_pydantic=is_pydantic,
             attempts=attempts,
             max_tokens=limit,
+            stream=stream,
+            idle_timeout=idle,
         )
 
     def _structured_anthropic(
@@ -1466,6 +2118,8 @@ class LLMClient:
         is_pydantic: bool,
         attempts: int,
         max_tokens: int,
+        stream: bool = False,
+        idle_timeout: float = 0.0,
     ) -> StructuredResult:
         tool = {
             "name": schema_name,
@@ -1491,10 +2145,27 @@ class LLMClient:
         for attempt in range(attempts):
             payload = dict(base_payload)
             payload["messages"] = messages
+            if stream:
+                payload["stream"] = True
             if attempt == 0:
                 self._dlp_scan_request(payload, context=f"structured anthropic model={self.spec.model}")
-            msg = self._call_transport(client.messages.create, **payload)
+            msg = self._anthropic_message(
+                client.messages.create,
+                payload,
+                stream=stream,
+                idle_timeout=idle_timeout,
+            )
             self._usage_from_anthropic(msg, into=usage)
+            # See the openai path: per ATTEMPT, because ``raw_response`` on the
+            # result is only the last attempt's.
+            if not getattr(msg, "krepis_usage_reported", True):
+                usage.usage_unknown = True
+                logger.error(
+                    "llm stream: no complete usage arrived for a streamed call "
+                    "on provider=%s model=%s — this call's spend is UNKNOWN "
+                    "and will not be priced.",
+                    self.spec.provider, self.spec.model,
+                )
             tool_input = self._extract_tool_input(msg, schema_name)
             # Same fault, Anthropic's spelling of it: the forced tool never
             # got emitted because the budget ran out first. Raised outside the
@@ -1571,6 +2242,8 @@ class LLMClient:
         is_pydantic: bool,
         attempts: int,
         max_tokens: int,
+        stream: bool = False,
+        idle_timeout: float = 0.0,
     ) -> StructuredResult:
         extra_body = self._openai_extra_body()
 
@@ -1601,6 +2274,8 @@ class LLMClient:
                 )
             if extra_body:
                 kw["extra_body"] = extra_body
+            if stream:
+                kw = self._openai_stream_kwargs(kw)
             return msgs, kw
 
         rung = (
@@ -1629,8 +2304,27 @@ class LLMClient:
                 if attempt == 0:
                     scan_payload: dict = {"messages": messages, **kwargs}
                     self._dlp_scan_request(scan_payload, context=f"structured openai model={self.spec.model}")
-                resp = self._call_transport(client.chat.completions.create, messages=messages, **kwargs)
+                resp = self._openai_completion(
+                    client.chat.completions.create,
+                    {"messages": messages, **kwargs},
+                    stream=stream,
+                    idle_timeout=idle_timeout,
+                )
                 self._usage_from_openai(resp, into=usage)
+                # Per ATTEMPT, not per result: ``raw_response`` on the returned
+                # StructuredResult is only the last attempt's, so an earlier
+                # attempt whose usage never arrived would otherwise be
+                # forgotten by a later one that reported normally.
+                if not getattr(resp, "krepis_usage_reported", True):
+                    usage.usage_unknown = True
+                    logger.error(
+                        "llm stream: no usage block arrived for a streamed "
+                        "call on provider=%s model=%s despite "
+                        "stream_options.include_usage — this call's spend is "
+                        "UNKNOWN and will not be priced. That is a route "
+                        "contract violation, not a zero-cost call.",
+                        self.spec.provider, self.spec.model,
+                    )
                 raw_text = _choice_text(resp, caller_raises_on_empty=True)
                 # Deliberately OUTSIDE the retry classification below: a
                 # budget exhausted before any content is not an attempt

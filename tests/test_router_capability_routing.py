@@ -61,6 +61,7 @@ models:
       max_tokens: 8192
     capabilities:
       tool_choice: true
+      streaming: true
   - id: also-accepts-tools
     provider: xai
     route: egress_proxy
@@ -278,3 +279,133 @@ class TestThinkingPassthrough:
         assert _mr.extra_body(
             {"route": "egress_proxy", "params": {"thinking": "null"}}
         ) is None
+
+
+class TestStreamingIsARoutableCapability:
+    """``streaming`` joined :data:`ROUTABLE_CAPABILITIES` for the same reason
+    ``tool_choice`` is there (alpha-engine-config-I8164): a route that cannot
+    stream does not serve a streamed request more slowly, it does not serve it
+    at all. It is also the one call shape whose absence a successful response
+    cannot reveal — a client that fell back to a non-streaming request would
+    get a valid completion carrying the request-deadline failure envelope
+    streaming was adopted to remove."""
+
+    def test_it_is_declared_routable(self):
+        assert "streaming" in _mr.ROUTABLE_CAPABILITIES
+
+    def test_a_requirement_narrows_the_chain_to_the_declaring_member(self, registry):
+        assert registry.live_group_ids("low", requires=("streaming",)) == [
+            "accepts-tools",
+        ]
+
+    def test_silence_about_streaming_is_a_rejection_with_a_reason(self, registry):
+        reasons = dict(registry.capability_rejections("low", requires=("streaming",)))
+        assert "capabilities.streaming" in reasons["refuses-tools"]
+        assert "capabilities.streaming" in reasons["also-accepts-tools"]
+
+    def test_a_group_with_no_streaming_member_raises_at_resolve_time(
+        self, monkeypatch, mixed_registry
+    ):
+        """Fail CLOSED at resolution, before any request is built — not a 400
+        the caller re-reads as an availability problem."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(mixed_registry))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                with pytest.raises(_mr.CapabilityUnavailableError):
+                    _router.resolve_group_structured(
+                        "med", exec_context="lambda", wire="openai",
+                        requires=("streaming",),
+                    )
+        finally:
+            _router._router = None
+
+
+class TestTheDeclarationReachesTheClient:
+    """A resolve-time filter is only half of it: an UNQUALIFIED call to a group
+    whose primary cannot stream must still hand the client a spec that says so,
+    or the refusal happens on the wire instead of in the library."""
+
+    def _resolve(self, monkeypatch, registry_path, group, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(_router, "_probe_egress_proxy", lambda *a, **k: True)
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                return _router.resolve_group_structured(
+                    group, exec_context="lambda", wire="openai", **kw
+                )
+        finally:
+            _router._router = None
+
+    def test_the_group_route_declares_the_primarys_streaming_flag(
+        self, monkeypatch, mixed_registry
+    ):
+        """The PRIMARY's fact, never an any() over the members: a group-level
+        capability derived from its membership declares support the served
+        model may not have (model-portability-policy §5)."""
+        unqualified = self._resolve(monkeypatch, mixed_registry, "low")
+        assert unqualified["primary_registry_id"] == "refuses-tools"
+        assert unqualified["capabilities"]["streaming"] is False
+
+        qualified = self._resolve(
+            monkeypatch, mixed_registry, "low", requires=("streaming",)
+        )
+        assert qualified["primary_registry_id"] == "accepts-tools"
+        assert qualified["capabilities"]["streaming"] is True
+
+    @pytest.mark.parametrize("declared", [True, False])
+    def test_the_spec_carries_it_through_to_the_client(self, monkeypatch, declared):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "low-x",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "low-x",
+            "auth_token_type": "litellm_master_key",
+            "group": "low",
+            "registry_id": "litellm:group:low",
+            "primary_model": "x",
+            "primary_registry_id": "x",
+            "capabilities": {"streaming": declared},
+            "params": {"max_tokens": 8192},
+        }
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+        spec, _ = _router.resolve_group_spec("low", exec_context="lambda")
+        assert spec.supports_streaming is declared
+
+    def test_a_route_silent_about_streaming_resolves_to_false(self, monkeypatch):
+        """An undeclared capability is not a capability — absent-means-
+        supported is how a request shape reaches a deployment that refuses
+        it."""
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "low-x",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "low-x",
+            "auth_token_type": "litellm_master_key",
+            "group": "low",
+            "registry_id": "litellm:group:low",
+            "primary_model": "x",
+            "primary_registry_id": "x",
+            "capabilities": {},
+            "params": {},
+        }
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+        spec, _ = _router.resolve_group_spec("low", exec_context="lambda")
+        assert spec.supports_streaming is False
