@@ -76,6 +76,12 @@ Issues = "https://github.com/nousergon/krepis/issues"
 # lower this floor: krepis is the layer that puts flow-doctor on the import
 # path, so krepis is the layer that owes consumers a version where being on
 # that path is safe.
+# Release note (alpha-engine-config-I8308): the floor above merged in
+# krepis-PR184 and shipped to NOBODY — auto-version-bump keyed its trigger
+# on `src/` alone, so the dependency change never produced a release and
+# PyPI kept serving `flow-doctor>=0.8.1`. This edit is deliberate: it puts
+# pyproject.toml in the same commit as the trigger fix, so merging this PR
+# releases the floor by the merge button alone.
 flow_doctor = ["flow-doctor>=0.16.0"]
 # krepis.llm transports. Both SDKs are lazy-imported at call time, so a
 # consumer installs only the transport(s) its ModelSpec can resolve to:
