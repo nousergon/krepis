@@ -31,6 +31,8 @@ model_groups:
   med:
     - refuses-tools-too
     - parked
+  quiet:
+    - silent-about-tools
 
 models:
   - id: refuses-tools
@@ -62,6 +64,8 @@ models:
     capabilities:
       tool_choice: true
       streaming: true
+      web_search: true
+      batches: true
   - id: also-accepts-tools
     provider: xai
     route: egress_proxy
@@ -409,3 +413,169 @@ class TestTheDeclarationReachesTheClient:
         )
         spec, _ = _router.resolve_group_spec("low", exec_context="lambda")
         assert spec.supports_streaming is False
+
+
+class TestTheGroupRouteDescribesItsPrimaryTruthfully:
+    """A capability-scoped resolution must not contradict the filter that
+    selected its own primary (alpha-engine-config-I8330).
+
+    `_resolve_group_json` carried three literal `False` capability values that
+    read identically, so nothing distinguished the oversight from the two
+    decisions. `tool_choice` was the oversight: the derivation filters the
+    chain to members that DECLARE it, picks one as the primary, and the route
+    then described that primary as refusing forced tool calls. Same class as
+    I7904 — a capability fact present in the registry that did not reach the
+    surface describing the route.
+
+    Nothing in krepis gated on the field, so this was a reporting defect
+    rather than a routing one; that is why it was P3 and not P2, and it is
+    also why it could sit there unnoticed.
+    """
+
+    def _resolve(self, monkeypatch, registry_path, group, **kw):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_path))
+                m.setattr(_router, "_probe_egress_proxy", lambda *a, **k: True)
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                return _router.resolve_group_structured(
+                    group, exec_context="lambda", wire="openai", **kw
+                )
+        finally:
+            _router._router = None
+
+    def test_a_tool_scoped_resolution_no_longer_contradicts_itself(
+        self, monkeypatch, mixed_registry
+    ):
+        info = self._resolve(
+            monkeypatch, mixed_registry, "low", requires=("tool_choice",)
+        )
+        assert info["primary_registry_id"] == "accepts-tools"
+        assert info["capabilities"]["tool_choice"] is True, (
+            "the chain was filtered to members that declare tool_choice and "
+            "this one was chosen BECAUSE it declares it — reporting False "
+            "here contradicts the filter that selected it"
+        )
+
+    def test_an_unqualified_resolution_reports_the_primarys_actual_flag(
+        self, monkeypatch, mixed_registry
+    ):
+        """The PRIMARY's fact, not an any() over the group, and not a
+        blanket False either — `low`'s declared primary genuinely refuses."""
+        info = self._resolve(monkeypatch, mixed_registry, "low")
+        assert info["primary_registry_id"] == "refuses-tools"
+        assert info["capabilities"]["tool_choice"] is False
+
+    def test_silence_is_still_not_capability(self, monkeypatch, mixed_registry):
+        """An entry with no `capabilities` block at all reports False —
+        derived, not assumed."""
+        info = self._resolve(monkeypatch, mixed_registry, "quiet")
+        assert info["primary_registry_id"] == "silent-about-tools"
+        assert info["capabilities"]["tool_choice"] is False
+        assert info["capabilities"]["streaming"] is False
+
+    def test_the_two_remaining_literals_are_decisions_not_oversights(
+        self, monkeypatch, mixed_registry
+    ):
+        """`web_search` and `batches` stay False on a group route on purpose.
+
+        `complete_grounded` serves grounding on the anthropic and openrouter
+        transports only and raises on any other openai-transport provider —
+        and the router edge is `litellm_proxy`, which is neither. `batches`
+        names a different API surface with no endpoint behind a group alias.
+        Reporting a primary's flag for either would advertise a capability
+        this route cannot reach.
+
+        Pinned so a later 'consistency' pass does not derive them by symmetry
+        with `tool_choice` and turn a correct False into a false True.
+        """
+        info = self._resolve(
+            monkeypatch, mixed_registry, "low", requires=("tool_choice",)
+        )
+        assert info["primary_registry_id"] == "accepts-tools"
+        # `accepts-tools` declares web_search AND batches; the route must not.
+        assert info["capabilities"]["web_search"] is False
+        assert info["capabilities"]["batches"] is False
+
+
+class TestTheStreamingDeclarationIsUnaffected:
+    """Guard for work in flight: `capabilities.streaming: true` is being
+    declared in `LLM_MODEL_REGISTRY.yaml` against krepis 0.59.35 while this
+    change lands.
+
+    `streaming` and `tool_choice` are read from the same registry block by the
+    same helper and emitted into the same dict, so 'I only touched the
+    neighbouring key' is an assertion that deserves a test rather than a
+    sentence. These pin that a streaming declaration made against 0.59.35
+    resolves identically after the tool_choice change — on its own, and
+    alongside every combination of the tool_choice flag.
+    """
+
+    def _spec_for(self, monkeypatch, capabilities):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "ultra-x",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "ultra-x",
+            "auth_token_type": "litellm_master_key",
+            "group": "ultra",
+            "registry_id": "litellm:group:ultra",
+            "primary_model": "x",
+            "primary_registry_id": "x",
+            "capabilities": capabilities,
+            "params": {"max_tokens": 8192},
+        }
+        monkeypatch.setattr(
+            _router, "resolve_group_structured", lambda *a, **k: route
+        )
+        spec, _ = _router.resolve_group_spec("ultra", exec_context="lambda")
+        return spec
+
+    @pytest.mark.parametrize("tool_choice", [True, False])
+    def test_streaming_survives_either_tool_choice_value(
+        self, monkeypatch, tool_choice
+    ):
+        spec = self._spec_for(
+            monkeypatch, {"streaming": True, "tool_choice": tool_choice}
+        )
+        assert spec.supports_streaming is True, (
+            "a registry entry declaring capabilities.streaming must reach "
+            "ModelSpec.supports_streaming regardless of its tool_choice flag "
+            "— the two are independent keys read from one block"
+        )
+
+    def test_streaming_is_read_from_the_registry_on_the_group_branch(
+        self, monkeypatch, tmp_path
+    ):
+        """End to end through the real derivation, not a hand-built route:
+        a primary declaring streaming AND tool_choice reports both."""
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(
+            _MIXED_CAPABILITY_REGISTRY.replace(
+                "  - id: accepts-tools", "  - id: accepts-tools"
+            )
+        )
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+                m.setattr(_router, "_probe_egress_proxy", lambda *a, **k: True)
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                info = _router.resolve_group_structured(
+                    "low", exec_context="lambda", wire="openai",
+                    requires=("streaming",),
+                )
+        finally:
+            _router._router = None
+        assert info["primary_registry_id"] == "accepts-tools"
+        assert info["capabilities"]["streaming"] is True
+        assert info["capabilities"]["tool_choice"] is True

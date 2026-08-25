@@ -1686,6 +1686,16 @@ def _resolve_group_json(
         # derived from its members declares support the served model may not
         # have, and the client then builds a request it cannot honor.
         _group_stream = _mr.entry_declares_capability(_primary_entry, "streaming")
+        # Same rule, same source — and this one was a literal `False` until
+        # I8330. A capability-scoped resolution filters the chain to members
+        # that DECLARE `tool_choice`, picks one as the primary, and then
+        # described it as refusing forced tool calls: the filter that selected
+        # the member and the block describing it disagreed. Same class as
+        # I7904, where a capability fact that existed in the registry did not
+        # reach the surface that describes the route.
+        _group_tool_choice = _mr.entry_declares_capability(
+            _primary_entry, "tool_choice"
+        )
         _cache_pricing = {}
         for _key in ("cost_per_1m_input", "cost_per_1m_output",
                       "cost_per_1m_cache_read", "cost_per_1m_cache_write"):
@@ -1732,11 +1742,26 @@ def _resolve_group_json(
             "registry_id": f"litellm:group:{group}",
             "primary_model": _primary_model,
             "primary_registry_id": _primary_registry_id,
+            # Three of these were literal `False` and they read identically,
+            # so nothing distinguished the oversight from the two decisions.
+            # `tool_choice` is now derived; the other two are decisions and say
+            # why (I8330).
             "capabilities": {
+                # DELIBERATE, and a property of the ROUTE rather than of the
+                # model: `LLMClient.complete_grounded` serves grounding on the
+                # anthropic and openrouter transports only and raises
+                # LLMConfigError on any other openai-transport provider — and
+                # the router edge is `litellm_proxy`, which is neither. So a
+                # group route genuinely cannot serve a grounded call no matter
+                # what its primary declares, and reporting the primary's flag
+                # here would advertise a capability this path cannot reach.
                 "web_search": False,
-                "tool_choice": False,
+                "tool_choice": _group_tool_choice,
                 "prompt_caching": _group_pc,
                 "automatic_prefix_caching": _group_apc,
+                # DELIBERATE: `batches` names a different API surface
+                # entirely. The edge exposes chat completions; there is no
+                # batch endpoint behind a group alias to declare.
                 "batches": False,
                 "streaming": _group_stream,
             },
