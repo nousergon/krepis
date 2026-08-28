@@ -206,16 +206,39 @@ ALERT_DESTINATIONS: Final[tuple[str, ...]] = (
     DESTINATION_CONSOLE_ONLY,
 )
 
-#: Secret naming the non-operator Telegram chat. Resolved through
-#: :func:`krepis.secrets.get_secret` with ``required=False``, exactly like
-#: ``TELEGRAM_CHAT_ID`` — absent is a normal, supported state (it is what
+# ── Naming, and why it is not cosmetic ─────────────────────────────────────
+# These two constants hold the NAME of a parameter, never its value. They are
+# suffixed ``_PARAM`` rather than ``_SECRET`` for that reason, and the
+# distinction is load-bearing twice over:
+#
+#   * A reader (and CodeQL's `py/clear-text-logging-sensitive-data`
+#     name heuristic) treats an identifier ending ``_SECRET`` as holding
+#     secret material. Logging one is then indistinguishable from logging a
+#     credential, whether or not it is. Naming the thing for what it holds —
+#     a parameter name — is the honest fix; suppressing the rule would not
+#     have made the code any easier to read correctly.
+#   * The VALUES these name are resolved by :func:`_resolve_log_chat` and are
+#     credential-adjacent: a chat id addresses a channel the bot token can
+#     post to. Nothing in this module may log a resolved chat or thread id,
+#     put one in :attr:`PublishResult.destination_reason`, or return one in a
+#     :class:`ChannelResult` detail — those surfaces are shipped to journald,
+#     CloudWatch and S3 run logs (``~/Development/CLAUDE.md``, "CLI output
+#     safety"). Routing facts are reported as a DESTINATION name plus a
+#     configured/not-configured boolean, which is everything an operator
+#     needs to diagnose routing and nothing an attacker needs to reach the
+#     chat. `TestDestinationReasonLeaksNoChatId` pins that.
+#
+#: Name of the parameter holding the non-operator Telegram chat id. Resolved
+#: through :func:`krepis.secrets.get_secret` with ``required=False``, exactly
+#: like ``TELEGRAM_CHAT_ID`` — absent is a normal, supported state (it is what
 #: every fleet box looks like until an operator configures one), and the
 #: fallback rule covers it.
-TELEGRAM_LOG_CHAT_SECRET: Final[str] = "TELEGRAM_LOG_CHAT_ID"
-#: Optional forum-topic id within the log chat, for a supergroup that files
-#: alert traffic into a topic rather than a whole separate chat. Ignored
-#: unless :data:`TELEGRAM_LOG_CHAT_SECRET` also resolves.
-TELEGRAM_LOG_THREAD_SECRET: Final[str] = "TELEGRAM_LOG_MESSAGE_THREAD_ID"
+TELEGRAM_LOG_CHAT_PARAM: Final[str] = "TELEGRAM_LOG_CHAT_ID"
+#: Name of the parameter holding an optional forum-topic id within the log
+#: chat, for a supergroup that files alert traffic into a topic rather than a
+#: whole separate chat. Ignored unless :data:`TELEGRAM_LOG_CHAT_PARAM` also
+#: resolves.
+TELEGRAM_LOG_THREAD_PARAM: Final[str] = "TELEGRAM_LOG_MESSAGE_THREAD_ID"
 
 # ── Dedup (v0.24.0; marker mechanism lifted to krepis._dedup in v0.NEXT) ────
 # When the caller passes a ``dedup_key``, ``publish`` writes a marker at
@@ -439,11 +462,19 @@ def _resolve_log_chat() -> tuple[str | None, int | None]:
     A thread id that will not parse as an int is dropped with a WARNING and
     the chat is still used: a malformed topic id must degrade to "the log
     chat, no topic", never to "no delivery".
+
+    **Neither resolved value is ever logged or returned in a message.** Both
+    come from :func:`krepis.secrets.get_secret`, and a chat id addresses a
+    channel this bot token can post into — it is credential-adjacent, and
+    every surface that would carry it (WARNING logs, ``destination_reason``,
+    ``ChannelResult.detail``) is shipped off the box. The WARNING below
+    therefore reports that the topic id is unparseable and names the
+    parameter to fix; it does not echo what was read.
     """
     from krepis.secrets import get_secret
 
     try:
-        chat_id = get_secret(TELEGRAM_LOG_CHAT_SECRET, required=False)
+        chat_id = get_secret(TELEGRAM_LOG_CHAT_PARAM, required=False)
     except Exception as exc:  # secrets backend unreachable — never fatal here
         logger.warning(
             "alerts: log-chat secret lookup failed (%s); routing falls back", exc
@@ -454,17 +485,22 @@ def _resolve_log_chat() -> tuple[str | None, int | None]:
 
     thread_id: int | None = None
     try:
-        raw_thread = get_secret(TELEGRAM_LOG_THREAD_SECRET, required=False)
+        raw_thread = get_secret(TELEGRAM_LOG_THREAD_PARAM, required=False)
     except Exception:
         raw_thread = None
     if raw_thread not in (None, ""):
         try:
             thread_id = int(str(raw_thread).strip())
         except (TypeError, ValueError):
+            # The VALUE is deliberately absent from this line. "which
+            # parameter, and what is wrong with it" is the whole of what an
+            # operator needs to fix it; the value itself would put a
+            # secrets-resolved string into journald.
             logger.warning(
-                "alerts: %s=%r is not an integer topic id — delivering to the "
-                "log chat without a thread",
-                TELEGRAM_LOG_THREAD_SECRET, raw_thread,
+                "alerts: the configured Telegram log topic id is not an "
+                "integer — delivering to the log chat without a thread. Fix "
+                "the value of the %s parameter (value not logged).",
+                TELEGRAM_LOG_THREAD_PARAM,
             )
     return str(chat_id), thread_id
 
@@ -499,6 +535,11 @@ def resolve_destination(
     :returns: ``(destination, reason)`` — ``reason`` is recorded on
         :attr:`PublishResult.destination_reason` so an operator reading a
         result can tell a ROUTED operator-chat delivery from a fallback one.
+        It names the DESTINATION and, where it matters, whether a log chat
+        was configured — a boolean. It NEVER carries a resolved chat or
+        thread id: the reason is serialized into run logs, and the id is
+        credential-adjacent (see the ``_PARAM`` naming note above).
+        ``log_chat_id`` is read here only for its truthiness.
     """
     if destination is not None and destination not in ALERT_DESTINATIONS:
         raise ValueError(
@@ -511,17 +552,20 @@ def resolve_destination(
 
     if destination == DESTINATION_LOG_CHAT:
         if log_chat_id:
-            return DESTINATION_LOG_CHAT, "explicit destination=log_chat"
+            return (
+                DESTINATION_LOG_CHAT,
+                "explicit destination=log_chat; log_chat configured=True",
+            )
         logger.warning(
             "alerts: destination=log_chat requested but %s is not configured — "
             "delivering to the OPERATOR chat instead. A finding is never "
             "dropped for want of routing config (alpha-engine-config-I7857).",
-            TELEGRAM_LOG_CHAT_SECRET,
+            TELEGRAM_LOG_CHAT_PARAM,
         )
         return (
             DESTINATION_OPERATOR_CHAT,
-            f"fallback: destination=log_chat requested but "
-            f"{TELEGRAM_LOG_CHAT_SECRET} is unset",
+            "fallback: destination=log_chat requested but log_chat "
+            "configured=False",
         )
 
     if destination == DESTINATION_CONSOLE_ONLY:
@@ -544,13 +588,16 @@ def resolve_destination(
 
     # ── Severity-derived routing (no explicit destination) ───────────────
     if severity.lower() in SEVERITY_PHONE_PUSH:
-        return DESTINATION_OPERATOR_CHAT, f"severity={severity!r} is an incident tier"
+        return (
+            DESTINATION_OPERATOR_CHAT,
+            f"severity={severity!r} is an incident tier",
+        )
 
     if log_chat_id:
         return (
             DESTINATION_LOG_CHAT,
             f"severity={severity!r} is not an incident tier; "
-            f"{TELEGRAM_LOG_CHAT_SECRET} is configured",
+            f"log_chat configured=True",
         )
 
     if console_artifact:
@@ -567,12 +614,12 @@ def resolve_destination(
         "log chat, or pass console_artifact naming the durable surface this "
         "finding is also published to. A finding is never dropped "
         "(alpha-engine-config-I7857).",
-        severity, TELEGRAM_LOG_CHAT_SECRET,
+        severity, TELEGRAM_LOG_CHAT_PARAM,
     )
     return (
         DESTINATION_OPERATOR_CHAT,
-        f"fallback: severity={severity!r} is non-pushing but no log chat and "
-        f"no console_artifact were configured",
+        f"fallback: severity={severity!r} is non-pushing; log_chat "
+        f"configured=False and no console_artifact was supplied",
     )
 
 

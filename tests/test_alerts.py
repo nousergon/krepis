@@ -1493,8 +1493,8 @@ class TestResolveLogChat:
 
     def test_chat_and_thread_are_resolved(self, monkeypatch):
         values = {
-            alerts.TELEGRAM_LOG_CHAT_SECRET: "-1001234",
-            alerts.TELEGRAM_LOG_THREAD_SECRET: "42",
+            alerts.TELEGRAM_LOG_CHAT_PARAM: "-1001234",
+            alerts.TELEGRAM_LOG_THREAD_PARAM: "42",
         }
         monkeypatch.setattr(
             "krepis.secrets.get_secret", lambda name, **kw: values.get(name)
@@ -1505,8 +1505,8 @@ class TestResolveLogChat:
         self, monkeypatch, caplog
     ):
         values = {
-            alerts.TELEGRAM_LOG_CHAT_SECRET: "-1001234",
-            alerts.TELEGRAM_LOG_THREAD_SECRET: "general",
+            alerts.TELEGRAM_LOG_CHAT_PARAM: "-1001234",
+            alerts.TELEGRAM_LOG_THREAD_PARAM: "general",
         }
         monkeypatch.setattr(
             "krepis.secrets.get_secret", lambda name, **kw: values.get(name)
@@ -1520,7 +1520,7 @@ class TestResolveLogChat:
         # "the log chat, no topic", not to "no log chat" — the latter would
         # push routine traffic back into the incident channel.
         def _get(name, **kw):
-            if name == alerts.TELEGRAM_LOG_CHAT_SECRET:
+            if name == alerts.TELEGRAM_LOG_CHAT_PARAM:
                 return "-1001234"
             raise RuntimeError("ssm unreachable for the thread id")
 
@@ -1863,8 +1863,20 @@ class TestPublicDestinationApi:
             alerts.DESTINATION_LOG_CHAT,
             alerts.DESTINATION_CONSOLE_ONLY,
         )
-        assert alerts.TELEGRAM_LOG_CHAT_SECRET == "TELEGRAM_LOG_CHAT_ID"
-        assert alerts.TELEGRAM_LOG_THREAD_SECRET == "TELEGRAM_LOG_MESSAGE_THREAD_ID"
+        assert alerts.TELEGRAM_LOG_CHAT_PARAM == "TELEGRAM_LOG_CHAT_ID"
+        assert alerts.TELEGRAM_LOG_THREAD_PARAM == "TELEGRAM_LOG_MESSAGE_THREAD_ID"
+
+    def test_parameter_constants_are_named_for_what_they_hold(self):
+        # They hold a PARAMETER NAME, never a value. The `_PARAM` suffix is
+        # what keeps a reader — and CodeQL's clear-text-logging name
+        # heuristic — from treating a logged config key as a logged
+        # credential. Renaming them back re-raises 3 of the 4 alerts this
+        # module was red for.
+        assert not any(
+            n.endswith("_SECRET")
+            for n in dir(alerts)
+            if n.startswith("TELEGRAM_")
+        )
 
 
 class TestCliDestination:
@@ -1918,3 +1930,92 @@ class TestCliDestination:
         )
         alerts.main(["publish", "--message", "m", "--severity", "info"])
         assert "destination=log_chat" in capsys.readouterr().err
+
+
+class TestDestinationReasonLeaksNoChatId:
+    """Routing telemetry must be safe to serialize into a run log.
+
+    `PublishResult.destination_reason`, `PublishResult.telegram.detail` and
+    every log record this module emits are shipped to journald, CloudWatch
+    and S3 run logs. A Telegram chat id addresses a channel the bot token can
+    post into — credential-adjacent, and `~/Development/CLAUDE.md` ("CLI
+    output safety") forbids putting it on those surfaces. CodeQL flagged 4
+    high alerts on krepis-PR193 for exactly this class; these pin the fix
+    rather than the alert.
+
+    The fake ids below are deliberately distinctive so a passing assertion
+    means the value is genuinely absent, not that a substring happened not
+    to collide.
+    """
+
+    FAKE_CHAT_ID = "-1009876543210XYZZY"
+    FAKE_THREAD_ID = 918273645
+
+    def _surfaces(self, result, caplog) -> list[str]:
+        """Everything this publish exposed to a log sink, as strings."""
+        return [
+            result.destination_reason,
+            result.telegram.detail,
+            result.sns.detail,
+            str(result.telegram_destination),
+            *[r.getMessage() for r in caplog.records],
+        ]
+
+    @pytest.mark.parametrize(
+        "severity", ["critical", "error", "warning", "info", "notice", "debug"]
+    )
+    @pytest.mark.parametrize("log_chat_configured", [True, False])
+    @pytest.mark.parametrize("with_artifact", [True, False])
+    def test_no_surface_carries_the_resolved_chat_id(
+        self, routed_publish, caplog, severity, log_chat_configured, with_artifact
+    ):
+        run, sends, _sns = routed_publish
+        log_chat = (
+            (self.FAKE_CHAT_ID, self.FAKE_THREAD_ID)
+            if log_chat_configured
+            else (None, None)
+        )
+        kwargs = {"severity": severity}
+        if with_artifact:
+            kwargs["console_artifact"] = "s3://console/box-health.json"
+        with caplog.at_level("DEBUG"):
+            result = run(log_chat=log_chat, **kwargs)
+
+        for surface in self._surfaces(result, caplog):
+            assert self.FAKE_CHAT_ID not in surface, surface
+            assert str(self.FAKE_THREAD_ID) not in surface, surface
+
+        # Not vacuous: the id DID reach the transport whenever routing chose
+        # the log chat, so the assertion above is about redaction on the
+        # reporting surfaces, not about the id never existing.
+        if result.telegram_destination == alerts.DESTINATION_LOG_CHAT:
+            assert sends[0]["chat_id"] == self.FAKE_CHAT_ID
+
+        # And the surfaces still say something useful: the destination is
+        # always named, and a fallback says whether a log chat was
+        # configured — a boolean, not an id.
+        assert result.telegram_destination in alerts.ALERT_DESTINATIONS
+        assert result.telegram_destination in result.destination_reason or (
+            "configured=" in result.destination_reason
+            or "incident tier" in result.destination_reason
+            or "console_artifact" in result.destination_reason
+        )
+
+    def test_an_unparseable_topic_id_is_not_echoed(self, monkeypatch, caplog):
+        values = {
+            alerts.TELEGRAM_LOG_CHAT_PARAM: self.FAKE_CHAT_ID,
+            alerts.TELEGRAM_LOG_THREAD_PARAM: "TOPIC-QUUX-NOT-AN-INT",
+        }
+        monkeypatch.setattr(
+            "krepis.secrets.get_secret", lambda name, **kw: values.get(name)
+        )
+        with caplog.at_level("DEBUG"):
+            chat_id, thread_id = alerts._resolve_log_chat()
+        assert (chat_id, thread_id) == (self.FAKE_CHAT_ID, None)
+        emitted = " ".join(r.getMessage() for r in caplog.records)
+        # The malformed VALUE is what a naive "log it so they can see it"
+        # warning would print; it is secrets-resolved, so it must not appear.
+        assert "TOPIC-QUUX-NOT-AN-INT" not in emitted
+        assert self.FAKE_CHAT_ID not in emitted
+        # It still names the parameter to fix — a config key, not a value.
+        assert alerts.TELEGRAM_LOG_THREAD_PARAM in emitted
