@@ -425,3 +425,60 @@ class TestIsEntityParseError:
             "",
         ):
             assert not tg._is_entity_parse_error(other)
+
+
+# ── Destination overrides (alpha-engine-config-I7857) ───────────────────────
+# `krepis.alerts` routes a non-incident finding to a SECOND chat by handing
+# this transport a `chat_id` (and optionally a forum-topic
+# `message_thread_id`). These pin the payload the transport actually builds,
+# because the routing tier above is only as real as the field it sets here.
+
+
+class TestDestinationOverrides:
+    def test_default_uses_the_operator_chat_from_secrets(
+        self, configured_env, mock_post
+    ):
+        tg.send_message("m")
+        assert mock_post.call_args.kwargs["json"]["chat_id"] == "12345"
+
+    def test_explicit_chat_id_replaces_the_secret(self, configured_env, mock_post):
+        tg.send_message("m", chat_id="-1001234")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["chat_id"] == "-1001234"
+
+    def test_chat_id_none_is_not_an_override(self, configured_env, mock_post):
+        # `alerts` passes `chat_id=None` for the operator destination; that
+        # must resolve the secret, never send to a chat named "None".
+        tg.send_message("m", chat_id=None)
+        assert mock_post.call_args.kwargs["json"]["chat_id"] == "12345"
+
+    def test_message_thread_id_is_sent_only_when_given(
+        self, configured_env, mock_post
+    ):
+        tg.send_message("m", chat_id="-1001234")
+        assert "message_thread_id" not in mock_post.call_args.kwargs["json"]
+        tg.send_message("m", chat_id="-1001234", message_thread_id=42)
+        assert mock_post.call_args.kwargs["json"]["message_thread_id"] == 42
+
+    def test_override_does_not_disturb_the_buzz_flag(self, configured_env, mock_post):
+        tg.send_message("m", chat_id="-1001234", disable_notification=True)
+        assert mock_post.call_args.kwargs["json"]["disable_notification"] is True
+        tg.send_message("m", chat_id="-1001234", disable_notification=False)
+        assert mock_post.call_args.kwargs["json"]["disable_notification"] is False
+
+    def test_override_survives_the_plain_text_retry(self, configured_env, mock_post):
+        # A Markdown parse failure retries the identical body without
+        # `parse_mode`; the destination must not silently revert to the
+        # operator chat on the retry.
+        mock_post.side_effect = [
+            MagicMock(
+                status_code=400,
+                text='{"description": "Bad Request: can\'t parse entities"}',
+            ),
+            MagicMock(status_code=200, text="ok"),
+        ]
+        assert tg.send_message("m *x", chat_id="-1001234", message_thread_id=7) is True
+        retry_payload = mock_post.call_args.kwargs["json"]
+        assert retry_payload["chat_id"] == "-1001234"
+        assert retry_payload["message_thread_id"] == 7
+        assert "parse_mode" not in retry_payload

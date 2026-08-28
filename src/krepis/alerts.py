@@ -36,6 +36,12 @@ CLI convention.
   could be told from a live outage.
 - :func:`diff_conditions` — the set arithmetic a publisher runs between two
   observations to get ``(opened, still_open, cleared)``.
+- :func:`resolve_destination` — the pure severity/config → destination
+  decision, exposed so a call site (or a test) can assert on where a finding
+  WOULD go without publishing it. Destinations are
+  :data:`DESTINATION_OPERATOR_CHAT`, :data:`DESTINATION_LOG_CHAT` and
+  :data:`DESTINATION_CONSOLE_ONLY` (:data:`ALERT_DESTINATIONS`), reported
+  back on :attr:`PublishResult.telegram_destination`.
 - CLI: ``python -m krepis.alerts publish --message "..."
   --severity error --source "..."`` and ``python -m krepis.alerts clear
   --message "..." --identity-key "..."``. Designed for Bash failure-trap
@@ -55,23 +61,47 @@ without paging the operator (PR165 paged Brian with a synthetic ERROR
 because ``publish()`` previously only suppressed fan-out under
 ``PYTEST_CURRENT_TEST``).
 
-**Severity tiering controls the phone buzz only — every severity is
-delivered.** ``severity`` is a free-form string that is prepended to the
-message (``[ERROR] ...`` / ``[WARNING] ...``) for both channels. Both SNS
-and Telegram fan-out happen at **every** severity: SNS delivery is
-byte-identical regardless of severity, and Telegram always posts the
-message into the chat. The only thing ``severity`` changes is whether the
-Telegram send also triggers a phone-push notification
-(``disable_notification=False`` for ``error``/``critical``,
-``disable_notification=True`` — no buzz, message still posted — for
-everything else, per :data:`SEVERITY_PHONE_PUSH`). **A severity outside
-:data:`SEVERITY_PHONE_PUSH` is NOT suppressed, muted, or dropped** — it
-reaches both the SNS-subscribed inbox and the Telegram chat exactly like
-``error``/``critical`` does; it just doesn't buzz the phone. Do not choose
-``info``/``warning`` believing the finding will be invisible — see
-alpha-engine-config-I7857, filed after this exact belief let a fleet of
-publishers assume a non-``error`` severity was unseen when the message was
-landing in the channel the whole time.
+**Severity gates DESTINATION and BUZZ. It never gates DELIVERY.**
+``severity`` is a free-form string prepended to the message (``[ERROR]
+...`` / ``[WARNING] ...``) for both channels. It decides two things and
+only two:
+
+1. **Which Telegram destination the message goes to.** Severities in
+   :data:`SEVERITY_PHONE_PUSH` go to the operator incident channel
+   (:data:`DESTINATION_OPERATOR_CHAT`). Every other severity goes to a
+   NON-operator destination — the log channel
+   (:data:`DESTINATION_LOG_CHAT`) when ``TELEGRAM_LOG_CHAT_ID`` is
+   configured, or nowhere on Telegram at all
+   (:data:`DESTINATION_CONSOLE_ONLY`) when the caller passes
+   ``console_artifact=`` naming the durable surface the finding is ALSO
+   published to.
+2. **Whether the send buzzes the phone** (``disable_notification``).
+   ``error``/``critical`` buzz; nothing else does.
+
+**SNS delivery is byte-identical at every severity.** Routing is a
+Telegram-only concept; the durable record on ``alpha-engine-alerts``
+does not move, whatever the destination resolves to.
+
+**The fallback rule — a finding is NEVER dropped.** A non-pushing
+severity with NEITHER a configured log chat NOR a ``console_artifact``
+falls back to the operator chat exactly as it did before this routing
+existed, and logs at WARNING that it did so. There is no code path in
+this module that discards a finding because of its severity: the worst
+case is that it lands in the incident channel and the operator sees a
+WARNING in the log explaining that the routing was unconfigured. Do not
+choose ``info``/``warning`` believing the finding will be invisible, and
+do not pass ``console_artifact`` for a surface you have not actually
+published to — that argument is the EVIDENCE that makes skipping the
+operator chat safe, and it is the only thing that does.
+
+This is alpha-engine-config-I7857 expressed in code rather than prose.
+That issue was filed after a fleet of publishers assumed a non-``error``
+severity would be unseen, when the message was landing in the operator's
+chat the whole time. The pre-2026-08-28 module said, correctly for its
+behaviour, that severity was not a delivery gate at all: every severity
+reached SNS and the one Telegram chat, and the only tier was the buzz.
+Severity now moves a message to a different destination — it still never
+removes it from one.
 
 **SNS topic resolution.** Defaults to
 ``arn:aws:sns:{region}:{account_id}:alpha-engine-alerts``, with
@@ -112,11 +142,15 @@ DEFAULT_SNS_TOPIC_NAME: Final[str] = "alpha-engine-alerts"
 DEFAULT_REGION: Final[str] = "us-east-1"
 
 # Severities that trigger a Telegram PHONE-PUSH notification
-# (``disable_notification=False``). Membership here is NOT a delivery gate —
-# every severity is published to both SNS and Telegram; this set only
-# decides whether the Telegram send also buzzes the phone. Read the module
-# docstring's "Severity tiering" paragraph before writing a new call site
-# that picks a severity believing it will be unseen — it will not be.
+# (``disable_notification=False``) AND route to the operator incident chat.
+# Membership here is still NOT a delivery gate: every severity is published
+# to SNS byte-identically, and every severity is delivered on Telegram — a
+# non-member goes to the LOG chat when one is configured, to the console
+# alone when the caller names the artifact it is published to, and otherwise
+# to this same operator chat with a WARNING logged. Read the module
+# docstring's "Severity gates DESTINATION and BUZZ" paragraph before writing
+# a new call site that picks a severity believing it will be unseen — it
+# will not be. See :func:`resolve_destination`.
 SEVERITY_PHONE_PUSH: Final[frozenset[str]] = frozenset({"error", "critical"})
 
 # Deprecated alias — kept additive-only per CONTRIBUTING.md ("renaming or
@@ -131,6 +165,57 @@ SEVERITY_PHONE_PUSH: Final[frozenset[str]] = frozenset({"error", "critical"})
 # :data:`SEVERITY_PHONE_PUSH` in new code. Remove once a migration window
 # has passed with no external usage confirmed.
 SEVERITY_PUSH: Final[frozenset[str]] = SEVERITY_PHONE_PUSH
+
+# ── Delivery DESTINATION (alpha-engine-config-I7857, 2026-08-28) ────────────
+# Severity tiering was "fixed" twice (2026-07-29 tier split, 2026-08-20
+# cadence 60→1440) without either change touching the thing that actually
+# reaches the operator: WHICH CHAT the message lands in. Both changes altered
+# whether a message buzzed or how often it repeated; neither could keep a
+# non-incident out of the incident channel, because there was exactly one
+# Telegram destination and every severity was posted into it.
+#
+# A destination is therefore a first-class, named concept — not an implicit
+# consequence of a boolean. Three of them, and every publish resolves to
+# exactly one:
+#
+#   operator_chat  the incident channel Brian reads (TELEGRAM_CHAT_ID). Where
+#                  error/critical go, and where EVERYTHING goes when nothing
+#                  else is configured.
+#   log_chat       a second Telegram destination (TELEGRAM_LOG_CHAT_ID, plus
+#                  an optional forum-topic thread id). Delivered, readable,
+#                  out of the incident channel.
+#   console_only   no Telegram send at all — legal ONLY when the caller names
+#                  the durable surface the finding is also published to.
+#
+# `console_only` is the one that could become a silent drop, so it is the one
+# that requires evidence: `console_artifact` must name the artifact / envelope
+# URI. The pattern it encodes already exists downstream in
+# `crucible-dashboard/infrastructure/emit_box_health_hygiene.py`, which routes
+# its `notice` tier to the console alone and is safe for reasons this argument
+# is asserting on the caller's behalf: the envelope is published on EVERY run
+# including clean ones, `ran_at` + `cadence_minutes` make a dead emitter read
+# STALE rather than green, and a missing artifact renders `unreadable`, never
+# `ok`. A destination that can go dark without saying so is a drop with extra
+# steps.
+DESTINATION_OPERATOR_CHAT: Final[str] = "operator_chat"
+DESTINATION_LOG_CHAT: Final[str] = "log_chat"
+DESTINATION_CONSOLE_ONLY: Final[str] = "console_only"
+ALERT_DESTINATIONS: Final[tuple[str, ...]] = (
+    DESTINATION_OPERATOR_CHAT,
+    DESTINATION_LOG_CHAT,
+    DESTINATION_CONSOLE_ONLY,
+)
+
+#: Secret naming the non-operator Telegram chat. Resolved through
+#: :func:`krepis.secrets.get_secret` with ``required=False``, exactly like
+#: ``TELEGRAM_CHAT_ID`` — absent is a normal, supported state (it is what
+#: every fleet box looks like until an operator configures one), and the
+#: fallback rule covers it.
+TELEGRAM_LOG_CHAT_SECRET: Final[str] = "TELEGRAM_LOG_CHAT_ID"
+#: Optional forum-topic id within the log chat, for a supergroup that files
+#: alert traffic into a topic rather than a whole separate chat. Ignored
+#: unless :data:`TELEGRAM_LOG_CHAT_SECRET` also resolves.
+TELEGRAM_LOG_THREAD_SECRET: Final[str] = "TELEGRAM_LOG_MESSAGE_THREAD_ID"
 
 # ── Dedup (v0.24.0; marker mechanism lifted to krepis._dedup in v0.NEXT) ────
 # When the caller passes a ``dedup_key``, ``publish`` writes a marker at
@@ -204,8 +289,8 @@ ALERT_STATES: Final[tuple[str, ...]] = (
 
 # Severity a recovery is published at. `info`, never `error`/`critical`:
 # alpha-engine-config-I7857 established that severity does NOT gate delivery
-# here (every severity reaches SNS and the Telegram chat) — it gates only the
-# phone push. A clear that buzzes Brian's phone at 8pm is a second alert, not
+# here (every severity reaches SNS, and reaches a Telegram destination) — it
+# gates the phone push and, since 2026-08-28, WHICH destination. A clear that buzzes Brian's phone at 8pm is a second alert, not
 # a resolution, so the recovery is delivered and silent. `publish_clear` also
 # forces `silent=True` explicitly rather than leaning on `info` being outside
 # SEVERITY_PHONE_PUSH, so a future widening of that set cannot turn every
@@ -261,6 +346,17 @@ class PublishResult:
     #: The condition identity a consumer pairs page-to-clear on; falls back to
     #: ``dedup_key`` when the caller passed one and no explicit identity.
     identity_key: str | None = None
+    #: Which Telegram destination this publish resolved to — one of
+    #: :data:`ALERT_DESTINATIONS`, or ``None`` when the Telegram leg was not
+    #: reached at all (``telegram=False``, dry-run, mute, dedup-skip, test-env
+    #: guard). Machine-readable on purpose: a caller or a test asserting on
+    #: routing must not have to parse :attr:`ChannelResult.detail` prose, and
+    #: a test that asserts the message TEXT cannot catch a wrong TIER.
+    telegram_destination: str | None = None
+    #: Why the destination resolved the way it did — in particular, whether a
+    #: non-pushing severity reached the operator chat because it was ROUTED
+    #: there or because nothing else was configured (the I7857 fallback).
+    destination_reason: str = ""
 
     @property
     def any_ok(self) -> bool:
@@ -332,9 +428,172 @@ def _publish_sns(arn: str, message: str, subject: str | None = None) -> ChannelR
         return ChannelResult(ok=False, detail=f"sns error: {exc!r}")
 
 
+def _resolve_log_chat() -> tuple[str | None, int | None]:
+    """Resolve the non-operator Telegram destination from secrets.
+
+    Returns ``(chat_id, message_thread_id)``; ``(None, None)`` when no log
+    chat is configured. Both are optional secrets — an unconfigured fleet is
+    the normal state, and :func:`resolve_destination` handles it by falling
+    back rather than by dropping.
+
+    A thread id that will not parse as an int is dropped with a WARNING and
+    the chat is still used: a malformed topic id must degrade to "the log
+    chat, no topic", never to "no delivery".
+    """
+    from krepis.secrets import get_secret
+
+    try:
+        chat_id = get_secret(TELEGRAM_LOG_CHAT_SECRET, required=False)
+    except Exception as exc:  # secrets backend unreachable — never fatal here
+        logger.warning(
+            "alerts: log-chat secret lookup failed (%s); routing falls back", exc
+        )
+        return None, None
+    if chat_id in (None, ""):
+        return None, None
+
+    thread_id: int | None = None
+    try:
+        raw_thread = get_secret(TELEGRAM_LOG_THREAD_SECRET, required=False)
+    except Exception:
+        raw_thread = None
+    if raw_thread not in (None, ""):
+        try:
+            thread_id = int(str(raw_thread).strip())
+        except (TypeError, ValueError):
+            logger.warning(
+                "alerts: %s=%r is not an integer topic id — delivering to the "
+                "log chat without a thread",
+                TELEGRAM_LOG_THREAD_SECRET, raw_thread,
+            )
+    return str(chat_id), thread_id
+
+
+def resolve_destination(
+    severity: str,
+    *,
+    destination: str | None = None,
+    console_artifact: str | None = None,
+    log_chat_id: str | None = None,
+) -> tuple[str, str]:
+    """Decide which destination an emission goes to, and say why.
+
+    Pure given its inputs — the secret lookup happens in
+    :func:`_resolve_log_chat` and is passed in as ``log_chat_id`` — so the
+    decision itself is testable without a secrets backend.
+
+    Order, and the ONLY order (see the module docstring):
+
+    1. An explicit ``destination`` is the caller's intent and is honoured
+       where it can be. It is still subject to steps 3 and 4: asking for a
+       log chat that is not configured, or for ``console_only`` with no
+       artifact named, cannot delete a finding.
+    2. A severity in :data:`SEVERITY_PHONE_PUSH` goes to the operator chat.
+       Nothing overrides this away except an explicit ``destination``.
+    3. Otherwise: the log chat if one is configured, else console-only if the
+       caller supplied evidence of a durable surface.
+    4. Otherwise: the operator chat, logged at WARNING. This is the
+       alpha-engine-config-I7857 invariant — there is no fourth branch, and
+       no branch that returns "delivered nowhere".
+
+    :returns: ``(destination, reason)`` — ``reason`` is recorded on
+        :attr:`PublishResult.destination_reason` so an operator reading a
+        result can tell a ROUTED operator-chat delivery from a fallback one.
+    """
+    if destination is not None and destination not in ALERT_DESTINATIONS:
+        raise ValueError(
+            f"alerts: unknown destination {destination!r}; expected one of "
+            f"{ALERT_DESTINATIONS}"
+        )
+
+    if destination == DESTINATION_OPERATOR_CHAT:
+        return DESTINATION_OPERATOR_CHAT, "explicit destination=operator_chat"
+
+    if destination == DESTINATION_LOG_CHAT:
+        if log_chat_id:
+            return DESTINATION_LOG_CHAT, "explicit destination=log_chat"
+        logger.warning(
+            "alerts: destination=log_chat requested but %s is not configured — "
+            "delivering to the OPERATOR chat instead. A finding is never "
+            "dropped for want of routing config (alpha-engine-config-I7857).",
+            TELEGRAM_LOG_CHAT_SECRET,
+        )
+        return (
+            DESTINATION_OPERATOR_CHAT,
+            f"fallback: destination=log_chat requested but "
+            f"{TELEGRAM_LOG_CHAT_SECRET} is unset",
+        )
+
+    if destination == DESTINATION_CONSOLE_ONLY:
+        if console_artifact:
+            return (
+                DESTINATION_CONSOLE_ONLY,
+                f"explicit destination=console_only, published to {console_artifact}",
+            )
+        logger.warning(
+            "alerts: destination=console_only requested with no "
+            "console_artifact naming where the finding IS published — "
+            "delivering to the OPERATOR chat instead. console_artifact is the "
+            "evidence that makes skipping the chat safe "
+            "(alpha-engine-config-I7857).",
+        )
+        return (
+            DESTINATION_OPERATOR_CHAT,
+            "fallback: destination=console_only requested with no console_artifact",
+        )
+
+    # ── Severity-derived routing (no explicit destination) ───────────────
+    if severity.lower() in SEVERITY_PHONE_PUSH:
+        return DESTINATION_OPERATOR_CHAT, f"severity={severity!r} is an incident tier"
+
+    if log_chat_id:
+        return (
+            DESTINATION_LOG_CHAT,
+            f"severity={severity!r} is not an incident tier; "
+            f"{TELEGRAM_LOG_CHAT_SECRET} is configured",
+        )
+
+    if console_artifact:
+        return (
+            DESTINATION_CONSOLE_ONLY,
+            f"severity={severity!r} is not an incident tier; also published to "
+            f"{console_artifact}",
+        )
+
+    logger.warning(
+        "alerts: severity=%r is not an incident tier, but neither %s nor a "
+        "console_artifact is configured for this call — delivering to the "
+        "OPERATOR chat. This is the fallback, not the intent: configure the "
+        "log chat, or pass console_artifact naming the durable surface this "
+        "finding is also published to. A finding is never dropped "
+        "(alpha-engine-config-I7857).",
+        severity, TELEGRAM_LOG_CHAT_SECRET,
+    )
+    return (
+        DESTINATION_OPERATOR_CHAT,
+        f"fallback: severity={severity!r} is non-pushing but no log chat and "
+        f"no console_artifact were configured",
+    )
+
+
 def _publish_telegram(
-    message: str, severity: str, silent: bool | None = None
+    message: str,
+    severity: str,
+    silent: bool | None = None,
+    *,
+    destination: str = DESTINATION_OPERATOR_CHAT,
+    chat_id: str | None = None,
+    message_thread_id: int | None = None,
 ) -> ChannelResult:
+    """Send one message to the resolved Telegram ``destination``.
+
+    ``chat_id`` / ``message_thread_id`` are the log-chat overrides;
+    ``None`` means "the operator chat resolved from ``TELEGRAM_CHAT_ID``",
+    which is what :func:`krepis.telegram.send_message` does by default.
+    ``destination`` is carried through only to name itself in the returned
+    :attr:`ChannelResult.detail` — the routing decision was already made by
+    :func:`resolve_destination`.
+    """
     try:
         from krepis.telegram import send_message
 
@@ -351,11 +610,27 @@ def _publish_telegram(
         disable_push = severity.lower() not in SEVERITY_PHONE_PUSH
         if silent:
             disable_push = True
-        ok = send_message(message, disable_notification=disable_push)
-        return ChannelResult(ok=bool(ok), detail="sent" if ok else "send_message returned False")
+        ok = send_message(
+            message,
+            disable_notification=disable_push,
+            chat_id=chat_id,
+            message_thread_id=message_thread_id,
+        )
+        # The destination is named in `detail` as well as on
+        # `PublishResult.telegram_destination` so a human reading a CLI
+        # stderr line (which prints only the detail) can tell the operator
+        # channel from the log channel without re-running anything.
+        detail = (
+            f"sent (destination={destination})"
+            if ok
+            else f"send_message returned False (destination={destination})"
+        )
+        return ChannelResult(ok=bool(ok), detail=detail)
     except Exception as exc:  # send_message itself never raises, but defensive
         logger.warning("alerts.publish: Telegram fan-out failed: %s", exc)
-        return ChannelResult(ok=False, detail=f"telegram error: {exc!r}")
+        return ChannelResult(
+            ok=False, detail=f"telegram error (destination={destination}): {exc!r}"
+        )
 
 
 def _dedup_marker_key(dedup_key: str) -> str:
@@ -509,6 +784,8 @@ def publish(
     state: str = ALERT_STATE_OPENED,
     identity_key: str | None = None,
     silent: bool | None = None,
+    destination: str | None = None,
+    console_artifact: str | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -605,6 +882,25 @@ def publish(
         phone push) regardless of severity. ``None`` (default) keeps the
         severity-derived behaviour. ``False`` is NOT an escalation — it is
         treated as "no override".
+    :param destination: Explicit override of the severity-derived Telegram
+        destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
+        derives it from ``severity``. An override is honoured where it can
+        be, and is still subject to the fallback rule: asking for
+        ``log_chat`` with no ``TELEGRAM_LOG_CHAT_ID`` configured, or for
+        ``console_only`` with no ``console_artifact``, delivers to the
+        operator chat and logs at WARNING rather than dropping the finding.
+        An unrecognised value raises :class:`ValueError`.
+    :param console_artifact: URI/identifier of the durable non-channel
+        surface this finding is ALSO published to — a console artifact, a
+        ``nousergon_lib.fleet_check_result`` envelope, an S3 key. Supplying
+        it is what makes ``console_only`` legal: it is the evidence that the
+        finding is readable somewhere the operator can find it without the
+        chat. Do not pass it for a surface you did not actually write. It
+        does not override an incident-tier severity — ``error``/``critical``
+        still page.
+    :param sns: SNS delivery is unaffected by all of the above. It is
+        byte-identical at every severity and every destination; routing is a
+        Telegram-only concept and the durable record never moves.
     :returns: :class:`PublishResult` — caller can inspect per-channel
         outcomes. :attr:`PublishResult.any_ok` is the typical success
         gate; :attr:`PublishResult.all_ok` is the strict variant.
@@ -722,13 +1018,58 @@ def publish(
             result.sns = _publish_sns(arn, formatted, subject=subject)
 
     if telegram:
-        # Suppress send_message's auto-emit hook — this publish call emits
-        # one rich event itself below; without the guard every publish
-        # would land twice on the Overseer intake bus.
-        with fleet_events.suppress_emission():
-            result.telegram = _publish_telegram(
-                formatted, severity=severity, silent=silent
+        # ── Destination resolution (alpha-engine-config-I7857) ───────────
+        # Runs here rather than at the top of `publish` so the dry-run
+        # short-circuit and the test-env guard keep their promise of
+        # constructing no client and reading no secret. Every path out of
+        # `resolve_destination` names a destination that DELIVERS: the
+        # unconfigured case is the operator chat plus a WARNING, never a
+        # drop.
+        log_chat_id, log_thread_id = (None, None)
+        if destination != DESTINATION_OPERATOR_CHAT:
+            # Skip the secret read entirely when the caller (or the severity,
+            # checked below) can only mean the operator chat — an incident
+            # must not wait on a secrets round-trip for a destination it was
+            # never going to use.
+            if destination is not None or severity.lower() not in SEVERITY_PHONE_PUSH:
+                log_chat_id, log_thread_id = _resolve_log_chat()
+        resolved, reason = resolve_destination(
+            severity,
+            destination=destination,
+            console_artifact=console_artifact,
+            log_chat_id=log_chat_id,
+        )
+        result.telegram_destination = resolved
+        result.destination_reason = reason
+
+        if resolved == DESTINATION_CONSOLE_ONLY:
+            # Delivered, not dropped: the caller named the durable surface it
+            # is published to, so `ok=True` — a Bash caller's `|| echo
+            # 'alert failed'` fallback must not fire for a finding that IS
+            # readable, and the SNS leg above already wrote the durable
+            # record regardless.
+            result.telegram = ChannelResult(
+                ok=True,
+                detail=(
+                    f"not sent (destination={DESTINATION_CONSOLE_ONLY}); "
+                    f"published to {console_artifact}"
+                ),
             )
+        else:
+            # Suppress send_message's auto-emit hook — this publish call emits
+            # one rich event itself below; without the guard every publish
+            # would land twice on the Overseer intake bus.
+            with fleet_events.suppress_emission():
+                result.telegram = _publish_telegram(
+                    formatted,
+                    severity=severity,
+                    silent=silent,
+                    destination=resolved,
+                    chat_id=log_chat_id if resolved == DESTINATION_LOG_CHAT else None,
+                    message_thread_id=(
+                        log_thread_id if resolved == DESTINATION_LOG_CHAT else None
+                    ),
+                )
 
     # ── Dedup marker write (post-publish, only if any channel succeeded) ─
     if marker_key and (result.sns.ok or result.telegram.ok):
@@ -768,6 +1109,8 @@ def publish_clear(
     sns_topic_arn: str | None = None,
     mute_ssm_param: str | None = None,
     dry_run: bool = False,
+    destination: str | None = None,
+    console_artifact: str | None = None,
 ) -> PublishResult:
     """Publish the terminator for a condition previously alerted on.
 
@@ -788,6 +1131,16 @@ def publish_clear(
     - **no ``dedup_key``.** The identity travels as ``identity_key``, which
       correlates without suppressing. Passing the page's dedup key here would
       let the page's own live marker swallow its terminator.
+
+    **Routing is inherited, not special-cased.** A clear is published at
+    ``info``, so it resolves to the same non-operator destination any other
+    non-incident severity does — the log chat when one is configured, the
+    console when the caller names an artifact, and the operator chat (with a
+    WARNING) when neither exists. ``destination`` / ``console_artifact``
+    pass straight through to :func:`publish`. A recovery landing in the
+    incident channel was the most-reported instance of the noise this tier
+    exists to remove, and it is fixed by the general rule rather than by a
+    branch that only clears take.
 
     :param message: What cleared, in the publisher's own words. The
         ``RESOLVED — `` marker is prepended by :func:`_format_message`.
@@ -814,6 +1167,8 @@ def publish_clear(
         state=ALERT_STATE_CLEARED,
         identity_key=identity_key,
         silent=True,
+        destination=destination,
+        console_artifact=console_artifact,
     )
 
 
@@ -960,6 +1315,29 @@ def main(argv: list[str] | None = None) -> int:
             "suppression. Defaults to --dedup-key when that is given."
         ),
     )
+    pub.add_argument(
+        "--destination",
+        default=None,
+        choices=list(ALERT_DESTINATIONS),
+        help=(
+            "Override the severity-derived Telegram destination: "
+            "operator_chat (the incident channel), log_chat "
+            "(TELEGRAM_LOG_CHAT_ID), or console_only (no Telegram send, "
+            "legal only with --console-artifact). Never drops the finding: "
+            "an unconfigured log chat or a console_only with no artifact "
+            "falls back to the operator chat and logs a WARNING."
+        ),
+    )
+    pub.add_argument(
+        "--console-artifact",
+        default=None,
+        help=(
+            "URI of the durable surface this finding is ALSO published to "
+            "(console artifact, fleet_check_result envelope, S3 key). This "
+            "is the evidence that makes console_only delivery safe — pass it "
+            "only for a surface you actually wrote."
+        ),
+    )
 
     clr = subparsers.add_parser(
         "clear",
@@ -994,6 +1372,29 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true",
         help="Verify the call site's argument shape without sending anything.",
     )
+    clr.add_argument(
+        "--destination",
+        default=None,
+        choices=list(ALERT_DESTINATIONS),
+        help=(
+            "Override the severity-derived Telegram destination: "
+            "operator_chat (the incident channel), log_chat "
+            "(TELEGRAM_LOG_CHAT_ID), or console_only (no Telegram send, "
+            "legal only with --console-artifact). Never drops the finding: "
+            "an unconfigured log chat or a console_only with no artifact "
+            "falls back to the operator chat and logs a WARNING."
+        ),
+    )
+    clr.add_argument(
+        "--console-artifact",
+        default=None,
+        help=(
+            "URI of the durable surface this finding is ALSO published to "
+            "(console artifact, fleet_check_result envelope, S3 key). This "
+            "is the evidence that makes console_only delivery safe — pass it "
+            "only for a surface you actually wrote."
+        ),
+    )
 
     args = parser.parse_args(argv)
 
@@ -1007,6 +1408,8 @@ def main(argv: list[str] | None = None) -> int:
             telegram=not args.no_telegram,
             sns_topic_arn=args.sns_topic_arn,
             dry_run=args.dry_run,
+            destination=args.destination,
+            console_artifact=args.console_artifact,
         )
         print(
             f"alerts.clear: identity_key={args.identity_key!r} "
@@ -1039,6 +1442,8 @@ def main(argv: list[str] | None = None) -> int:
         dry_run=args.dry_run,
         state=args.state,
         identity_key=args.identity_key,
+        destination=args.destination,
+        console_artifact=args.console_artifact,
     )
 
     # One-line status to stderr (stdout reserved for structured output if
@@ -1056,7 +1461,8 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             f"alerts.publish: sns.ok={result.sns.ok} ({result.sns.detail}); "
-            f"telegram.ok={result.telegram.ok} ({result.telegram.detail})",
+            f"telegram.ok={result.telegram.ok} ({result.telegram.detail}); "
+            f"destination={result.telegram_destination}",
             file=sys.stderr,
         )
 

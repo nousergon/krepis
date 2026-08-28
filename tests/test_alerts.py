@@ -1227,8 +1227,12 @@ class TestPublishTelegramSilent:
     def test_silent_true_forces_no_push_at_pushing_severity(self):
         sent = {}
 
-        def _send(msg, disable_notification=False):
+        def _send(msg, disable_notification=False, **kwargs):
+            # `**kwargs` absorbs the destination overrides (`chat_id`,
+            # `message_thread_id`) the routing tier passes; these cases pin
+            # the BUZZ decision, which routing must not disturb.
             sent["disable_notification"] = disable_notification
+            sent["chat_id"] = kwargs.get("chat_id")
             return True
 
         with patch.dict(
@@ -1241,8 +1245,12 @@ class TestPublishTelegramSilent:
     def test_silent_none_keeps_severity_default(self):
         sent = {}
 
-        def _send(msg, disable_notification=False):
+        def _send(msg, disable_notification=False, **kwargs):
+            # `**kwargs` absorbs the destination overrides (`chat_id`,
+            # `message_thread_id`) the routing tier passes; these cases pin
+            # the BUZZ decision, which routing must not disturb.
             sent["disable_notification"] = disable_notification
+            sent["chat_id"] = kwargs.get("chat_id")
             return True
 
         with patch.dict(
@@ -1255,8 +1263,12 @@ class TestPublishTelegramSilent:
     def test_silent_false_is_not_an_escalation(self):
         sent = {}
 
-        def _send(msg, disable_notification=False):
+        def _send(msg, disable_notification=False, **kwargs):
+            # `**kwargs` absorbs the destination overrides (`chat_id`,
+            # `message_thread_id`) the routing tier passes; these cases pin
+            # the BUZZ decision, which routing must not disturb.
             sent["disable_notification"] = disable_notification
+            sent["chat_id"] = kwargs.get("chat_id")
             return True
 
         with patch.dict(
@@ -1306,9 +1318,10 @@ class TestPublishClear:
         fake, _sts, _sns = fake_boto3
         sent = {}
 
-        def _send(msg, disable_notification=False):
+        def _send(msg, disable_notification=False, **kwargs):
             sent["disable_notification"] = disable_notification
             sent["text"] = msg
+            sent["chat_id"] = kwargs.get("chat_id")
             return True
 
         with patch.dict("sys.modules", {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)}):
@@ -1363,3 +1376,545 @@ class TestCliLifecycle:
         assert rc == 0
         assert captured["state"] == "still_open"
         assert captured["identity_key"] == "id-9"
+
+
+# ── Delivery DESTINATION tier (alpha-engine-config-I7857) ───────────────────
+# These assert the DESTINATION and the delivery decision, never the message
+# text. A test that pins the string cannot catch a wrong tier: the same body
+# is correct in the operator chat and in the log chat, and the whole defect
+# class this tier fixes is a correct message in the wrong channel.
+
+
+class TestResolveDestination:
+    """The pure decision function. No secrets, no transport."""
+
+    def test_incident_severity_goes_to_the_operator_chat(self):
+        for sev in sorted(alerts.SEVERITY_PHONE_PUSH):
+            dest, _ = alerts.resolve_destination(sev, log_chat_id="-100777")
+            assert dest == alerts.DESTINATION_OPERATOR_CHAT
+
+    def test_incident_severity_is_not_diverted_by_a_console_artifact(self):
+        # An artifact argument is evidence for a NON-incident finding. It must
+        # never be a way to keep a real page out of the incident channel.
+        dest, _ = alerts.resolve_destination(
+            "critical", console_artifact="s3://console/x.json", log_chat_id="-100777"
+        )
+        assert dest == alerts.DESTINATION_OPERATOR_CHAT
+
+    def test_non_incident_severity_goes_to_the_log_chat_when_configured(self):
+        for sev in ("info", "warning", "notice"):
+            dest, _ = alerts.resolve_destination(sev, log_chat_id="-100777")
+            assert dest == alerts.DESTINATION_LOG_CHAT
+
+    def test_console_artifact_used_only_when_no_log_chat(self):
+        dest, _ = alerts.resolve_destination(
+            "info", console_artifact="s3://console/x.json", log_chat_id=None
+        )
+        assert dest == alerts.DESTINATION_CONSOLE_ONLY
+
+    def test_log_chat_wins_over_console_artifact(self):
+        # Both configured is not ambiguous: a chat a human reads beats a
+        # surface they must go and look at.
+        dest, _ = alerts.resolve_destination(
+            "info", console_artifact="s3://console/x.json", log_chat_id="-100777"
+        )
+        assert dest == alerts.DESTINATION_LOG_CHAT
+
+    def test_neither_configured_falls_back_to_the_operator_chat(self, caplog):
+        with caplog.at_level("WARNING"):
+            dest, reason = alerts.resolve_destination("info")
+        assert dest == alerts.DESTINATION_OPERATOR_CHAT
+        assert reason.startswith("fallback")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_explicit_operator_chat_override(self):
+        dest, _ = alerts.resolve_destination(
+            "info",
+            destination=alerts.DESTINATION_OPERATOR_CHAT,
+            log_chat_id="-100777",
+        )
+        assert dest == alerts.DESTINATION_OPERATOR_CHAT
+
+    def test_explicit_log_chat_without_config_falls_back_loudly(self, caplog):
+        with caplog.at_level("WARNING"):
+            dest, reason = alerts.resolve_destination(
+                "info", destination=alerts.DESTINATION_LOG_CHAT, log_chat_id=None
+            )
+        assert dest == alerts.DESTINATION_OPERATOR_CHAT
+        assert reason.startswith("fallback")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_explicit_console_only_without_evidence_falls_back_loudly(self, caplog):
+        # console_artifact is the EVIDENCE, not a formality: without it,
+        # console_only is indistinguishable from a drop.
+        with caplog.at_level("WARNING"):
+            dest, reason = alerts.resolve_destination(
+                "info", destination=alerts.DESTINATION_CONSOLE_ONLY
+            )
+        assert dest == alerts.DESTINATION_OPERATOR_CHAT
+        assert reason.startswith("fallback")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_no_input_combination_resolves_to_nothing(self):
+        # The invariant, exhaustively: every reachable combination names a
+        # destination that DELIVERS. There is no "dropped" outcome to return.
+        for sev in ("info", "warning", "error", "critical"):
+            for dest_arg in (None, *alerts.ALERT_DESTINATIONS):
+                for artifact in (None, "s3://console/x.json"):
+                    for log_chat in (None, "-100777"):
+                        dest, reason = alerts.resolve_destination(
+                            sev,
+                            destination=dest_arg,
+                            console_artifact=artifact,
+                            log_chat_id=log_chat,
+                        )
+                        assert dest in alerts.ALERT_DESTINATIONS
+                        assert reason
+                        if dest == alerts.DESTINATION_CONSOLE_ONLY:
+                            assert artifact, (
+                                "console_only without an artifact is a silent drop"
+                            )
+                        if dest == alerts.DESTINATION_LOG_CHAT:
+                            assert log_chat
+
+    def test_unknown_destination_raises(self):
+        with pytest.raises(ValueError, match="unknown destination"):
+            alerts.resolve_destination("info", destination="somewhere-else")
+
+
+class TestResolveLogChat:
+    """Secret resolution for the log destination."""
+
+    def test_unset_secret_resolves_to_no_log_chat(self, monkeypatch):
+        monkeypatch.setattr(
+            "krepis.secrets.get_secret", lambda name, **kw: None
+        )
+        assert alerts._resolve_log_chat() == (None, None)
+
+    def test_chat_and_thread_are_resolved(self, monkeypatch):
+        values = {
+            alerts.TELEGRAM_LOG_CHAT_SECRET: "-1001234",
+            alerts.TELEGRAM_LOG_THREAD_SECRET: "42",
+        }
+        monkeypatch.setattr(
+            "krepis.secrets.get_secret", lambda name, **kw: values.get(name)
+        )
+        assert alerts._resolve_log_chat() == ("-1001234", 42)
+
+    def test_unparseable_thread_id_degrades_to_the_chat_not_to_nothing(
+        self, monkeypatch, caplog
+    ):
+        values = {
+            alerts.TELEGRAM_LOG_CHAT_SECRET: "-1001234",
+            alerts.TELEGRAM_LOG_THREAD_SECRET: "general",
+        }
+        monkeypatch.setattr(
+            "krepis.secrets.get_secret", lambda name, **kw: values.get(name)
+        )
+        with caplog.at_level("WARNING"):
+            assert alerts._resolve_log_chat() == ("-1001234", None)
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_thread_lookup_failure_still_yields_the_chat(self, monkeypatch):
+        # A readable chat id plus an unreadable topic id must degrade to
+        # "the log chat, no topic", not to "no log chat" — the latter would
+        # push routine traffic back into the incident channel.
+        def _get(name, **kw):
+            if name == alerts.TELEGRAM_LOG_CHAT_SECRET:
+                return "-1001234"
+            raise RuntimeError("ssm unreachable for the thread id")
+
+        monkeypatch.setattr("krepis.secrets.get_secret", _get)
+        assert alerts._resolve_log_chat() == ("-1001234", None)
+
+    def test_secrets_backend_failure_is_not_fatal(self, monkeypatch):
+        def _boom(name, **kw):
+            raise RuntimeError("ssm unreachable")
+
+        monkeypatch.setattr("krepis.secrets.get_secret", _boom)
+        assert alerts._resolve_log_chat() == (None, None)
+
+
+@pytest.fixture
+def routed_publish(monkeypatch, fake_boto3):
+    """Run a REAL ``alerts.publish`` with every transport captured.
+
+    Returns ``(run, sends, sns_client)``. ``run(log_chat=..., **kwargs)``
+    publishes with the log-chat config named by ``log_chat`` (a
+    ``(chat_id, thread_id)`` tuple, i.e. what ``_resolve_log_chat`` would
+    return) and appends one dict per Telegram send to ``sends`` — so an
+    empty ``sends`` list is itself the assertion that no chat was touched.
+    """
+    fake, _sts, sns_client = fake_boto3
+    monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *a, **kw: [])
+    monkeypatch.setattr(alerts.fleet_events, "emit_alert_event", lambda **kw: True)
+    sends: list[dict] = []
+
+    def _send(
+        text,
+        disable_notification=False,
+        bot_token=None,
+        chat_id=None,
+        message_thread_id=None,
+    ):
+        sends.append(
+            {
+                "text": text,
+                "disable_notification": disable_notification,
+                "chat_id": chat_id,
+                "message_thread_id": message_thread_id,
+            }
+        )
+        return True
+
+    def _run(log_chat=(None, None), **kwargs):
+        monkeypatch.setattr(alerts, "_resolve_log_chat", lambda: log_chat)
+        with patch.dict(
+            "sys.modules",
+            {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            return alerts.publish("boom", source="box-health", **kwargs)
+
+    return _run, sends, sns_client
+
+
+class TestPublishDestinationRouting:
+    """End-to-end: which chat did the message actually go to?"""
+
+    def test_error_reaches_the_operator_chat_with_the_buzz(self, routed_publish):
+        run, sends, _sns = routed_publish
+        result = run(log_chat=("-1001234", None), severity="error")
+        assert result.telegram_destination == alerts.DESTINATION_OPERATOR_CHAT
+        assert len(sends) == 1
+        # chat_id=None means send_message resolves TELEGRAM_CHAT_ID — the
+        # operator channel — rather than being handed the log override.
+        assert sends[0]["chat_id"] is None
+        assert sends[0]["disable_notification"] is False
+
+    def test_critical_reaches_the_operator_chat_with_the_buzz(self, routed_publish):
+        run, sends, _sns = routed_publish
+        result = run(log_chat=("-1001234", None), severity="critical")
+        assert result.telegram_destination == alerts.DESTINATION_OPERATOR_CHAT
+        assert sends[0]["chat_id"] is None
+        assert sends[0]["disable_notification"] is False
+
+    def test_info_with_a_log_chat_goes_there_and_not_to_the_operator(
+        self, routed_publish
+    ):
+        run, sends, _sns = routed_publish
+        result = run(log_chat=("-1001234", 42), severity="info")
+        assert result.telegram_destination == alerts.DESTINATION_LOG_CHAT
+        assert len(sends) == 1
+        assert sends[0]["chat_id"] == "-1001234"
+        assert sends[0]["message_thread_id"] == 42
+        assert "log_chat" in result.telegram.detail
+
+    def test_warning_with_a_log_chat_goes_there_and_not_to_the_operator(
+        self, routed_publish
+    ):
+        run, sends, _sns = routed_publish
+        result = run(log_chat=("-1001234", None), severity="warning")
+        assert result.telegram_destination == alerts.DESTINATION_LOG_CHAT
+        assert sends[0]["chat_id"] == "-1001234"
+        assert sends[0]["message_thread_id"] is None
+
+    def test_console_artifact_and_no_log_chat_touches_neither_chat(
+        self, routed_publish
+    ):
+        run, sends, _sns = routed_publish
+        result = run(
+            log_chat=(None, None),
+            severity="info",
+            console_artifact="s3://alpha-engine-console/fleet_checks/box-health.json",
+        )
+        assert result.telegram_destination == alerts.DESTINATION_CONSOLE_ONLY
+        assert sends == []
+        # Delivered, not failed: the finding is on the console and the SNS
+        # record was written. A Bash caller's `|| echo failed` must not fire.
+        assert result.telegram.ok is True
+        assert result.any_ok is True
+        assert "console_only" in result.telegram.detail
+        assert "s3://alpha-engine-console/fleet_checks/box-health.json" in (
+            result.telegram.detail
+        )
+
+    def test_console_only_still_pages_at_an_incident_severity(self, routed_publish):
+        run, sends, _sns = routed_publish
+        result = run(
+            log_chat=(None, None),
+            severity="error",
+            console_artifact="s3://console/x.json",
+        )
+        assert result.telegram_destination == alerts.DESTINATION_OPERATOR_CHAT
+        assert sends[0]["chat_id"] is None
+        assert sends[0]["disable_notification"] is False
+
+    def test_neither_configured_falls_back_to_the_operator_chat_loudly(
+        self, routed_publish, caplog
+    ):
+        # THE invariant (alpha-engine-config-I7857). An unconfigured fleet
+        # behaves exactly as it did before this tier existed — noisy, and
+        # never silent.
+        run, sends, _sns = routed_publish
+        with caplog.at_level("WARNING"):
+            result = run(log_chat=(None, None), severity="warning")
+        assert result.telegram_destination == alerts.DESTINATION_OPERATOR_CHAT
+        assert len(sends) == 1
+        assert sends[0]["chat_id"] is None
+        # Still no buzz — the buzz tier is unchanged by this work.
+        assert sends[0]["disable_notification"] is True
+        assert result.destination_reason.startswith("fallback")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_explicit_destination_overrides_the_severity_default(
+        self, routed_publish
+    ):
+        run, sends, _sns = routed_publish
+        result = run(
+            log_chat=("-1001234", None),
+            severity="error",
+            destination=alerts.DESTINATION_LOG_CHAT,
+        )
+        assert result.telegram_destination == alerts.DESTINATION_LOG_CHAT
+        assert sends[0]["chat_id"] == "-1001234"
+
+    def test_unknown_destination_raises_from_publish(self, routed_publish):
+        run, _sends, _sns = routed_publish
+        with pytest.raises(ValueError, match="unknown destination"):
+            run(severity="info", destination="nowhere")
+
+    def test_telegram_false_records_no_destination(self, routed_publish):
+        run, sends, _sns = routed_publish
+        result = run(log_chat=("-1001234", None), severity="info", telegram=False)
+        assert sends == []
+        assert result.telegram_destination is None
+
+
+class TestSnsIsUnaffectedByRouting:
+    """SNS is the durable record. Routing must not move, mute or reshape it."""
+
+    def _sns_call(self, run, sns_client, **kwargs):
+        sns_client.publish.reset_mock()
+        run(**kwargs)
+        assert sns_client.publish.call_count == 1
+        return dict(sns_client.publish.call_args.kwargs)
+
+    def test_identical_across_every_destination(self, routed_publish):
+        run, _sends, sns_client = routed_publish
+        to_log = self._sns_call(
+            run, sns_client, log_chat=("-1001234", None), severity="warning"
+        )
+        to_console = self._sns_call(
+            run,
+            sns_client,
+            log_chat=(None, None),
+            severity="warning",
+            console_artifact="s3://console/x.json",
+        )
+        fallback = self._sns_call(
+            run, sns_client, log_chat=(None, None), severity="warning"
+        )
+        assert to_log == to_console == fallback
+
+    def test_sns_still_publishes_when_telegram_is_console_only(self, routed_publish):
+        run, _sends, sns_client = routed_publish
+        result = run(
+            log_chat=(None, None),
+            severity="info",
+            console_artifact="s3://console/x.json",
+        )
+        assert sns_client.publish.call_count == 1
+        assert result.sns.ok is True
+
+    def test_incident_and_non_incident_differ_only_by_the_severity_tag(
+        self, routed_publish
+    ):
+        run, _sends, sns_client = routed_publish
+        err = self._sns_call(
+            run, sns_client, log_chat=("-1001234", None), severity="error"
+        )
+        warn = self._sns_call(
+            run, sns_client, log_chat=("-1001234", None), severity="warning"
+        )
+        assert err["TopicArn"] == warn["TopicArn"]
+        assert err["Message"].replace("[ERROR]", "") == warn["Message"].replace(
+            "[WARNING]", ""
+        )
+
+
+class TestPublishClearRouting:
+    """A recovery inherits the routing; it is not a special case."""
+
+    def test_clear_goes_to_the_log_chat_when_configured(
+        self, monkeypatch, fake_boto3
+    ):
+        fake, _sts, _sns = fake_boto3
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *a, **kw: [])
+        monkeypatch.setattr(alerts.fleet_events, "emit_alert_event", lambda **kw: True)
+        monkeypatch.setattr(alerts, "_resolve_log_chat", lambda: ("-1005555", 7))
+        sends: list[dict] = []
+
+        def _send(text, disable_notification=False, chat_id=None, message_thread_id=None, bot_token=None):
+            sends.append({"chat_id": chat_id, "thread": message_thread_id,
+                          "disable_notification": disable_notification})
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            result = alerts.publish_clear(
+                "disk high cleared", identity_key="k-1", source="box-health"
+            )
+        assert result.telegram_destination == alerts.DESTINATION_LOG_CHAT
+        assert sends[0]["chat_id"] == "-1005555"
+        assert sends[0]["thread"] == 7
+        assert sends[0]["disable_notification"] is True
+
+    def test_clear_with_a_console_artifact_touches_no_chat(
+        self, monkeypatch, fake_boto3
+    ):
+        fake, _sts, sns_client = fake_boto3
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *a, **kw: [])
+        monkeypatch.setattr(alerts.fleet_events, "emit_alert_event", lambda **kw: True)
+        monkeypatch.setattr(alerts, "_resolve_log_chat", lambda: (None, None))
+        sends: list[dict] = []
+
+        def _send(text, **kw):
+            sends.append(kw)
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            result = alerts.publish_clear(
+                "disk high cleared",
+                identity_key="k-1",
+                console_artifact="s3://console/box-health.json",
+            )
+        assert result.telegram_destination == alerts.DESTINATION_CONSOLE_ONLY
+        assert sends == []
+        # The durable record of the recovery is still written.
+        assert sns_client.publish.call_count == 1
+        assert result.any_ok is True
+
+    def test_clear_falls_back_to_the_operator_chat_when_unconfigured(
+        self, monkeypatch, fake_boto3, caplog
+    ):
+        fake, _sts, _sns = fake_boto3
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        monkeypatch.setenv("AWS_REGION", "us-east-1")
+        monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *a, **kw: [])
+        monkeypatch.setattr(alerts.fleet_events, "emit_alert_event", lambda **kw: True)
+        monkeypatch.setattr(alerts, "_resolve_log_chat", lambda: (None, None))
+        sends: list[dict] = []
+
+        def _send(text, disable_notification=False, chat_id=None, message_thread_id=None, bot_token=None):
+            sends.append({"chat_id": chat_id, "disable_notification": disable_notification})
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"boto3": fake, "krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            with caplog.at_level("WARNING"):
+                result = alerts.publish_clear("cleared", identity_key="k-1")
+        assert result.telegram_destination == alerts.DESTINATION_OPERATOR_CHAT
+        assert sends[0]["chat_id"] is None
+        assert sends[0]["disable_notification"] is True
+        assert result.destination_reason.startswith("fallback")
+        assert any(r.levelname == "WARNING" for r in caplog.records)
+
+    def test_clear_passes_routing_arguments_through(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured.update(kwargs)
+            return alerts.PublishResult()
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        alerts.publish_clear(
+            "x",
+            identity_key="k",
+            destination=alerts.DESTINATION_LOG_CHAT,
+            console_artifact="s3://console/x.json",
+        )
+        assert captured["destination"] == alerts.DESTINATION_LOG_CHAT
+        assert captured["console_artifact"] == "s3://console/x.json"
+
+
+class TestPublicDestinationApi:
+    def test_legacy_severity_names_are_still_exported(self):
+        # CONTRIBUTING.md: the public API is additive-only. Consumers pin
+        # krepis; a rename breaks them at import time.
+        assert alerts.SEVERITY_PHONE_PUSH == frozenset({"error", "critical"})
+        assert alerts.SEVERITY_PUSH is alerts.SEVERITY_PHONE_PUSH
+
+    def test_destination_constants_are_public_and_complete(self):
+        assert alerts.ALERT_DESTINATIONS == (
+            alerts.DESTINATION_OPERATOR_CHAT,
+            alerts.DESTINATION_LOG_CHAT,
+            alerts.DESTINATION_CONSOLE_ONLY,
+        )
+        assert alerts.TELEGRAM_LOG_CHAT_SECRET == "TELEGRAM_LOG_CHAT_ID"
+        assert alerts.TELEGRAM_LOG_THREAD_SECRET == "TELEGRAM_LOG_MESSAGE_THREAD_ID"
+
+
+class TestCliDestination:
+    def test_flags_forward_to_publish(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish(message, **kwargs):
+            captured.update(kwargs)
+            return alerts.PublishResult(sns=alerts.ChannelResult(ok=True, detail="ok"))
+
+        monkeypatch.setattr(alerts, "publish", _fake_publish)
+        rc = alerts.main(
+            [
+                "publish", "--message", "m", "--severity", "info",
+                "--destination", "console_only",
+                "--console-artifact", "s3://console/x.json",
+            ]
+        )
+        assert rc == 0
+        assert captured["destination"] == "console_only"
+        assert captured["console_artifact"] == "s3://console/x.json"
+
+    def test_clear_flags_forward(self, monkeypatch):
+        captured = {}
+
+        def _fake_publish_clear(message, **kwargs):
+            captured.update(kwargs)
+            return alerts.PublishResult(sns=alerts.ChannelResult(ok=True, detail="ok"))
+
+        monkeypatch.setattr(alerts, "publish_clear", _fake_publish_clear)
+        rc = alerts.main(
+            [
+                "clear", "--message", "m", "--identity-key", "k",
+                "--destination", "log_chat",
+            ]
+        )
+        assert rc == 0
+        assert captured["destination"] == "log_chat"
+
+    def test_unknown_destination_rejected_by_argparse(self):
+        with pytest.raises(SystemExit):
+            alerts.main(["publish", "--message", "m", "--destination", "nowhere"])
+
+    def test_stderr_names_the_destination(self, monkeypatch, capsys):
+        monkeypatch.setattr(
+            alerts, "publish",
+            lambda message, **kw: alerts.PublishResult(
+                sns=alerts.ChannelResult(ok=True, detail="ok"),
+                telegram_destination=alerts.DESTINATION_LOG_CHAT,
+            ),
+        )
+        alerts.main(["publish", "--message", "m", "--severity", "info"])
+        assert "destination=log_chat" in capsys.readouterr().err
