@@ -112,11 +112,25 @@ class TestPublish:
         assert result.any_ok is True
 
     def test_both_failures(self, fake_boto3):
+        """Both human channels down. Under `raise_on_total_failure=False` the
+        structured result is still returned and still reports the failure.
+
+        REVERSED 2026-08-29 (alpha-engine-config-I9209). This test used to
+        assert the default path returned quietly. It cannot: on the default
+        path, both human channels failing AND the Overseer intake failing now
+        raises `AlertDeliveryError` — see
+        `tests/test_alert_total_delivery_failure.py`. The opt-out is what
+        preserves the shape this test was written to pin, and pinning it here
+        keeps the structured-result contract asserted for the callers that
+        legitimately use it.
+        """
         fake, _sts, sns = fake_boto3
         sns.publish.side_effect = RuntimeError("nope")
         with patch.dict("sys.modules", {"boto3": fake}):
             with patch.object(alerts, "_publish_telegram", return_value=alerts.ChannelResult(ok=False, detail="creds missing")):
-                result = alerts.publish("boom", source="x")
+                result = alerts.publish(
+                    "boom", source="x", raise_on_total_failure=False,
+                )
         assert result.any_ok is False
         assert result.all_ok is False
 
@@ -198,9 +212,19 @@ class TestPublish:
         assert len(subject) <= 100
         assert "\n" not in subject
 
-    def test_never_raises_on_publish_exception(self, fake_boto3):
-        """``publish`` must NEVER raise — both channels can fail and the
-        function still returns a structured PublishResult.
+    def test_never_raises_on_a_TRANSPORT_exception(self, fake_boto3):
+        """A transport blowing up is caught; only TOTAL non-delivery raises.
+
+        RENAMED AND NARROWED 2026-08-29 (alpha-engine-config-I9209). The old
+        name asserted "``publish`` must NEVER raise", which is no longer the
+        contract and was the property that let a fleet of laptop detectors emit
+        into an IAM-denied channel and report success for months. What survives
+        — and what this test now pins — is the half that was always right: an
+        exception thrown by a transport must never escape as itself. A
+        `RuntimeError` out of boto3 is still turned into a structured
+        `ChannelResult`. The deliberate raise on total non-delivery is exercised
+        under `raise_on_total_failure=False` here so the two properties stay
+        independently tested.
 
         Surfaced 2026-05-21 (post-v0.24.0 dedup PR): the prior version of
         this test ran with no mocks at all, claiming "no creds + no
@@ -221,7 +245,10 @@ class TestPublish:
                 alerts, "_publish_telegram",
                 return_value=alerts.ChannelResult(ok=False, detail="simulated"),
             ):
-                result = alerts.publish("boom", source="test", sns_topic_arn=None)
+                result = alerts.publish(
+                    "boom", source="test", sns_topic_arn=None,
+                    raise_on_total_failure=False,
+                )
         # Structured result returned despite both channels failing.
         assert isinstance(result, alerts.PublishResult)
         assert result.any_ok is False
@@ -655,6 +682,10 @@ class TestPublishWithDedup:
             ):
                 result = alerts.publish(
                     "anomaly", source="x", dedup_key="no-marker-on-fail",
+                    # I9209: the default now raises on total non-delivery.
+                    # This test is about the MARKER, not the raise — opting
+                    # out keeps it testing the one property it names.
+                    raise_on_total_failure=False,
                 )
         assert result.any_ok is False
         marker_key = alerts._dedup_marker_key("no-marker-on-fail")
