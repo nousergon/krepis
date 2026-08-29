@@ -110,11 +110,21 @@ removes it from one.
 Override with the ``--sns-topic-arn`` CLI flag or ``sns_topic_arn``
 kwarg.
 
-**Failure behavior.** Never raises. SNS errors (boto3 ``ClientError``,
-network) and Telegram errors both log at WARNING and return a
-:class:`PublishResult` with the failed channel marked ``ok=False``. This
-is by design — the caller is already in a failure path; secondary
-surveillance failure must not mask the primary error.
+**Failure behavior.** A transport exception never escapes as itself: SNS
+errors (boto3 ``ClientError``, network) and Telegram errors both log at
+WARNING and return a :class:`PublishResult` with the failed channel marked
+``ok=False``. A PARTIAL failure is by design — the caller is already in a
+failure path and secondary surveillance failure must not mask the primary
+error.
+
+**TOTAL non-delivery does raise** (:class:`AlertDeliveryError`, default
+``raise_on_total_failure=True``, alpha-engine-config-I9209). When every
+requested human channel failed AND the Overseer intake event failed on both
+of its transports, the alert reached nothing at all, and returning quietly is
+what let both laptop identities emit into an IAM-denied channel and report
+success for months while a real regression worsened underneath
+(alpha-engine-config-I9314). Callers with a genuine reason to survive that
+pass ``raise_on_total_failure=False`` with a written rationale.
 
 **Source-keyed suppression** (v0.57.0, alpha-engine-config mute-arc).
 Distinct from dedup: an operator can mute an entire alert *source*
@@ -326,6 +336,44 @@ CLEAR_SEVERITY: Final[str] = "info"
 CLEAR_MESSAGE_PREFIX: Final[str] = "RESOLVED"
 
 
+class AlertDeliveryError(RuntimeError):
+    """Every requested delivery surface failed. Raised by :func:`publish`.
+
+    WHY THIS EXISTS (alpha-engine-config-I9209)
+    -------------------------------------------
+    On 2026-08-29 both laptop identities were IAM-denied on `sns:Publish`,
+    on `events:PutEvents` and on the S3 drop-zone fallback simultaneously.
+    `publish` returned a `PublishResult` whose `.any_ok` was False, every
+    caller ignored it, and the `router-canary` went on paging hourly about
+    the `ultra` capability class sitting under its prompt-cache floor for
+    119 runs (alpha-engine-config-I9314) into a channel that could not
+    deliver. Nothing anywhere said so.
+
+    `~/Development/CLAUDE.md`, *Fail loud and fast*: the default is RAISE,
+    and a producer whose ENTIRE PURPOSE is delivery is the strongest case
+    for it — a silent non-delivery is indistinguishable from a delivered
+    page on every surface an operator can read.
+
+    WHAT IT DOES NOT COVER
+    ----------------------
+    A partial failure is not this. One channel failing while another
+    delivers is the designed behaviour (`PublishResult.sns` and
+    `.telegram` are independent, and the module has always fanned out
+    best-effort per channel). This is raised only when the alert reached
+    *nothing*: no requested human channel, and not the machine-readable
+    Overseer intake either.
+
+    A raise is also NOT the mechanism that makes this failure class
+    visible. The launchd detectors were already exiting non-zero and
+    nobody was told, because a launchd exit code is read by nothing. The
+    detection is
+    `claude-code-config/laptop-checks/alert_transport_liveness.py`, whose
+    verdict lands on the console and whose ABSENCE renders `MISSED`. This
+    exception is what stops a caller from *continuing as if it had
+    paged* — a different and equally necessary job.
+    """
+
+
 @dataclass
 class ChannelResult:
     """Per-channel outcome from a :func:`publish` call."""
@@ -358,6 +406,14 @@ class PublishResult:
 
     sns: ChannelResult = field(default_factory=lambda: ChannelResult(ok=False, detail="not attempted"))
     telegram: ChannelResult = field(default_factory=lambda: ChannelResult(ok=False, detail="not attempted"))
+    #: Did the machine-readable Overseer intake event reach EITHER of its two
+    #: transports (EventBridge, then the S3 drop zone)? ``None`` when emission
+    #: was not attempted at all (dry-run, dedup skip, mute, test guard). This
+    #: is the third delivery surface, and it is recorded here because on
+    #: 2026-08-29 it was the only one anybody looked at afterwards — its
+    #: failure was a WARNING in a log file and its success was indistinguishable
+    #: from it (alpha-engine-config-I9209).
+    event_emitted: bool | None = None
     dedup_skipped: bool = False
     dedup_reason: str = ""
     muted: bool = False
@@ -833,6 +889,7 @@ def publish(
     silent: bool | None = None,
     destination: str | None = None,
     console_artifact: str | None = None,
+    raise_on_total_failure: bool = True,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -875,6 +932,13 @@ def publish(
     :param source: Optional source identifier (script path, repo, Lambda
         name) inserted between the tag and the message body. Helps the
         operator triage at a glance.
+    :param raise_on_total_failure: When ``True`` (the default), raise
+        :class:`AlertDeliveryError` if every requested human channel failed
+        AND the Overseer intake event failed on both of its transports —
+        i.e. the alert reached nothing at all. A partial failure never
+        raises. Pass ``False`` only with a written rationale naming the
+        failure mode being swallowed and the surface that records it
+        (``~/Development/CLAUDE.md``, *Fail loud and fast*).
     :param sns: When ``False``, skip the SNS publish entirely.
     :param telegram: When ``False``, skip the Telegram fan-out entirely.
     :param sns_topic_arn: Explicit topic ARN. Defaults to
@@ -1129,7 +1193,7 @@ def publish(
     # Emitted only when channels were actually attempted: the test-env
     # guard and dedup-skip paths return earlier, so suppressed repeats and
     # test runs never reach the bus.
-    fleet_events.emit_alert_event(
+    result.event_emitted = fleet_events.emit_alert_event(
         origin="alerts.publish",
         body=message,
         severity_raw=severity,
@@ -1142,6 +1206,42 @@ def publish(
         state=state,
         identity_key=effective_identity,
     )
+
+    # ── Total non-delivery is LOUD (alpha-engine-config-I9209) ───────────
+    # Reached only when channels were actually attempted: dry-run, the test
+    # guard, a source mute and a dedup skip all return earlier, so none of
+    # them can trip this.
+    #
+    # "Total" is deliberately strict. Every surface the caller ASKED for has
+    # to have failed, AND the machine-readable Overseer intake has to have
+    # failed on both of ITS transports. A partial failure stays exactly as it
+    # was — per-channel best-effort — because a caller in a failure path that
+    # reached one channel has been heard.
+    #
+    # A caller with a genuine reason to survive total non-delivery passes
+    # `raise_on_total_failure=False`, which per `~/Development/CLAUDE.md`
+    # requires a written rationale naming the failure mode swallowed and the
+    # surface that records it. There is no environment variable for this: a
+    # tolerance that can be switched on from outside the call site is not
+    # reviewable at the call site.
+    requested_any_human_channel = sns or telegram
+    if requested_any_human_channel and not result.any_ok and not result.event_emitted:
+        detail = (
+            f"NOUSERGON_ALERT_TOTAL_DELIVERY_FAILURE: alert reached NOTHING — "
+            f"sns.ok={result.sns.ok} ({result.sns.detail}); "
+            f"telegram.ok={result.telegram.ok} ({result.telegram.detail}); "
+            f"overseer_event_emitted=False (both EventBridge and the S3 "
+            f"fallback failed). severity={severity!r} source={source!r}. "
+            f"The most common cause is an identity missing events:PutEvents "
+            f"on the nousergon-alerts bus, sns:Publish on alpha-engine-alerts, "
+            f"and s3:PutObject on overseer/intake-fallback/* — check with "
+            f"`aws iam simulate-principal-policy`, not by reading a log."
+        )
+        # ERROR, not WARNING: a WARNING is what this failure wore for the
+        # whole time it was invisible.
+        logger.error(detail)
+        if raise_on_total_failure:
+            raise AlertDeliveryError(detail)
 
     return result
 
@@ -1476,22 +1576,30 @@ def main(argv: list[str] | None = None) -> int:
     else:
         window_min = args.dedup_window_min
 
-    result = publish(
-        args.message,
-        severity=args.severity,
-        source=args.source,
-        sns=not args.no_sns,
-        telegram=not args.no_telegram,
-        sns_topic_arn=args.sns_topic_arn,
-        dedup_key=args.dedup_key,
-        dedup_window_min=window_min,
-        dedup_bucket=args.dedup_bucket,
-        dry_run=args.dry_run,
-        state=args.state,
-        identity_key=args.identity_key,
-        destination=args.destination,
-        console_artifact=args.console_artifact,
-    )
+    try:
+        result = publish(
+            args.message,
+            severity=args.severity,
+            source=args.source,
+            sns=not args.no_sns,
+            telegram=not args.no_telegram,
+            sns_topic_arn=args.sns_topic_arn,
+            dedup_key=args.dedup_key,
+            dedup_window_min=window_min,
+            dedup_bucket=args.dedup_bucket,
+            dry_run=args.dry_run,
+            state=args.state,
+            identity_key=args.identity_key,
+            destination=args.destination,
+            console_artifact=args.console_artifact,
+        )
+    except AlertDeliveryError as exc:
+        # The CLI is the Bash-caller surface, so the diagnosis goes to stderr
+        # as one greppable line and the exit code is 1. Not re-raised: a
+        # traceback out of `python -m krepis.alerts` tells a shell caller
+        # nothing the message does not, and it buries the marker.
+        print(f"alerts.publish: {exc}", file=sys.stderr)
+        return 1
 
     # One-line status to stderr (stdout reserved for structured output if
     # any caller starts parsing it). Bash callers can ignore.

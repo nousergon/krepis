@@ -18,8 +18,11 @@ byte-identical whether or not emission succeeds.
   drop-zone write (roles fleet-wide already hold write on the shared research
   bucket, so events flow even before an IAM ``events:PutEvents`` grant reaches
   a given role). If both transports fail, a WARNING with the stable marker
-  ``NOUSERGON_ALERT_EVENT_EMIT_FAILED`` is logged and the alert's human
-  delivery is unaffected.
+  ``NOUSERGON_ALERT_EVENT_EMIT_FAILED`` is logged at **ERROR** and
+  ``False`` is returned; the alert's human delivery is unaffected, but
+  ``alerts.publish`` raises :class:`~krepis.alerts.AlertDeliveryError` when
+  that return coincides with every human channel having failed too
+  (alpha-engine-config-I9209).
 - :func:`suppress_emission` — context manager used by ``alerts.publish`` so
   its nested ``telegram.send_message`` call does not double-emit; the publish
   call emits one rich event itself.
@@ -290,9 +293,26 @@ def emit_alert_event(
         _write_fallback(detail)
         return True
     except Exception as exc:
-        # Swallowed by design (same rationale). Recording surface: this
-        # stable log marker — the event is lost, the human alert is not.
-        logger.warning(
+        # Still swallowed here — this IS the side channel, and it must not
+        # be able to fail the human alert path. What changed
+        # (alpha-engine-config-I9209) is the level and who acts on it.
+        #
+        # WHY ERROR, NOT WARNING. For the whole time both transports were
+        # IAM-denied on this laptop, this exact line was written at WARNING
+        # every run, in a log file, and read by nobody. A WARNING is the
+        # level this failure wore while it was invisible.
+        #
+        # RECORDING SURFACE (the thing a swallow owes, per
+        # `~/Development/CLAUDE.md`): two, now, not just this marker.
+        # 1. `alerts.publish` reads this function's False return and raises
+        #    `AlertDeliveryError` when the human channels ALSO failed — so a
+        #    caller can no longer continue as if it had paged.
+        # 2. `claude-code-config/laptop-checks/alert_transport_liveness.py`
+        #    emits a real synthetic event on a schedule and verifies it
+        #    ARRIVED at the intake rule, publishing a check envelope whose
+        #    absence the console renders MISSED. That is the detector; this
+        #    marker is only the evidence it points at.
+        logger.error(
             "fleet_events: emission failed on both transports "
             "[NOUSERGON_ALERT_EVENT_EMIT_FAILED]: %s",
             exc,
