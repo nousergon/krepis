@@ -329,6 +329,58 @@ class TestStreamingIsARoutableCapability:
             _router._router = None
 
 
+class TestBatchesIsARoutableCapability:
+    """``batches`` joined :data:`ROUTABLE_CAPABILITIES` 2026-08-29
+    (alpha-engine-config-I9308), reversing an earlier call that it "names a
+    different API surface entirely" and so did not belong beside
+    ``tool_choice``/``streaming``. It passes the same acceptance test they do:
+    a route either serves an async batch submission or it does not, and a
+    route that cannot does not serve one more slowly — it does not serve it
+    at all. The earlier exclusion is also what let six
+    ``LLM_MODEL_REGISTRY.yaml`` rows declare ``capabilities.batches: true`` on
+    OpenRouter routes that expose no Message Batches endpoint go unnoticed:
+    nothing at resolve time ever consulted the flag."""
+
+    def test_it_is_declared_routable(self):
+        assert "batches" in _mr.ROUTABLE_CAPABILITIES
+
+    def test_a_requirement_narrows_the_chain_to_the_declaring_member(self, registry):
+        assert registry.live_group_ids("low", requires=("batches",)) == [
+            "accepts-tools",
+        ]
+
+    def test_silence_about_batches_is_a_rejection_with_a_reason(self, registry):
+        reasons = dict(registry.capability_rejections("low", requires=("batches",)))
+        assert "capabilities.batches" in reasons["refuses-tools"]
+        assert "capabilities.batches" in reasons["also-accepts-tools"]
+
+    def test_a_group_with_no_batches_member_raises_at_resolve_time(
+        self, monkeypatch, mixed_registry
+    ):
+        """The fleet-real case (alpha-engine-config-I9308): every registry
+        row that used to declare ``batches: true`` did so on a route that
+        cannot serve it, so a group required to serve the capability
+        resolves to zero live members. Fail CLOSED at resolution — a
+        :class:`CapabilityUnavailableError` naming the registry gap, never a
+        ``ValueError`` saying the flag itself is unrouteable, and never a
+        silent fall-through to a route that would take a 400."""
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(mixed_registry))
+                m.setattr(
+                    _router, "_litellm_edge_admission",
+                    lambda: (True, "https://router.example:8443", []),
+                )
+                with pytest.raises(_mr.CapabilityUnavailableError):
+                    _router.resolve_group_structured(
+                        "med", exec_context="lambda", wire="openai",
+                        requires=("batches",),
+                    )
+        finally:
+            _router._router = None
+
+
 class TestTheDeclarationReachesTheClient:
     """A resolve-time filter is only half of it: an UNQUALIFIED call to a group
     whose primary cannot stream must still hand the client a spec that says so,

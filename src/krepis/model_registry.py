@@ -115,17 +115,34 @@ MIN_ADMISSIBLE_TPM = 1_000_000
 #:
 #: Listed here rather than derived from the union of `capabilities` keys on
 #: purpose: `prompt_caching` / `cache_min_tokens` / `automatic_prefix_caching`
-#: are COST facts a consumer reads off the resolved route, and `batches` names
-#: a different API surface entirely. Only a flag that decides whether a request
-#: is ACCEPTED belongs here — requiring anything else would silently narrow a
-#: chain for a preference rather than a contract.
+#: are COST facts a consumer reads off the resolved route. Only a flag that
+#: decides whether a request is ACCEPTED belongs here — requiring anything
+#: else would silently narrow a chain for a preference rather than a contract.
 #: `streaming` joined it 2026-08-25 (alpha-engine-config-I8164) and passes the
 #: same test: a route that cannot stream does not serve a streamed request more
 #: slowly, it does not serve it at all, so the flag decides ACCEPTANCE. It is
 #: also the one call shape whose absence cannot be discovered from a successful
 #: response — a client that fell back to a non-streaming request would get a
 #: valid completion and the original request-deadline failure envelope back.
-ROUTABLE_CAPABILITIES = ("tool_choice", "streaming")
+#:
+#: `batches` joined 2026-08-29 (alpha-engine-config-I9308). It was deliberately
+#: LEFT OUT above on the reasoning that it "names a different API surface
+#: entirely" — but that framing described the wrong axis. A batch submission
+#: either is accepted by a route (an async fan-out endpoint exists there) or
+#: it is not; a route that cannot serve one does not serve it more slowly or
+#: more expensively, exactly the acceptance test `streaming` already passes.
+#: The prior exclusion is also what let six `LLM_MODEL_REGISTRY.yaml` rows
+#: declare `capabilities.batches: true` on OpenRouter routes that expose no
+#: Message Batches endpoint at all — a lie about the MODEL rather than the
+#: ROUTE — sit unnoticed for weeks, because nothing at resolve time ever
+#: consulted the flag (alpha-engine-config-I9263/I9308). Those six rows are
+#: corrected to `false` in the same change that adds this entry. Until a
+#: route somewhere declares `batches: true` truthfully, a group required to
+#: serve it resolves to zero live members and
+#: :class:`CapabilityUnavailableError` fires at resolve time (R20 fail
+#: closed) — a registry gap, honestly reported, not a `ValueError` saying the
+#: flag itself is unknown.
+ROUTABLE_CAPABILITIES = ("tool_choice", "streaming", "batches")
 
 _MAX_WALK_DEPTH = 8
 
