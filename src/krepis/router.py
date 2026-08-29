@@ -2409,6 +2409,155 @@ def resolve_group_spec(
 
 
 
+# ── Complexity tier → registry model group (the ONE mapping, fleet-wide) ──
+#
+# WHY THIS LIVES HERE. Brian's 2026-08-29 ruling: "the entire nous ergon
+# system should now be running through the krepis router... we should have no
+# other parallel setups, it should all funnel through the krepis router."
+#
+# Before this, a complexity tier was turned into a MODEL ID by five separate
+# hand-maintained tables — `nousergon_lib.groom_eligibility.TIER_MODELS` and
+# `.FALLBACK_TIER_MODELS`, and three copies in `alpha-engine-config`
+# (`scripts/groom_eligibility_fallback.py`, `scripts/disposition_audit.py`,
+# `scripts/generate_drain_manifests.py`), two of which additionally carried a
+# hardcoded model-ID ladder as a SILENT fallback for "the router CLI did not
+# answer". That is a second routing plane: it names model IDs and providers at
+# the call site (principle 8), it cannot honour `reachable_from`
+# (model-router-policy R28/R29), and its silent degrade is exactly the
+# unannounced provider switch R20 forbids.
+#
+# The mapping a consumer legitimately owns is tier → GROUP. Everything below
+# the group — which model, which provider, which endpoint, which credential,
+# which reasoning params, and the cross-provider fallback chain — is a
+# registry decision resolved here. A group name is not a model ID, a base
+# URL, or a provider name, so this table is addressable under principle 8;
+# the tables it replaces were not.
+#
+# DELTA (principles.md §2.4), stated because the SOTA option is one step
+# further on. SOTA: the tier→group alias is a block in
+# `LLM_MODEL_REGISTRY.yaml` itself, covered by the R2 pull-request validator,
+# so R1's "exactly ONE registry file is the source of truth for model
+# identity, groups and endpoints" covers the alias too. Why this stands for
+# now: it is a strictly smaller change that already collapses five tables to
+# one and removes every model ID from every call site; the registry-native
+# form additionally needs a schema change plus a validator change in a third
+# repo. Cost of the SOTA path: alpha-engine-config registry schema +
+# validator + a krepis reader, landing after this. Tracked follow-up:
+# alpha-engine-config-I9297.
+
+#: Complexity tiers, cheapest first. These are the `complexity:*` issue-label
+#: values and the groom's own tier vocabulary — NOT registry group names.
+COMPLEXITY_TIERS: tuple[str, ...] = ("low", "mid", "high")
+
+#: Complexity tier → registry model group. The ONLY place this mapping
+#: exists. `mid` maps to `med` because the tier vocabulary and the registry
+#: group vocabulary were named independently; the map exists to reconcile
+#: exactly that, and carries no model, provider, endpoint or price.
+TIER_GROUPS: dict[str, str] = {
+    "low": "low",
+    "mid": "med",
+    "high": "high",
+}
+
+
+def group_for_tier(tier: str) -> str:
+    """Return the registry model group serving complexity tier *tier*.
+
+    Raises
+    ------
+    ValueError
+        *tier* is not a declared complexity tier. It REFUSES rather than
+        defaulting to a middle tier: every table this replaced defaulted a
+        typo to `mid`, which silently bills a wrong tier and looks healthy.
+    """
+    try:
+        return TIER_GROUPS[tier]
+    except KeyError:
+        raise ValueError(
+            f"Unknown complexity tier {tier!r}. Declared tiers are "
+            f"{list(COMPLEXITY_TIERS)}. A tier is not a model group — the "
+            f"registry groups are addressed by name via resolve_group_spec()."
+        ) from None
+
+
+def resolve_tier_structured(
+    tier: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+    requires: tuple[str, ...] = (),
+) -> dict:
+    """Resolve a complexity *tier* to a full routing decision.
+
+    Exactly :func:`resolve_group_structured` on :func:`group_for_tier`'s
+    answer, and it is the supported entry point for any consumer that thinks
+    in complexity tiers. It FAILS CLOSED (model-router-policy R20): an
+    unresolvable tier raises, and there is deliberately no hardcoded model
+    ladder behind it to fall through to.
+    """
+    return resolve_group_structured(
+        group_for_tier(tier),
+        exec_context=exec_context,
+        wire=wire,
+        requires=requires,
+    )
+
+
+def resolve_tier_spec(
+    tier: str,
+    *,
+    exec_context: str | None = None,
+    wire: str = DEFAULT_WIRE,
+    max_tokens: int | None = None,
+    structured_outputs: bool | None = None,
+    requires: tuple[str, ...] = (),
+) -> tuple:
+    """Resolve a complexity *tier* to a ``(ModelSpec, route)`` pair.
+
+    :func:`resolve_group_spec` on :func:`group_for_tier`'s answer.
+    """
+    return resolve_group_spec(
+        group_for_tier(tier),
+        exec_context=exec_context,
+        wire=wire,
+        max_tokens=max_tokens,
+        structured_outputs=structured_outputs,
+        requires=requires,
+    )
+
+
+def reasoning_params(route: dict) -> dict | None:
+    """The registry's declared reasoning params for a resolved *route*.
+
+    Returns the registry's own ``params.reasoning`` mapping (e.g.
+    ``{"effort": "max"}``) or ``None`` when the served entry declares no
+    reasoning configuration — which is how the registry says "thinking off".
+
+    This exists so a consumer that must render reasoning settings into a
+    subprocess environment or a request body reads them from the registry
+    instead of keeping a per-tier thinking/effort table beside its model
+    table. Both of the tables this replaces carried one.
+
+    Raises
+    ------
+    RuntimeError
+        *route* carries a ``schema_version`` this function was not written
+        against. Consumers MUST branch on schema_version rather than probing
+        for fields, so reading an unknown one refuses rather than guessing.
+    """
+    version = route.get("schema_version")
+    if version != RESOLVE_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"reasoning_params() understands resolve schema_version "
+            f"{RESOLVE_SCHEMA_VERSION}, got {version!r}. Refusing to guess "
+            f"field meanings on an unknown contract version."
+        )
+    params = route.get("params") or {}
+    reasoning = params.get("reasoning")
+    return dict(reasoning) if reasoning else None
+
+
+
 # ── Single registered model (the pinned-model path) ───────────────────────
 
 
