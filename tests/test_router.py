@@ -1499,6 +1499,34 @@ class TestResolveExecContext:
         monkeypatch.setenv("AWS_LAMBDA_FUNCTION_NAME", "alpha-engine-evaluator-director")
         assert _router._resolve_exec_context() == _router.EXEC_CONTEXT_LAPTOP
 
+    def test_undeclared_context_warns_loudly(self, monkeypatch, caplog):
+        """alpha-engine-config-I7409 deliverable 1/3/4 — an undeclared context
+        (no argument, no env var) does not silently resolve to `laptop`: it
+        still resolves that way for now (staged), but logs a WARNING naming
+        the default in use, so a fleet sweep for remaining call sites is
+        observable from logs rather than asserted by reading code."""
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            ctx = _router._resolve_exec_context()
+        assert ctx == _router.EXEC_CONTEXT_LAPTOP
+        assert any(
+            "UNDECLARED" in rec.message and "KREPIS_EXEC_CONTEXT" in rec.message
+            for rec in caplog.records
+        )
+
+    def test_declared_context_never_warns(self, monkeypatch, caplog):
+        """Neither an explicit argument nor the env var should trip the
+        undeclared-context warning — only silence on both does."""
+        monkeypatch.setenv("KREPIS_EXEC_CONTEXT", "ec2")
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            _router._resolve_exec_context()
+        assert not any("UNDECLARED" in rec.message for rec in caplog.records)
+        caplog.clear()
+        monkeypatch.delenv("KREPIS_EXEC_CONTEXT", raising=False)
+        with caplog.at_level("WARNING", logger="krepis.router"):
+            _router._resolve_exec_context("ec2")
+        assert not any("UNDECLARED" in rec.message for rec in caplog.records)
+
 
 class TestEntryReachableFrom:
     def test_declared_context_matches(self):
