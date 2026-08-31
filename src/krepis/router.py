@@ -240,9 +240,28 @@ def _resolve_exec_context(exec_context: str | None = None) -> str:
     back to the default — an unknown context means the caller believes it is
     somewhere krepis has no reachability facts about, and resolving anyway
     would hand it an endpoint chosen on a vocabulary mismatch.
+
+    STAGED (alpha-engine-config-I7409 deliverable 1/3): an UNDECLARED context
+    (neither argument nor env var set) still resolves to
+    :data:`DEFAULT_EXEC_CONTEXT` for now, but logs a loud warning naming the
+    call — R29 says this may never be inferred, and a silent default to
+    ``laptop`` (the most-connected environment) is how a Lambda or spot box
+    with no local egress proxy fails with an opaque "no model reachable"
+    instead of an honest "you never said where you are". The warning makes
+    the fleet sweep for every remaining undeclared call site observable from
+    logs (deliverable 2) instead of asserted from reading code; once a full
+    week of scheduled runs shows zero occurrences, this flips to raising.
     """
-    ctx = exec_context or os.environ.get("KREPIS_EXEC_CONTEXT") or DEFAULT_EXEC_CONTEXT
-    ctx = ctx.strip()
+    _declared = exec_context or os.environ.get("KREPIS_EXEC_CONTEXT")
+    if not _declared:
+        logger.warning(
+            "krepis.router: exec_context UNDECLARED (no argument, no "
+            "KREPIS_EXEC_CONTEXT env var) — defaulting to %r (R29 violation, "
+            "staged per alpha-engine-config-I7409). Set KREPIS_EXEC_CONTEXT "
+            "explicitly at this call site's launcher/deploy config to one of "
+            "%s.", DEFAULT_EXEC_CONTEXT, list(EXEC_CONTEXTS),
+        )
+    ctx = (_declared or DEFAULT_EXEC_CONTEXT).strip()
     if ctx not in EXEC_CONTEXTS:
         raise ValueError(
             f"Unknown execution context {ctx!r}. Declared contexts are "
