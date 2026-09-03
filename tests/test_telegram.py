@@ -436,6 +436,20 @@ class TestParseModeMarkdownIsUnchanged:
         assert explicit_payload["parse_mode"] == "Markdown"
         assert explicit_payload["text"] == "ticker\\_AAPL \\[BUY\\] *bold*"
 
+    def test_the_wire_body_is_byte_identical_including_key_order(self, configured_env, mock_post):
+        # "Byte-identical" means the serialised JSON, not a dict comparison
+        # (review A1): `requests` serialises in insertion order, so the order
+        # the payload is BUILT in is the order on the wire.
+        import json
+
+        tg.send_message("hello world")
+        payload = mock_post.call_args.kwargs["json"]
+        assert list(payload) == ["chat_id", "text", "parse_mode", "disable_notification"]
+        assert json.dumps(payload) == (
+            '{"chat_id": "12345", "text": "hello world", "parse_mode": "Markdown", '
+            '"disable_notification": false}'
+        )
+
     def test_the_module_default_constant_is_still_markdown(self):
         assert tg.PARSE_MODE == "Markdown"
 

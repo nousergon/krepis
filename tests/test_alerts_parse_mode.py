@@ -71,6 +71,40 @@ class TestPublishTelegramThreadsParseMode:
         assert sent["disable_notification"] is False
 
 
+class TestAnInvalidModeRaisesThroughPublish:
+    """Review A2: `send_message` raising INSIDE `_publish_telegram`'s
+    `except Exception` would become `ok=False` on the Telegram leg, and with
+    SNS also delivering `publish` would not raise on total failure either —
+    a caller's typo silently downgraded to a partial delivery. So both
+    `publish` and `_publish_telegram` validate before any try."""
+
+    def test_publish_raises_before_any_channel(self, monkeypatch):
+        monkeypatch.setenv("ALPHA_ENGINE_ALLOW_TEST_ALERTS", "1")
+        with patch.object(alerts, "_publish_sns") as sns, patch.object(tg.requests, "post") as post:
+            with pytest.raises(ValueError, match="parse_mode"):
+                alerts.publish("m", severity="info", parse_mode="markdown")
+        sns.assert_not_called()
+        post.assert_not_called()
+
+    def test_publish_raises_even_when_dry_run(self):
+        # The dry-run short-circuit sits AFTER validation, not before it.
+        with pytest.raises(ValueError, match="parse_mode"):
+            alerts.publish("m", severity="info", parse_mode="MarkdownV2", dry_run=True)
+
+    def test_publish_telegram_raises_rather_than_returning_a_failed_channel(self):
+        with pytest.raises(ValueError, match="parse_mode"):
+            alerts._publish_telegram("m", severity="info", parse_mode="html")
+
+    def test_the_default_is_the_transports_constant_not_a_literal(self):
+        import inspect
+
+        assert inspect.signature(alerts.publish).parameters["parse_mode"].default is tg.PARSE_MODE
+        assert (
+            inspect.signature(alerts._publish_telegram).parameters["parse_mode"].default
+            is tg.PARSE_MODE
+        )
+
+
 class TestPublishEndToEnd:
     """Through the real ``krepis.telegram`` to the HTTP payload."""
 

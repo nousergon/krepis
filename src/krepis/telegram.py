@@ -403,14 +403,15 @@ def send_message(
     else:
         body_text = _truncate_for_telegram(text)
 
-    payload = {
-        "chat_id": resolved_chat,
-        "text": body_text,
-        "disable_notification": disable_notification,
-    }
+    # Key ORDER is preserved from before I9925 (chat_id, text, parse_mode,
+    # disable_notification) so the default call is byte-identical on the
+    # wire, not merely dict-equal; a reordered JSON body is a diff in every
+    # transport log and fixture that compares serialised payloads.
+    payload = {"chat_id": resolved_chat, "text": body_text}
     if parse_mode is not None:
         # Plain text is the ABSENCE of the key, not `parse_mode: null`.
         payload["parse_mode"] = parse_mode
+    payload["disable_notification"] = disable_notification
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
 

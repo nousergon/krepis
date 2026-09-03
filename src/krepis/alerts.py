@@ -165,6 +165,8 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from krepis import _dedup, fleet_events
+from krepis.telegram import PARSE_MODE as TELEGRAM_PARSE_MODE
+from krepis.telegram import _validate_parse_mode
 
 logger = logging.getLogger(__name__)
 
@@ -707,7 +709,7 @@ def _publish_telegram(
     destination: str = DESTINATION_OPERATOR_CHAT,
     chat_id: str | None = None,
     message_thread_id: int | None = None,
-    parse_mode: str | None = "Markdown",
+    parse_mode: str | None = TELEGRAM_PARSE_MODE,
 ) -> ChannelResult:
     """Send one message to the resolved Telegram ``destination``.
 
@@ -720,6 +722,11 @@ def _publish_telegram(
     :func:`krepis.telegram.send_message` (alpha-engine-config-I9925); the
     default is that function's own default, so no existing caller changes.
     """
+    # OUTSIDE the try below, on purpose: a caller's typo (`"markdown"`) is a
+    # defect at the call site, and the `except Exception` that turns a
+    # transport failure into `ok=False` would otherwise swallow it — and with
+    # SNS also delivering, `publish` would not even raise on total failure.
+    _validate_parse_mode(parse_mode)
     try:
         from krepis.telegram import send_message
 
@@ -760,7 +767,7 @@ def _publish_telegram(
         # fan-out failed" — a fake transport failure manufactured by a
         # signature change).
         transport_kwargs: dict = {}
-        if parse_mode != "Markdown":
+        if parse_mode != TELEGRAM_PARSE_MODE:
             transport_kwargs["parse_mode"] = parse_mode
         ok = send_message(
             message,
@@ -940,7 +947,7 @@ def publish(
     destination: str | None = None,
     console_artifact: str | None = None,
     raise_on_total_failure: bool = True,
-    parse_mode: str | None = "Markdown",
+    parse_mode: str | None = TELEGRAM_PARSE_MODE,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1096,6 +1103,10 @@ def publish(
     result = PublishResult()
     result.state = state
     result.identity_key = effective_identity
+    # A bad `parse_mode` is the caller's defect and raises HERE, before the
+    # dry-run short-circuit, the test-env guard and the channel fan-out —
+    # none of which may turn it into a quiet `ok=False` (I9925 review A2).
+    _validate_parse_mode(parse_mode)
     formatted = _format_message(message, severity, source, state)
 
     # ── Dry-run short-circuit (config-I6759) ─────────────────────────────
