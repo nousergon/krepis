@@ -707,6 +707,7 @@ def _publish_telegram(
     destination: str = DESTINATION_OPERATOR_CHAT,
     chat_id: str | None = None,
     message_thread_id: int | None = None,
+    parse_mode: str | None = "Markdown",
 ) -> ChannelResult:
     """Send one message to the resolved Telegram ``destination``.
 
@@ -715,7 +716,9 @@ def _publish_telegram(
     which is what :func:`krepis.telegram.send_message` does by default.
     ``destination`` is carried through only to name itself in the returned
     :attr:`ChannelResult.detail` — the routing decision was already made by
-    :func:`resolve_destination`.
+    :func:`resolve_destination`. ``parse_mode`` is passed straight through to
+    :func:`krepis.telegram.send_message` (alpha-engine-config-I9925); the
+    default is that function's own default, so no existing caller changes.
     """
     try:
         from krepis.telegram import send_message
@@ -749,11 +752,22 @@ def _publish_telegram(
         disable_push = severity.lower() not in SEVERITY_PHONE_PUSH
         if silent is not None:
             disable_push = bool(silent)
+        # `parse_mode` is forwarded ONLY when a caller chose one. The default
+        # is the transport's own default, and not naming it keeps the call
+        # shape byte-identical for every existing caller AND every existing
+        # test double of `send_message` (several accept an explicit kwarg
+        # list, and an unexpected kwarg there would read as "Telegram
+        # fan-out failed" — a fake transport failure manufactured by a
+        # signature change).
+        transport_kwargs: dict = {}
+        if parse_mode != "Markdown":
+            transport_kwargs["parse_mode"] = parse_mode
         ok = send_message(
             message,
             disable_notification=disable_push,
             chat_id=chat_id,
             message_thread_id=message_thread_id,
+            **transport_kwargs,
         )
         # The destination is named in `detail` as well as on
         # `PublishResult.telegram_destination` so a human reading a CLI
@@ -926,6 +940,7 @@ def publish(
     destination: str | None = None,
     console_artifact: str | None = None,
     raise_on_total_failure: bool = True,
+    parse_mode: str | None = "Markdown",
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1036,6 +1051,13 @@ def publish(
         key, and this argument is only the push key. Before 2026-09-03
         ``False`` was indistinguishable from ``None`` and silently produced
         silence (alpha-engine-config-I9916).
+    :param parse_mode: Telegram parse mode for the body, passed through to
+        :func:`krepis.telegram.send_message` (alpha-engine-config-I9925).
+        ``"Markdown"`` (default) is today's behaviour, byte for byte. ``"HTML"``
+        sends the body unescaped — the caller owns the markup and has run every
+        interpolated string through :func:`krepis.telegram.escape_html`,
+        INCLUDING ``source``, which this function splices into the prefix
+        verbatim. ``None`` sends plain text with no ``parse_mode`` key.
     :param destination: Explicit override of the severity-derived Telegram
         destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
         derives it from ``severity``. An override is honoured where it can
@@ -1218,6 +1240,7 @@ def publish(
                     formatted,
                     severity=severity,
                     silent=silent,
+                    parse_mode=parse_mode,
                     destination=resolved,
                     chat_id=log_chat_id if resolved == DESTINATION_LOG_CHAT else None,
                     message_thread_id=(

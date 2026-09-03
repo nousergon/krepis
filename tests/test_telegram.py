@@ -345,6 +345,175 @@ def _responses(*specs):
     return [MagicMock(status_code=code, text=body) for code, body in specs]
 
 
+# ── parse_mode (alpha-engine-config-I9925) ──────────────────────────────────
+#
+# Every assertion here is about the WIRE PAYLOAD (`requests.post(..., json=)`),
+# never about which Python function was called: a mocked transport proves the
+# call, the payload proves the behaviour (krepis-PR199's `silent=False` was a
+# no-op for a week because its tests asserted the call).
+
+
+class TestParseModeHtml:
+    def test_html_mode_sends_parse_mode_html(self, configured_env, mock_post):
+        tg.send_message("<b>LADDER</b>", parse_mode="HTML")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["parse_mode"] == "HTML"
+
+    def test_html_mode_does_not_escape_the_callers_markup(self, configured_env, mock_post):
+        # The caller OWNS the tags under HTML; escaping `<` here would destroy
+        # the heading the caller built. Interpolated content is the caller's
+        # to escape (see TestEscapeHtml).
+        tg.send_message("<b>LADDER</b> phase_0 [x] `ok`", parse_mode="HTML")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["text"] == "<b>LADDER</b> phase_0 [x] `ok`"
+
+    def test_html_mode_applies_no_markdown_escaping(self, configured_env, mock_post):
+        tg.send_message("ticker_AAPL [BUY]", parse_mode="HTML")
+        payload = mock_post.call_args.kwargs["json"]
+        assert "\\" not in payload["text"]
+
+    def test_html_entity_error_is_retried_as_plain_text(self, configured_env, mock_post):
+        # Telegram's HTML-mode parse failure carries the same marker as v1's,
+        # so the plain-text redelivery covers both (gotcha 2 of I9925).
+        mock_post.side_effect = _responses(
+            (400, '{"ok":false,"error_code":400,"description":"Bad Request: '
+                  'can\'t parse entities: Unsupported start tag \\"x\\" at byte offset 3"}'),
+            (200, "ok"),
+        )
+        assert tg.send_message("<x>bad</x>", parse_mode="HTML") is True
+        first = mock_post.call_args_list[0].kwargs["json"]
+        retry = mock_post.call_args_list[1].kwargs["json"]
+        assert first["parse_mode"] == "HTML"
+        assert "parse_mode" not in retry
+        assert retry["text"] == first["text"]
+
+
+class TestParseModeNone:
+    def test_none_omits_the_parse_mode_key_entirely(self, configured_env, mock_post):
+        tg.send_message("plain *text* _here_", parse_mode=None)
+        payload = mock_post.call_args.kwargs["json"]
+        assert "parse_mode" not in payload
+        # Absence, not `null`: Telegram rejects an explicit null.
+        assert None not in payload.values()
+
+    def test_none_applies_no_escaping(self, configured_env, mock_post):
+        tg.send_message("a_b [c] `d` <e>", parse_mode=None)
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["text"] == "a_b [c] `d` <e>"
+
+    def test_none_is_not_retried_on_a_parse_error(self, configured_env, mock_post):
+        # Plain text was never sent with a parse mode, so there is nothing to
+        # drop on retry; a 400 here is some other failure and is not repeated.
+        mock_post.side_effect = _responses(
+            (400, '{"ok":false,"description":"Bad Request: can\'t parse entities"}'),
+        )
+        assert tg.send_message("x", parse_mode=None) is False
+        assert mock_post.call_count == 1
+
+    def test_none_still_truncates(self, configured_env, mock_post):
+        tg.send_message("y" * 5000, parse_mode=None)
+        payload = mock_post.call_args.kwargs["json"]
+        assert len(payload["text"]) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert "truncated" in payload["text"]
+
+
+class TestParseModeMarkdownIsUnchanged:
+    """The default is byte-identical to the pre-I9925 behaviour.
+
+    `TestSendMessageHappyPath.test_payload_shape` already pins the exact
+    payload for a default call; this class pins that passing the default
+    EXPLICITLY produces the same bytes, so the new parameter is provably a
+    no-op for every existing call site.
+    """
+
+    def test_explicit_markdown_equals_the_default_payload(self, configured_env, mock_post):
+        tg.send_message("ticker_AAPL [BUY] *bold*")
+        default_payload = mock_post.call_args.kwargs["json"]
+        mock_post.reset_mock()
+        tg.send_message("ticker_AAPL [BUY] *bold*", parse_mode="Markdown")
+        explicit_payload = mock_post.call_args.kwargs["json"]
+        assert explicit_payload == default_payload
+        assert explicit_payload["parse_mode"] == "Markdown"
+        assert explicit_payload["text"] == "ticker\\_AAPL \\[BUY\\] *bold*"
+
+    def test_the_module_default_constant_is_still_markdown(self):
+        assert tg.PARSE_MODE == "Markdown"
+
+
+class TestParseModeValidation:
+    def test_unknown_mode_raises_before_any_request(self, configured_env, mock_post):
+        with pytest.raises(ValueError, match="parse_mode"):
+            tg.send_message("x", parse_mode="markdown")
+        mock_post.assert_not_called()
+
+    def test_markdown_v2_is_not_supported(self, configured_env, mock_post):
+        # Not implemented here: v2 needs a different escaper. Refusing is
+        # honest; sending it would 400 and silently downgrade on the retry.
+        with pytest.raises(ValueError):
+            tg.send_message("x", parse_mode="MarkdownV2")
+
+
+class TestEscapeHtml:
+    def test_escapes_the_three_html_syntax_characters(self):
+        assert tg.escape_html("a < b & c > d") == "a &lt; b &amp; c &gt; d"
+
+    def test_ampersand_first_so_entities_are_not_double_escaped(self):
+        assert tg.escape_html("&lt;") == "&amp;lt;"
+
+    def test_leaves_quotes_and_markdown_characters_alone(self):
+        assert tg.escape_html("it's *fine* _here_ [ok]") == "it's *fine* _here_ [ok]"
+
+    def test_escaped_text_survives_an_html_send_verbatim(self, configured_env, mock_post):
+        body = "<b>DETAIL</b> " + tg.escape_html("gates/<phase>/gate.json & more")
+        tg.send_message(body, parse_mode="HTML")
+        assert mock_post.call_args.kwargs["json"]["text"] == body
+
+
+class TestHtmlTruncation:
+    def test_within_limit_passes_through(self):
+        assert tg._truncate_html("<b>x</b>") == "<b>x</b>"
+
+    def test_result_fits_the_limit(self):
+        text = "<pre>" + "z" * 6000 + "</pre>"
+        out = tg._truncate_html(text)
+        assert len(out) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+
+    def test_an_open_tag_at_the_cut_is_closed_before_the_marker(self):
+        text = "<pre>" + "z" * 6000 + "</pre>"
+        out = tg._truncate_html(text)
+        assert "</pre>" in out
+        assert out.index("</pre>") < out.index("…(truncated")
+
+    @pytest.mark.parametrize("head_len", range(4000, 4060))
+    def test_a_partial_tag_at_the_cut_is_dropped(self, head_len):
+        # Sweep the cut point across a `<code>` opener: wherever the budget
+        # lands, no `<` is ever left without its `>` and the result balances.
+        text = "a" * head_len + "<code>" + "b" * 3000 + "</code>"
+        out = tg._truncate_html(text)
+        assert out.count("<") == out.count(">")
+        assert "<code>" not in out or "</code>" in out
+        assert len(out) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+
+    def test_nested_tags_close_innermost_first(self):
+        text = "<b><i>" + "n" * 6000 + "</i></b>"
+        out = tg._truncate_html(text)
+        assert "</i></b>" in out
+
+    def test_unknown_tags_are_not_treated_as_structure(self):
+        # `<x>` is not a Telegram tag; it neither opens nor needs closing.
+        text = "<x>" + "n" * 6000
+        out = tg._truncate_html(text)
+        assert "</x>" not in out
+
+    def test_send_under_html_uses_tag_aware_truncation(self, configured_env, mock_post):
+        tg.send_message("<pre>" + "z" * 6000 + "</pre>", parse_mode="HTML")
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["text"].endswith(
+            f"</pre>\n…(truncated, showing {tg.TELEGRAM_MESSAGE_MAX_CHARS} of 6011 chars)"
+        )
+        assert len(payload["text"]) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+
+
 class TestMarkdownEntityFallback:
     def test_unpaired_asterisk_message_is_redelivered_as_plain_text(
         self, configured_env, mock_post
