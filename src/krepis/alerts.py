@@ -76,7 +76,27 @@ only two:
    ``console_artifact=`` naming the durable surface the finding is ALSO
    published to.
 2. **Whether the send buzzes the phone** (``disable_notification``).
-   ``error``/``critical`` buzz; nothing else does.
+   ``error``/``critical`` buzz; nothing else does — *by default*.
+
+**The push is overridable in BOTH directions; the destination is not.**
+``publish(..., silent=...)`` is three-state: ``None`` (default) keeps the
+severity-derived push above, ``True`` forces the silent delivery, and
+``False`` forces the phone push. Severity stays the **routing** key — which
+Telegram destination — and ``silent`` is the **push** key, so the two are
+decided separately and neither has to be distorted to get the other.
+
+That symmetry is the point. ``True`` exists so :func:`publish_clear` never
+depends on ``info`` staying outside :data:`SEVERITY_PHONE_PUSH` (I8105).
+``False`` exists because **a daily digest that must be seen is a legitimate
+``info``-severity push**: a report is not an incident, so publishing it at
+``error`` to buy a buzz corrupts the severity taxonomy and the operator
+channel routing along with it, while leaving it silent means the operator
+does not know it arrived. Until 2026-09-03 this override ran one way only
+(``if silent:``), which made ``False`` indistinguishable from ``None``: a
+caller asking for a push at ``info`` got silence, with no error and no log
+line. Measured consequence (alpha-engine-config-I9916): ``crucible``'s daily
+accountability report passed ``silent=False`` and was delivered silently,
+and the operator reported never receiving it.
 
 **SNS delivery is byte-identical at every severity.** Routing is a
 Telegram-only concept; the durable record on ``alpha-engine-alerts``
@@ -706,13 +726,29 @@ def _publish_telegram(
         # a delivery gate. See SEVERITY_PHONE_PUSH and the module docstring.
         #
         # `silent` is an explicit caller override of that severity-derived
-        # decision, in ONE direction only: True forces the silent delivery,
-        # None keeps the severity default. It exists so `publish_clear` does
-        # not depend on `info` staying outside SEVERITY_PHONE_PUSH forever
-        # (I8105) — a recovery must never push, whatever that set becomes.
+        # decision, in BOTH directions — it is three-state:
+        #   None  → keep the severity-derived default (SEVERITY_PHONE_PUSH)
+        #   True  → force silent delivery, whatever the severity
+        #   False → force the phone push, whatever the severity
+        #
+        # True exists so `publish_clear` does not depend on `info` staying
+        # outside SEVERITY_PHONE_PUSH forever (I8105) — a recovery must never
+        # push, whatever that set becomes.
+        #
+        # False exists because a daily digest that MUST be seen is a
+        # legitimate `info`-severity push. Severity is the ROUTING key, not
+        # the push key: a report is not an incident and must not be published
+        # at `error` merely to buzz a phone, nor must it be silent merely
+        # because it is not an incident. Until 2026-09-03 `False` was
+        # indistinguishable from `None` (`if silent:`), so a caller that
+        # asked for a push at `info` got silence and had no way to tell —
+        # `crucible`'s daily accountability report (`crucible/morning.py::
+        # deliver`, Brian ruling alpha-engine-config-I9916 "notify") passed
+        # `silent=False` and arrived silently, which is why the operator
+        # reported never receiving it.
         disable_push = severity.lower() not in SEVERITY_PHONE_PUSH
-        if silent:
-            disable_push = True
+        if silent is not None:
+            disable_push = bool(silent)
         ok = send_message(
             message,
             disable_notification=disable_push,
@@ -989,10 +1025,17 @@ def publish(
         marker is still live. Defaults to ``dedup_key`` when that is set and
         this is not, so existing dedup-keyed publishers become pairable
         without touching their call sites.
-    :param silent: Force silent Telegram delivery (delivered to the chat, no
-        phone push) regardless of severity. ``None`` (default) keeps the
-        severity-derived behaviour. ``False`` is NOT an escalation — it is
-        treated as "no override".
+    :param silent: Three-state explicit override of the severity-derived
+        phone push, in BOTH directions. ``None`` (default) keeps the
+        severity-derived behaviour (:data:`SEVERITY_PHONE_PUSH`). ``True``
+        forces silent delivery — delivered to the chat, no phone push —
+        whatever the severity. ``False`` forces the phone push whatever the
+        severity, for the caller whose message must be SEEN at a non-incident
+        severity (a daily digest is a legitimate ``info``-severity push).
+        Neither value changes the destination: severity remains the routing
+        key, and this argument is only the push key. Before 2026-09-03
+        ``False`` was indistinguishable from ``None`` and silently produced
+        silence (alpha-engine-config-I9916).
     :param destination: Explicit override of the severity-derived Telegram
         destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
         derives it from ``severity``. An override is honoured where it can

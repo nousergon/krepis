@@ -1291,7 +1291,7 @@ class TestPublishTelegramSilent:
             alerts._publish_telegram("m", severity="critical", silent=None)
         assert sent["disable_notification"] is False
 
-    def test_silent_false_is_not_an_escalation(self):
+    def test_silent_false_forces_push_at_non_pushing_severity(self):
         sent = {}
 
         def _send(msg, disable_notification=False, **kwargs):
@@ -1307,6 +1307,28 @@ class TestPublishTelegramSilent:
             {"krepis.telegram": MagicMock(send_message=_send)},
         ):
             alerts._publish_telegram("m", severity="info", silent=False)
+        # `silent=False` is an EXPLICIT push override, symmetric with
+        # `silent=True`, not a synonym for `None`. A daily digest that must be
+        # seen is a legitimate `info`-severity push; severity stays the
+        # routing key, `silent` is the push key (alpha-engine-config-I9916 —
+        # crucible's accountability report passed `silent=False` and arrived
+        # silent because this used to read `if silent:`).
+        assert sent["disable_notification"] is False
+
+    def test_silent_none_keeps_the_severity_default_at_non_pushing_severity(
+        self,
+    ):
+        sent = {}
+
+        def _send(msg, disable_notification=False, **kwargs):
+            sent["disable_notification"] = disable_notification
+            return True
+
+        with patch.dict(
+            "sys.modules",
+            {"krepis.telegram": MagicMock(send_message=_send)},
+        ):
+            alerts._publish_telegram("m", severity="info", silent=None)
         assert sent["disable_notification"] is True
 
 
