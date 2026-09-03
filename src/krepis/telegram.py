@@ -72,14 +72,32 @@ PARSE_MODE: Final[str] = "Markdown"
 # `alpha-engine-dashboard/infrastructure/alert_on_failure.sh` builds its
 # message from up to 30 raw `journalctl` lines with no length guard.
 TELEGRAM_MESSAGE_MAX_CHARS: Final[int] = 4096
-# Telegram's 400 `description` when the Markdown parser reaches the end of the
-# body with an entity still open. See `_is_entity_parse_error` for why this is
-# matched on text rather than a status code.
+#: The parse modes a caller may ask for (alpha-engine-config-I9925). ``None``
+#: is also accepted and means "send with NO ``parse_mode`` key" — plain text —
+#: which is distinct from the default: the payload omits the key rather than
+#: sending ``null``, because Telegram rejects an explicit null.
+PARSE_MODE_HTML: Final[str] = "HTML"
+PARSE_MODES: Final[tuple] = (PARSE_MODE, PARSE_MODE_HTML)
+# Telegram's 400 `description` when the entity parser reaches the end of the
+# body with an entity still open, or meets a tag it does not know. The same
+# marker opens BOTH the Markdown-v1 and the HTML variants (measured against the
+# Bot API: `can't parse entities: Can't find end of the entity starting at
+# byte offset 355` for v1, `can't parse entities: Unsupported start tag "x" at
+# byte offset 3` and `... Unclosed start tag at byte offset 12` for HTML), so
+# one predicate covers every mode this module can send. See
+# `_is_entity_parse_error` for why this is matched on text rather than a
+# status code.
 _ENTITY_PARSE_ERROR_MARKER: Final[str] = "can't parse entities"
+#: Tags Telegram's HTML mode accepts. Anything else is an "Unsupported start
+#: tag" 400 and, on our side, a truncation boundary that must not be crossed.
+_HTML_TAGS: Final[frozenset] = frozenset({
+    "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span",
+    "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote",
+})
 
 
 def _is_entity_parse_error(description: str) -> bool:
-    """True when a Telegram 400 was caused by unparseable Markdown entities.
+    """True when a Telegram 400 was caused by unparseable entities, in any mode.
 
     Telegram returns HTTP 400 for many unrelated conditions (chat not found,
     bot blocked, message too long), and the status code alone cannot tell them
@@ -88,9 +106,45 @@ def _is_entity_parse_error(description: str) -> bool:
 
     Deliberately narrow: a formatting failure is the one 400 that a plain-text
     retry can fix. Retrying the others would send the same doomed request
-    twice and delay the failure log.
+    twice and delay the failure log. Markdown v1 and HTML share the marker (see
+    the constant), so a caller switching modes does not switch off the retry.
     """
     return _ENTITY_PARSE_ERROR_MARKER in description.lower()
+
+
+def escape_html(text: str) -> str:
+    """Escape ``& < >`` so ``text`` renders literally under ``parse_mode="HTML"``.
+
+    Under HTML mode the CALLER owns the markup — a heading is ``<b>…</b>`` in
+    the text it passes — so :func:`send_message` escapes nothing for that mode
+    (escaping the whole body would destroy the caller's own tags). Every piece
+    of interpolated content therefore goes through this first. It is public
+    because it is the caller's job; keeping it private would make every caller
+    write its own, which is how three escapers diverge.
+
+    Only the three characters Telegram's HTML parser treats as syntax are
+    escaped. Quotes are not: they are only special inside an attribute value,
+    which this helper is not for (a caller building ``<a href="…">`` escapes
+    the URL as an attribute itself).
+    """
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _validate_parse_mode(parse_mode: "str | None") -> None:
+    """Fail loud on a mode this module cannot escape or truncate for.
+
+    A typo like ``"markdown"`` (Telegram is case-sensitive: it accepts
+    ``Markdown`` and ``MarkdownV2``, not ``markdown``) would otherwise be sent
+    as-is, rejected with a 400 that looks like a formatting error, and then
+    retried as plain text — a silent downgrade of every message from that
+    caller. Raising at the call site is the honest outcome: the caller asked
+    for something this transport does not do.
+    """
+    if parse_mode is not None and parse_mode not in PARSE_MODES:
+        raise ValueError(
+            f"parse_mode must be one of {PARSE_MODES!r} or None (plain text), "
+            f"got {parse_mode!r}"
+        )
 
 
 def _truncate_for_telegram(text: str) -> str:
@@ -110,6 +164,105 @@ def _truncate_for_telegram(text: str) -> str:
     suffix = f"\n…(truncated, showing {TELEGRAM_MESSAGE_MAX_CHARS} of {len(text)} chars)"
     keep = TELEGRAM_MESSAGE_MAX_CHARS - len(suffix)
     return text[:keep] + suffix
+
+
+def _truncate_html(text: str) -> str:
+    """Truncate an HTML-mode body to a TAG BOUNDARY, then close what is open.
+
+    :func:`_truncate_for_telegram` cuts at a character count. Under
+    ``parse_mode="HTML"`` a cut can land inside ``<co`` (Telegram: "Unsupported
+    start tag"), inside ``<a href="…`` (attribute never closed), or after a
+    ``<pre>`` whose ``</pre>`` was in the discarded tail ("Unclosed start
+    tag") — each of which rejects the WHOLE message, which is the outcome the
+    truncation existed to prevent (alpha-engine-config-I9925, gotcha 3). So:
+
+    1. cut at the same character budget as plain truncation;
+    2. drop a trailing partial tag (a ``<`` with no ``>`` after it);
+    3. re-close, innermost first, every tag still open at the cut, so the
+       marker itself renders as plain text rather than inside a code block.
+
+    The budget for step 3's closers is reserved up front from the worst case
+    (the deepest nesting the body actually has), so the result never exceeds
+    ``TELEGRAM_MESSAGE_MAX_CHARS``. Entities (``&lt;``) are never split: a cut
+    inside ``&am`` renders those characters literally, which is ugly and
+    accepted, not a rejection.
+    """
+    if len(text) <= TELEGRAM_MESSAGE_MAX_CHARS:
+        return text
+    suffix = f"\n…(truncated, showing {TELEGRAM_MESSAGE_MAX_CHARS} of {len(text)} chars)"
+    keep = TELEGRAM_MESSAGE_MAX_CHARS - len(suffix)
+    # Reserve room for the closers of the deepest nesting in the whole body:
+    # cheaper than iterating, and the over-reservation is at most a few tags.
+    keep -= _max_open_tag_closer_length(text)
+    keep = max(keep, 0)
+    head = text[:keep]
+    lt = head.rfind("<")
+    if lt != -1 and head.find(">", lt) == -1:
+        head = head[:lt]
+    closers = "".join(f"</{tag}>" for tag in reversed(_open_tags(head)))
+    return head + closers + suffix
+
+
+def _open_tags(fragment: str) -> list:
+    """The stack of Telegram-HTML tags still open at the end of ``fragment``."""
+    stack: list = []
+    i = 0
+    while True:
+        i = fragment.find("<", i)
+        if i == -1:
+            break
+        j = fragment.find(">", i)
+        if j == -1:
+            break
+        inner = fragment[i + 1 : j].strip()
+        i = j + 1
+        if not inner:
+            continue
+        closing = inner.startswith("/")
+        name = inner.lstrip("/").split()[0].lower() if inner.lstrip("/").split() else ""
+        if name not in _HTML_TAGS:
+            continue
+        if closing:
+            if name in stack:
+                # Pop to and including the matching opener; Telegram nests
+                # strictly, so anything above it was already malformed.
+                while stack and stack[-1] != name:
+                    stack.pop()
+                if stack:
+                    stack.pop()
+        else:
+            stack.append(name)
+    return stack
+
+
+def _max_open_tag_closer_length(text: str) -> int:
+    """Characters the closers would need at the deepest nesting in ``text``."""
+    deepest = 0
+    stack: list = []
+    i = 0
+    while True:
+        i = text.find("<", i)
+        if i == -1:
+            break
+        j = text.find(">", i)
+        if j == -1:
+            break
+        inner = text[i + 1 : j].strip()
+        i = j + 1
+        parts = inner.lstrip("/").split()
+        name = parts[0].lower() if parts else ""
+        if name not in _HTML_TAGS:
+            continue
+        if inner.startswith("/"):
+            if name in stack:
+                while stack and stack[-1] != name:
+                    stack.pop()
+                if stack:
+                    stack.pop()
+        else:
+            stack.append(name)
+            deepest = max(deepest, sum(len(f"</{t}>") for t in stack))
+    return deepest
 
 
 def _escape_markdown(text: str) -> str:
@@ -179,8 +332,23 @@ def send_message(
     bot_token: str | None = None,
     chat_id: str | int | None = None,
     message_thread_id: int | None = None,
+    parse_mode: str | None = PARSE_MODE,
 ) -> bool:
     """Send a single Telegram message to the channel resolved from secrets.
+
+    ``parse_mode`` (alpha-engine-config-I9925) selects how the body is
+    interpreted, and with it how this function prepares the body:
+
+    - ``"Markdown"`` (the default, unchanged for every existing caller): v1
+      escaping via :func:`_escape_markdown`; ``*bold*`` is the caller's.
+    - ``"HTML"``: **no escaping** — the caller owns the markup and has already
+      run every interpolated string through :func:`escape_html`. Truncation
+      respects tag boundaries (:func:`_truncate_html`).
+    - ``None``: plain text. No escaping, and the payload carries **no**
+      ``parse_mode`` key at all (Telegram rejects an explicit null).
+
+    Any other value raises ``ValueError`` at the call site rather than being
+    sent, rejected and silently downgraded on the retry path.
 
     Loads ``TELEGRAM_BOT_TOKEN`` + ``TELEGRAM_CHAT_ID`` via
     :func:`krepis.secrets.get_secret` (required=False) when ``bot_token`` /
@@ -205,11 +373,15 @@ def send_message(
     :param bot_token: Optional explicit bot token (skips secret lookup).
     :param chat_id: Optional explicit chat id (skips secret lookup).
     :param message_thread_id: Optional forum-topic id for supergroup routing.
+    :param parse_mode: ``"Markdown"`` (default), ``"HTML"`` or ``None`` for
+        plain text — see above.
     :returns: ``True`` if the Telegram API returned HTTP 200, ``False``
         otherwise (missing secrets, network error, non-200 response). A 400
-        caused by unparseable Markdown is retried once as plain text before
-        ``False`` is returned — see the fallback comment in the body.
+        caused by unparseable entities (Markdown or HTML) is retried once as
+        plain text before ``False`` is returned — see the fallback comment in
+        the body.
     """
+    _validate_parse_mode(parse_mode)
     token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", required=False)
     resolved_chat = chat_id if chat_id is not None else get_secret("TELEGRAM_CHAT_ID", required=False)
     if not token or resolved_chat in (None, ""):
@@ -220,12 +392,26 @@ def send_message(
         )
         return False
 
-    payload = {
-        "chat_id": resolved_chat,
-        "text": _escape_markdown(_truncate_for_telegram(text)),
-        "parse_mode": PARSE_MODE,
-        "disable_notification": disable_notification,
-    }
+    # Escaping is per mode, and truncation runs BEFORE escaping (so the escape
+    # sequences the transport adds are never what pushes a body over the
+    # limit, and never what gets cut in half). HTML is the one mode where the
+    # cut itself must respect structure — see `_truncate_html`.
+    if parse_mode == PARSE_MODE:
+        body_text = _escape_markdown(_truncate_for_telegram(text))
+    elif parse_mode == PARSE_MODE_HTML:
+        body_text = _truncate_html(text)
+    else:
+        body_text = _truncate_for_telegram(text)
+
+    # Key ORDER is preserved from before I9925 (chat_id, text, parse_mode,
+    # disable_notification) so the default call is byte-identical on the
+    # wire, not merely dict-equal; a reordered JSON body is a diff in every
+    # transport log and fixture that compares serialised payloads.
+    payload = {"chat_id": resolved_chat, "text": body_text}
+    if parse_mode is not None:
+        # Plain text is the ABSENCE of the key, not `parse_mode: null`.
+        payload["parse_mode"] = parse_mode
+    payload["disable_notification"] = disable_notification
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
 
@@ -293,13 +479,26 @@ def send_message(
     # presentation to preserve the delivery is the correct direction for an
     # alerting transport — the inverse, which is what shipped, silently
     # converts a formatting defect into a missed incident.
-    if not ok and description is not None and _is_entity_parse_error(description):
+    #
+    # The same retry covers HTML mode (I9925): an unbalanced or unsupported
+    # tag in caller-owned markup is the HTML analogue of the unpaired `*`, and
+    # Telegram names it with the same `can't parse entities` marker. A
+    # plain-text body was never sent with `parse_mode`, so it has nothing to
+    # retry — `parse_mode` is not in its payload and the branch is inert.
+    if (
+        not ok
+        and description is not None
+        and "parse_mode" in payload
+        and _is_entity_parse_error(description)
+    ):
         retry_payload = {k: v for k, v in payload.items() if k != "parse_mode"}
         ok, _ = _post(retry_payload)
         logger.warning(
-            "Telegram Markdown parse failed; %s as plain text "
-            "(krepis._escape_markdown preserves '*', which arbitrary "
-            "interpolated text can leave unpaired)",
+            "Telegram %s parse failed; %s as plain text "
+            "(under Markdown krepis._escape_markdown preserves '*', which "
+            "arbitrary interpolated text can leave unpaired; under HTML the "
+            "caller owns the tags)",
+            parse_mode,
             "redelivered" if ok else "plain-text retry ALSO failed",
         )
 
