@@ -109,6 +109,13 @@ class CostSinkConfigError(ValueError):
 # agentic loop to a single PUT while capping worst-case loss.
 DEFAULT_FLUSH_THRESHOLD = 200
 
+# A group whose PUT keeps failing re-buffers its records (I10000) rather than
+# retrying forever unbounded. Cap retained records per group at this many
+# multiples of flush_threshold; anything past the cap is dropped and counted
+# on `records_dropped` — bounded, counted loss instead of unbounded memory
+# growth if the destination stays unreachable for a long run.
+MAX_RETAINED_MULTIPLE = 10
+
 
 def resolve_run_id(env_var: str = "KREPIS_RUN_ID") -> str:
     """Return a stable run identifier for this process.
@@ -153,6 +160,21 @@ class S3JsonlCostSink:
     :meth:`krepis.llm.LLMClient._emit_cost_record` makes and for the same
     reason. Failures are logged at ERROR and counted on
     :attr:`flush_errors`, which is the surface a caller asserts on.
+
+    **A failed flush re-buffers its records instead of dropping them**
+    (alpha-engine-config-I10000): the pre-fix implementation cleared
+    ``_buffers`` before the PUT, so a failure logged, counted, and then
+    permanently discarded the records it was holding — a later successful
+    flush recovered nothing. Failed groups go back to the front of their
+    buffer (oldest-first) so the next flush — the auto-threshold flush, the
+    next ``flush_default_sink()`` call, or the atexit/handler-exit hook —
+    retries them, and a per-group retained-buffer cap
+    (:data:`MAX_RETAINED_MULTIPLE` × ``flush_threshold``) bounds memory if
+    the destination stays unreachable for a long run; records dropped past
+    that cap, and records still buffered when :meth:`close` runs, are
+    counted on :attr:`records_dropped` — read unconditionally by
+    :func:`flush_cost_on_exit` so "flushed zero objects" is distinguishable
+    from "no sink was configured".
     """
 
     def __init__(
@@ -175,6 +197,11 @@ class S3JsonlCostSink:
         self.flush_threshold = max(1, int(flush_threshold))
         self.flush_errors = 0
         self.records_written = 0
+        #: Records permanently lost — dropped past the retained-buffer cap
+        #: after a repeated flush failure, or still buffered when close()
+        #: runs. Distinct from `flush_errors` (a failed PUT attempt, which
+        #: may still be recovered by a later successful flush).
+        self.records_dropped = 0
         self._s3 = s3_client
         self._buffers: dict[tuple[str, str], list[dict]] = defaultdict(list)
         self._seq: dict[tuple[str, str], int] = defaultdict(int)
@@ -212,22 +239,78 @@ class S3JsonlCostSink:
     # ── flushing ─────────────────────────────────────────────────────
 
     def flush(self) -> int:
-        """Write every buffered group. Returns the number of objects PUT."""
+        """Write every buffered group. Returns the number of objects PUT.
+
+        A group whose PUT fails is re-buffered (oldest-first) rather than
+        dropped — see the class docstring (I10000). ``seq`` advances only
+        for a group that actually wrote, so a retry can never leave a gap
+        or overwrite a prior object with the same ``seq``.
+        """
         with self._lock:
             groups = {k: v for k, v in self._buffers.items() if v}
             self._buffers.clear()
-            seqs = {}
-            for key in groups:
-                seqs[key] = self._seq[key]
-                self._seq[key] += 1
+            seqs = {key: self._seq[key] for key in groups}
         written = 0
-        for (date_str, callsite_id), records in groups.items():
-            if self._put_group(date_str, callsite_id, seqs[(date_str, callsite_id)], records):
+        failed: dict[tuple[str, str], list[dict]] = {}
+        for key, records in groups.items():
+            date_str, callsite_id = key
+            if self._put_group(date_str, callsite_id, seqs[key], records):
                 written += 1
+                with self._lock:
+                    self._seq[key] = seqs[key] + 1
+            else:
+                failed[key] = records
+        if failed:
+            self._requeue_failed(failed)
         return written
 
+    def _requeue_failed(self, failed: dict[tuple[str, str], list[dict]]) -> None:
+        """Put failed groups back at the front of their buffer, capped.
+
+        Records already in the buffer (accepted via ``__call__`` while the
+        flush's PUT was in flight) are newer than the failed batch, so the
+        failed records go first — chronological order is preserved for the
+        eventual successful write.
+        """
+        cap = self.flush_threshold * MAX_RETAINED_MULTIPLE
+        with self._lock:
+            for key, records in failed.items():
+                merged = records + self._buffers[key]
+                if len(merged) > cap:
+                    overflow = len(merged) - cap
+                    merged = merged[overflow:]
+                    self.records_dropped += overflow
+                    logger.error(
+                        "cost sink: dropping %d record(s) for %s past the "
+                        "retained-buffer cap (%d) after repeated flush "
+                        "failures — records_dropped=%d",
+                        overflow, key, cap, self.records_dropped,
+                    )
+                self._buffers[key] = merged
+
     def close(self) -> None:
+        """Flush, then account for anything still buffered as a final loss.
+
+        Records left in ``_buffers`` after this flush (a group whose PUT
+        just failed, within the retained cap) will never be retried again —
+        there is no further flush after close — so they are counted on
+        :attr:`records_dropped` and logged at WARNING before being
+        discarded. This is the surface :func:`flush_cost_on_exit` reads
+        unconditionally.
+        """
         self.flush()
+        with self._lock:
+            remaining = sum(len(v) for v in self._buffers.values())
+            if remaining:
+                self.records_dropped += remaining
+            self._buffers.clear()
+        if remaining:
+            logger.warning(
+                "cost sink: close() with %d unflushed record(s) still "
+                "buffered after a failed flush — PERMANENTLY LOST "
+                "(flush_errors=%d, records_dropped=%d)",
+                remaining, self.flush_errors, self.records_dropped,
+            )
         self._closed = True
 
     def _put_group(
@@ -410,8 +493,17 @@ def flush_cost_on_exit(func: Callable[..., Any]) -> Callable[..., Any]:
     the handler failed afterwards is the same loss with a better excuse.
 
     The flush never raises, so it cannot convert a successful handler into a
-    failed one, and it returns 0 when no sink is configured — a consumer with
-    cost telemetry switched off pays one function call.
+    failed one, and does nothing when no sink is configured — a consumer
+    with cost telemetry switched off pays one function call.
+
+    **Logs unconditionally, not only ``if n``** (alpha-engine-config-I10000):
+    the pre-fix version logged nothing when a flush wrote zero objects, which
+    is indistinguishable from a run with no sink configured at all — a run
+    whose every PUT failed produced no signal from this decorator, with the
+    only surface being a lower-severity ERROR line per failed group. This
+    version logs at INFO whenever a sink is configured (naming ``n``,
+    ``flush_errors`` and ``records_dropped`` every time) and at DEBUG when
+    none is, so the two cases are never confused on the same log line.
 
     Usage::
 
@@ -425,9 +517,20 @@ def flush_cost_on_exit(func: Callable[..., Any]) -> Callable[..., Any]:
             return func(*args, **kwargs)
         finally:
             try:
-                n = flush_default_sink()
-                if n:
-                    logger.info("cost sink: flushed %d object(s) on handler exit", n)
+                with _DEFAULT_SINK_LOCK:
+                    sink = _DEFAULT_SINK
+                if sink is None:
+                    logger.debug(
+                        "cost sink: no process-default sink configured — "
+                        "nothing to flush on handler exit"
+                    )
+                else:
+                    n = sink.flush()
+                    logger.info(
+                        "cost sink: flushed %d object(s) on handler exit "
+                        "(flush_errors=%d, records_dropped=%d)",
+                        n, sink.flush_errors, sink.records_dropped,
+                    )
             except Exception:  # noqa: BLE001 — telemetry never fails the work
                 logger.exception("cost sink: flush on handler exit failed")
 

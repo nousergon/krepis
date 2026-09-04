@@ -15,6 +15,7 @@ import pytest
 from krepis.cost_sink import (
     BUCKET_ENV_VAR,
     DEFAULT_FLUSH_THRESHOLD,
+    MAX_RETAINED_MULTIPLE,
     PREFIX_ENV_VAR,
     CostSinkConfigError,
     S3JsonlCostSink,
@@ -183,6 +184,75 @@ class TestFailureHandling:
         sink.flush()
         assert sink.records_written == 2
         assert sink.flush_errors == 0
+
+
+class TestFailedFlushRecovery:
+    """alpha-engine-config-I10000: the pre-fix implementation cleared
+    _buffers before the PUT, so a failed flush permanently discarded the
+    records it held. A subsequent successful flush against a healthy
+    client must recover them."""
+
+    def test_failed_flush_recovers_on_retry(self):
+        s3 = FakeS3(fail=True)
+        sink = _sink(s3)
+        sink(_record())
+        assert sink.flush() == 0
+        assert sink.flush_errors == 1
+
+        s3.fail = False  # destination becomes healthy
+        assert sink.flush() == 1
+        assert sink.records_written == 1
+        assert len(s3.puts) == 1
+
+    def test_seq_does_not_advance_on_failure(self):
+        """A retry must reuse the same seq — advancing it on a failed PUT
+        would let the eventual successful write collide with (or skip) a
+        seq number, either overwriting or leaving a gap."""
+        s3 = FakeS3(fail=True)
+        sink = _sink(s3)
+        sink(_record())
+        sink.flush()
+        s3.fail = False
+        sink.flush()
+        assert s3.puts[0]["Key"].endswith(".0.jsonl")
+
+    def test_newly_buffered_records_are_ordered_after_the_retry(self):
+        s3 = FakeS3(fail=True)
+        sink = _sink(s3)
+        sink(_record(cost=0.01))
+        sink.flush()  # fails, record re-buffered
+        s3.fail = False
+        sink(_record(cost=0.02))  # buffered normally alongside the retry
+        sink.flush()
+        lines = s3.puts[0]["Body"].decode().splitlines()
+        assert [json.loads(x)["cost_usd"] for x in lines] == [0.01, 0.02]
+
+    def test_records_dropped_past_the_retained_cap(self):
+        s3 = FakeS3(fail=True)
+        sink = _sink(s3, flush_threshold=1)
+        cap = sink.flush_threshold * MAX_RETAINED_MULTIPLE
+        for i in range(cap + 5):
+            sink({"ts": "2026-07-28T00:00:00+00:00", "callsite_id": "c",
+                  "cost_usd": float(i)})
+            sink.flush()
+        assert sink.records_dropped == 5
+
+    def test_close_with_unrecoverable_buffer_counts_and_logs(self, caplog):
+        s3 = FakeS3(fail=True)
+        sink = _sink(s3)
+        sink(_record())
+        sink.close()
+        assert sink.records_dropped == 1
+        assert any(
+            "PERMANENTLY LOST" in r.message for r in caplog.records
+        )
+
+    def test_close_with_healthy_flush_drops_nothing(self):
+        s3 = FakeS3()
+        sink = _sink(s3)
+        sink(_record())
+        sink.close()
+        assert sink.records_dropped == 0
 
 
 class TestLifecycle:
@@ -500,3 +570,48 @@ class TestFlushCostOnExit:
 
         assert handler.__name__ == "handler"
         assert handler.__doc__ == "docstring."
+
+    def test_logs_unconditionally_when_flush_writes_zero_objects(
+        self, monkeypatch, caplog
+    ):
+        """alpha-engine-config-I10000: a run whose every PUT failed must
+        produce a log line from this decorator, not silence — silence is
+        indistinguishable from no sink being configured at all."""
+        import logging
+        caplog.set_level(logging.INFO, logger="krepis.cost_sink")
+        monkeypatch.setenv(BUCKET_ENV_VAR, "b")
+        monkeypatch.setenv(PREFIX_ENV_VAR, "p")
+        reset_default_sink_for_tests()
+        sink = default_sink_from_env(s3_client=FakeS3(fail=True))
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            sink({"ts": "2026-08-15T00:00:00+00:00", "callsite_id": "c"})
+            return {"status": "OK"}
+
+        handler({}, None)
+        assert any(
+            "flushed 0 object" in r.message and "flush_errors=1" in r.message
+            for r in caplog.records
+        )
+        reset_default_sink_for_tests()
+
+    def test_no_sink_configured_is_distinguishable_from_zero_writes(
+        self, monkeypatch, caplog
+    ):
+        import logging
+        caplog.set_level(logging.DEBUG, logger="krepis.cost_sink")
+        monkeypatch.delenv(BUCKET_ENV_VAR, raising=False)
+        monkeypatch.delenv(PREFIX_ENV_VAR, raising=False)
+        reset_default_sink_for_tests()
+
+        @flush_cost_on_exit
+        def handler(event, context):
+            return {"status": "OK"}
+
+        handler({}, None)
+        assert any(
+            "no process-default sink configured" in r.message
+            for r in caplog.records
+        )
+        assert not any("flushed" in r.message for r in caplog.records)
