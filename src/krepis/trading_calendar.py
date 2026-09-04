@@ -2,7 +2,20 @@
 trading_calendar.py — NYSE trading day check with holiday awareness.
 
 Lightweight implementation that doesn't require exchange_calendars or
-pandas_market_calendars. Maintains a static list of NYSE holidays through 2030.
+pandas_market_calendars. Maintains a static list of NYSE holidays through
+``NYSE_CALENDAR_COVERS_THROUGH`` (see below), reconciled in CI against
+``exchange_calendars`` (a dev-only dependency — never installed at runtime)
+by ``tests/test_trading_calendar_reconciliation.py``.
+
+Deliberate departure from the reference implementations (alpha-engine-config-
+I9998): a full swap to ``exchange_calendars``/``pandas_market_calendars``
+is the strictly-correct answer and was rejected here because it pulls
+numpy/pandas transitively onto every consumer of this library, including
+Lambdas that install krepis for unrelated primitives (SSM secrets, alert
+transport, cost telemetry). The CI reconciliation check gives the
+correctness property — divergence from the authoritative calendar fails
+the build — without the runtime dependency. If the dependency becomes
+acceptable at the consumer tier, prefer the swap and delete this table.
 
 Usage:
     python trading_calendar.py              # check today
@@ -22,12 +35,16 @@ import sys
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
-# NYSE observed holidays through 2030.
+# NYSE observed holidays through NYSE_CALENDAR_COVERS_THROUGH (below).
 # Source: https://www.nyse.com/markets/hours-calendars
-# Updated annually — add new years as they're published.
+# Updated annually — add new years as they're published. Kept honest by
+# tests/test_trading_calendar_reconciliation.py, which fails CI on any
+# divergence from exchange_calendars for the declared range (I9998) — this
+# comment alone did not catch the table missing 2025-01-09, below.
 NYSE_HOLIDAYS: set[date] = {
     # 2025
     date(2025, 1, 1),    # New Year's Day
+    date(2025, 1, 9),    # National Day of Mourning — President Carter
     date(2025, 1, 20),   # MLK Day
     date(2025, 2, 17),   # Presidents' Day
     date(2025, 4, 18),   # Good Friday
@@ -91,13 +108,69 @@ NYSE_HOLIDAYS: set[date] = {
     date(2030, 9, 2),    # Labor Day
     date(2030, 11, 28),  # Thanksgiving
     date(2030, 12, 25),  # Christmas
+    # 2031
+    date(2031, 1, 1),    # New Year's Day
+    date(2031, 1, 20),   # MLK Day
+    date(2031, 2, 17),   # Presidents' Day
+    date(2031, 4, 11),   # Good Friday
+    date(2031, 5, 26),   # Memorial Day
+    date(2031, 6, 19),   # Juneteenth
+    date(2031, 7, 4),    # Independence Day
+    date(2031, 9, 1),    # Labor Day
+    date(2031, 11, 27),  # Thanksgiving
+    date(2031, 12, 25),  # Christmas
+    # 2032
+    date(2032, 1, 1),    # New Year's Day
+    date(2032, 1, 19),   # MLK Day
+    date(2032, 2, 16),   # Presidents' Day
+    date(2032, 3, 26),   # Good Friday
+    date(2032, 5, 31),   # Memorial Day
+    date(2032, 6, 18),   # Juneteenth (observed, June 19 is Saturday)
+    date(2032, 7, 5),    # Independence Day (observed, July 4 is Sunday)
+    date(2032, 9, 6),    # Labor Day
+    date(2032, 11, 25),  # Thanksgiving
+    date(2032, 12, 24),  # Christmas (observed, Dec 25 is Saturday)
 }
+
+# Last calendar date this module has verified holiday + early-close data
+# for. `is_trading_day` (and everything built on it) RAISES past this date
+# rather than silently treating every weekday as a trading day — the
+# degrade-unsafe failure measured in alpha-engine-config-I9998 (the table
+# ran out at 2030-12-25 and every weekday after, including Christmas,
+# read as a trading day with no assertion, no expiry check, no log line).
+# Bump this (with the holiday + early-close tables) when the calendar is
+# next extended — never past what has actually been verified.
+NYSE_CALENDAR_COVERS_THROUGH: date = date(2032, 12, 31)
+
+
+class TradingCalendarExpiredError(ValueError):
+    """Raised when a date falls past the verified calendar range.
+
+    Distinct from plain ``ValueError`` so a caller that wants to catch
+    this specific condition (e.g. to page for a calendar-table refresh)
+    doesn't have to pattern-match an error string.
+    """
 
 
 def is_trading_day(d: date | None = None) -> bool:
-    """Return True if the given date is an NYSE trading day."""
+    """Return True if the given date is an NYSE trading day.
+
+    Raises :class:`TradingCalendarExpiredError` for any ``d`` past
+    :data:`NYSE_CALENDAR_COVERS_THROUGH` — the calendar table has no
+    holiday or early-close data beyond that date, and silently answering
+    ``True`` for every such weekday (including Christmas) is the unsafe
+    direction for a function every artifact key is built on.
+    """
     if d is None:
         d = date.today()
+    if d > NYSE_CALENDAR_COVERS_THROUGH:
+        raise TradingCalendarExpiredError(
+            f"is_trading_day({d.isoformat()}): NYSE_HOLIDAYS only covers "
+            f"through {NYSE_CALENDAR_COVERS_THROUGH.isoformat()} — extend "
+            f"NYSE_HOLIDAYS, NYSE_EARLY_CLOSES and "
+            f"NYSE_CALENDAR_COVERS_THROUGH in krepis.trading_calendar "
+            f"before resolving dates past that range."
+        )
     if d.weekday() > 4:  # Saturday=5, Sunday=6
         return False
     if d in NYSE_HOLIDAYS:
@@ -172,16 +245,65 @@ def count_trading_days(start: date, end: date) -> int:
     return total
 
 
-# NYSE regular-session close (early-close holidays like the day after
-# Thanksgiving close at 1 PM ET; we keep 4 PM as the conservative
-# threshold — consumers waiting on post-close data should not assume
-# anything before 4 PM ET).
+# Sessions that close early (1 PM ET) rather than the regular 4 PM close —
+# the day after Thanksgiving, Christmas Eve when it is itself a trading
+# day (it is a full NYSE_HOLIDAYS closure, not an early close, in the
+# years the observed Christmas holiday falls on it — 2027 and 2032
+# below), and the day before Independence Day when July 4 falls
+# midweek (Tue-Fri) so July 3 is itself a trading day. Reconciled
+# against exchange_calendars in CI alongside NYSE_HOLIDAYS (I9998) —
+# the July-3rd early closes below were found BY that reconciliation
+# script, not composed by hand; do not hand-add a new one without
+# re-running it.
+NYSE_EARLY_CLOSES: set[date] = {
+    date(2025, 7, 3),    # day before Independence Day (July 4 is Friday)
+    date(2025, 11, 28),  # day after Thanksgiving
+    date(2025, 12, 24),  # Christmas Eve
+    date(2026, 11, 27),  # day after Thanksgiving
+    date(2026, 12, 24),  # Christmas Eve
+    date(2027, 11, 26),  # day after Thanksgiving
+    # 2027-12-24 is the observed Christmas holiday (12/25 is a Saturday) —
+    # a full closure, not an early close.
+    date(2028, 7, 3),    # day before Independence Day (July 4 is Tuesday)
+    date(2028, 11, 24),  # day after Thanksgiving
+    # 2028-12-24 is a Sunday — not a trading day at all.
+    date(2029, 7, 3),    # day before Independence Day (July 4 is Wednesday)
+    date(2029, 11, 23),  # day after Thanksgiving
+    date(2029, 12, 24),  # Christmas Eve
+    date(2030, 7, 3),    # day before Independence Day (July 4 is Thursday)
+    date(2030, 11, 29),  # day after Thanksgiving
+    date(2030, 12, 24),  # Christmas Eve
+    date(2031, 7, 3),    # day before Independence Day (July 4 is Friday)
+    date(2031, 11, 28),  # day after Thanksgiving
+    date(2031, 12, 24),  # Christmas Eve
+    date(2032, 11, 26),  # day after Thanksgiving
+    # 2032-12-24 is the observed Christmas holiday (12/25 is a Saturday) —
+    # a full closure, not an early close. 2032 July 4 is a Sunday
+    # (observed Monday July 5) so July 3 (Saturday) is not a trading day.
+}
+
+# NYSE regular-session close. Consumers that need the ACTUAL close on a
+# given day (last_closed_trading_day) must read session_close_et(d)
+# instead — this constant alone does not know about early closes.
 _NYSE_CLOSE_ET = time(16, 0)
+_EARLY_CLOSE_ET = time(13, 0)
 _NYSE_TZ = ZoneInfo("America/New_York")
 
 # NYSE regular-session open. Paired with ``_NYSE_CLOSE_ET`` above so the
 # session window has exactly one definition in the fleet.
 _NYSE_OPEN_ET = time(9, 30)
+
+
+def session_close_et(d: date) -> time:
+    """Return the actual NYSE close time for session ``d``.
+
+    ``time(13, 0)`` on a day in :data:`NYSE_EARLY_CLOSES`, else the
+    regular ``time(16, 0)`` close. This is the close :func:`last_closed_trading_day`
+    must use — that function answers "has this session actually closed",
+    and answering it with the regular close on an early-close day reports
+    a session as still-open for three hours after it settled (I9998 §3).
+    """
+    return _EARLY_CLOSE_ET if d in NYSE_EARLY_CLOSES else _NYSE_CLOSE_ET
 
 
 def is_market_hours(
@@ -210,12 +332,16 @@ def is_market_hours(
     ``nousergon_lib.trading_calendar.is_market_hours`` — that module is an
     alias for this one.
 
-    Deliberately answers only "is the regular session live". Early-close
-    sessions (the day after Thanksgiving, Christmas Eve) close at 13:00 ET
-    and are reported as open until 16:00; that is the conservative
-    direction for every caller this serves — a caller refusing to act
-    in-session refuses for three extra hours rather than acting inside a
-    session it thought had ended.
+    Deliberately answers only "is the regular session live" and
+    deliberately does NOT consult :func:`session_close_et` /
+    :data:`NYSE_EARLY_CLOSES`: early-close sessions (the day after
+    Thanksgiving, Christmas Eve) close at 13:00 ET and are reported as
+    open until 16:00 here; that is the conservative direction for every
+    caller this serves — a caller refusing to act in-session refuses for
+    three extra hours rather than acting inside a session it thought had
+    ended. :func:`last_closed_trading_day` is the opposite case (the
+    knowledge axis, not the action axis) and DOES use the actual close —
+    see its docstring.
 
     Args:
         now: naive (assumed NYSE-local) or tz-aware datetime; defaults to
@@ -336,6 +462,14 @@ def last_closed_trading_day(now: datetime | None = None) -> date:
     Accepts either a naive datetime (assumed in NYSE local time) or a
     timezone-aware datetime (converted to NYSE time for comparison).
     Defaults to now in NYSE time.
+
+    Reads the actual close via :func:`session_close_et` (unlike
+    :func:`is_market_hours`, which deliberately pins the regular 16:00
+    close for every day) — this is the knowledge axis: a postclose
+    consumer running at 14:00 ET on an early-close day must see today's
+    session as already closed, not two hours from closing
+    (alpha-engine-config-I9998 §3; measured: previously returned the
+    PRIOR session at 14:00 ET on an early-close day).
     """
     if now is None:
         now = datetime.now(_NYSE_TZ)
@@ -345,7 +479,7 @@ def last_closed_trading_day(now: datetime | None = None) -> date:
         now = now.astimezone(_NYSE_TZ)
 
     today = now.date()
-    if is_trading_day(today) and now.time() >= _NYSE_CLOSE_ET:
+    if is_trading_day(today) and now.time() >= session_close_et(today):
         return today
     d = today - timedelta(days=1)
     while not is_trading_day(d):
