@@ -6,6 +6,13 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel, Field
 
+import krepis.llm as _llm
+from krepis.session_dlp import (
+    DLP_BLOCKED,
+    DLP_DISABLED,
+    DLP_OK,
+    DLPVerdict,
+)
 from krepis.llm import (
     BudgetExhaustedError,
     LLMClient,
@@ -2194,3 +2201,433 @@ models:
         fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
         with pytest.raises(LLMConfigError, match="does not resolve through"):
             self._router_client(fake).complete(system="s", user_content="u")
+
+
+class TestServerSideFallbackIsVisibleAndPriceable:
+    """A server-side fallback must be VISIBLE and its call must still be
+    priced (alpha-engine-config-I9995).
+
+    LiteLLM's proxy stamps the client-requested deployment back onto every
+    NON-fallback response, so ``resp.model == spec.model`` on a healthy call
+    and names the deployment that actually served on a fallback. That
+    difference is the only fallback signal a proxy-routed consumer gets, and
+    krepis discarded it twice: ``_resolve_group_served_model`` gated
+    resolution on ``served_model.startswith(f"{spec.model}-")``, a predicate
+    that became unsatisfiable when I6543 made ``spec.model`` the qualified
+    ``{group}-{mid}``; and all three fallback-reporting mechanisms
+    (``route_is_degraded`` on the proxy route, ``_check_fallback_transition``,
+    ``LLMResult.fallback_used``) were dead.
+
+    Measured on v0.59.46: ``med-qwen3-max`` came back as the served model,
+    carried no price card, ``recompute_cost`` raised, and
+    ``_emit_cost_record`` swallowed it — so the call's cost row did not exist
+    at all, precisely when a primary provider was failing.
+    """
+
+    _REGISTRY = """
+model_groups:
+  med:
+    - deepseek-v4-flash-max
+    - qwen3-max
+
+models:
+  - id: deepseek-v4-flash-max
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
+    model: deepseek/deepseek-v4-flash
+    status: active
+  - id: qwen3-max
+    provider: openrouter
+    route: openrouter
+    model: qwen/qwen3-max
+    status: active
+"""
+
+    # The wire shape since router.py emits deployment_id = _qualified_primary
+    # on the litellm_proxy route: the consumer addresses `{group}-{mid}`.
+    SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="med-deepseek-v4-flash-max",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _registry(self, tmp_path, monkeypatch):
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(self._REGISTRY)
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+
+    @pytest.fixture(autouse=True)
+    def _clean_fallback_state(self, monkeypatch):
+        """`_fallback_state` is module-global and keyed by group, so a
+        transition recorded by one test would decide whether the next one
+        sees a transition at all."""
+        monkeypatch.setattr(_llm, "_fallback_state", {}, raising=True)
+
+    def _client(self, fake, sink=None):
+        return LLMClient(
+            self.SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+            cost_sink=sink,
+        )
+
+    # ── deliverable 1: the fallback deployment resolves ──────────────────
+
+    def test_fallback_deployment_resolves_to_its_upstream_model(self):
+        """The exact pair from the issue's measurement: addressed
+        `med-deepseek-v4-flash-max`, served `med-qwen3-max`, and the registry
+        resolves it perfectly — the function simply never asked."""
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.model == "qwen/qwen3-max"
+
+    def test_fallback_deployment_resolves_on_the_structured_path_too(self):
+        fake = FakeOpenAI([
+            _openai_resp('{"anything": 1}', model="med-qwen3-max")
+        ])
+        result = self._client(fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.model == "qwen/qwen3-max"
+
+    def test_a_real_upstream_model_still_passes_through_unresolved(self):
+        """The bare return this fix narrowed is still reachable and still
+        right: a served model that is not a `{group}-` deployment name is a
+        real upstream model the router reported directly."""
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="deepseek/deepseek-v4-flash")
+        ])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek/deepseek-v4-flash"
+
+    def test_unresolvable_group_prefixed_fallback_raises(self):
+        """Registry drift is loud. A `{group}-`-shaped name the local
+        registry cannot resolve means the router and this consumer read
+        different registries."""
+        fake = FakeOpenAI([_openai_resp("hello", model="med-not-in-registry")])
+        with pytest.raises(LLMConfigError, match="does not resolve through"):
+            self._client(fake).complete(system="s", user_content="u")
+
+    # ── deliverable 1: the cost row EXISTS and is priced ─────────────────
+
+    def test_fallback_call_produces_a_priced_cost_row(self):
+        records = []
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        result = self._client(fake, sink=records.append).complete(
+            system="s", user_content="u"
+        )
+        assert result.cost_emission_error is None
+        assert len(records) == 1, (
+            "no cost row exists for a fallback-served call — the deployment "
+            "name reached the price-card lookup, PriceCardLookupError "
+            "propagated, and _emit_cost_record swallowed it"
+        )
+        assert records[0]["model"] == "qwen/qwen3-max"
+        assert records[0]["cost_usd"] is not None
+        assert records[0]["fallback_used"] is True
+
+    def test_healthy_call_cost_row_is_not_marked_as_fallback(self):
+        records = []
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="med-deepseek-v4-flash-max")
+        ])
+        self._client(fake, sink=records.append).complete(
+            system="s", user_content="u"
+        )
+        assert records[0]["model"] == "deepseek/deepseek-v4-flash"
+        assert records[0]["fallback_used"] is False
+
+    # ── deliverable 2: the result says a fallback served ─────────────────
+
+    def test_fallback_used_is_true_when_a_non_primary_deployment_served(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.fallback_used is True
+        assert result.served_deployment == "med-qwen3-max"
+
+    def test_fallback_used_is_false_on_a_healthy_call(self):
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="med-deepseek-v4-flash-max")
+        ])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.fallback_used is False
+        assert result.served_deployment == "med-deepseek-v4-flash-max"
+
+    def test_fallback_flag_does_not_ride_along_to_the_next_call(self):
+        """The `dropped_params` failure mode: a flag set on one call that
+        attaches itself to every later result from the same client."""
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="med-qwen3-max"),
+            _openai_resp("hello", model="med-deepseek-v4-flash-max"),
+        ])
+        client = self._client(fake)
+        first = client.complete(system="s", user_content="u")
+        second = client.complete(system="s", user_content="u")
+        assert first.fallback_used is True
+        assert second.fallback_used is False
+
+    def test_non_router_transport_never_reports_a_fallback(self):
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(
+            system="s", user_content="u"
+        )
+        assert result.fallback_used is False
+        assert result.served_deployment is None
+
+    # ── deliverable 2: the transition is announced ───────────────────────
+
+    def test_fallback_engagement_warns(self, caplog):
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            self._client(fake).complete(system="s", user_content="u")
+        assert any(
+            "FALLBACK ENGAGED" in r.getMessage() and "med-qwen3-max" in r.getMessage()
+            for r in caplog.records
+            if r.levelno >= logging.WARNING
+        ), "model-router-policy R12 makes serving from a fallback an ALERT"
+
+    def test_primary_recovery_is_announced(self, caplog):
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="med-qwen3-max"),
+            _openai_resp("hello", model="med-deepseek-v4-flash-max"),
+        ])
+        client = self._client(fake)
+        client.complete(system="s", user_content="u")
+        with caplog.at_level(logging.INFO, logger="krepis.llm"):
+            client.complete(system="s", user_content="u")
+        assert any(
+            "PRIMARY RESTORED" in r.getMessage() for r in caplog.records
+        )
+
+    def test_a_steady_fallback_does_not_re_announce_every_call(self, caplog):
+        """`_check_fallback_transition` is a TRANSITION detector; a group
+        stuck on its fallback must not page once per call."""
+        fake = FakeOpenAI([
+            _openai_resp("hello", model="med-qwen3-max"),
+            _openai_resp("hello", model="med-qwen3-max"),
+        ])
+        client = self._client(fake)
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            client.complete(system="s", user_content="u")
+            client.complete(system="s", user_content="u")
+        engaged = [
+            r for r in caplog.records if "FALLBACK ENGAGED" in r.getMessage()
+        ]
+        assert len(engaged) == 1, "one transition, two calls"
+        assert _llm._fallback_state["med"] is True
+
+
+class TestDLPVerdictReachesTheArtifact:
+    """The DLP scan's OUTCOME must be observable (alpha-engine-config-I10001).
+
+    `krepis.session_dlp` is the in-process DLP tier — the only control on
+    paths that cannot reach the localhost egress proxy (Lambda, spot boxes).
+    Its scan mechanics were sound; its outcome reached nothing. A process with
+    `KREPIS_DLP_DISABLED=1` returned from `_dlp_scan_request` with no log, no
+    counter and no field, indistinguishable on every surface from one scanning
+    cleanly; the OK verdict logged at DEBUG, which `setup_logging`'s INFO pin
+    makes unreachable in every deployed environment. Principle 7: a component
+    emitting nothing is not healthy, it is unobserved.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _rearm_the_once_per_process_warning(self, monkeypatch):
+        monkeypatch.setattr(_llm, "_DLP_DISABLED_WARNED", False, raising=True)
+
+    # ── administratively disabled ────────────────────────────────────────
+
+    def test_disabled_stamps_the_verdict_on_every_result(self, monkeypatch):
+        monkeypatch.setenv("KREPIS_DLP_DISABLED", "1")
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(
+            system="s", user_content="u"
+        )
+        assert result.dlp_verdict == DLP_DISABLED
+
+    def test_disabled_warns_exactly_once_per_process(self, monkeypatch, caplog):
+        monkeypatch.setenv("KREPIS_DLP_DISABLED", "1")
+        fake = FakeOpenAI([_openai_resp("hi"), _openai_resp("hi")])
+        client = _client(OPENROUTER_SPEC, fake)
+        with caplog.at_level(logging.WARNING, logger="krepis.llm"):
+            client.complete(system="s", user_content="u")
+            client.complete(system="s", user_content="u")
+        warnings = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING
+            and "KREPIS_DLP_DISABLED" in r.getMessage()
+        ]
+        assert len(warnings) == 1, (
+            "an administratively-disabled security control is an event, not "
+            "a no-op — and not one line per call either"
+        )
+
+    # ── a clean scan is observable ───────────────────────────────────────
+
+    def test_clean_scan_is_recorded_on_the_result(self, monkeypatch):
+        """The laptop cannot run a real gitleaks scan (`/opt/llm-routing`
+        does not exist — alpha-engine-config-I7913), so the scanner is
+        injected rather than invoked. `check_request` is patched on
+        `krepis.llm`, which is where the name is bound."""
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _body: DLPVerdict(DLP_OK, "", 12.5, 0.75),
+        )
+        fake = FakeOpenAI([_openai_resp("hi")])
+        result = _client(OPENROUTER_SPEC, fake).complete(
+            system="s", user_content="u"
+        )
+        assert result.dlp_verdict == DLP_OK
+        assert result.dlp_scan_ms == 12.5
+        assert result.dlp_cache_ratio == 0.75
+
+    def test_clean_scan_is_visible_at_info_not_only_debug(
+        self, monkeypatch, caplog
+    ):
+        """`krepis.logging.setup_logging` pins the root logger at INFO with no
+        override, so the DEBUG line this replaced emitted nothing at all in
+        every deployed environment."""
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _body: DLPVerdict(DLP_OK, "", 12.5, 0.75),
+        )
+        fake = FakeOpenAI([_openai_resp("hi")])
+        with caplog.at_level(logging.INFO, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert any(
+            r.levelno >= logging.INFO and "dlp: ok" in r.getMessage()
+            for r in caplog.records
+        )
+
+    # ── the cost row carries coverage ────────────────────────────────────
+
+    def test_cost_record_carries_the_dlp_verdict(self, monkeypatch):
+        """Coverage is queryable from the cost partitions that already exist,
+        rather than needing a surface of its own."""
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _body: DLPVerdict(DLP_OK, "", 3.0, 0.0),
+        )
+        records = []
+        fake = FakeOpenAI([_openai_resp("hi")])
+        LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=records.append,
+        ).complete(system="s", user_content="u")
+        assert records[0]["dlp_verdict"] == DLP_OK
+
+    def test_cost_record_says_when_dlp_was_administratively_off(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("KREPIS_DLP_DISABLED", "1")
+        records = []
+        fake = FakeOpenAI([_openai_resp("hi")])
+        LLMClient(
+            OPENROUTER_SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            cost_sink=records.append,
+        ).complete(system="s", user_content="u")
+        assert records[0]["dlp_verdict"] == DLP_DISABLED
+
+    # ── no ride-along ────────────────────────────────────────────────────
+
+    def test_a_blocked_verdict_does_not_ride_along_to_the_next_result(
+        self, monkeypatch
+    ):
+        """The `dropped_params` failure mode, on the most audit-relevant field
+        there is: a verdict from a call that never reached the wire attaching
+        itself to the next result from the same client."""
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        verdicts = [
+            DLPVerdict(DLP_BLOCKED, "aws-access-key-id", 40.0, 0.0),
+            DLPVerdict(DLP_OK, "", 5.0, 1.0),
+        ]
+        monkeypatch.setattr(
+            _llm, "check_request", lambda _body: verdicts.pop(0)
+        )
+        fake = FakeOpenAI([_openai_resp("hi")])
+        client = _client(OPENROUTER_SPEC, fake)
+        with pytest.raises(LLMError, match="DLP scan blocked"):
+            client.complete(system="s", user_content="u")
+        result = client.complete(system="s", user_content="u")
+        assert result.dlp_verdict == DLP_OK
+        assert result.dlp_scan_ms == 5.0
+        assert result.dlp_cache_ratio == 1.0
+
+    def test_a_scan_verdict_does_not_ride_along_from_call_to_call(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        verdicts = [
+            DLPVerdict(DLP_OK, "", 50.0, 0.0),
+            DLPVerdict(DLP_OK, "", 1.0, 1.0),
+        ]
+        monkeypatch.setattr(
+            _llm, "check_request", lambda _body: verdicts.pop(0)
+        )
+        fake = FakeOpenAI([_openai_resp("hi"), _openai_resp("hi")])
+        client = _client(OPENROUTER_SPEC, fake)
+        first = client.complete(system="s", user_content="u")
+        second = client.complete(system="s", user_content="u")
+        assert (first.dlp_scan_ms, first.dlp_cache_ratio) == (50.0, 0.0)
+        assert (second.dlp_scan_ms, second.dlp_cache_ratio) == (1.0, 1.0)
+
+    def test_verdict_reaches_the_structured_path_too(self, monkeypatch):
+        """Stamped by `_finalize_result`, the ONE public-method boundary, so a
+        return path cannot escape it."""
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _body: DLPVerdict(DLP_OK, "", 2.0, 0.5),
+        )
+        fake = FakeOpenAI([_openai_resp('{"anything": 1}')])
+        result = _client(OPENROUTER_SPEC, fake).structured(
+            system="s", user_content="u",
+            schema={"type": "object"}, schema_name="blob",
+        )
+        assert result.dlp_verdict == DLP_OK
+
+    def test_a_call_path_that_does_not_scan_carries_no_verdict(
+        self, monkeypatch
+    ):
+        """What the snapshot-and-clear in `_finalize_result` is actually for.
+
+        Every public method scans today, so a stale verdict cannot survive the
+        current call's scan overwriting it — the reset is invisible while that
+        holds. A future return path that does NOT scan is precisely the
+        `dropped_params` defect (alpha-engine-config-I7232): a field that reads
+        as a fact about THIS call while describing an earlier one. Simulated
+        here by neutralising the scan on the second call, which is the only way
+        to hold the property under test rather than under coincidence.
+        """
+        monkeypatch.delenv("KREPIS_DLP_DISABLED", raising=False)
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _body: DLPVerdict(DLP_OK, "", 7.0, 0.25),
+        )
+        fake = FakeOpenAI([_openai_resp("hi"), _openai_resp("hi")])
+        client = _client(OPENROUTER_SPEC, fake)
+        first = client.complete(system="s", user_content="u")
+        assert first.dlp_verdict == DLP_OK
+
+        monkeypatch.setattr(
+            LLMClient, "_dlp_scan_request",
+            lambda _self, _payload, context="": None,
+        )
+        second = client.complete(system="s", user_content="u")
+        assert second.dlp_verdict is None, (
+            "the previous call's verdict rode along onto a result whose own "
+            "body was never scanned"
+        )
+        assert second.dlp_scan_ms is None
+        assert second.dlp_cache_ratio is None
