@@ -160,7 +160,9 @@ def now_dual(*, now: datetime | None = None) -> DualDate:
     )
 
 
-def resolve_trading_day(date_str: str | None = None) -> str:
+def resolve_trading_day(
+    date_str: str | None = None, *, on_error: str = "raise"
+) -> str:
     """Normalize a date string to the most recent NYSE trading day on or before it.
 
     Canonical artifact-keying helper. Per ``DATE_CONVENTIONS``: every trade
@@ -186,18 +188,32 @@ def resolve_trading_day(date_str: str | None = None) -> str:
         * Default (``date_str is None``) = today UTC, then normalized.
         * Tolerant of an ISO datetime / longer string — only the leading
           ``yyyy-mm-dd`` is parsed.
-        * Defensive: on any parse failure, returns the input unchanged with a
-          WARNING rather than raising. A date-normalization miss must not abort
-          the caller (the backtester run or the non-fatal grading path).
+        * ``on_error="raise"`` (the default): a parse failure raises
+          ``ValueError`` naming the offending input. This is a key-producer
+          chokepoint — ``'latest'``, ``''``, ``'2026-13-45'`` and an
+          unexpanded ``'${RUN_DATE}'`` were all previously returned VERBATIM
+          and written into an S3 key no consumer would ever read
+          (alpha-engine-config-I9999). A key producer must not
+          graceful-degrade; the caller decides whether a bad input is fatal,
+          not this function.
+        * ``on_error="passthrough"`` reproduces the pre-fix behavior — logs a
+          WARNING and returns the raw input unchanged — for a caller that
+          has explicitly decided a normalization miss must not abort it.
+          State that decision at the call site; it must be greppable.
 
     Args:
         date_str: ISO ``yyyy-mm-dd`` (or longer ISO) string, or ``None`` for
             today UTC.
+        on_error: ``"raise"`` (default) or ``"passthrough"``. Keyword-only
+            to force an explicit, greppable choice at every call site.
 
     Returns:
         ISO ``yyyy-mm-dd`` string of the most recent NYSE trading day on or
-        before the input (the input itself if it is already a trading day),
-        or the raw input unchanged on a parse failure.
+        before the input (the input itself if it is already a trading day).
+
+    Raises:
+        ValueError: the input could not be parsed as a date, and
+            ``on_error="raise"`` (the default).
 
     Example::
 
@@ -208,16 +224,38 @@ def resolve_trading_day(date_str: str | None = None) -> str:
         >>> resolve_trading_day("2026-05-30T12:00:00Z")  # ISO datetime tolerated
         '2026-05-29'
     """
-    raw = date_str if date_str is not None else date.today().isoformat()
+    if on_error not in ("raise", "passthrough"):
+        raise ValueError(
+            f"resolve_trading_day: on_error must be 'raise' or 'passthrough', "
+            f"got {on_error!r}"
+        )
+    raw = (
+        date_str
+        if date_str is not None
+        else datetime.now(timezone.utc).date().isoformat()
+    )
     try:
         d = date.fromisoformat(raw[:10])
         td = d if is_trading_day(d) else previous_trading_day(d)
         return td.isoformat()
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning(
-            "resolve_trading_day(%r) failed (%s) — using input unchanged", raw, exc
-        )
-        return raw
+    except Exception as exc:
+        if on_error == "passthrough":
+            # Deliberate swallow: caller has explicitly opted out of the
+            # fail-loud default (on_error="passthrough") and accepted that
+            # a parse miss returns the raw, un-normalized input. Recording
+            # surface: this WARNING log line, naming the input and the
+            # underlying exception.
+            logger.warning(
+                "resolve_trading_day(%r, on_error='passthrough') failed "
+                "(%s) — using input unchanged", raw, exc
+            )
+            return raw
+        raise ValueError(
+            f"resolve_trading_day({raw!r}) could not be parsed as a date: "
+            f"{exc}. This is an artifact-keying chokepoint — pass "
+            f"on_error='passthrough' only if the caller has a specific, "
+            f"documented reason a normalization miss must not abort it."
+        ) from exc
 
 
 # ── Freshness checks (trading-day-aware) ─────────────────────────────────────
