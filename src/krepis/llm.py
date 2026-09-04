@@ -67,6 +67,8 @@ from krepis.llm_search import (
     final_text_after_last_tool,
 )
 from krepis.session_dlp import (
+    DLP_DISABLED,
+    DLP_SCAN_ERROR,
     check_request,
     dlp_enabled,
 )
@@ -79,11 +81,48 @@ logger = logging.getLogger(__name__)
 _fallback_state: dict[str, bool] = {}
 
 
+# One WARNING per process when DLP is administratively disabled, not one per
+# call: the condition is process-scoped (a single env var read by
+# `session_dlp.dlp_enabled`), so a per-call line would be pure volume and the
+# per-call record is the `dlp_verdict` field on each result instead.
+# Module-level rather than per-client because a consumer that rebuilds its
+# `LLMClient` per request — the documented pattern, so SSM flips are picked up
+# — would otherwise emit the "once" line on every call.
+_DLP_DISABLED_WARNED = False
+
+
+def _warn_dlp_disabled_once() -> None:
+    """Emit the administratively-disabled DLP warning, at most once."""
+    global _DLP_DISABLED_WARNED
+    if _DLP_DISABLED_WARNED:
+        return
+    _DLP_DISABLED_WARNED = True
+    logger.warning(
+        "dlp: DISABLED for this process — KREPIS_DLP_DISABLED is set. "
+        "krepis.session_dlp is the only DLP control on paths that cannot "
+        "reach the localhost egress proxy (Lambda, spot boxes), so outbound "
+        "request bodies are leaving UNSCANNED. Every LLMResult from this "
+        "process carries dlp_verdict=%r (alpha-engine-config-I10001).",
+        DLP_DISABLED,
+    )
+
+
 def _check_fallback_transition(group: str, fallback_used: bool, served_model: str, primary: str) -> None:
     """Log a warning/info when a group enters or exits fallback.
 
-    Called after every LiteLLM Router completion so the operator sees
-    exactly when a backup model signs on and when the primary recovers.
+    Called by :meth:`LLMClient._stamp_fallback_facts` on every completed
+    router-edge call, so the operator sees exactly when a backup model signs
+    on and when the primary recovers.  ``model-router-policy`` R12 makes
+    serving from a fallback an ALERT, and the WARNING below is the line an
+    alert rule can key on.
+
+    It had ZERO call sites until alpha-engine-config-I9995 — the only writer
+    of ``_fallback_state`` was never reached, so the transition it exists to
+    announce was never announced.
+
+    *primary* is the DEPLOYMENT this process addressed (``{group}-{mid}``),
+    not an upstream model id, because that is the name the comparison was made
+    against and an operator reading the line needs the two to be comparable.
     """
     was_in_fallback = _fallback_state.get(group, False)
     if fallback_used and not was_in_fallback:
@@ -166,17 +205,43 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
         if upstream:
             return upstream
     if served_model and served_model != spec.model:
-        if served_model.startswith(f"{spec.model}-"):
+        # THE FALLBACK PATH. The predicate here is the GROUP prefix, not
+        # ``spec.model``'s own — `{group}-`, derived from the addressed
+        # deployment name, so it holds for both addressing forms:
+        #
+        #   spec.model = "med"                        -> group "med"  (pre-I6543)
+        #   spec.model = "med-deepseek-v4-flash-max"  -> group "med"  (post-I6543)
+        #
+        # It used to read ``served_model.startswith(f"{spec.model}-")``, which
+        # was written when ``spec.model`` was always a bare group and became
+        # UNSATISFIABLE the moment I6543 made it qualified: a fallback
+        # deployment ``med-qwen3-max`` does not start with
+        # ``med-deepseek-v4-flash-max-``, so every server-side fallback fell
+        # straight to the bare ``return`` and handed a DEPLOYMENT NAME back as
+        # the served model. Measured 2026-09-04 on v0.59.46: ``med-qwen3-max``
+        # carries no price card, ``recompute_cost`` raised, and
+        # ``_emit_cost_record`` swallowed it — so the call's cost row did not
+        # exist, precisely when a primary provider was failing and spend
+        # attribution mattered most (alpha-engine-config-I9995).
+        #
+        # Groups are single tokens ("low"/"med"/"high"/"ultra") and deployment
+        # names are ``{group}-{mid}``, so the group is the first ``-``-delimited
+        # segment. A real upstream model reported directly by the router
+        # ("qwen/qwen3-max", "deepseek-v4-flash") does not share that segment
+        # and still falls through to the bare return below, which is what that
+        # branch was always for.
+        group = spec.model.split("-", 1)[0]
+        if served_model.startswith(f"{group}-"):
             upstream = served_model_for_deployment(served_model)
             if upstream:
                 return upstream
             raise LLMConfigError(
-                f"provider={spec.provider!r} group={spec.model!r}: the router "
-                f"reported served model {served_model!r}, which is shaped like "
-                f"a derived deployment name for this group but does not "
-                f"resolve through the local LLM_MODEL_REGISTRY.yaml. The "
-                f"router and this consumer are reading different registries "
-                f"(alpha-engine-config-I6543)."
+                f"provider={spec.provider!r} group={group!r} "
+                f"addressed={spec.model!r}: the router reported served model "
+                f"{served_model!r}, which is shaped like a derived deployment "
+                f"name for this group but does not resolve through the local "
+                f"LLM_MODEL_REGISTRY.yaml. The router and this consumer are "
+                f"reading different registries (alpha-engine-config-I6543)."
             )
         return served_model
     hidden = getattr(resp, "_hidden_params", None)
@@ -1271,7 +1336,36 @@ class LLMResult:
     # True when a fallback model in the group's chain served this request
     # (the primary failed and LiteLLM's Router transparently tried the
     # next model).  Always False on non-litellm transports.
+    #
+    # Assigned in :meth:`LLMClient._stamp_fallback_facts`, from the ONE public
+    # method boundary (:func:`_finalize_result`). It was declared here and
+    # assigned NOWHERE until alpha-engine-config-I9995 — the `dropped_params`
+    # failure mode (I7232) a second time: every consumer reading it, including
+    # crucible's run manifest, concluded the primary had served.
     fallback_used: bool = False
+    # The deployment name the router actually reported for this call —
+    # `{group}-{mid}` on the router edge, the upstream model id elsewhere,
+    # ``None`` when the route reported none. Distinct from ``model``, which is
+    # the RESOLVED upstream id that price cards key on: the comparison that
+    # decides ``fallback_used`` happens at the deployment layer (LiteLLM's
+    # proxy echoes the client-requested deployment on every non-fallback
+    # response), and an artifact reader cannot reconstruct it from ``model``
+    # alone because two deployments can share one upstream model.
+    served_deployment: Optional[str] = None
+    # The DLP verdict for this call's outbound body: ``"ok"``, ``"dlp_block"``,
+    # ``"scan_error"``, ``"dlp_disabled"`` (KREPIS_DLP_DISABLED is set), or
+    # ``None`` where no scan was attempted on this path. Present on the RESULT
+    # for the reason `dropped_params` is: on the Lambda and spot paths
+    # `krepis.session_dlp` is the ONLY DLP control there is, and a run manifest
+    # that cannot say whether the bodies were scanned cannot answer Principle 1
+    # from durable artifacts alone (alpha-engine-config-I10001).
+    dlp_verdict: Optional[str] = None
+    # Wall-clock milliseconds the last DLP scan on this call took. ``None``
+    # when no scan ran (disabled, or a path that does not scan).
+    dlp_scan_ms: Optional[float] = None
+    # Fraction of the last DLP scan served from the in-process result cache,
+    # 0.0-1.0. ``None`` when no scan ran.
+    dlp_cache_ratio: Optional[float] = None
     # The group name (or model id) that was requested — preserved so
     # callers can tell WHAT was asked for separately from WHAT served it.
     model_requested: str = ""
@@ -1382,15 +1476,25 @@ def _finalize_result(method):
     @functools.wraps(method)
     def _wrapped(self, *args, **kwargs):
         self.dropped_params = []
+        self._dlp_facts = {}
         try:
             result = method(self, *args, **kwargs)
         finally:
             # Cleared even when the call RAISES: a drop recorded on a failed
-            # call must not attach itself to the next successful one.
+            # call must not attach itself to the next successful one. The DLP
+            # facts are snapshot-and-cleared on exactly the same rule and for
+            # exactly the same reason — a verdict from a blocked call riding
+            # along onto the next result would report the wrong body as
+            # scanned (alpha-engine-config-I10001).
             dropped = self.dropped_params
             self.dropped_params = []
+            dlp_facts = self._dlp_facts
+            self._dlp_facts = {}
         result.dropped_params = dropped
+        for _field, _value in dlp_facts.items():
+            setattr(result, _field, _value)
         _stamp_response_facts(result)
+        self._stamp_fallback_facts(result)
         self._emit_cost_record(result)
         return result
 
@@ -1564,6 +1668,10 @@ class LLMClient:
         # drop. Surfaced on LLMResult so a degraded call is visible in the
         # artifact rather than only in a log line.
         self.dropped_params: list[str] = []
+        # DLP facts for the in-flight public call, snapshot-and-cleared by
+        # ``_finalize_result`` onto the result. Same shape and same lifetime
+        # rule as ``dropped_params`` above (alpha-engine-config-I10001).
+        self._dlp_facts: dict[str, Any] = {}
 
     # ── cost emission ─────────────────────────────────────────────────
 
@@ -1581,8 +1689,37 @@ class LLMClient:
         A future consolidation may unify the payload shape; until then this
         explicit call at each site is the unambiguous single-point hook the
         Lambda-path DLP gap requires (``alpha-engine-config-I4927``).
+
+        **Every outcome is recorded, including the no-op one.**  The verdict,
+        scan duration and cache ratio are stashed on ``self._dlp_facts`` and
+        stamped onto the result by :func:`_finalize_result`, on the same
+        snapshot-and-clear rule ``dropped_params`` uses.  Before
+        alpha-engine-config-I10001 a process running with
+        ``KREPIS_DLP_DISABLED=1`` — the fleet's only DLP control on the Lambda
+        and spot paths, which have no egress proxy behind them — was
+        indistinguishable on every surface from one scanning cleanly: the
+        disabled path returned with no log, no counter and no field, and the
+        OK path logged at DEBUG, which ``krepis.logging.setup_logging``'s INFO
+        pin makes unreachable in every deployed environment.  A control that
+        emits nothing is not healthy, it is unobserved.
+
+        When several scans run inside one public call (the ``structured``
+        retry loop scans each attempt's payload), the LAST scan's facts are
+        what reach the result — it is the body that actually produced the
+        returned answer.
         """
         if not dlp_enabled():
+            # A no-op with a RECORD. Loud once per process because an
+            # administratively-disabled security control is an event, not a
+            # configuration detail, and per-call because the artifact is the
+            # only place an unattended run can answer "were these bodies
+            # scanned?" from durable evidence.
+            _warn_dlp_disabled_once()
+            self._dlp_facts = {
+                "dlp_verdict": DLP_DISABLED,
+                "dlp_scan_ms": None,
+                "dlp_cache_ratio": None,
+            }
             return
         try:
             body = json.dumps(payload, default=str).encode("utf-8")
@@ -1601,9 +1738,19 @@ class LLMClient:
             logger.error(
                 "dlp: scan raised for %s request: %s", context, exc
             )
+            self._dlp_facts = {
+                "dlp_verdict": DLP_SCAN_ERROR,
+                "dlp_scan_ms": None,
+                "dlp_cache_ratio": None,
+            }
             raise LLMError(
                 f"DLP scan failed (fail-closed): {exc}"
             ) from exc
+        self._dlp_facts = {
+            "dlp_verdict": verdict.verdict,
+            "dlp_scan_ms": verdict.scan_ms,
+            "dlp_cache_ratio": verdict.cache_ratio,
+        }
         if verdict.should_block:
             logger.warning(
                 "dlp: BLOCKED %s request — %s (scan=%.0fms cache=%.0f%%)",
@@ -1615,11 +1762,68 @@ class LLMClient:
             raise LLMError(
                 f"DLP scan blocked outbound request: {verdict.reason}"
             )
-        logger.debug(
+        # INFO, not DEBUG. `krepis.logging.setup_logging` pins the root logger
+        # at INFO with no env override, so the DEBUG line this replaced was
+        # unreachable in every deployed environment — the clean-scan path
+        # emitted nothing at all, and "were this run's bodies scanned?" had no
+        # answer on any surface (alpha-engine-config-I10001, I8329).
+        logger.info(
             "dlp: ok %s request (scan=%.0fms cache=%.0f%%)",
             context,
             verdict.scan_ms,
             verdict.cache_ratio,
+        )
+
+    def _stamp_fallback_facts(self, result: Any) -> None:
+        """Record whether a NON-PRIMARY deployment served this call.
+
+        On the router edge the fallback chain is walked by the proxy,
+        server-side, so :func:`krepis.router.route_is_degraded` — a
+        resolve-time predicate — structurally cannot answer it. The only
+        signal a proxy-routed consumer gets is the response's own ``model``
+        field: LiteLLM stamps the CLIENT-REQUESTED deployment back onto every
+        non-fallback response, so ``resp.model == spec.model`` on a healthy
+        call and names the deployment that actually served on a fallback.
+
+        Three mechanisms for this existed and all three were dead
+        (alpha-engine-config-I9995): ``route_is_degraded`` short-circuits to
+        ``False`` on ``litellm_proxy``; its docstring named
+        ``get_group_primary`` as the compensating control, which had ZERO call
+        sites; ``_check_fallback_transition`` had zero call sites; and
+        ``LLMResult.fallback_used`` was never assigned. A phase-5 arm served by
+        a fallback therefore recorded a manifest saying the primary served.
+
+        The comparison is made at the DEPLOYMENT layer, deliberately, and
+        reads no registry. ``result.model`` has already been resolved to the
+        billable upstream id, and two deployments in one group can share an
+        upstream model string, so comparing upstream ids would under-report.
+        Resolving the primary's upstream id here would also mean a second
+        registry read on a path that has already returned its answer to the
+        caller — turning an unreadable registry into a failure of a call that
+        succeeded.
+        """
+        if self.spec.provider != ROUTER_EDGE_PROVIDER:
+            # Non-edge transports address one deployment directly; there is no
+            # chain behind them and `fallback_used` stays False, as documented.
+            return
+        resp = getattr(result, "raw_response", None)
+        served_deployment = (getattr(resp, "model", "") or "") if resp is not None else ""
+        if not served_deployment:
+            # Unreachable on the edge path in practice — a group-addressed call
+            # with no reported model already raised in
+            # `_resolve_group_served_model` before a result existed. Guarded
+            # anyway so a hand-built result cannot be stamped with a
+            # comparison against an empty string, which would read as a
+            # fallback on every call.
+            return
+        result.served_deployment = served_deployment
+        fallback_used = served_deployment != self.spec.model
+        result.fallback_used = fallback_used
+        _check_fallback_transition(
+            self.spec.model.split("-", 1)[0],
+            fallback_used,
+            served_deployment,
+            self.spec.model,
         )
 
     def _emit_cost_record(self, result: Any) -> None:
@@ -1632,8 +1836,20 @@ class LLMClient:
         try:
             from krepis.cost import record_llm_call
 
+            # Additive columns, carried through `extra_fields` so the cost
+            # contract in `krepis.cost` stays the one place record SHAPE is
+            # decided. Both are degradation facts about the call that the
+            # priced row is the only queryable surface for: coverage of the
+            # DLP control (I10001) and service by a non-primary deployment
+            # (I9995) are answerable from the cost partitions that already
+            # exist, rather than needing a new surface each.
             record = record_llm_call(
-                result, extra_fields={"callsite_id": self.callsite_id}
+                result,
+                extra_fields={
+                    "callsite_id": self.callsite_id,
+                    "fallback_used": bool(getattr(result, "fallback_used", False)),
+                    "dlp_verdict": getattr(result, "dlp_verdict", None),
+                },
             )
             self._cost_sink(record)
         except Exception as exc:  # noqa: BLE001

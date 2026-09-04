@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.59.46"
+version = "0.59.47"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS/Web Push alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -121,6 +121,19 @@ dev = [
     # instead of importorskip'ing itself into silence -- an unrun guard is
     # how the I4453 field rename reached four consumers unnoticed.
     "jsonschema>=4.0",
+    # tests/test_trading_calendar_reconciliation.py reconciles
+    # NYSE_HOLIDAYS + NYSE_EARLY_CLOSES against the reference calendar for
+    # the whole declared range and fails CI on divergence
+    # (alpha-engine-config-I9998). Dev-only -- never a runtime dependency
+    # of krepis itself; see trading_calendar.py's module docstring for why
+    # the full runtime swap was rejected (pulls numpy/pandas onto every
+    # consumer, including Lambdas that install krepis for unrelated
+    # primitives). exchange_calendars 4.x requires Python >=3.10 (measured
+    # against 4.13.2's METADATA), so the reconciliation test
+    # importorskip's on the 3.9 leg of the matrix -- the same pattern
+    # already used for the litellm cap above -- and runs for real on the
+    # other four declared interpreters.
+    "exchange_calendars>=4.0; python_version >= '3.10'",
 ]
 
 [tool.setuptools.packages.find]

@@ -1307,12 +1307,19 @@ def group_supports_explicit_cache_breakpoints(group: str) -> bool:
 def get_group_primary(group: str) -> Optional[str]:
     """Return the litellm model string for *group*'s primary model.
 
-    This is the value that ``resp.model`` will carry when the primary
-    (not a fallback) served the request.  Callers compare against it to
-    detect whether a fallback was engaged::
+    This is the litellm_params model string of the group's primary
+    DEPLOYMENT, read out of a live :func:`get_router` object — so it is
+    answerable only where an in-process litellm Router exists.
 
-        primary = get_group_primary("low")        # "openai/deepseek-v4-flash"
-        fallback_used = (resp.model != primary)
+    **Not the fallback detector for a proxy-routed consumer.**  A consumer
+    behind the router EDGE has no Router object, addresses the qualified
+    deployment name ``{group}-{mid}`` on the wire, and gets that same name
+    echoed back as ``resp.model`` on every non-fallback response.  Its
+    comparison is therefore deployment-name against ``ModelSpec.model``, and
+    it lives in :meth:`krepis.llm.LLMClient._stamp_fallback_facts`.  This
+    docstring used to claim ``LLMClient`` compared against this function; it
+    never called it at all, which is how the fallback signal went missing on
+    every krepis surface (alpha-engine-config-I9995).
     """
     router = get_router()
     # The primary deployment is named "{group}-{mid}", never the bare group
@@ -1948,6 +1955,17 @@ def _resolve_group_json(
             "auth_token_type": auth_token_type,
             "group": group,
             "registry_id": mid,
+            # The group's PRIMARY — `live_ids[0]`, the same entry the proxy
+            # branch above names, so both branches answer "which entry should
+            # have served this?" from one list. Emitting them here is what
+            # makes `route_is_degraded`'s comparison reachable at all: this
+            # branch declared neither key, so the function's absence guard
+            # returned True for EVERY per-provider route, primary or not, and
+            # its comparison branch was dead across the whole module. The two
+            # tests that covered it hand-built an `egress_proxy` dict carrying
+            # both keys — a shape no producer emitted (alpha-engine-config-I9995).
+            "primary_registry_id": live_ids[0],
+            "primary_model": models_by_id.get(live_ids[0], {}).get("model", ""),
             "capabilities": capabilities,
             # Same single reader as the LiteLLM branch, so the two paths
             # cannot disagree about a model's caching mechanism.
@@ -2213,15 +2231,31 @@ def route_is_degraded(route: dict) -> bool:
     than a log line, so this is a supported predicate rather than something
     each consumer re-derives from ``skipped_entries``.
 
-    **This answers a resolve-time question only.**  On the ``litellm_proxy``
-    route the chain is walked by the proxy, so which entry serves is not
-    knowable here — it arrives at call time as ``resp.model``, which is what
-    ``LLMClient`` compares against :func:`get_group_primary`.  Returning
-    "degraded" for that route would fire on every healthy router call:
-    ``registry_id`` is the synthetic ``litellm:group:<g>`` while
-    ``primary_registry_id`` is a real model id, so the two NEVER match there.
-    A detector whose output does not vary with the condition it names is not
-    a detector.
+    **This answers a resolve-time question only, and on the ``litellm_proxy``
+    route the honest answer is "not here".**  The chain is walked by the proxy,
+    server-side, so which entry serves is not knowable at resolve time; it
+    arrives at CALL time as ``resp.model``, and
+    :meth:`krepis.llm.LLMClient._stamp_fallback_facts` is the detector that
+    reads it, assigning :attr:`krepis.llm.LLMResult.fallback_used` and
+    :attr:`~krepis.llm.LLMResult.served_deployment`.  Returning "degraded" for
+    that route here would fire on every healthy router call: ``registry_id``
+    is the synthetic ``litellm:group:<g>`` while ``primary_registry_id`` is a
+    real model id, so the two NEVER match there.  A detector whose output does
+    not vary with the condition it names is not a detector.
+
+    So a caller asking "did a fallback serve this?" on a proxy-routed group
+    must read the RESULT, not this predicate.  ``False`` here means "resolution
+    did not fall past the primary", never "the primary served".
+
+    The docstring previously named :func:`get_group_primary` as the
+    compensating control ``LLMClient`` used for the proxy route.  It had zero
+    call sites in ``krepis.llm``; the compensating control did not exist, and
+    the comparison branch below was additionally unreachable for every
+    per-provider route because that route dict declared no ``primary_*`` key,
+    so the absence guard answered first — always ``True``.  Both halves fixed
+    under alpha-engine-config-I9995: the per-provider branch of
+    :func:`_resolve_group_json` now emits ``primary_registry_id`` and
+    ``primary_model``, and the call-time detector is real.
     """
     if route.get("route") == "litellm_proxy":
         return False
