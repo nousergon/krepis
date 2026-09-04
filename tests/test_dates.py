@@ -1,5 +1,6 @@
 """Tests for krepis.dates — dual-tracking date convention."""
 
+import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
@@ -304,12 +305,48 @@ class TestResolveTradingDay:
         # Only the leading yyyy-mm-dd is parsed.
         assert resolve_trading_day("2026-05-30T12:00:00Z") == "2026-05-29"
 
-    def test_none_defaults_to_today_normalized(self):
-        # Default (None) == normalizing today's calendar date. NOTE this is
-        # today-itself when today is a trading day (it normalizes a calendar
-        # KEY), distinct from now_dual().trading_day's last-*closed*-session.
-        assert resolve_trading_day() == resolve_trading_day(_date.today().isoformat())
+    def test_none_defaults_to_today_utc_normalized(self):
+        # Default (None) == normalizing today's UTC calendar date — the
+        # docstring's claim, and now_dual's convention (I9999 §2: this used
+        # to call date.today(), the system-LOCAL date, contradicting both
+        # its own docstring and now_dual's explicit UTC-only rule). NOTE
+        # this is today-itself when today is a trading day (it normalizes
+        # a calendar KEY), distinct from now_dual().trading_day's
+        # last-*closed*-session.
+        from datetime import timezone as _timezone
+        today_utc = datetime.now(_timezone.utc).date().isoformat()
+        assert resolve_trading_day() == resolve_trading_day(today_utc)
 
-    def test_parse_failure_returns_input_unchanged(self):
-        # Defensive: a normalization miss must not raise — return raw + WARN.
-        assert resolve_trading_day("not-a-date") == "not-a-date"
+    def test_utc_not_local_on_a_divergent_moment(self):
+        # Freeze a moment where UTC and system-local dates disagree
+        # (23:30 UTC on a Tuesday is already Wednesday nowhere behind UTC,
+        # but is still Tuesday in every US timezone) and confirm the
+        # default reads UTC, not date.today().
+        import unittest.mock as mock
+        frozen_utc = datetime(2026, 5, 26, 23, 30, tzinfo=timezone.utc)  # Tue 23:30 UTC
+
+        class _FrozenDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return frozen_utc if tz is not None else frozen_utc.replace(tzinfo=None)
+
+        with mock.patch("krepis.dates.datetime", _FrozenDateTime):
+            # 2026-05-26 (Tuesday) is a trading day -> normalizes to itself.
+            assert resolve_trading_day() == "2026-05-26"
+
+    def test_parse_failure_raises_by_default(self):
+        # I9999: the canonical artifact-keying helper must fail loud on an
+        # input it cannot interpret, not write it verbatim into an S3 key.
+        for bad in ["latest", "", "2026-13-45", "${RUN_DATE}", "not-a-date", "None"]:
+            with pytest.raises(ValueError, match=re.escape(bad) if bad else None):
+                resolve_trading_day(bad)
+
+    def test_parse_failure_passthrough_opt_in(self):
+        # A caller that explicitly wants the old graceful-degrade behavior
+        # states so at the call site.
+        assert resolve_trading_day("not-a-date", on_error="passthrough") == "not-a-date"
+        assert resolve_trading_day("${RUN_DATE}", on_error="passthrough") == "${RUN_DATE}"
+
+    def test_invalid_on_error_value_raises(self):
+        with pytest.raises(ValueError):
+            resolve_trading_day("2026-05-29", on_error="ignore")
