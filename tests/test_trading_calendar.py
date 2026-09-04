@@ -1,17 +1,22 @@
 """Unit tests for krepis.trading_calendar."""
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from krepis.trading_calendar import (
+    NYSE_CALENDAR_COVERS_THROUGH,
+    NYSE_EARLY_CLOSES,
     NYSE_HOLIDAYS,
+    TradingCalendarExpiredError,
     add_trading_days,
     count_trading_days,
     is_market_hours,
     is_trading_day,
+    last_closed_trading_day,
     next_trading_day,
     previous_trading_day,
+    session_close_et,
     subtract_trading_days,
 )
 
@@ -39,6 +44,23 @@ class TestIsTradingDay:
         assert is_trading_day(date(2026, 7, 3)) is False
         assert is_trading_day(date(2026, 7, 2)) is True
 
+    def test_national_day_of_mourning_2025_01_09(self):
+        """alpha-engine-config-I9998: NYSE was closed for President
+        Carter's National Day of Mourning; the table did not carry it."""
+        assert is_trading_day(date(2025, 1, 9)) is False
+
+    def test_raises_past_calendar_coverage(self):
+        """alpha-engine-config-I9998 §2: the table must fail loud past its
+        verified range, not silently answer True for every weekday."""
+        past = NYSE_CALENDAR_COVERS_THROUGH + timedelta(days=1)
+        with pytest.raises(TradingCalendarExpiredError) as exc_info:
+            is_trading_day(past)
+        assert NYSE_CALENDAR_COVERS_THROUGH.isoformat() in str(exc_info.value)
+
+    def test_last_covered_date_still_answers(self):
+        # The boundary itself is not expired.
+        is_trading_day(NYSE_CALENDAR_COVERS_THROUGH)
+
 
 class TestNextTradingDay:
     def test_skips_weekend(self):
@@ -54,6 +76,44 @@ class TestNextTradingDay:
 class TestHolidayCoverage:
     def test_covers_through_2030(self):
         assert {d.year for d in NYSE_HOLIDAYS} >= {2025, 2026, 2027, 2028, 2029, 2030}
+
+    def test_covers_through_2032(self):
+        assert {d.year for d in NYSE_HOLIDAYS} >= {2031, 2032}
+
+
+class TestEarlyCloses:
+    def test_day_after_thanksgiving_is_early_close(self):
+        assert date(2026, 11, 27) in NYSE_EARLY_CLOSES
+        assert session_close_et(date(2026, 11, 27)) == time(13, 0)
+
+    def test_christmas_eve_2026_is_early_close(self):
+        assert date(2026, 12, 24) in NYSE_EARLY_CLOSES
+        assert session_close_et(date(2026, 12, 24)) == time(13, 0)
+
+    def test_regular_day_uses_regular_close(self):
+        assert date(2026, 8, 12) not in NYSE_EARLY_CLOSES
+        assert session_close_et(date(2026, 8, 12)) == time(16, 0)
+
+    def test_observed_christmas_holiday_is_not_double_counted_as_early_close(self):
+        # 2027-12-25 (Christmas) is a Saturday; observed on Friday 12/24,
+        # which is therefore a full closure, not an early close.
+        assert date(2027, 12, 24) in NYSE_HOLIDAYS
+        assert date(2027, 12, 24) not in NYSE_EARLY_CLOSES
+
+    def test_last_closed_trading_day_on_early_close_afternoon(self):
+        """alpha-engine-config-I9998 §3: at 14:00 ET on an early-close day
+        (day after Thanksgiving, closes 13:00) the session has already
+        closed. Measured against origin/main before the fix: returned
+        2026-11-25, two days early."""
+        assert date(2026, 11, 27) in NYSE_EARLY_CLOSES
+        at_2pm = datetime(2026, 11, 27, 14, 0, tzinfo=_ET)
+        assert last_closed_trading_day(at_2pm) == date(2026, 11, 27)
+
+    def test_last_closed_trading_day_before_early_close(self):
+        # 12:00 ET on the same day — session still live (opens 09:30,
+        # closes 13:00) — must NOT report today as closed yet.
+        at_noon = datetime(2026, 11, 27, 12, 0, tzinfo=_ET)
+        assert last_closed_trading_day(at_noon) == date(2026, 11, 25)
 
 
 class TestPreviousTradingDay:
