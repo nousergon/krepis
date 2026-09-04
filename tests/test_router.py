@@ -2328,7 +2328,40 @@ def _capture_ssm_param(monkeypatch) -> dict:
     monkeypatch.setitem(sys.modules, "boto3", _FakeBoto3)
     return seen
 
-    # ── route_is_degraded ────────────────────────────────────────────────
+
+class TestRouteIsDegraded:
+    """`route_is_degraded` answers a RESOLVE-time question, and must answer it
+    from route dicts a producer actually emits.
+
+    Its four unit tests used to sit INSIDE `_capture_ssm_param`, after that
+    function's `return seen` — nested `def test_*` bodies referencing a `self`
+    that is not in scope. pytest collects test functions from modules and
+    classes, never from inside another function, so they were not merely green
+    against an unemitted shape: they were never collected and never ran once
+    (`pytest --collect-only | grep degraded` returned nothing on v0.59.46).
+    Restored here as a real class, plus the producer-level tests that hold the
+    hand-built dicts honest (alpha-engine-config-I9995).
+    """
+
+    def _route(self, **over):
+        route = {
+            "schema_version": _router.RESOLVE_SCHEMA_VERSION,
+            "model": "med-deepseek-v4-flash-max",
+            "display_name": "deepseek-v4-flash-max (med)",
+            "provider": "litellm",
+            "route": "litellm_proxy",
+            "api_base_url": "https://router.example:8443",
+            "deployment_id": "med-deepseek-v4-flash-max",
+            "auth_token_type": "litellm_master_key",
+            "group": "med",
+            "registry_id": "litellm:group:med",
+            "primary_model": "deepseek-v4-flash",
+            "primary_registry_id": "deepseek-v4-flash-max",
+            "capabilities": {},
+            "params": {"max_tokens": 8192, "structured_outputs": True},
+        }
+        route.update(over)
+        return route
 
     def test_litellm_proxy_route_is_never_degraded_at_resolve_time(self):
         """The proxy walks the chain itself, so which entry serves is a
@@ -2358,6 +2391,47 @@ def _capture_ssm_param(monkeypatch) -> dict:
         r.pop("primary_registry_id")
         r.pop("primary_model")
         assert _router.route_is_degraded(r) is True
+
+    # ── against the REAL producer, not a hand-built dict ─────────────────
+
+    def _resolve(self, group, registry_file, monkeypatch):
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.delenv("LITELLM_MASTER_KEY", raising=False)
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                return _router._resolve_group_json(group)
+        finally:
+            _router._router = None
+
+    def test_per_provider_route_declares_the_groups_primary(
+        self, registry_file, monkeypatch
+    ):
+        """The per-provider branch emitted NEITHER `primary_registry_id` nor
+        `primary_model`, so `route_is_degraded`'s absence guard answered first
+        and returned True for every per-provider route — primary or fallback.
+        Its comparison branch was unreachable across the whole module."""
+        info = self._resolve("med", registry_file, monkeypatch)
+        assert info["primary_registry_id"] == "deepseek-v4-flash-max"
+        assert info["primary_model"] == "deepseek-v4-flash"
+        # `med` resolves to its own primary, so this route is NOT degraded.
+        assert info["registry_id"] == info["primary_registry_id"]
+        assert _router.route_is_degraded(info) is False
+
+    def test_per_provider_route_that_fell_past_the_primary_is_degraded(
+        self, registry_file, monkeypatch
+    ):
+        """With the egress proxy unreachable, `med`'s primary is skipped and
+        resolution walks to the OpenRouter fallback — the exact condition
+        model-router-policy R12 makes an alert. Producer-emitted, not
+        hand-built: this is the assertion the four hand-built dicts above
+        could never make, and the reason they were satisfied by a shape
+        `_resolve_group_json` did not emit."""
+        with mock.patch.object(_router, "_probe_egress_proxy", return_value=False):
+            info = self._resolve("med", registry_file, monkeypatch)
+        assert info["registry_id"] == "deepseek-v4-flash-openrouter-max"
+        assert info["primary_registry_id"] == "deepseek-v4-flash-max"
+        assert _router.route_is_degraded(info) is True
 
 
 class TestAppConfigFailureIsObservable:
