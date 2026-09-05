@@ -82,6 +82,47 @@ class TestClassifyFromText:
         assert resource_kill.find_kill_line(None) is None
 
 
+class TestStructuredLogLineIsNotAKillLine:
+    """alpha-engine-config-I10057: a killer never writes through the
+    victim's own logging handler, so a structured INFO/DEBUG record
+    containing a kill token is never selected as the kill line — even when
+    it is the only line matching a kill pattern at all."""
+
+    def test_the_9_5_shape_is_not_a_resource_kill(self):
+        """The exact measured 2026-09-05 shape: rc=1, the workload's own
+        INFO diagnostic contains the bare token 'OOM', and a Python
+        traceback follows. This is an ordinary exception exit, not a
+        resource kill."""
+        text = (
+            "2026-09-05 16:01:48,855 INFO [predictor-training] RSS after "
+            "Step 4b macro-array build (OOM hotspot): 2588 MB\n"
+            "Traceback (most recent call last):\n"
+            "  File \"train.py\", line 42, in <module>\n"
+            "    raise ArmValidityError('invalid arm')\n"
+            "training.arm_validity.ArmValidityError: invalid arm\n"
+        )
+        assert resource_kill.classify(returncode=1, text=text) is None
+
+    def test_rc_137_with_no_line_is_still_oom(self):
+        """The returncode alone is authoritative — no line required."""
+        assert resource_kill.classify(returncode=137, text="") == resource_kill.OOM
+
+    def test_rc_none_with_a_real_kernel_kill_line_is_oom(self):
+        """A raw (non-structured) kernel banner is still admissible."""
+        text = "kernel: Out of memory: Killed process 1234 (python)\n"
+        assert resource_kill.classify(returncode=None, text=text) == resource_kill.OOM
+
+    def test_an_info_line_containing_oom_is_not_selected_as_the_kill_line(self):
+        """Unit-level check on the selection primitive itself: an
+        INFO-level structured record is disqualified regardless of what
+        kill token it contains, even when it is the ONLY matching line."""
+        text = (
+            "2026-09-05 16:01:48,855 INFO [predictor-training] "
+            "RSS (OOM hotspot): 2588 MB\n"
+        )
+        assert resource_kill.find_kill_line(text) is None
+
+
 class TestClassifyFromSsmStatus:
     def test_ssm_timedout_status_is_timeout(self):
         assert (

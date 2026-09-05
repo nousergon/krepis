@@ -122,6 +122,18 @@ KILL_LINE_RE: Final = re.compile(
     "(?:{})|(?:{})".format(OOM_LINE_RE.pattern, TIMEOUT_LINE_RE.pattern)
 )
 
+#: A structured log record emitted BY the victim's own logger — ``INFO`` or
+#: ``DEBUG`` severity, in the fleet's conventional ``LEVEL [component]``
+#: shape. A killer never writes through the victim's logging handler: the
+#: kernel oom-killer, bash's job-control message and a watchdog's SIGTERM all
+#: land in raw stdout/stderr, not inside the workload's own structured
+#: diagnostics. Measured 2026-09-05 (alpha-engine-config-I10057): a workload's
+#: own ``INFO [predictor-training] ... (OOM hotspot) ...`` line matched
+#: ``OOM_LINE_RE`` on the bare token and was selected as the kill line for a
+#: plain ``rc=1`` exception exit. A line matching this pattern is disqualified
+#: from kill-line selection regardless of what token it also contains.
+STRUCTURED_LOG_LINE_RE: Final = re.compile(r"\b(?:INFO|DEBUG)\b\s*\[")
+
 #: Cap on a rendered kill line. The whole point of the cause message is to fit
 #: inside a downstream window (SSM's 24KB ``StandardErrorContent``, a Step
 #: Functions ``cause`` field, a Telegram message); one unbounded line would
@@ -161,7 +173,9 @@ def find_kill_line(text: Optional[str]) -> Optional[str]:
         return None
     for line in reversed(text.splitlines()):
         stripped = line.strip()
-        if stripped and KILL_LINE_RE.search(stripped):
+        if not stripped or STRUCTURED_LOG_LINE_RE.search(stripped):
+            continue
+        if KILL_LINE_RE.search(stripped):
             return stripped
     return None
 
@@ -187,6 +201,19 @@ def classify(
     OOM wins a tie. A SIGKILL that follows an ``executionTimeout`` mention is
     still the memory kill: the budget message is context, the kill is the
     event.
+
+    A line-based match is scanned only among lines a killer could plausibly
+    have emitted — :func:`find_kill_line` (and ``ssm_log_capture``'s own
+    streaming selection) exclude a workload's own structured ``INFO``/``DEBUG``
+    log records before matching :data:`OOM_LINE_RE` /
+    :data:`TIMEOUT_LINE_RE`, so a kill token quoted inside the victim's own
+    diagnostic prose (e.g. an ``INFO [component] ... (OOM hotspot) ...`` line)
+    is never selected as evidence — a killer never writes through the
+    victim's own logging handler (alpha-engine-config-I10057). ``returncode``
+    is deliberately NOT used to gate a line match: launderers routinely turn a
+    ``137`` into a ``1`` before this layer ever sees it, and the surviving
+    kill line is the only honest signal left — see
+    :func:`test_kill_line_wins_over_a_laundered_exit_code`.
     """
     if returncode in OOM_RETURNCODES:
         return OOM
