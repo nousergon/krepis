@@ -377,6 +377,11 @@ _CAUSE_RE = re.compile(
 _RESOURCE_KILL_RE = resource_kill.KILL_LINE_RE
 _OOM_RETURNCODES = resource_kill.OOM_RETURNCODES
 _TIMEOUT_RETURNCODES = resource_kill.TIMEOUT_RETURNCODES
+#: alpha-engine-config-I10057: a killer never writes through the victim's own
+#: structured logging handler, so a line at INFO/DEBUG severity is never
+#: admissible as the selected kill line even when it contains a kill token —
+#: see :data:`krepis.resource_kill.STRUCTURED_LOG_LINE_RE`.
+_STRUCTURED_LOG_LINE_RE = resource_kill.STRUCTURED_LOG_LINE_RE
 
 
 def _classify_resource_kill(
@@ -672,7 +677,10 @@ def run(
                         stripped = line.strip()
                         if stripped:
                             last_output_line = stripped
-                            if _RESOURCE_KILL_RE.search(stripped):
+                            if _STRUCTURED_LOG_LINE_RE.search(stripped):
+                                if _CAUSE_RE.search(stripped):
+                                    last_cause_line = stripped
+                            elif _RESOURCE_KILL_RE.search(stripped):
                                 last_kill_line = stripped
                             elif _CAUSE_RE.search(stripped):
                                 last_cause_line = stripped
