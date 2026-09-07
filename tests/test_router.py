@@ -1,5 +1,7 @@
 """Tests for krepis.router — registry parsing, model resolution, CLI."""
 
+import io
+import logging
 import os
 import sys
 import tempfile
@@ -3057,3 +3059,104 @@ class TestOneAdapterAndOneAdmission:
             "expected exactly the definition and its single call inside "
             "_litellm_edge_admission"
         )
+
+
+class _FakeLevelRoutingHandler(logging.StreamHandler):
+    """Stands in for litellm's own handler: sub-WARNING records to stdout.
+
+    A copy of the behaviour under test, not an import of it, so the test
+    states the contract it is defending even if litellm renames the class.
+    Its ``__module__`` is patched to ``litellm._logging`` in the fixture
+    because provenance — not shape — is what the fix keys on.
+    """
+
+    def emit(self, record):
+        self.stream = sys.stdout if record.levelno < logging.WARNING else sys.stderr
+        super().emit(record)
+
+
+class TestLiteLLMLogsStayOffStdout:
+    """`python -m krepis.router` stdout is a data channel, not a log stream.
+
+    litellm's LevelRoutingStreamHandler routes every record below WARNING to
+    stdout, so a Router build wrote `LiteLLM Router:INFO: Routing strategy:
+    simple-shuffle` into the output shell consumers parse. Measured
+    2026-09-07 on all five CI interpreters after an unpinned litellm bump.
+    """
+
+    def _attach_litellm_handler(self, logger_name):
+        handler = _FakeLevelRoutingHandler()
+        type(handler).__module__ = "litellm._logging"
+        logger = logging.getLogger(logger_name)
+        logger.addHandler(handler)
+        return logger, handler
+
+    def test_the_record_goes_to_stderr_not_stdout(self, capsys):
+        logger, handler = self._attach_litellm_handler("LiteLLM Router")
+        previous = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            _router._pin_litellm_logs_to_stderr()
+            logger.info("Routing strategy: simple-shuffle")
+            captured = capsys.readouterr()
+            # Moved, not swallowed: absent from stdout, present on stderr.
+            assert "simple-shuffle" not in captured.out
+            assert "simple-shuffle" in captured.err
+        finally:
+            logger.setLevel(previous)
+            for h in list(logger.handlers):
+                logger.removeHandler(h)
+
+    def test_litellm_handler_is_replaced(self):
+        logger, handler = self._attach_litellm_handler("LiteLLM")
+        try:
+            _router._pin_litellm_logs_to_stderr()
+            assert handler not in logger.handlers
+            assert any(isinstance(h, _router._StderrOnlyHandler) for h in logger.handlers)
+        finally:
+            for h in list(logger.handlers):
+                logger.removeHandler(h)
+
+    def test_level_and_formatter_survive_the_replacement(self):
+        logger, handler = self._attach_litellm_handler("LiteLLM Proxy")
+        handler.setLevel(logging.DEBUG)
+        formatter = logging.Formatter("%(message)s!")
+        handler.setFormatter(formatter)
+        try:
+            _router._pin_litellm_logs_to_stderr()
+            # ANY stderr-pinned handler may already sit on this logger from
+            # a real litellm replacement earlier in the session; the one this
+            # test cares about is the one carrying its formatter.
+            replacements = [
+                h
+                for h in logger.handlers
+                if isinstance(h, _router._StderrOnlyHandler) and h.formatter is formatter
+            ]
+            assert len(replacements) == 1
+            assert replacements[0].level == logging.DEBUG
+        finally:
+            for h in list(logger.handlers):
+                logger.removeHandler(h)
+
+    def test_a_consumers_own_handler_is_left_alone(self):
+        logger = logging.getLogger("LiteLLM")
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger.addHandler(handler)
+        try:
+            _router._pin_litellm_logs_to_stderr()
+            assert handler in logger.handlers
+            assert handler.stream is stream
+        finally:
+            logger.removeHandler(handler)
+
+    def test_is_idempotent(self):
+        logger, _ = self._attach_litellm_handler("LiteLLM Router")
+        try:
+            _router._pin_litellm_logs_to_stderr()
+            _router._pin_litellm_logs_to_stderr()
+            ours = [h for h in logger.handlers if isinstance(h, _router._StderrOnlyHandler)]
+            assert len(ours) == 1
+        finally:
+            for h in list(logger.handlers):
+                logger.removeHandler(h)

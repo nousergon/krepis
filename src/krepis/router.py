@@ -1124,6 +1124,68 @@ def _parse_registry(
 
 # ── Contract-aware Router ────────────────────────────────────────────────
 
+#: The loggers litellm attaches its own handler to at import time
+#: (``litellm._logging``). The set has grown across versions; the sweep
+#: below does not depend on this being exhaustive, and a name that no
+#: longer exists simply has no handlers.
+_LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
+
+
+class _StderrOnlyHandler(logging.StreamHandler):
+    """A stream handler pinned to whatever ``sys.stderr`` is at emit time.
+
+    Deliberately resolves the stream per record, exactly as litellm's own
+    ``LevelRoutingStreamHandler`` does — because a handler that binds the
+    stream once holds the object that was ``sys.stderr`` when it was built,
+    which is the wrong one under any harness that replaces the stream later.
+    """
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.stream = sys.stderr
+        super().emit(record)
+
+
+def _pin_litellm_logs_to_stderr() -> None:
+    """Replace litellm's own log handlers with stderr-pinned equivalents.
+
+    ``python -m krepis.router groups|models|resolve|resolve-shell-env`` is a
+    MACHINE interface — shell consumers ``eval`` its output and read
+    ``resolve``'s single line. litellm's ``LevelRoutingStreamHandler`` sends
+    every record below WARNING to **stdout**, so building a Router prints
+    ``LiteLLM Router:INFO: Routing strategy: simple-shuffle`` into that data
+    channel: a line we did not write, in the output someone is parsing.
+    Measured 2026-09-07 — it turned ``groups`` output from four tokens into
+    twelve and failed ``tests/test_router.py::TestGroupResolutionThroughAlias
+    ::test_cli_groups_lists_all_groups`` on all five CI interpreters the day a
+    new litellm reached the unpinned CI install.
+
+    The records are MOVED, not suppressed: same level, same formatter, same
+    logger — only the sink is fixed at stderr. Nothing is silenced, because a
+    swallow here would hide a router-build problem at exactly the moment
+    someone is debugging one.
+
+    Setting ``handler.stream`` is NOT sufficient and was tried first: that
+    handler's ``emit`` re-resolves ``sys.stdout`` per record, so an assigned
+    stream is overwritten on the next line. The handler itself has to go.
+
+    Only handlers litellm installed are touched (``type(h).__module__``
+    starts with ``litellm``) — a consumer that attached its own handler to
+    one of these loggers keeps it. Idempotent, and safe before litellm is
+    imported (the loggers simply have no handlers yet).
+    """
+    for name in _LITELLM_LOGGER_NAMES:
+        log = logging.getLogger(name)
+        for handler in list(log.handlers):
+            if not type(handler).__module__.startswith("litellm"):
+                continue
+            replacement = _StderrOnlyHandler()
+            replacement.setLevel(handler.level)
+            if handler.formatter is not None:
+                replacement.setFormatter(handler.formatter)
+            log.removeHandler(handler)
+            log.addHandler(replacement)
+
+
 def _contract_aware_router_class() -> Any:
     """Return a :class:`litellm.Router` subclass that never fails a 4xx over.
 
@@ -1196,6 +1258,9 @@ def get_router() -> Any:
     from threading import Lock as _Lock
 
     _Router = _contract_aware_router_class()
+    # litellm is imported by the line above; its INFO records go to stdout
+    # until this runs, and this CLI's stdout is a data channel (see helper).
+    _pin_litellm_logs_to_stderr()
 
     _router_lock = _Lock()
     with _router_lock:
