@@ -134,15 +134,25 @@ jobs:
           version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
           local_sha=$(sha256sum dist/*.tar.gz | awk '{print $1}')
 
+          # PyPI's JSON API lags the upload. The budget here was 6 x 10s =
+          # 60s and it was NOT enough: on 2026-09-07 the v0.59.53 publish
+          # failed this step, paged through notify-main-failure, and a rerun
+          # minutes later passed against the same artifact — a red main and a
+          # page for an eventual-consistency window, not a divergence. The
+          # budget is now ~5.5 minutes with escalating waits, and the error
+          # names the elapsed time so a future timeout is judged against a
+          # number rather than re-derived.
           pypi_json=""
-          for _ in 1 2 3 4 5 6; do
+          waited=0
+          for delay in 5 10 10 15 15 20 20 30 30 45 45 60 60 60; do
             if pypi_json=$(curl -sf "https://pypi.org/pypi/krepis/${version}/json"); then
               break
             fi
-            sleep 10
+            sleep "${delay}"
+            waited=$((waited + delay))
           done
           if [ -z "${pypi_json}" ]; then
-            echo "::error::Could not reach PyPI JSON API for krepis ${version} after publish — cannot verify byte-identity."
+            echo "::error::Could not reach PyPI JSON API for krepis ${version} after ${waited}s of retries — cannot verify byte-identity. The upload itself may still have succeeded; check https://pypi.org/project/krepis/${version}/ before assuming divergence."
             exit 1
           fi
 
