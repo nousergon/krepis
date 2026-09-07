@@ -26,12 +26,17 @@ import pytest
 xcals = pytest.importorskip("exchange_calendars")
 
 from krepis.trading_calendar import (  # noqa: E402
+    NYSE_CALENDAR_COVERS_FROM,
     NYSE_CALENDAR_COVERS_THROUGH,
     NYSE_EARLY_CLOSES,
     NYSE_HOLIDAYS,
 )
 
-_RANGE_START = date(2025, 1, 1)
+# The DECLARED range, both edges, read off the module rather than typed here:
+# a start literal of its own would let the table grow backwards without the
+# reconciliation following it, which is how the pre-2025 years came to be
+# absent from a table nothing complained about (alpha-engine-config-I10127).
+_RANGE_START = NYSE_CALENDAR_COVERS_FROM
 _ET = __import__("zoneinfo").ZoneInfo("America/New_York")
 
 

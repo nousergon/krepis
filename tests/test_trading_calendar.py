@@ -4,6 +4,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from krepis import trading_calendar
 from krepis.trading_calendar import (
     NYSE_CALENDAR_COVERS_THROUGH,
     NYSE_EARLY_CLOSES,
@@ -294,3 +295,62 @@ class TestIsMarketHours:
         # this asserts the surviving table is the one this module owns.
         assert date(2026, 11, 26) in NYSE_HOLIDAYS  # Thanksgiving
         assert is_market_hours(datetime(2026, 11, 26, 12, 0, tzinfo=_ET)) is False
+
+
+class TestCalendarLowerBound:
+    """The guard's missing half (alpha-engine-config-I10127).
+
+    `is_trading_day` raised past the table's END and answered freely before
+    its START, so every 2024 weekday read as a session — including Labor Day
+    2024, which failed a `crucible data.heal` backfill on 2026-09-07 with a
+    panel that correctly carried no rows for a closed market.
+    """
+
+    def test_labor_day_2024_is_not_a_trading_day(self):
+        assert trading_calendar.is_trading_day(date(2024, 9, 2)) is False
+
+    def test_christmas_2024_is_not_a_trading_day(self):
+        assert trading_calendar.is_trading_day(date(2024, 12, 25)) is False
+
+    def test_independence_day_2024_is_not_a_trading_day(self):
+        assert trading_calendar.is_trading_day(date(2024, 7, 4)) is False
+
+    def test_national_day_of_mourning_2018_12_05(self):
+        assert trading_calendar.is_trading_day(date(2018, 12, 5)) is False
+
+    def test_ordinary_2024_weekday_is_a_trading_day(self):
+        assert trading_calendar.is_trading_day(date(2024, 9, 3)) is True
+
+    def test_july_3_2024_is_an_early_close(self):
+        assert trading_calendar.session_close_et(date(2024, 7, 3)) == time(13, 0)
+
+    def test_raises_before_calendar_coverage(self):
+        with pytest.raises(trading_calendar.TradingCalendarPrecedesCoverageError):
+            trading_calendar.is_trading_day(
+                trading_calendar.NYSE_CALENDAR_COVERS_FROM - timedelta(days=1)
+            )
+
+    def test_first_covered_date_still_answers(self):
+        # 2016-01-01 is itself a holiday; the point is that it ANSWERS.
+        assert (
+            trading_calendar.is_trading_day(trading_calendar.NYSE_CALENDAR_COVERS_FROM)
+            is False
+        )
+
+    def test_both_edge_errors_share_one_catchable_base(self):
+        before = trading_calendar.NYSE_CALENDAR_COVERS_FROM - timedelta(days=1)
+        after = trading_calendar.NYSE_CALENDAR_COVERS_THROUGH + timedelta(days=1)
+        for d in (before, after):
+            with pytest.raises(trading_calendar.TradingCalendarRangeError):
+                trading_calendar.is_trading_day(d)
+
+    def test_expired_error_does_not_absorb_a_below_range_date(self):
+        # Different remediation (extend backwards, not forwards), so a caller
+        # paging for a forward refresh must not catch this one.
+        with pytest.raises(trading_calendar.TradingCalendarPrecedesCoverageError):
+            try:
+                trading_calendar.is_trading_day(
+                    trading_calendar.NYSE_CALENDAR_COVERS_FROM - timedelta(days=1)
+                )
+            except trading_calendar.TradingCalendarExpiredError:  # pragma: no cover
+                raise AssertionError("below-range date raised the EXPIRED error")

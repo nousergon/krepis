@@ -42,6 +42,103 @@ from zoneinfo import ZoneInfo
 # divergence from exchange_calendars for the declared range (I9998) — this
 # comment alone did not catch the table missing 2025-01-09, below.
 NYSE_HOLIDAYS: set[date] = {
+    # Years before 2025 carry no per-holiday comment: they were generated
+    # from exchange_calendars by the same reconciliation this table is
+    # checked against, and a hand-written label on a generated row is a
+    # second source that can disagree with the date beside it.
+    # 2016
+    date(2016, 1, 1),
+    date(2016, 1, 18),
+    date(2016, 2, 15),
+    date(2016, 3, 25),
+    date(2016, 5, 30),
+    date(2016, 7, 4),
+    date(2016, 9, 5),
+    date(2016, 11, 24),
+    date(2016, 12, 26),
+    # 2017
+    date(2017, 1, 2),
+    date(2017, 1, 16),
+    date(2017, 2, 20),
+    date(2017, 4, 14),
+    date(2017, 5, 29),
+    date(2017, 7, 4),
+    date(2017, 9, 4),
+    date(2017, 11, 23),
+    date(2017, 12, 25),
+    # 2018
+    date(2018, 1, 1),
+    date(2018, 1, 15),
+    date(2018, 2, 19),
+    date(2018, 3, 30),
+    date(2018, 5, 28),
+    date(2018, 7, 4),
+    date(2018, 9, 3),
+    date(2018, 11, 22),
+    date(2018, 12, 5),
+    date(2018, 12, 25),
+    # 2019
+    date(2019, 1, 1),
+    date(2019, 1, 21),
+    date(2019, 2, 18),
+    date(2019, 4, 19),
+    date(2019, 5, 27),
+    date(2019, 7, 4),
+    date(2019, 9, 2),
+    date(2019, 11, 28),
+    date(2019, 12, 25),
+    # 2020
+    date(2020, 1, 1),
+    date(2020, 1, 20),
+    date(2020, 2, 17),
+    date(2020, 4, 10),
+    date(2020, 5, 25),
+    date(2020, 7, 3),
+    date(2020, 9, 7),
+    date(2020, 11, 26),
+    date(2020, 12, 25),
+    # 2021
+    date(2021, 1, 1),
+    date(2021, 1, 18),
+    date(2021, 2, 15),
+    date(2021, 4, 2),
+    date(2021, 5, 31),
+    date(2021, 7, 5),
+    date(2021, 9, 6),
+    date(2021, 11, 25),
+    date(2021, 12, 24),
+    # 2022
+    date(2022, 1, 17),
+    date(2022, 2, 21),
+    date(2022, 4, 15),
+    date(2022, 5, 30),
+    date(2022, 6, 20),
+    date(2022, 7, 4),
+    date(2022, 9, 5),
+    date(2022, 11, 24),
+    date(2022, 12, 26),
+    # 2023
+    date(2023, 1, 2),
+    date(2023, 1, 16),
+    date(2023, 2, 20),
+    date(2023, 4, 7),
+    date(2023, 5, 29),
+    date(2023, 6, 19),
+    date(2023, 7, 4),
+    date(2023, 9, 4),
+    date(2023, 11, 23),
+    date(2023, 12, 25),
+    # 2024
+    date(2024, 1, 1),
+    date(2024, 1, 15),
+    date(2024, 2, 19),
+    date(2024, 3, 29),
+    date(2024, 5, 27),
+    date(2024, 6, 19),
+    date(2024, 7, 4),
+    date(2024, 9, 2),
+    date(2024, 11, 28),
+    date(2024, 12, 25),
     # 2025
     date(2025, 1, 1),    # New Year's Day
     date(2025, 1, 9),    # National Day of Mourning — President Carter
@@ -143,7 +240,34 @@ NYSE_HOLIDAYS: set[date] = {
 NYSE_CALENDAR_COVERS_THROUGH: date = date(2032, 12, 31)
 
 
-class TradingCalendarExpiredError(ValueError):
+# FIRST calendar date this module has verified holiday + early-close data
+# for. `is_trading_day` RAISES below it for the same reason it raises above
+# `NYSE_CALENDAR_COVERS_THROUGH`: with no data, every weekday reads as a
+# trading day, and the guard was written on the future edge only
+# (alpha-engine-config-I10127). Measured 2026-09-07: `is_trading_day` said
+# True for 2024-09-02 (Labor Day), 2024-07-04, 2024-11-28 and 2024-12-25,
+# and a `crucible data.heal` backfill of the 2024-08-07..2025-01-21 window
+# failed on the first of them — the panel correctly carried no rows for a
+# closed market on a day the calendar called a session.
+#
+# The table now starts here rather than at 2025 because the price history
+# every historical run reads begins in 2016, so a session the store can
+# hold is a session this calendar must be able to resolve. Extend the
+# tables and this constant together, never one alone.
+NYSE_CALENDAR_COVERS_FROM: date = date(2016, 1, 1)
+
+
+class TradingCalendarRangeError(ValueError):
+    """Raised when a date falls outside the verified calendar range.
+
+    Base of the two edge-specific errors below. Catch this to mean "the
+    table cannot answer for this date"; catch a subclass when the two
+    edges need different remediation, which they do — one is extended
+    forwards and the other backwards.
+    """
+
+
+class TradingCalendarExpiredError(TradingCalendarRangeError):
     """Raised when a date falls past the verified calendar range.
 
     Distinct from plain ``ValueError`` so a caller that wants to catch
@@ -152,17 +276,41 @@ class TradingCalendarExpiredError(ValueError):
     """
 
 
+class TradingCalendarPrecedesCoverageError(TradingCalendarRangeError):
+    """Raised when a date falls before the verified calendar range.
+
+    The mirror of :class:`TradingCalendarExpiredError`, and a DIFFERENT
+    remediation: the table is extended backwards, and until it is, every
+    weekday in the uncovered range would otherwise read as a trading day
+    — including Christmas. A distinct type so a caller that pages for a
+    forward refresh does not silently absorb a historical run asking
+    about a range nobody has verified.
+    """
+
+
 def is_trading_day(d: date | None = None) -> bool:
     """Return True if the given date is an NYSE trading day.
 
     Raises :class:`TradingCalendarExpiredError` for any ``d`` past
-    :data:`NYSE_CALENDAR_COVERS_THROUGH` — the calendar table has no
-    holiday or early-close data beyond that date, and silently answering
-    ``True`` for every such weekday (including Christmas) is the unsafe
-    direction for a function every artifact key is built on.
+    :data:`NYSE_CALENDAR_COVERS_THROUGH`, and
+    :class:`TradingCalendarPrecedesCoverageError` for any ``d`` before
+    :data:`NYSE_CALENDAR_COVERS_FROM` — outside either edge the table has no
+    holiday or early-close data, and silently answering ``True`` for every
+    such weekday (including Christmas) is the unsafe direction for a
+    function every artifact key is built on. Both edges raise; the guard
+    covered only the future one until alpha-engine-config-I10127.
     """
     if d is None:
         d = date.today()
+    if d < NYSE_CALENDAR_COVERS_FROM:
+        raise TradingCalendarPrecedesCoverageError(
+            f"is_trading_day({d.isoformat()}): NYSE_HOLIDAYS starts at "
+            f"{NYSE_CALENDAR_COVERS_FROM.isoformat()} — a date before it has no "
+            f"holiday data at all, so answering would call every weekday a "
+            f"trading day (Christmas included). Extend NYSE_HOLIDAYS, "
+            f"NYSE_EARLY_CLOSES and NYSE_CALENDAR_COVERS_FROM in "
+            f"krepis.trading_calendar before resolving dates before that range."
+        )
     if d > NYSE_CALENDAR_COVERS_THROUGH:
         raise TradingCalendarExpiredError(
             f"is_trading_day({d.isoformat()}): NYSE_HOLIDAYS only covers "
@@ -256,6 +404,33 @@ def count_trading_days(start: date, end: date) -> int:
 # script, not composed by hand; do not hand-add a new one without
 # re-running it.
 NYSE_EARLY_CLOSES: set[date] = {
+    # 2016
+    date(2016, 11, 25),  # close 13:00:00
+    # 2017
+    date(2017, 7, 3),  # close 13:00:00
+    date(2017, 11, 24),  # close 13:00:00
+    # 2018
+    date(2018, 7, 3),  # close 13:00:00
+    date(2018, 11, 23),  # close 13:00:00
+    date(2018, 12, 24),  # close 13:00:00
+    # 2019
+    date(2019, 7, 3),  # close 13:00:00
+    date(2019, 11, 29),  # close 13:00:00
+    date(2019, 12, 24),  # close 13:00:00
+    # 2020
+    date(2020, 11, 27),  # close 13:00:00
+    date(2020, 12, 24),  # close 13:00:00
+    # 2021
+    date(2021, 11, 26),  # close 13:00:00
+    # 2022
+    date(2022, 11, 25),  # close 13:00:00
+    # 2023
+    date(2023, 7, 3),  # close 13:00:00
+    date(2023, 11, 24),  # close 13:00:00
+    # 2024
+    date(2024, 7, 3),  # close 13:00:00
+    date(2024, 11, 29),  # close 13:00:00
+    date(2024, 12, 24),  # close 13:00:00
     date(2025, 7, 3),    # day before Independence Day (July 4 is Friday)
     date(2025, 11, 28),  # day after Thanksgiving
     date(2025, 12, 24),  # Christmas Eve
