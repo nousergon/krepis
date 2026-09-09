@@ -149,16 +149,47 @@ def test_page_after_consecutive_is_carried_through(tmp_path, monkeypatch):
     assert alert_tiers.resolve_tier("box-health", "critical").page_after_consecutive == 2
 
 
-def test_muted_topic_arn_rewrites_only_the_topic_name():
+def test_muted_topic_arn_rewrites_the_fleet_default_only():
     from krepis import alerts
 
-    got = alerts._muted_topic_arn(
+    assert alerts._muted_topic_arn(
+        "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    ) == f"arn:aws:sns:us-east-1:711398986525:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
+    # A topic with no declared muted sibling keeps its email leg rather than
+    # having its durable record published into a topic the caller's role may
+    # not be granted. `crucible-v2-pages` is the live example, and crucible-v2
+    # phase 2's page-counting clauses must keep observing it unchanged through
+    # 2026-09-19.
+    assert alerts._muted_topic_arn(
         "arn:aws:sns:us-east-1:711398986525:crucible-v2-pages"
-    )
-    # Region and account follow the caller's own topic — the gate must cover
-    # `crucible-v2-pages` and `alpha-engine-alarm-backstop` too, both measured
-    # 2026-09-09 to carry an unfiltered email subscription.
-    assert got == (
-        f"arn:aws:sns:us-east-1:711398986525:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
-    )
+    ) is None
     assert alerts._muted_topic_arn(None) is None
+
+
+def test_episode_override_can_retier_one_episode_of_a_class(tmp_path, monkeypatch):
+    """A class that is legitimately two conditions sharing one source.
+
+    Measured cases: the EOD reconciler's scheduled vendor substitution vs a
+    genuinely bad provisional print (alpha-engine-config-I10360), and a
+    crucible-v2 fault-injection replay vs a live failure
+    (alpha-engine-config-I10366). The MECHANISM ships now; no registry row
+    declares an override until each is ruled.
+    """
+    _registry(tmp_path, monkeypatch, [
+        {"class": "recon", "source": "eod-recon", "tier": "page",
+         "severities": ["warning"],
+         "episode_overrides": [
+             {"when": {"close_source": "substitution"}, "tier": "tracked-only"},
+         ]},
+    ])
+    assert alert_tiers.resolve_tier("eod-recon", "warning").tier == alert_tiers.TIER_PAGE
+    held = alert_tiers.resolve_tier(
+        "eod-recon", "warning", {"close_source": "substitution"},
+    )
+    assert held.tier == alert_tiers.TIER_TRACKED_ONLY
+    assert "episode override" in held.reason
+    # A partial attribute match must NOT retier — an override is an exact
+    # claim about an episode, not a fuzzy one.
+    assert alert_tiers.resolve_tier(
+        "eod-recon", "warning", {"close_source": "yfinance"},
+    ).tier == alert_tiers.TIER_PAGE

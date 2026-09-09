@@ -284,7 +284,11 @@ def _match(source: str, entries: list[dict]) -> list[dict]:
     return [e for e in wild if len(str(e["source"])) == longest]
 
 
-def resolve_tier(source: str | None, severity: str) -> TierDecision:
+def resolve_tier(
+    source: str | None,
+    severity: str,
+    attributes: dict | None = None,
+) -> TierDecision:
     """Resolve the delivery tier for one emission. Never raises.
 
     :param source: The emitter's declared source string — the registry key.
@@ -292,6 +296,24 @@ def resolve_tier(source: str | None, severity: str) -> TierDecision:
         attribute cannot be routed, so it pages.
     :param severity: Used ONLY to resolve a row the registry declares
         ``dynamic``, and to name the reason.
+    :param attributes: PER-EPISODE facts the emitter knows and the class does
+        not. Some classes are legitimately two conditions sharing one source:
+        the EOD reconciler emits both a routine scheduled vendor substitution
+        (35 records, 20 of the last 20 sessions, median 3.80bp — measured
+        2026-09-09, alpha-engine-config-I10360) and a genuinely bad
+        provisional print; a crucible-v2 page is either a live failure or a
+        deliberate fault-injection replay (`synthetic`, crucible-PR188). A
+        tier bound only to the class would either page on all of them or
+        silence the real ones.
+
+        A registry row may therefore carry ``episode_overrides``: an ordered
+        list of ``{"when": {attr: value, ...}, "tier": ...}``. The FIRST whose
+        every key matches ``attributes`` exactly wins; nothing matching leaves
+        the row's own tier. The mechanism ships with ZERO overrides declared —
+        adding one is a routing decision, and the two known candidates
+        (`synthetic`, alpha-engine-config-I10366; `close_source`
+        substitution, already fixed at the producer in crucible-executor-PR553)
+        are on the Decision Queue rather than assumed here.
     """
     if not source:
         return TierDecision(
@@ -323,8 +345,17 @@ def resolve_tier(source: str | None, severity: str) -> TierDecision:
         )
 
     resolved: list[tuple[str, dict]] = []
+    override_note = ""
     for row in rows:
         tier = row.get("tier")
+        for override in row.get("episode_overrides") or []:
+            when = override.get("when") or {}
+            if when and all(
+                (attributes or {}).get(k) == v for k, v in when.items()
+            ):
+                tier = override.get("tier")
+                override_note = f"; episode override matched {when!r}"
+                break
         if tier == TIER_DYNAMIC:
             tier = _DYNAMIC_LADDER.get(str(severity).lower())
             if tier is None:
@@ -350,7 +381,10 @@ def resolve_tier(source: str | None, severity: str) -> TierDecision:
     dynamic = " (dynamic row resolved from severity)" if row.get("tier") == TIER_DYNAMIC else ""
     return TierDecision(
         tier=tier,
-        reason=f"registry class={row.get('class')!r} tier={tier}{dynamic}{collision}",
+        reason=(
+            f"registry class={row.get('class')!r} tier={tier}"
+            f"{dynamic}{override_note}{collision}"
+        ),
         alert_class=row.get("class"),
         page_after_consecutive=int(row.get("page_after_consecutive", 1) or 1),
     )

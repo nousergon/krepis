@@ -513,24 +513,36 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
 
 
 def _muted_topic_arn(page_arn: str | None) -> str | None:
-    """The `alpha-engine-alerts-muted` sibling of a resolved topic ARN.
+    """The zero-subscriber sibling of a resolved topic ARN, or ``None``.
 
-    Every non-`page` emission is redirected here. Measured 2026-09-09: the
-    topic exists in 711398986525/us-east-1 with ZERO subscriptions, so the
-    durable SNS record is kept while no email is sent — which is exactly what
-    observability-policy.md §7.2a means by "suppression is a delivery decision
-    and never a recording one". The §7.3 bus event is unaffected.
+    ``None`` means "this topic has no known muted sibling — publish to it
+    unchanged": the email leg stays, the Telegram leg is still suppressed by
+    the tier, and the caller sees a WARNING naming the gap. Losing the durable
+    SNS record to a topic the caller's role cannot publish to would be worse
+    than one extra email.
 
-    Rewrites only the topic NAME, so it follows whichever account and region
-    the caller's own topic resolved in — including
-    ``crucible-v2-pages`` and ``alpha-engine-alarm-backstop``, the other two
-    topics measured to carry an unfiltered email subscription to
-    cipher813@gmail.com. A gate that covered only ``alpha-engine-alerts``
-    would have left two live paths into the inbox.
+    ONLY the fleet default (`alpha-engine-alerts`) is rewritten today.
+    Measured 2026-09-09: two other topics carry an unfiltered email
+    subscription to cipher813@gmail.com — `crucible-v2-pages` (54 messages in
+    the seven days to 2026-09-09) and `alpha-engine-alarm-backstop` (13). Both
+    need a muted sibling of their own before they can be covered, and
+    crucible-v2's is env-declared with its own IAM grant
+    (`crucible.alerts.muted_topic`), so guessing `<topic>-muted` here would
+    publish into a topic the v2 RuntimeRole is not granted. Tracked
+    separately; until then those two topics keep today's behaviour, which is
+    also what crucible-v2 phase 2's `pages_within_ceiling` and
+    `pages_commissioned` clauses must keep observing through 2026-09-19.
     """
     if not page_arn:
         return None
-    head, _, _name = page_arn.rpartition(":")
+    head, _, name = page_arn.rpartition(":")
+    if name != DEFAULT_SNS_TOPIC_NAME:
+        logger.warning(
+            "alerts: no muted sibling is declared for SNS topic %r, so this "
+            "non-page emission keeps the email leg. Only %r is covered today "
+            "(alpha-engine-config-I6751).", name, DEFAULT_SNS_TOPIC_NAME,
+        )
+        return None
     return f"{head}:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
 
 
@@ -991,6 +1003,7 @@ def publish(
     silent: bool | None = None,
     destination: str | None = None,
     console_artifact: str | None = None,
+    episode_attributes: dict | None = None,
     raise_on_total_failure: bool = True,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
 ) -> PublishResult:
@@ -1035,6 +1048,12 @@ def publish(
     :param source: Optional source identifier (script path, repo, Lambda
         name) inserted between the tag and the message body. Helps the
         operator triage at a glance.
+    :param episode_attributes: Per-episode facts the emitter knows and the
+        alert CLASS does not — e.g. ``{"synthetic": True}`` for a deliberate
+        fault-injection replay, or ``{"close_source": "substitution"}`` for a
+        scheduled vendor swap. Matched against a registry row's
+        ``episode_overrides``; ignored when the row declares none, which is
+        every row today. See :func:`krepis.alert_tiers.resolve_tier`.
     :param raise_on_total_failure: When ``True`` (the default), raise
         :class:`AlertDeliveryError` if every requested human channel failed
         AND the Overseer intake event failed on both of its transports —
@@ -1229,7 +1248,7 @@ def publish(
     # This is the line that stops severity from deciding delivery. Severity
     # remains diagnostic metadata and still picks the Telegram phone push
     # within the `page` tier; it no longer decides whether Brian is reached.
-    decision = alert_tiers.resolve_tier(source, severity)
+    decision = alert_tiers.resolve_tier(source, severity, episode_attributes)
     result.tier = decision.tier
     result.tier_reason = decision.reason
     result.alert_class = decision.alert_class
@@ -1297,12 +1316,14 @@ def publish(
     if sns:
         arn = _resolve_sns_topic_arn(sns_topic_arn)
         if arn is not None and tier != alert_tiers.TIER_PAGE:
+            # `None` back from the rewrite means "no muted sibling declared" —
+            # keep the caller's topic rather than dropping the record.
             # Measured 2026-09-09: all three topics that email
             # cipher813@gmail.com carry `FilterPolicy: null`, so the ONLY way
             # to keep a non-page emission out of the inbox is to publish it to
             # a topic with no email subscriber. The record is kept, not
             # dropped.
-            arn = _muted_topic_arn(arn)
+            arn = _muted_topic_arn(arn) or arn
         if arn is None:
             result.sns = ChannelResult(ok=False, detail="topic ARN resolution failed")
         else:
