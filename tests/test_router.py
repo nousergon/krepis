@@ -1961,8 +1961,9 @@ class TestResolveGroupSpec:
         """`resolve_group_structured` reports provider `litellm` for the proxy
         route, and ModelSpec binds that name to TRANSPORT_LITELLM — the
         in-process `get_router()`, which calls each provider DIRECTLY from
-        the consumer and reads OPENROUTER_API_KEY from the environment as it
-        goes. Emitting it verbatim would egress unscanned to openrouter.ai,
+        the consumer and resolves OPENROUTER_API_KEY via
+        ``krepis.secrets.get_secret`` (SSM-first, env fallback) as it goes.
+        Emitting it verbatim would egress unscanned to openrouter.ai,
         bypass the authenticated edge entirely, and require litellm plus a
         readable registry inside every consumer — the constraint that
         reverted crucible-evaluator-PR157 (alpha-engine-config-I6059)."""
@@ -2977,8 +2978,9 @@ class TestResolveModelSpec:
     ):
         """Same trap as the group path: `provider: litellm` binds to
         TRANSPORT_LITELLM, an in-process Router that calls each provider
-        DIRECTLY from the consumer reading OPENROUTER_API_KEY from the
-        environment. Emitting it verbatim would egress unscanned."""
+        DIRECTLY from the consumer, resolving OPENROUTER_API_KEY via
+        ``krepis.secrets.get_secret``. Emitting it verbatim would egress
+        unscanned."""
         from krepis.llm_config import PROVIDER_REGISTRY, TRANSPORT_OPENAI
 
         spec, route = self._spec(monkeypatch, pinned_registry, "by-name-only")
