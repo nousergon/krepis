@@ -14,18 +14,26 @@
 # checks for a duplicate (package-ecosystem, directory, target-branch) triple —
 # krepis was the last repo in the fleet still on the broken shape.
 #
-# `cooldown` is set for pip only. Dependabot rejects cooldown.semver-major-days
-# for the github-actions ecosystem (validated live 2026-07-16,
-# alpha-engine-config), so it is omitted here rather than assumed-supported — a
-# rejected key would silently disable this file a second time.
+# `pip`, NOT `uv` -- CORRECTED to `uv` 2026-09-09 (alpha-engine-config-I10348):
+# this repo tracks both pyproject.toml AND uv.lock, and the `pip` ecosystem
+# edits only pyproject.toml — every PR it opened left uv.lock silently stale
+# rather than in sync with the dependency it had just bumped. `uv` regenerates
+# uv.lock in the same commit, the same fix applied fleet-wide after
+# `crucible-PR175`..`179` (2026-09-09) failed a `uv lock --check` CI gate this
+# repo's own CI does not (yet) run — the drift here was invisible rather than
+# red, which is the worse of the two failure modes.
+#
+# `cooldown` is dropped rather than carried across: it was validated live for
+# `pip` (2026-07-16) and is UNVALIDATED for `uv` — this repo was bitten once
+# already by an unvalidated Dependabot key silently disabling the whole file
+# (see history above), so it is omitted here rather than assumed-supported,
+# matching how github-actions already treats an unvalidated cooldown key.
 version: 2
 updates:
-  - package-ecosystem: pip
+  - package-ecosystem: uv
     directory: "/"
     schedule:
       interval: weekly
-    cooldown:
-      semver-major-days: 30
     groups:
       minor-and-patch:
         update-types:
