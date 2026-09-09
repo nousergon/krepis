@@ -22,11 +22,29 @@ route-table compulsion, the SOTA tier) remains the long-term posture;
 this module closes the immediate gap at the chokepoint that fleet code
 already uses.
 
-**Dependency:** gitleaks must be on ``PATH`` at runtime and its config
-file (``gitleaks-egress.toml`` + its ``[extend]`` chain) must be
-readable. The standard location is ``/opt/llm-routing/``; override with
-``KREPIS_GITLEAKS_DIR``.  On Lambda this requires bundling the gitleaks
-binary + config files in the deployment package or a Lambda layer.
+**Dependency:** gitleaks must be on ``PATH`` at runtime. Its config
+(``gitleaks-egress.toml`` + its ``[extend]`` chain) is **shipped as krepis
+package data** (``krepis/dlp_config/``) and therefore present in every
+context that can import krepis — Lambda, an ephemeral EC2 spot box, a CI
+runner, a laptop, a container. An operator-managed directory still wins
+when one exists: ``$KREPIS_GITLEAKS_DIR``, then
+``/opt/{llm,groom,drain}-llm-routing``, then the packaged copy.
+
+Until 2026-09-09 there was no packaged copy, so the resolver's last resort
+was the string ``/opt/llm-routing`` whether or not anything was there, and
+any context without that directory failed CLOSED on **every** outbound LLM
+call. That was filed four times against four substrates
+(``alpha-engine-config-I7913`` laptop, ``-I7719`` CI runner, ``-I9972``
+crucible-v2 spot box, ``-I9407`` backtester tests), fixed on none, and ran
+for 27 days undetected on the data-collector flow-doctor diagnosis path.
+Provisioning a directory per substrate is a control that has to be
+re-installed everywhere the code can run; packaging it is a control that
+cannot be missing.
+
+The gitleaks **binary** is still an environment dependency — a Go binary
+krepis cannot ship in a wheel. Call :func:`preflight` at startup (or
+``python -m krepis.session_dlp preflight``) to assert readiness where a
+first outbound call would otherwise be the discovery mechanism.
 """
 
 from __future__ import annotations
@@ -56,6 +74,9 @@ __all__ = [
     "DLP_SCAN_ERROR",
     "DLP_OK",
     "dlp_enabled",
+    "packaged_gitleaks_dir",
+    "preflight",
+    "DLPPreflight",
 ]
 
 # ── verdict constants ────────────────────────────────────────────────────
@@ -82,27 +103,81 @@ def dlp_enabled() -> bool:
 
 # ── config resolution ────────────────────────────────────────────────────
 
+# The gitleaks ruleset shipped inside the wheel. Both files live in the same
+# package directory, which matters: ``gitleaks-egress.toml``'s ``[extend].path``
+# is relative and gitleaks resolves it against the PROCESS CWD, so the scan
+# below runs with ``cwd=GITLEAKS_DIR`` and the two files must be siblings.
+_PACKAGED_CONFIG_DIRNAME = "dlp_config"
+_ENTRY_CONFIG_FILENAME = "gitleaks-egress.toml"
+
+# Operator-managed directories, in precedence order. A box that manages its own
+# ruleset keeps it; the packaged copy is the floor, not an override.
+_OPERATOR_CONFIG_DIRS = (
+    "/opt/llm-routing",
+    "/opt/groom-llm-routing",
+    "/opt/drain-llm-routing",
+)
+
+
+def packaged_gitleaks_dir() -> Optional[str]:
+    """Filesystem path of the gitleaks ruleset shipped with krepis, or None.
+
+    gitleaks is a subprocess: it needs a real directory on disk, both for
+    ``--config`` and as the cwd its relative ``[extend].path`` resolves
+    against. ``importlib.resources.files()`` is the correct accessor, but it
+    returns a ``Traversable`` that need not be a real path (a zipimported
+    krepis has none). Rather than extract to a temp directory whose lifetime
+    nothing owns, this returns ``None`` in that case and the caller fails loud
+    with a message naming the missing config — the same fail-closed outcome as
+    any other unusable ruleset, never a silent skip.
+    """
+    candidates = []
+    try:
+        from importlib.resources import files as _files
+
+        candidates.append(str(_files("krepis") / _PACKAGED_CONFIG_DIRNAME))
+    except Exception:  # noqa: BLE001 - see __file__ fallback immediately below
+        # importlib.resources can raise for a namespace package or an exotic
+        # loader. That is not a reason to give up: __file__ answers the same
+        # question for every ordinary install, and a genuinely unresolvable
+        # ruleset still returns None below and fails closed at scan time.
+        pass
+    candidates.append(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     _PACKAGED_CONFIG_DIRNAME)
+    )
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, _ENTRY_CONFIG_FILENAME)):
+            return d
+    return None
+
+
 def _gitleaks_dir() -> str:
     """Resolve the gitleaks config directory.
 
-    Checks env override first, then the standard groom/dashboard-box
-    paths, then a Lambda-layer path.
+    ``$KREPIS_GITLEAKS_DIR``, then the operator ``/opt`` directories, then the
+    ruleset packaged inside krepis.
+
+    Each candidate is tested for the ENTRY CONFIG FILE, not merely for the
+    directory existing. A present-but-empty ``/opt/llm-routing`` — the shape a
+    half-finished bootstrap leaves behind — used to satisfy ``os.path.isdir``
+    and shadow every remaining candidate, turning a provisioning slip into a
+    total egress outage with the packaged copy sitting unused on the same disk.
     """
     env_dir = os.environ.get("KREPIS_GITLEAKS_DIR")
-    if env_dir and os.path.isdir(env_dir):
+    if env_dir and os.path.isfile(os.path.join(env_dir, _ENTRY_CONFIG_FILENAME)):
         return env_dir
-    for candidate in (
-        "/opt/llm-routing",
-        "/opt/groom-llm-routing",
-        "/opt/drain-llm-routing",
-    ):
-        if os.path.isdir(candidate):
+    for candidate in _OPERATOR_CONFIG_DIRS:
+        if os.path.isfile(os.path.join(candidate, _ENTRY_CONFIG_FILENAME)):
             return candidate
-    # Lambda fallback — bundled in the deployment package alongside krepis
-    lambda_candidate = os.path.join(os.path.dirname(__file__), "_gitleaks_config")
-    if os.path.isdir(lambda_candidate):
-        return lambda_candidate
-    return "/opt/llm-routing"  # default; will fail loudly at scan time if missing
+    packaged = packaged_gitleaks_dir()
+    if packaged is not None:
+        return packaged
+    # Nothing resolved — including the packaged copy, which means krepis itself
+    # is installed in a form whose package data is unreadable. Return the
+    # conventional path so the scan-time error names something an operator can
+    # act on; the scan fails closed either way.
+    return _OPERATOR_CONFIG_DIRS[0]
 
 
 GITLEAKS_DIR = _gitleaks_dir()
@@ -115,29 +190,30 @@ _EXTEND_PATH_RE = re.compile(
 )
 
 
-def _verify_gitleaks_config_chain() -> Optional[str]:
-    """Verify ``GITLEAKS_CONFIG`` and its ``[extend]`` chain resolve.
+def _verify_gitleaks_config_chain_at(config_dir: str) -> Optional[str]:
+    """Verify the entry config in *config_dir* and its ``[extend]`` chain resolve.
 
-    ``gitleaks-egress.toml`` extends its parent by a path that is
-    **relative to the gitleaks process's CWD**, not to the referencing
-    config file's directory (see the module docstring and the toml's own
-    header). The caller invokes gitleaks with ``cwd=GITLEAKS_DIR``
-    (below), so the extend target must resolve relative to
-    ``GITLEAKS_DIR``. Checking that here — before shelling out — turns a
-    misconfigured chain into a message naming exactly the missing file,
-    instead of a bare ``gitleaks exited 1`` that a caller has to
-    re-derive from stderr.
+    ``gitleaks-egress.toml`` extends its parent by a path that is **relative to
+    the gitleaks process's CWD**, not to the referencing config file's
+    directory (see the module docstring and the toml's own header). The caller
+    invokes gitleaks with ``cwd=config_dir``, so the extend target must resolve
+    relative to *config_dir*. Checking that here — before shelling out — turns
+    a misconfigured chain into a message naming exactly the missing file,
+    instead of a bare ``gitleaks exited 1`` that a caller has to re-derive from
+    stderr.
 
-    Returns ``None`` if the chain resolves; otherwise an error string
-    naming the missing file.
+    Returns ``None`` if the chain resolves; otherwise an error string naming
+    the missing file. Parametrised by directory so :func:`preflight` can grade
+    a candidate without mutating module state.
     """
-    if not os.path.isfile(GITLEAKS_CONFIG):
-        return f"gitleaks config not found: {GITLEAKS_CONFIG!r}"
+    config = os.path.join(config_dir, _ENTRY_CONFIG_FILENAME)
+    if not os.path.isfile(config):
+        return f"gitleaks config not found: {config!r}"
     try:
-        with open(GITLEAKS_CONFIG, encoding="utf-8", errors="replace") as f:
+        with open(config, encoding="utf-8", errors="replace") as f:
             text = f.read()
     except OSError as exc:
-        return f"gitleaks config unreadable: {GITLEAKS_CONFIG!r} ({exc})"
+        return f"gitleaks config unreadable: {config!r} ({exc})"
     m = _EXTEND_PATH_RE.search(text)
     if not m:
         # No [extend] stanza — nothing further to resolve.
@@ -146,15 +222,21 @@ def _verify_gitleaks_config_chain() -> Optional[str]:
     resolved = (
         extend_path
         if os.path.isabs(extend_path)
-        else os.path.join(GITLEAKS_DIR, extend_path)
+        else os.path.join(config_dir, extend_path)
     )
     if not os.path.isfile(resolved):
         return (
-            f"gitleaks [extend].path {extend_path!r} in {GITLEAKS_CONFIG!r} "
-            f"resolves to {resolved!r} (against GITLEAKS_DIR={GITLEAKS_DIR!r}), "
+            f"gitleaks [extend].path {extend_path!r} in {config!r} "
+            f"resolves to {resolved!r} (against GITLEAKS_DIR={config_dir!r}), "
             "which does not exist"
         )
     return None
+
+
+def _verify_gitleaks_config_chain() -> Optional[str]:
+    """Verify the chain under the module-resolved :data:`GITLEAKS_DIR`."""
+    return _verify_gitleaks_config_chain_at(GITLEAKS_DIR)
+
 
 # ── content substitution (mirrors llm_egress_proxy.py) ────────────────────
 
@@ -534,3 +616,202 @@ class DLPBlockError(RuntimeError):
             f"DLP scan blocked outbound LLM request: {verdict.reason}"
         )
         self.verdict = verdict
+
+
+# ── preflight ────────────────────────────────────────────────────────────
+
+
+class DLPPreflight:
+    """The readiness of the in-process DLP control, as a value.
+
+    Every field here was previously discoverable only by making a real
+    outbound LLM call and reading the exception — which is why a missing
+    ruleset ran for 27 days on the data-collector diagnosis path before a
+    human happened to read the failure text inside an alert body
+    (2026-08-13 last success .. 2026-09-09; the DLP cause from 2026-09-01).
+    A control whose readiness can only be learned by tripping it is a
+    control nothing can monitor.
+    """
+
+    __slots__ = (
+        "enabled", "config_dir", "config_source", "config_error",
+        "ruleset_sha256", "packaged_sha256", "binary_path", "binary_version",
+        "binary_error",
+    )
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        config_dir: str,
+        config_source: str,
+        config_error: Optional[str],
+        ruleset_sha256: Optional[str],
+        packaged_sha256: Optional[str],
+        binary_path: Optional[str],
+        binary_version: Optional[str],
+        binary_error: Optional[str],
+    ) -> None:
+        self.enabled = enabled
+        self.config_dir = config_dir
+        self.config_source = config_source
+        self.config_error = config_error
+        self.ruleset_sha256 = ruleset_sha256
+        self.packaged_sha256 = packaged_sha256
+        self.binary_path = binary_path
+        self.binary_version = binary_version
+        self.binary_error = binary_error
+
+    @property
+    def ready(self) -> bool:
+        """True only if a real scan would run and could produce a verdict.
+
+        Administratively disabled is NOT ready. ``KREPIS_DLP_DISABLED`` is one
+        environment entry away from turning the fleet's only Lambda-path DLP
+        control off, and a process running with it off is otherwise
+        indistinguishable from one scanning cleanly (alpha-engine-config-I10001).
+        Reporting that state as ready would preserve exactly that blindness.
+        """
+        return self.enabled and self.config_error is None and self.binary_error is None
+
+    @property
+    def ruleset_matches_packaged(self) -> Optional[bool]:
+        """Whether the resolved ruleset is byte-identical to the packaged one.
+
+        ``None`` when either side could not be hashed. A ``False`` here is the
+        observable form of ruleset divergence between the operator directory
+        and the shipped copy (alpha-engine-config-I9712), which until now
+        changed detection strength with nothing reporting it.
+        """
+        if self.ruleset_sha256 is None or self.packaged_sha256 is None:
+            return None
+        return self.ruleset_sha256 == self.packaged_sha256
+
+    def to_dict(self) -> dict:
+        return {
+            "ready": self.ready,
+            "enabled": self.enabled,
+            "config_dir": self.config_dir,
+            "config_source": self.config_source,
+            "config_error": self.config_error,
+            "ruleset_sha256": self.ruleset_sha256,
+            "packaged_sha256": self.packaged_sha256,
+            "ruleset_matches_packaged": self.ruleset_matches_packaged,
+            "binary_path": self.binary_path,
+            "binary_version": self.binary_version,
+            "binary_error": self.binary_error,
+        }
+
+    def __repr__(self) -> str:
+        return f"DLPPreflight(ready={self.ready}, source={self.config_source!r})"
+
+
+def _config_source_for(config_dir: str) -> str:
+    env_dir = os.environ.get("KREPIS_GITLEAKS_DIR")
+    if env_dir and os.path.abspath(env_dir) == os.path.abspath(config_dir):
+        return "env"
+    if config_dir in _OPERATOR_CONFIG_DIRS:
+        return "operator"
+    packaged = packaged_gitleaks_dir()
+    if packaged is not None and os.path.abspath(packaged) == os.path.abspath(config_dir):
+        return "packaged"
+    return "unresolved"
+
+
+def _hash_config_chain(config_dir: str) -> Optional[str]:
+    """SHA-256 over the entry config and every file its ``[extend]`` chain names.
+
+    Hashing the chain rather than the entry file alone is the point: the entry
+    config is stable boilerplate and ``gitleaks-custom.toml`` is where every
+    fleet-specific secret shape lives, so a hash of the entry file alone would
+    read identical across two materially different rulesets.
+    """
+    entry = os.path.join(config_dir, _ENTRY_CONFIG_FILENAME)
+    h = hashlib.sha256()
+    seen = set()
+    queue = [entry]
+    while queue:
+        path = queue.pop(0)
+        real = os.path.abspath(path)
+        if real in seen:
+            continue
+        seen.add(real)
+        try:
+            with open(real, "rb") as f:
+                data = f.read()
+        except OSError:
+            return None
+        h.update(os.path.basename(real).encode("utf-8"))
+        h.update(data)
+        text = data.decode("utf-8", errors="replace")
+        for rel in re.findall(r'^\s*path\s*=\s*"([^"]+)"', text, re.M):
+            queue.append(rel if os.path.isabs(rel) else os.path.join(config_dir, rel))
+    return h.hexdigest()
+
+
+def _binary_probe() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    """Return ``(path, version, error)`` for the gitleaks binary."""
+    path = shutil.which("gitleaks")
+    if not path:
+        return None, None, "gitleaks binary not found on PATH"
+    try:
+        proc = subprocess.run(
+            [path, "version"], capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return path, None, f"gitleaks binary at {path!r} is not runnable ({exc})"
+    if proc.returncode != 0:
+        return path, None, (
+            f"gitleaks binary at {path!r} exited {proc.returncode} on `version`"
+        )
+    return path, (proc.stdout or proc.stderr).strip() or None, None
+
+
+def preflight() -> DLPPreflight:
+    """Report whether an outbound DLP scan could run here, without running one.
+
+    Call this at process start on any substrate whose first LLM call would
+    otherwise be the readiness test. It performs no scan and makes no network
+    call; it resolves the ruleset, hashes the chain, and probes the binary.
+    """
+    config_dir = _gitleaks_dir()
+    config_error = _verify_gitleaks_config_chain_at(config_dir)
+    ruleset = None if config_error else _hash_config_chain(config_dir)
+    packaged_dir = packaged_gitleaks_dir()
+    packaged = _hash_config_chain(packaged_dir) if packaged_dir else None
+    binary_path, binary_version, binary_error = _binary_probe()
+    return DLPPreflight(
+        enabled=dlp_enabled(),
+        config_dir=config_dir,
+        config_source=_config_source_for(config_dir),
+        config_error=config_error,
+        ruleset_sha256=ruleset,
+        packaged_sha256=packaged,
+        binary_path=binary_path,
+        binary_version=binary_version,
+        binary_error=binary_error,
+    )
+
+
+def _main(argv: Optional[list] = None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m krepis.session_dlp",
+        description="Report in-process DLP readiness on this substrate.",
+    )
+    parser.add_argument("command", choices=["preflight"])
+    parser.add_argument("--json", action="store_true", help="emit JSON")
+    args = parser.parse_args(argv)
+
+    pf = preflight()
+    if args.json:
+        print(json.dumps(pf.to_dict(), indent=2, sort_keys=True))
+    else:
+        for key, value in sorted(pf.to_dict().items()):
+            print(f"{key}: {value}")
+    return 0 if pf.ready else 1
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    raise SystemExit(_main())

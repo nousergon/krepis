@@ -140,7 +140,12 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed"]
+# `dlp_config/*.toml` is the in-process DLP ruleset. It is package DATA, not a
+# sample: `krepis.session_dlp` resolves it as the last-resort config so no
+# execution context can be missing the control (see that module's docstring).
+# Dropping it from this list restores the outage it exists to close, silently —
+# `tests/test_session_dlp_packaged_config.py` fails if it is unreadable.
+"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed", "dlp_config/*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

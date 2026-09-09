@@ -82,8 +82,14 @@ class TestDLPVerdict:
 
 # ── scan integration tests (require gitleaks on PATH) ─────────────────────
 
-_GITLEAKS_AVAILABLE = os.path.isdir("/opt/groom-llm-routing") and os.path.isfile(
-    "/opt/groom-llm-routing/gitleaks-egress.toml"
+# These ran ONLY on a groom spot box. Every other machine — CI included — was
+# a skip, so the scan path this module exists for had no exercised integration
+# test anywhere a merge could see. Since the ruleset ships as krepis package
+# data the resolved chain is always available, and the gate is now the one
+# thing krepis genuinely cannot ship: the gitleaks binary.
+_GITLEAKS_AVAILABLE = (
+    shutil.which("gitleaks") is not None
+    and session_dlp._verify_gitleaks_config_chain() is None
 )
 
 
@@ -187,7 +193,11 @@ def _find_real_config_dir():
     for d in _REAL_CONFIG_DIRS:
         if os.path.isfile(os.path.join(d, "gitleaks-egress.toml")):
             return d
-    return None
+    # The ruleset packaged inside krepis. Consulted LAST so a laptop with a
+    # locally-managed config still exercises that one, and consulted at all so
+    # this class stops skipping on CI and on any machine without a fleet
+    # checkout — a guard that skips everywhere is not a guard.
+    return session_dlp.packaged_gitleaks_dir()
 
 
 _REAL_CONFIG_DIR = _find_real_config_dir()
