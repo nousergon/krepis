@@ -146,6 +146,9 @@ def _build_detail(
     disable_notification: Optional[bool],
     state: Optional[str] = None,
     identity_key: Optional[str] = None,
+    delivery_tier: Optional[str] = None,
+    alert_class: Optional[str] = None,
+    registry_drift: Optional[bool] = None,
 ) -> Dict[str, Any]:
     hostname: Optional[str]
     try:
@@ -174,6 +177,15 @@ def _build_detail(
         "state": state,
         "identity_key": identity_key,
         "channels": channels,
+        # Delivery tier (alpha-engine-config-I6751). Carried onto the bus so
+        # the response plane and the Phase-4 notifications/incidents ratio can
+        # count deliveries BY TIER without parsing prose, and so a
+        # `registry_drift` emission — a source with no alert_classes row,
+        # which pages as the fail-upward default — is countable rather than
+        # merely survivable (observability-policy.md §2.2).
+        "delivery_tier": delivery_tier,
+        "alert_class": alert_class,
+        "registry_drift": registry_drift,
         "disable_notification": disable_notification,
         "runtime": {
             "lambda_function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME"),
@@ -233,6 +245,9 @@ def emit_alert_event(
     disable_notification: Optional[bool] = None,
     state: Optional[str] = None,
     identity_key: Optional[str] = None,
+    delivery_tier: Optional[str] = None,
+    alert_class: Optional[str] = None,
+    registry_drift: Optional[bool] = None,
 ) -> bool:
     """Emit one structured alert event to the Overseer intake. Never raises.
 
@@ -278,6 +293,9 @@ def emit_alert_event(
         disable_notification=disable_notification,
         state=state,
         identity_key=identity_key,
+        delivery_tier=delivery_tier,
+        alert_class=alert_class,
+        registry_drift=registry_drift,
     )
 
     try:
