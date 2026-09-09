@@ -1267,7 +1267,18 @@ def get_router() -> Any:
         if _router is not None:
             return _router
 
-        openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+        # Routed through krepis.secrets.get_secret rather than a literal
+        # os.environ.get — mirrors nousergon-lib PR#345/346
+        # (alpha-engine-config-I7924/I7925): a literal `os.environ.get(NAME)`
+        # read of a pinned secret is invisible to a consumer's repo-tree
+        # secret scan once this module ships inside site-packages, which is
+        # exactly the shape that let a stale GITHUB_TOKEN halt preopen
+        # trading. get_secret() also gives this read the SSM-first
+        # resolution every other pinned secret in the fleet gets, instead of
+        # env-only (alpha-engine-config-I10233).
+        from .secrets import get_secret
+
+        openrouter_key = get_secret("OPENROUTER_API_KEY", required=False) or ""
 
         reg_path = _find_registry()
         if not reg_path:
