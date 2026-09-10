@@ -1,7 +1,7 @@
 # krepis
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/python-3.9+-blue.svg)]()
+[![License: MIT](https://img.shields.io/github/license/nousergon/krepis)](LICENSE)
+[![Python](https://img.shields.io/pypi/pyversions/krepis)]()
 [![Typed](https://img.shields.io/badge/typed-PEP_561-blue.svg)]()
 [![Tests](https://github.com/nousergon/krepis/actions/workflows/test.yml/badge.svg)](https://github.com/nousergon/krepis/actions/workflows/test.yml)
 
