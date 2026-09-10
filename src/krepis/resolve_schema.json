@@ -26,7 +26,7 @@
     },
     "model": {
       "type": "string",
-      "description": "Model identifier for the resolved route. On the litellm_proxy route from resolve_group_structured() this is the qualified primary deployment name ({group}-{registry_id}); from resolve_model_structured() it is the registry entry id, which the derivation layer emits as its own deployment for direct calls by name. Otherwise the concrete registry model string."
+      "description": "Model identifier to send on the wire. On the litellm_proxy route from resolve_group_structured() this is a MODEL GROUP -- the bare group name, or '{group}-cap-{sorted capabilities}' when the caller declared `requires` -- because a fallback chain is declared on a group and addressing a concrete deployment silently opts out of it (alpha-engine-config-I10399, reversing config-I6727). From resolve_model_structured() it is the registry entry id, which is a deliberate pin with no chain. Otherwise the concrete registry model string."
     },
     "display_name": {
       "type": "string",
@@ -57,7 +57,16 @@
     },
     "deployment_id": {
       "type": "string",
-      "description": "The model identifier to send on the wire (bare name for egress_proxy, full slug for openrouter; on litellm_proxy the qualified primary deployment name for a group resolution, or the registry entry id for a single-model resolution)."
+      "description": "The model identifier to send on the wire (bare name for egress_proxy, full slug for openrouter; on litellm_proxy a MODEL GROUP for a group resolution -- see `model` -- or the registry entry id for a single-model resolution). Kept as an alias of `model` for consumers that read this key."
+    },
+    "wire_addressing": {
+      "type": "string",
+      "enum": [
+        "group",
+        "capability_group",
+        "deployment"
+      ],
+      "description": "What KIND of name `model`/`deployment_id` is. 'group' and 'capability_group' are names LiteLLM applies a fallback chain to; 'deployment' addresses one concrete entry and has no chain. A consumer or auditor can tell the two apart without pattern-matching the string (alpha-engine-config-I10399). Absent from producers older than that fix."
     },
     "auth_token_type": {
       "type": "string",
