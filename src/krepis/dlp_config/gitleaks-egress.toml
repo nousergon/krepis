@@ -1,0 +1,89 @@
+# PACKAGED DLP RULESET — krepis package data (`krepis/dlp_config/`).
+#
+# This is the entry config `krepis.session_dlp` scans with when no operator
+# directory is present. It ships INSIDE the wheel, so every execution context
+# that can import krepis has it: Lambda, an ephemeral EC2 spot box, a CI
+# runner, a laptop, a container. Before it existed the config was resolved
+# only from `$KREPIS_GITLEAKS_DIR` or an `/opt/*-llm-routing` directory an
+# operator had to have provisioned, and any context missing that directory
+# failed CLOSED on every outbound LLM call — measured on four substrates
+# (alpha-engine-config-I7913 laptop, -I7719 CI runner, -I9972 crucible-v2 spot
+# box, -I9407 backtester tests) and, unnoticed for 27 days, on the
+# data-collector flow-doctor diagnosis path.
+#
+# Resolution order (`krepis.session_dlp._gitleaks_dir`):
+#   $KREPIS_GITLEAKS_DIR  >  /opt/{llm,groom,drain}-llm-routing  >  THIS FILE
+# An operator directory still wins, so a box with a locally-managed ruleset is
+# unchanged; `python -m krepis.session_dlp preflight` reports which source was
+# used and whether it differs from this packaged copy.
+#
+# Content provenance: byte-copied 2026-09-09 from
+# `alpha-engine-config/infrastructure/groom-llm-routing/gitleaks-egress.toml`,
+# the maintained variant (alpha-engine-config-I4946's false-positive fixes are
+# in it; the nousergon-lib copy predates them — that divergence is
+# alpha-engine-config-I9712 and is NOT resolved here). Changing a rule is a
+# change to a security control: edit here, and let the drift test in
+# alpha-engine-config fail until the other copies follow.
+#
+# Original file's own header follows verbatim:
+title = "LLM egress session content-scan config (DeepSeek, xAI, ...)"
+
+# Chain-extends gitleaks-custom.toml (config-I3011: fleet-specific secret
+# shapes -- Telegram/OpenRouter/Anthropic/DeepSeek key formats, AWS session
+# tokens, IBKR config lines, SSM SecureString responses -- plus the
+# prefix-only Anthropic-key stopgap, config-I3012), which itself extends
+# gitleaks' stock ruleset. This used to say `useDefault = true` directly;
+# chaining through gitleaks-custom.toml means every consumer of THIS file
+# (check_file_path.sh's content scan, llm_egress_proxy.py's outbound-body
+# scan) picks up the custom rules automatically with no code change on
+# either consumer's side.
+#
+# RELATIVE path, resolved against the gitleaks PROCESS's CWD (config-I3011
+# established that gitleaks resolves [extend].path against the process cwd,
+# NOT the referencing config file's directory). Every consumer therefore MUST
+# invoke gitleaks with cwd set to the directory holding this file:
+#
+#   llm_egress_proxy.py  -> subprocess.run(..., cwd=GITLEAKS_CONFIG_DIR)
+#   check_file_path.sh   -> (cd "$ROUTING_DIR" && gitleaks ...)
+#
+# CHANGED 2026-08-31 (alpha-engine-config-I4500). This used to be the absolute
+# `/opt/groom-llm-routing/gitleaks-custom.toml`, correct on the groom box and
+# WRONG in `/opt/drain-llm-routing`, `/opt/ci-watch-llm-routing`,
+# `/opt/sf-watch-llm-routing` and `/opt/llm-routing` — where gitleaks died with
+# "failed to load extended config" on EVERY scan
+# (alpha-engine-config-I4471/I4451). The vendored proxy worked around that with
+# a fleet-only `_normalize_extend_path()` that rewrote this line at startup:
+# one rule, re-implemented in a fork of a security control, to compensate for a
+# path this file could simply have declared relatively. The relative path plus
+# the cwd contract above makes one file correct on every host, and is why the
+# fork no longer needs that function.
+[extend]
+path = "./gitleaks-custom.toml"
+
+# Exclude vendored/build/cache trees from scanning — they generate false
+# positives (minified JS, compiled bytecode, test fixtures with fake keys)
+# that would otherwise block legitimate Grep/Glob calls scoped to a repo
+# root. Mirrors the vendored-marker list in check_denylist_drift.py.
+[allowlist]
+paths = [
+  '''(^|/)\.venv/''',
+  '''(^|/)venv/''',
+  '''(^|/)trading-env/''',
+  '''(^|/)[^/]*-env/''',
+  '''(^|/)__pycache__/''',
+  '''(^|/)\.git/''',
+  '''(^|/)node_modules/''',
+  '''(^|/)\.claude/''',
+  '''(^|/)site-packages/''',
+  '''(^|/)\.eggs/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)\.next/''',
+  # Bulk binary/data formats — not meaningfully text-scannable and
+  # dominate scan time on data-heavy repos (predictor price caches,
+  # research archives) without adding real secret-detection coverage.
+  '''\.(parquet|pkl|joblib|npz|npy|h5|hdf5|feather|arrow)$''',
+  '''\.(pt|pth|safetensors|onnx|pb|ckpt)$''',
+  '''\.(whl|so|dylib|dll|a|o)$''',
+  '''\.(png|jpg|jpeg|gif|ico|pdf|zip|tar|gz|bz2)$''',
+]
