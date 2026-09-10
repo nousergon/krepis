@@ -164,7 +164,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Final
 
-from krepis import _dedup, fleet_events
+from krepis import _dedup, alert_tiers, fleet_events
 from krepis.telegram import PARSE_MODE as TELEGRAM_PARSE_MODE
 from krepis.telegram import _validate_parse_mode
 
@@ -459,6 +459,29 @@ class PublishResult:
     #: there or because nothing else was configured (the I7857 fallback).
     destination_reason: str = ""
 
+    # ── Delivery TIER (alpha-engine-config-I6751 Phase 1) ────────────────
+    #: The delivery tier this emission resolved to, from the alert-class
+    #: registry keyed on ``source`` — one of :data:`krepis.alert_tiers.TIERS`,
+    #: or ``None`` when the tier gate was not reached (dry-run, test guard,
+    #: mute). This, not ``severity``, is what decided whether Brian's phone
+    #: buzzed and whether his inbox received anything.
+    tier: str | None = None
+    #: How the tier was derived: the matched registry class, a dynamic-row
+    #: resolution, a collision resolved to the strictest claim, or a
+    #: fail-upward. Recorded so a routed PAGE can be told from a fallback one.
+    tier_reason: str = ""
+    #: The registry class name that owns this source, when one matched.
+    alert_class: str | None = None
+    #: True when the source had no registry row or the registry was
+    #: unreadable. The emission PAGED either way; this is what makes the gap
+    #: countable rather than merely survivable (observability-policy.md §2.2).
+    registry_drift: bool = False
+    #: True when a ``page``-tier emission was delivered at ``notify-silent``
+    #: because the condition has not yet survived ``page_after_consecutive``
+    #: consecutive detections — a self-healing blip on a job whose own next
+    #: run precedes any human action.
+    streak_held: bool = False
+
     @property
     def any_ok(self) -> bool:
         if self.dedup_skipped or self.muted:
@@ -487,6 +510,40 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
         logger.warning("alerts.publish: SNS topic ARN resolution failed: %s", exc)
         return None
     return f"arn:aws:sns:{region}:{account_id}:{DEFAULT_SNS_TOPIC_NAME}"
+
+
+def _muted_topic_arn(page_arn: str | None) -> str | None:
+    """The zero-subscriber sibling of a resolved topic ARN, or ``None``.
+
+    ``None`` means "this topic has no known muted sibling — publish to it
+    unchanged": the email leg stays, the Telegram leg is still suppressed by
+    the tier, and the caller sees a WARNING naming the gap. Losing the durable
+    SNS record to a topic the caller's role cannot publish to would be worse
+    than one extra email.
+
+    ONLY the fleet default (`alpha-engine-alerts`) is rewritten today.
+    Measured 2026-09-09: two other topics carry an unfiltered email
+    subscription to cipher813@gmail.com — `crucible-v2-pages` (54 messages in
+    the seven days to 2026-09-09) and `alpha-engine-alarm-backstop` (13). Both
+    need a muted sibling of their own before they can be covered, and
+    crucible-v2's is env-declared with its own IAM grant
+    (`crucible.alerts.muted_topic`), so guessing `<topic>-muted` here would
+    publish into a topic the v2 RuntimeRole is not granted. Tracked
+    separately; until then those two topics keep today's behaviour, which is
+    also what crucible-v2 phase 2's `pages_within_ceiling` and
+    `pages_commissioned` clauses must keep observing through 2026-09-19.
+    """
+    if not page_arn:
+        return None
+    head, _, name = page_arn.rpartition(":")
+    if name != DEFAULT_SNS_TOPIC_NAME:
+        logger.warning(
+            "alerts: no muted sibling is declared for SNS topic %r, so this "
+            "non-page emission keeps the email leg. Only %r is covered today "
+            "(alpha-engine-config-I6751).", name, DEFAULT_SNS_TOPIC_NAME,
+        )
+        return None
+    return f"{head}:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
 
 
 def _format_message(
@@ -946,6 +1003,7 @@ def publish(
     silent: bool | None = None,
     destination: str | None = None,
     console_artifact: str | None = None,
+    episode_attributes: dict | None = None,
     raise_on_total_failure: bool = True,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
 ) -> PublishResult:
@@ -990,6 +1048,12 @@ def publish(
     :param source: Optional source identifier (script path, repo, Lambda
         name) inserted between the tag and the message body. Helps the
         operator triage at a glance.
+    :param episode_attributes: Per-episode facts the emitter knows and the
+        alert CLASS does not — e.g. ``{"synthetic": True}`` for a deliberate
+        fault-injection replay, or ``{"close_source": "substitution"}`` for a
+        scheduled vendor swap. Matched against a registry row's
+        ``episode_overrides``; ignored when the row declares none, which is
+        every row today. See :func:`krepis.alert_tiers.resolve_tier`.
     :param raise_on_total_failure: When ``True`` (the default), raise
         :class:`AlertDeliveryError` if every requested human channel failed
         AND the Overseer intake event failed on both of its transports —
@@ -1173,9 +1237,65 @@ def publish(
         result.telegram = ChannelResult(ok=False, detail="suppressed by source mute")
         return result
 
+    bucket = dedup_bucket or DEFAULT_DEDUP_BUCKET
+
+    # ── Delivery TIER gate (alpha-engine-config-I6751 Phase 1) ───────────
+    # Runs AFTER the mute (an operator-declared mute outranks everything) and
+    # BEFORE dedup, so a tracked-only emission still writes its dedup marker
+    # and still lands on the bus — the tier changes WHERE it is delivered,
+    # never WHETHER it is recorded (observability-policy.md §7.2a).
+    #
+    # This is the line that stops severity from deciding delivery. Severity
+    # remains diagnostic metadata and still picks the Telegram phone push
+    # within the `page` tier; it no longer decides whether Brian is reached.
+    decision = alert_tiers.resolve_tier(source, severity, episode_attributes)
+    result.tier = decision.tier
+    result.tier_reason = decision.reason
+    result.alert_class = decision.alert_class
+    result.registry_drift = decision.registry_drift
+    if decision.registry_drift:
+        # ERROR, not WARNING: an unroutable source is a REGISTRY gap, and the
+        # emission paged to cover for it. A WARNING is what this class of gap
+        # wore for the whole time nobody counted it.
+        logger.error(
+            "alerts.publish: %s — this emission PAGED as the fail-upward "
+            "default. Countable on the bus event's `registry_drift` field.",
+            decision.reason,
+        )
+
+    # The consecutive-detection gate. A `page` row whose registry-derived
+    # `page_after_consecutive` exceeds 1 belongs to a job that retries itself
+    # before a human could act, so a first detection is delivered silently and
+    # only a condition that SURVIVES pages. Errs upward on any uncertainty.
+    if (
+        decision.tier == alert_tiers.TIER_PAGE
+        and decision.page_after_consecutive > 1
+        and state != ALERT_STATE_CLEARED
+        and effective_identity
+    ):
+        seen = alert_tiers.consecutive_count(bucket, effective_identity)
+        if seen is None:
+            result.tier_reason += (
+                "; streak state unreadable — paging (the gate may only quieten "
+                "an alert on positive evidence)"
+            )
+        else:
+            streak = seen + 1
+            alert_tiers.record_open(bucket, effective_identity, streak)
+            if streak < decision.page_after_consecutive:
+                result.tier = alert_tiers.TIER_NOTIFY_SILENT
+                result.streak_held = True
+                result.tier_reason += (
+                    f"; held at notify-silent — detection {streak} of "
+                    f"{decision.page_after_consecutive} required consecutive "
+                    f"detections (the emitting job's own next run precedes any "
+                    f"human action)"
+                )
+
+    tier = result.tier
+
     # ── Dedup check (pre-publish) ────────────────────────────────────────
     marker_key: str | None = None
-    bucket = dedup_bucket or DEFAULT_DEDUP_BUCKET
     if dedup_key:
         marker_key = _dedup_marker_key(dedup_key)
         within_window, reason = _check_dedup_marker(
@@ -1195,6 +1315,15 @@ def publish(
     # ── Publish ──────────────────────────────────────────────────────────
     if sns:
         arn = _resolve_sns_topic_arn(sns_topic_arn)
+        if arn is not None and tier != alert_tiers.TIER_PAGE:
+            # `None` back from the rewrite means "no muted sibling declared" —
+            # keep the caller's topic rather than dropping the record.
+            # Measured 2026-09-09: all three topics that email
+            # cipher813@gmail.com carry `FilterPolicy: null`, so the ONLY way
+            # to keep a non-page emission out of the inbox is to publish it to
+            # a topic with no email subscriber. The record is kept, not
+            # dropped.
+            arn = _muted_topic_arn(arn) or arn
         if arn is None:
             result.sns = ChannelResult(ok=False, detail="topic ARN resolution failed")
         else:
@@ -1204,7 +1333,22 @@ def publish(
                 subject += f" — {source}"
             result.sns = _publish_sns(arn, formatted, subject=subject)
 
-    if telegram:
+    if telegram and tier == alert_tiers.TIER_TRACKED_ONLY:
+        # TRACKED-ONLY: zero notification, full recording. The SNS leg above
+        # already wrote the durable record to the muted topic and the §7.3 bus
+        # event fires below, so the finding is readable on the console and
+        # actionable by the drain — it simply does not interrupt anyone.
+        # `ok=True` because the finding WAS delivered to its declared surface:
+        # a Bash caller's `|| echo 'alert failed'` must not fire here.
+        result.telegram = ChannelResult(
+            ok=True,
+            detail=(
+                f"not sent (tier={alert_tiers.TIER_TRACKED_ONLY}); recorded on "
+                f"the muted SNS topic and the overseer bus — "
+                f"{result.tier_reason}"
+            ),
+        )
+    elif telegram:
         # ── Destination resolution (alpha-engine-config-I7857) ───────────
         # Runs here rather than at the top of `publish` so the dry-run
         # short-circuit and the test-env guard keep their promise of
@@ -1218,11 +1362,23 @@ def publish(
             # checked below) can only mean the operator chat — an incident
             # must not wait on a secrets round-trip for a destination it was
             # never going to use.
-            if destination is not None or severity.lower() not in SEVERITY_PHONE_PUSH:
+            if (
+                destination is not None
+                or tier != alert_tiers.TIER_PAGE
+                or severity.lower() not in SEVERITY_PHONE_PUSH
+            ):
                 log_chat_id, log_thread_id = _resolve_log_chat()
+        # A notify-silent emission prefers the LOG chat when one is
+        # configured: delivered and readable, out of the incident channel.
+        # `resolve_destination`'s own fallback still applies — an unconfigured
+        # log chat delivers to the operator chat rather than dropping the
+        # finding (alpha-engine-config-I7857).
+        effective_destination = destination
+        if effective_destination is None and tier == alert_tiers.TIER_NOTIFY_SILENT:
+            effective_destination = DESTINATION_LOG_CHAT
         resolved, reason = resolve_destination(
             severity,
-            destination=destination,
+            destination=effective_destination,
             console_artifact=console_artifact,
             log_chat_id=log_chat_id,
         )
@@ -1250,7 +1406,14 @@ def publish(
                 result.telegram = _publish_telegram(
                     formatted,
                     severity=severity,
-                    silent=silent,
+                    # The tier decides the buzz. `silent=False` is still an
+                    # explicit caller demand for a push and is honoured
+                    # (alpha-engine-config-I9916); `None` at a non-page tier
+                    # now means silent rather than severity-derived.
+                    silent=(
+                        silent if silent is not None
+                        else (tier != alert_tiers.TIER_PAGE or None)
+                    ),
                     parse_mode=parse_mode,
                     destination=resolved,
                     chat_id=log_chat_id if resolved == DESTINATION_LOG_CHAT else None,
@@ -1282,6 +1445,9 @@ def publish(
         },
         state=state,
         identity_key=effective_identity,
+        delivery_tier=result.tier,
+        alert_class=result.alert_class,
+        registry_drift=result.registry_drift,
     )
 
     # ── Total non-delivery is LOUD (alpha-engine-config-I9209) ───────────
@@ -1378,6 +1544,13 @@ def publish_clear(
             "alerts.publish_clear: identity_key is required — an unpairable "
             "clear is prose, not a terminator (alpha-engine-config-I8105)"
         )
+    # Reset the consecutive-detection streak: the condition ended, so the
+    # NEXT occurrence is a fresh first detection and must not inherit credit
+    # from this one. Best-effort — a failed reset errs UPWARD (the next
+    # occurrence pages sooner), which is the safe direction.
+    if not dry_run:
+        alert_tiers.clear_streak(DEFAULT_DEDUP_BUCKET, identity_key)
+
     return publish(
         message,
         severity=CLEAR_SEVERITY,

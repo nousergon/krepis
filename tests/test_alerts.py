@@ -666,8 +666,17 @@ class TestPublishWithDedup:
             ):
                 result = alerts.publish("anomaly", source="x")  # no dedup_key
         assert result.dedup_skipped is False
-        # No S3 marker activity — neither get_object nor put_object was called.
-        s3.get_object.assert_not_called()
+        # No DEDUP MARKER activity. Narrowed from `get_object.assert_not_called()`
+        # by alpha-engine-config-I6751: `publish` now also reads the delivery-tier
+        # registry object on every emission, so "no S3 calls at all" stopped
+        # being the contract this test means. What it means — and what a dedup
+        # regression would break — is that nothing under the marker prefix was
+        # read or written.
+        marker_reads = [
+            c for c in s3.get_object.call_args_list
+            if alerts.DEDUP_MARKER_PREFIX in str(c.kwargs.get("Key", ""))
+        ]
+        assert marker_reads == []
         s3.put_object.assert_not_called()
 
     def test_failed_publish_does_not_write_marker(self, fake_boto3_with_s3):
