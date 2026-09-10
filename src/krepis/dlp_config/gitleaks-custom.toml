@@ -1,0 +1,175 @@
+# PACKAGED DLP RULESET — krepis package data (`krepis/dlp_config/`).
+# Chain-extended by gitleaks-egress.toml in this same directory (see that
+# file's header for why this ships inside the wheel and what it replaces).
+# Content byte-copied 2026-09-09 from
+# `alpha-engine-config/infrastructure/groom-llm-routing/gitleaks-custom.toml`.
+# Original header follows verbatim:
+#
+title = "Fleet-specific secret-shape rules (config-I3011)"
+
+# Extends gitleaks' stock ruleset (~180 provider-specific rules: generic AWS,
+# GitHub, Slack, Stripe, etc). gitleaks-egress.toml then chain-extends THIS
+# file (see its own [extend] block) rather than useDefault directly, so both
+# active scan paths pick these rules up automatically with zero code changes:
+#   - check_file_path.sh (Read/Edit/Write/Grep/Glob/NotebookEdit PreToolUse hook)
+#   - llm_egress_proxy.py (outbound HTTP body scan, GITLEAKS_CONFIG constant;
+#     one instance per provider)
+# Both already point at gitleaks-egress.toml; only the toml wiring changed.
+#
+# Each rule below has a positive+negative fixture pair under
+# gitleaks-custom-fixtures/{positive,negative}/<rule-id>.txt, exercised by
+# test_gitleaks_custom_rules.sh. Fixture secrets are OBVIOUSLY fake (FAKE/TEST
+# markers baked into the matched span) — never a real credential shape copied
+# from a live key.
+[extend]
+useDefault = true
+
+# ------------------------------------------------------------------
+# Telegram bot tokens
+# ------------------------------------------------------------------
+# Format: <8-10 digit bot id>:<35-char token>, e.g. what BotFather issues.
+# Fleet uses these for the Overseer/groom Telegram notify helper.
+[[rules]]
+id = "nousergon-telegram-bot-token"
+description = "Telegram bot token (BotFather format: <numeric id>:<35-char secret>)"
+regex = '''\b\d{8,10}:[A-Za-z0-9_-]{35}\b'''
+tags = ["telegram", "fleet-custom"]
+
+# ------------------------------------------------------------------
+# OpenRouter API key
+# ------------------------------------------------------------------
+# Documented format: "sk-or-v1-" followed by 64 lowercase hex characters.
+[[rules]]
+id = "nousergon-openrouter-api-key"
+description = "OpenRouter API key (sk-or-v1-<64 hex>)"
+regex = '''\bsk-or-v1-[a-f0-9]{64}\b'''
+tags = ["openrouter", "fleet-custom"]
+
+# ------------------------------------------------------------------
+# Anthropic API key
+# ------------------------------------------------------------------
+# CONFIRMED GITLEAKS ENGINE DEFECT (config-I3011 build, 2026-07-19), filed
+# upstream-adjacent as alpha-engine-config-I3012 -- read before touching
+# this rule:
+#
+# The full-secret regex a real Anthropic key needs ("sk-ant-api03-" + a
+# 93-char body + "AA", matching gitleaks' OWN stock "anthropic-api-key"
+# rule) DOES NOT FIRE on this machine's gitleaks v8.30.1 whenever
+# `useDefault = true` is in effect -- verified with THREE independent
+# reproductions: (1) this custom rule using that exact shape, (2) gitleaks'
+# own unmodified default "anthropic-api-key"/"anthropic-admin-api-key"
+# rules alone (useDefault=true, zero custom rules) against a syntactically
+# valid fake key, (3) plain `gitleaks detect` with NO --config flag at all
+# in a neutral empty directory. All three silently report "no leaks found"
+# for content a plain Python re.search() confirms DOES match the pattern.
+# The same rule/content combination fires reliably standalone (no
+# useDefault). This means: right now, a real leaked Anthropic key would
+# NOT be caught by gitleaks on this machine, in ANY repo whose
+# .gitleaks.toml uses useDefault=true (i.e. the whole fleet) -- this
+# predates and is independent of this build.
+#
+# Rather than ship a full-secret rule I've proven doesn't fire (false
+# confidence), this rule intentionally trades secret-capture precision for
+# RELIABLE FIRING: matching just the fixed, short literal prefix
+# "sk-ant-api03-" (13 chars, no long quantifier) sidesteps whatever makes
+# long bounded-repetition quantifiers silently fail under useDefault=true.
+# For a BLOCKING gate this is sufficient -- the hook/proxy only needs to
+# know content contains what looks like a real key, not capture its exact
+# bytes. Verified firing consistently (3/3 repeated runs) where the
+# full-length version failed 100% of attempts across 15+ length/prefix
+# combinations during this investigation.
+[[rules]]
+id = "nousergon-anthropic-api-key"
+description = "Anthropic API key (sk-ant-api03- + key body); short open-ended quantifier avoids the useDefault long-quantifier defect"
+# 2026-07-28 (alpha-engine-config-I4946): was prefix-ONLY (`\bsk-ant-api03-`),
+# which fired on every PROSE MENTION of the prefix -- including this file's own
+# comments and any diff of it. That blocked two sweep CI-fix batches whose agent
+# was reading a diff of these very rules. Requiring >=8 body chars keeps real
+# keys (95+ body chars) firing while a bare prefix in text no longer matches.
+# `{8,}` is a SHORT open-ended quantifier -- deliberately not the 93-char BOUNDED
+# form that silently fails under useDefault, which is why this rule was
+# prefix-only in the first place.
+regex = '''\bsk-ant-api03-[A-Za-z0-9_-]{8,}'''
+tags = ["anthropic", "fleet-custom", "gitleaks-defect-workaround"]
+
+# ------------------------------------------------------------------
+# DeepSeek API key
+# ------------------------------------------------------------------
+# ASSUMPTION FLAGGED FOR VERIFICATION: built from DeepSeek's publicly
+# documented key format (OpenAI-SDK-compatible convention: "sk-" + 32
+# lowercase hex chars), NOT confirmed against the real live key's actual
+# prefix — the auto-mode classifier correctly declined a shell command that
+# would have read even a redacted prefix of secrets.env mid-session (see
+# config-I3011 build notes), and per this task's absolute rule that block
+# was respected rather than routed around. If this regex doesn't fire on a
+# real (deliberately fake-valued) DeepSeek-shaped key during the next live
+# gitleaks-baseline refresh, tighten/loosen the {N} count then.
+# No collision risk with the anthropic/openrouter rules above: both of those
+# require a literal "-ant-" or "-or-" immediately after "sk-", which breaks
+# the contiguous [a-f0-9]{32} run this rule requires.
+[[rules]]
+id = "nousergon-deepseek-api-key"
+description = "DeepSeek API key (sk-<32 hex chars>) -- format assumed from public docs, see comment"
+regex = '''\bsk-[a-f0-9]{32}\b'''
+tags = ["deepseek", "fleet-custom", "unverified-format"]
+
+# ------------------------------------------------------------------
+# AWS temporary session-token shape (STS AssumeRole / GetSessionToken)
+# ------------------------------------------------------------------
+# Long-lived AWS keys are already covered by gitleaks' default aws-access-
+# token / aws-secret-key rules (useDefault above). Temporary STS credentials
+# add a THIRD value, the session token: a long base64-ish blob that is high
+# entropy but otherwise looks like nothing else. It reliably starts with one
+# of a small set of magic-byte prefixes baked into AWS's internal protobuf
+# encoding (well-known across leak-detection tooling, not fleet-specific):
+#   FQoGZXIvYXdzE / FQoDYXdz / FwoGZXIvYXdz / IQoJb3JpZ2luX2Vj
+[[rules]]
+id = "nousergon-aws-session-token"
+description = "AWS STS temporary session token (magic-byte-prefixed base64 blob)"
+regex = '''\b(FQoGZXIvYXdzE|FQoDYXdz|FwoGZXIvYXdz|IQoJb3JpZ2luX2Vj)[A-Za-z0-9/+=]{100,900}\b'''
+tags = ["aws", "sts", "fleet-custom"]
+
+# ------------------------------------------------------------------
+# IBKR IBC config.ini credential lines
+# ------------------------------------------------------------------
+# ~/ibc/config.ini itself is already hard-blocked by PATH in
+# secret-file-patterns.txt (belt-and-suspenders: this rule catches the same
+# credential lines if they ever get pasted/copied into a DIFFERENT file --
+# a doc, a chat log, a debug dump -- that the path-based block wouldn't
+# cover. Field names (IbLoginId/IbPassword/FIXLoginId/FIXPassword) are
+# IBC's own public config-key names, not secret in themselves; only the
+# value after "=" is. NOTE: ~/ibc/config.ini does not exist on this laptop
+# (IBC/IB Gateway runs on the EC2 executor box per ~/Development/CLAUDE.md
+# "Shared Infrastructure" -- this rule is forward cover for the case content
+# gets copied to the laptop, not evidence it currently is here).
+[[rules]]
+id = "nousergon-ibkr-config-credential-line"
+description = "IBC config.ini credential line (IbLoginId/IbPassword/FIXLoginId/FIXPassword = real-value)"
+# 2026-07-28 (alpha-engine-config-I4946): the value must not be a `<...>`
+# DOCUMENTATION PLACEHOLDER. This rule's own description used to end
+# `... = <value>)` and therefore matched ITSELF -- any diff of this file blocked
+# the request carrying it. gitleaks uses RE2, which has no lookahead, so the
+# exclusion is a leading character class rather than `(?!<)`.
+regex = '''(?i)\b(IbLoginId|IbPassword|FIXLoginId|FIXPassword)\s*=\s*[^<\s]\S*'''
+tags = ["ibkr", "fleet-custom"]
+
+# ------------------------------------------------------------------
+# SSM GetParameter --with-decryption JSON response shape
+# ------------------------------------------------------------------
+# The PRIMARY defense is pre-execution: check_bash_command.sh's
+# SECRET_DUMP_PATTERNS already hard-blocks any Bash command containing
+# "--with-decryption" outright, so this command's output cannot enter
+# context via the Bash tool at all -- there is no fixed regex "shape" for
+# an arbitrary decrypted SSM parameter value the way there is for a
+# provider API key, so a content rule can't be the primary control here.
+# This rule is defense-in-depth for the same content arriving via a
+# DIFFERENT channel (e.g. someone pastes a decrypted-parameter JSON blob
+# into a doc/log that then gets Read/Grep'd). Deliberately requires the
+# co-occurrence of Type":"SecureString" + a Name path + a Value field on
+# the same line/object to stay specific to genuine SSM SecureString
+# responses rather than firing on any JSON with a "Value" key.
+[[rules]]
+id = "nousergon-ssm-secure-string-response"
+description = "AWS SSM GetParameter --with-decryption JSON response body (SecureString value)"
+regex = '''"Name"\s*:\s*"/[^"]+"\s*,\s*"Type"\s*:\s*"SecureString"\s*,\s*"Value"\s*:\s*"[^"]{8,}"'''
+tags = ["aws", "ssm", "fleet-custom"]
