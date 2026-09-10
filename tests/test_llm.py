@@ -4,6 +4,7 @@ import logging
 from types import SimpleNamespace
 
 import pytest
+from dataclasses import replace
 from pydantic import BaseModel, Field
 
 import krepis.llm as _llm
@@ -2201,6 +2202,100 @@ models:
         fake = FakeOpenAI([_openai_resp("hello", model="low-model-we-never-heard-of")])
         with pytest.raises(LLMConfigError, match="does not resolve through"):
             self._router_client(fake).complete(system="s", user_content="u")
+
+
+class TestGroupAddressedCallsAreStillPriceable:
+    """alpha-engine-config-I10399 — the accounting half of group addressing.
+
+    The wire now carries a model GROUP, because that is the only name LiteLLM
+    applies a fallback chain to. LiteLLM restamps the requested model onto
+    every response that did NOT fall back, so a healthy group-addressed call
+    reports the GROUP as its served model — which carries no price card. The
+    resolution already named the primary; the spec carries it, and that is
+    what gets billed.
+
+    Without this, honesty about what served and engagement of the chain are
+    traded against each other, which is the trade config-I6727 made the wrong
+    way round: it bought an honest `resp.model` at the price of every group
+    fallback, and the Director's weekly plan call took a 429 with
+    `Available Model Group Fallbacks=[]`.
+    """
+
+    _REGISTRY = """
+model_groups:
+  ultra:
+    - glm-5.2-direct
+    - deepseek-v4-pro
+
+models:
+  - id: glm-5.2-direct
+    provider: zhipu
+    route: egress_proxy
+    api_base: http://127.0.0.1:8981/v1
+    model: glm-5.2
+    status: active
+  - id: deepseek-v4-pro
+    provider: deepseek
+    route: egress_proxy
+    api_base: http://127.0.0.1:8972/v1
+    model: deepseek/deepseek-v4-pro
+    status: active
+"""
+
+    SPEC = ModelSpec(
+        provider=ROUTER_EDGE_PROVIDER,
+        model="ultra",
+        base_url="https://router.example.invalid:8443",
+        api_key_env="ROUTER_CONSUMER_THINKTANK",
+        group_primary_model="glm-5.2",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _registry(self, tmp_path, monkeypatch):
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(self._REGISTRY)
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+
+    @pytest.fixture(autouse=True)
+    def _clean_fallback_state(self, monkeypatch):
+        monkeypatch.setattr(_llm, "_fallback_state", {}, raising=True)
+
+    def _client(self, fake, spec=None, sink=None):
+        return LLMClient(
+            spec or self.SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+            cost_sink=sink,
+        )
+
+    def test_group_echo_is_billed_to_the_declared_primary(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="ultra")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.model == "glm-5.2"
+        assert result.fallback_used is False
+
+    def test_a_fallback_response_is_used_verbatim(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="deepseek/deepseek-v4-pro")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.model == "deepseek/deepseek-v4-pro"
+        assert result.fallback_used is True
+
+    def test_capability_group_echo_is_billed_to_the_declared_primary(self):
+        spec = replace(self.SPEC, model="ultra-cap-streaming")
+        fake = FakeOpenAI([_openai_resp("hello", model="ultra-cap-streaming")])
+        result = self._client(fake, spec=spec).complete(system="s", user_content="u")
+        assert result.model == "glm-5.2"
+
+    def test_a_group_echo_with_no_declared_primary_raises(self):
+        """Fail LOUD rather than bill a group name. Reached when a spec
+        addressed a group but was built by something that did not set
+        `group_primary_model` — a hand-built spec, or a krepis older than the
+        resolver that produced the route."""
+        spec = replace(self.SPEC, group_primary_model=None)
+        fake = FakeOpenAI([_openai_resp("hello", model="ultra")])
+        with pytest.raises(LLMConfigError, match="group_primary_model"):
+            self._client(fake, spec=spec).complete(system="s", user_content="u")
 
 
 class TestServerSideFallbackIsVisibleAndPriceable:

@@ -177,7 +177,12 @@ class TestResolution:
     ):
         info = self._resolve(monkeypatch, mixed_registry, wire="openai")
         assert info["primary_registry_id"] == "refuses-tools"
-        assert info["deployment_id"] == "low-refuses-tools"
+        # The wire name is the GROUP: a fallback chain is declared on a group,
+        # and addressing the primary deployment opts out of it
+        # (alpha-engine-config-I10399). Which entry the derivation picked is
+        # still reported, in `primary_registry_id` above.
+        assert info["deployment_id"] == "low"
+        assert info["wire_addressing"] == "group"
 
     def test_a_forced_tool_call_resolves_to_a_member_that_accepts_one(
         self, monkeypatch, mixed_registry
@@ -186,7 +191,11 @@ class TestResolution:
             monkeypatch, mixed_registry, wire="openai", requires=("tool_choice",)
         )
         assert info["primary_registry_id"] == "accepts-tools"
-        assert info["deployment_id"] == "low-accepts-tools"
+        # Capability-scoped resolutions address a name derived from the
+        # CAPABILITY the consumer declared, not from the member the
+        # derivation picked — one name, one meaning, one chain (I10399).
+        assert info["deployment_id"] == "low-cap-tool_choice"
+        assert info["wire_addressing"] == "capability_group"
 
     def test_an_unservable_requirement_raises_at_resolve_time(
         self, monkeypatch, mixed_registry
@@ -250,8 +259,11 @@ class TestFallbackChainsAreCapabilityHomogeneous:
         blip into a permanent 400."""
         _model_list, fallbacks, _aliases = _router._parse_registry(mixed_registry)
         chains = {k: v for f in fallbacks for k, v in f.items()}
-        assert chains["low-accepts-tools"] == ["low-also-accepts-tools"]
-        assert "low-refuses-tools" not in chains["low-accepts-tools"]
+        # The capability-scoped chain lives under a name derived from the
+        # CAPABILITY (I10399), so it can never overwrite — or be overwritten
+        # by — the chain of any other meaning of the same primary.
+        assert chains["low-cap-tool_choice"] == ["low-also-accepts-tools"]
+        assert "low-refuses-tools" not in chains["low-cap-tool_choice"]
 
 
 class TestThinkingPassthrough:

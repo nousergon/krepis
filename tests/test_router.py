@@ -201,12 +201,109 @@ def registry_file():
     os.unlink(f.name)
 
 
+#: An `ultra`-shaped registry: the primary is the ONLY tool_choice-capable
+#: member, and a second member can stream. On 2026-09-09 this shape emptied
+#: the chain under `{group}-{primary}` — the very key the resolver told
+#: consumers to address (alpha-engine-config-I10399).
+CAPABILITY_REGISTRY_YAML = """
+schema_version: 1
+
+model_groups:
+  ultra:
+    - glm-5.2
+    - deepseek-v4-pro
+
+models:
+  - id: glm-5.2
+    name: GLM 5.2
+    provider: zhipu
+    route: egress_proxy
+    reachable_from: [laptop, ec2, lambda]
+    api_base: http://127.0.0.1:8981/v1
+    upstream_host: api.z.ai
+    model: glm-5.2
+    group: ultra
+    group_role: primary
+    params:
+      max_tokens: 8192
+    capabilities:
+      tool_choice: true
+      streaming: true
+      batches: false
+    status: active
+
+  - id: deepseek-v4-pro
+    name: DeepSeek V4 Pro
+    provider: deepseek
+    route: egress_proxy
+    reachable_from: [laptop, ec2, lambda]
+    api_base: http://127.0.0.1:8972/v1
+    upstream_host: api.deepseek.com
+    model: deepseek-v4-pro
+    group: ultra
+    group_role: fallback
+    params:
+      max_tokens: 8192
+    capabilities:
+      tool_choice: false
+      streaming: true
+      batches: false
+    status: active
+"""
+
+
+@pytest.fixture
+def capability_registry_file():
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        f.write(CAPABILITY_REGISTRY_YAML)
+    yield Path(f.name)
+    os.unlink(f.name)
+
+
 @pytest.fixture(autouse=True)
 def _patch_egress_probe():
     """Mock the egress proxy health probe so tests don't depend on a running
     proxy (config#4923).  All egress_proxy routes appear healthy."""
     with mock.patch.object(_router, "_probe_egress_proxy", return_value=True):
         yield
+
+
+class TestCapabilityGroupsAreDistinctNames:
+    """alpha-engine-config-I10399 — the in-process half.
+
+    `{group}-{capable[0]}` named the group's default primary AND every
+    capability whose filtered primary is that same member. Each meaning
+    carries a different chain under one key; the code resolved the collision
+    by letting "the narrower chain win", which emptied the key the unfiltered
+    resolution addresses. The proxy-config generator had the same shape, and
+    that is the one that reached production.
+    """
+
+    def test_group_primary_keeps_the_group_chain(self, capability_registry_file):
+        _, fallbacks, aliases = _router._parse_registry(capability_registry_file)
+        assert aliases["ultra"] == "ultra-glm-5.2"
+        chains = {k: v for fb in fallbacks for k, v in fb.items()}
+        assert chains["ultra"] == ["ultra-deepseek-v4-pro"]
+        assert chains["ultra-glm-5.2"] == ["ultra-deepseek-v4-pro"], (
+            "the group primary's key was overwritten with a capability chain"
+        )
+
+    def test_each_capability_set_has_its_own_name(self, capability_registry_file):
+        model_list, fallbacks, _ = _router._parse_registry(capability_registry_file)
+        names = {m["model_name"] for m in model_list}
+        assert {"ultra-cap-streaming", "ultra-cap-tool_choice"} <= names
+        chains = {k: v for fb in fallbacks for k, v in fb.items()}
+        assert chains["ultra-cap-streaming"] == ["ultra-deepseek-v4-pro"]
+        # Only one tool_choice-capable member exists, so no chain is emitted
+        # at all — honest, and no longer contagious.
+        assert "ultra-cap-tool_choice" not in chains
+
+    def test_no_fallback_key_is_declared_twice(self, capability_registry_file):
+        _, fallbacks, _ = _router._parse_registry(capability_registry_file)
+        keys = [k for fb in fallbacks for k in fb]
+        assert len(keys) == len(set(keys)), (
+            f"a key declared twice makes the chain depend on read order: {keys}"
+        )
 
 
 class TestParseRegistry:
@@ -773,15 +870,22 @@ class TestLitellmProbeSpeaksTheDeclaredScheme:
         )
         assert info["route"] == "litellm_proxy"
 
-    def test_proxy_route_addresses_the_qualified_primary_not_the_alias(
+    def test_proxy_route_addresses_the_group_not_a_deployment(
         self, registry_file, monkeypatch
     ):
-        """config-I6727 deliverable 2: on the litellm_proxy route the model to
-        ADDRESS is the qualified primary deployment name ({group}-{mid}, the
-        #118 naming), never the bare group alias — litellm's proxy stamps the
-        client-requested model back onto every non-fallback response, so a
-        bare-alias-addressed healthy call reports the alias as resp.model and
-        trips the #115 masquerade guard."""
+        """alpha-engine-config-I10399, reversing config-I6727 deliverable 2.
+
+        A fallback chain is declared ON A GROUP. Addressing a concrete
+        deployment silently opts out of every fallback the registry declares
+        — measured live 2026-09-09 through the running router, back to back:
+        `model="ultra"` fell back to `deepseek-v4-pro` and answered;
+        `model="ultra-glm-5.2-direct"` returned Zhipu's 429 with
+        `Available Model Group Fallbacks=[]`.
+
+        The Director addresses `deployment_id`, so this assertion is the one
+        standing between `ultra`'s second arm and a weekly run that fails
+        outright.
+        """
         self._capture(monkeypatch)
         _router._router = None
         try:
@@ -793,11 +897,95 @@ class TestLitellmProbeSpeaksTheDeclaredScheme:
         finally:
             _router._router = None
         assert info["route"] == "litellm_proxy"
-        assert info["model"] == "ultra-glm-5.2"
-        assert info["deployment_id"] == "ultra-glm-5.2"
-        assert info["model"] != info["group"] == "ultra"
-        # the resolve-time primary facts survive unchanged
+        assert info["model"] == "ultra"
+        assert info["deployment_id"] == "ultra"
+        assert info["wire_addressing"] == "group"
+        # the resolve-time primary facts survive unchanged — the honesty half
+        # of I6727 is kept, it just travels beside the wire name instead of
+        # replacing it.
         assert info["primary_registry_id"] == "glm-5.2"
+
+    def test_capability_scoped_resolution_addresses_a_capability_group(
+        self, capability_registry_file, monkeypatch
+    ):
+        """A declared `requires` narrows the NAME, and the name is derived
+        from what the consumer declared — not from which member the
+        derivation picked. `{group}-{capable[0]}` meant "default primary",
+        "streaming primary" and "tool_choice primary" at once; each carries a
+        different chain, and the last one written won."""
+        self._capture(monkeypatch)
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv(
+                    "LLM_MODEL_REGISTRY_PATH", str(capability_registry_file)
+                )
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                info = _router.resolve_group_structured(
+                    "ultra", requires=("streaming",)
+                )
+        finally:
+            _router._router = None
+        assert info["deployment_id"] == "ultra-cap-streaming"
+        assert info["wire_addressing"] == "capability_group"
+
+    def test_no_group_resolution_ever_puts_a_deployment_on_the_wire(
+        self, registry_file, monkeypatch
+    ):
+        """The class guard: for every group and every capability subset, the
+        name a consumer is told to address is a GROUP name — never
+        `{group}-{registry id}`, the shape that has no chain."""
+        import krepis.model_registry as _mr
+
+        self._capture(monkeypatch)
+        registry = _mr.load_registry(registry_file)
+        deployment_names = {
+            f"{g}-{mid}"
+            for g, ids in registry.groups.items()
+            for mid in ids
+        }
+        _router._router = None
+        try:
+            with monkeypatch.context() as m:
+                m.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+                m.setenv("KREPIS_LITELLM_PROXY_URL", "https://router.example.ai")
+                m.setenv("LITELLM_MASTER_KEY", "test-key")
+                for group in registry.groups:
+                    for caps in ((),) + tuple(_router._capability_subsets()):
+                        try:
+                            info = _router.resolve_group_structured(
+                                group, requires=caps
+                            )
+                        except (ValueError, _mr.CapabilityUnavailableError):
+                            continue
+                        if info["route"] != "litellm_proxy":
+                            continue
+                        assert info["deployment_id"] not in deployment_names, (
+                            f"{group} requires={caps} addresses the deployment "
+                            f"{info['deployment_id']!r}, which carries no "
+                            f"fallback chain (alpha-engine-config-I10399)"
+                        )
+                        assert info["deployment_id"] == _router.group_wire_model(
+                            group, caps
+                        )
+        finally:
+            _router._router = None
+
+    def test_capability_group_name_is_the_sorted_capability_set(self):
+        """Pinned as a LITERAL on both sides of the cross-repo boundary:
+        `alpha-engine-config/scripts/test_generate_litellm_proxy_config.py`
+        pins the same strings for the generator that EMITS these names. The
+        convention is duplicated deliberately — importing it would put a
+        krepis version floor on a script the launchd shim runs at every
+        router start — so a contract test is what holds the two together."""
+        assert _router.capability_group_name(
+            "ultra", ("streaming",)
+        ) == "ultra-cap-streaming"
+        assert _router.capability_group_name(
+            "ultra", ("tool_choice", "streaming")
+        ) == "ultra-cap-streaming-tool_choice"
+        assert _router.group_wire_model("ultra") == "ultra"
 
     def test_explicit_port_is_honoured(self, registry_file, monkeypatch):
         seen = self._capture(monkeypatch)

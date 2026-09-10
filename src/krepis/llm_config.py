@@ -226,6 +226,26 @@ class ModelSpec:
     # indistinguishable from `{effort: max}` downstream — the exact distinction
     # the reasoning-budget class turns on (alpha-engine-config-I6901, I6908).
     registry_id: Optional[str] = None
+    # The upstream model the router's derivation named as this group's
+    # PRIMARY, when this spec addresses a model group (alpha-engine-config-
+    # I10399). ``None`` for a hand-built spec or a single-model resolution.
+    #
+    # A group-addressed request puts the GROUP on the wire — that is what
+    # makes LiteLLM apply the group's fallback chain — and LiteLLM stamps the
+    # client-requested model back onto every response that did NOT fall back
+    # (`litellm/proxy/common_request_processing.py::
+    # _override_openai_response_model`, whose first documented exception is
+    # "if a fallback occurred, preserve the actual model used"). So on a
+    # group-addressed call the response's own `model` field is the group name
+    # exactly when the primary served, and the real model exactly when it did
+    # not. This field is the other half of that: the name to bill and record
+    # when the echo comes back.
+    #
+    # Without it, honesty about which model served and engagement of the
+    # fallback chain were traded against each other — and the trade was made
+    # the wrong way round, by addressing the deployment (config-I6727), which
+    # bought an honest `resp.model` at the price of every group fallback.
+    group_primary_model: Optional[str] = None
 
     def __post_init__(self) -> None:
         # `provider="litellm"` used to select an IN-PROCESS LiteLLM Router,

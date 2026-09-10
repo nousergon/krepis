@@ -49,6 +49,7 @@ Derivation
 from __future__ import annotations
 
 import http.client as _http_client
+import itertools
 import json
 import logging
 import os
@@ -77,6 +78,67 @@ _MAX_WALK_DEPTH = 8
 # Rule (model-router-policy R19): emit BOTH names for one release, migrate
 # consumers, then remove.  Never a same-commit rename.
 RESOLVE_SCHEMA_VERSION = 2
+
+#: Infix separating a group name from its capability qualifier on the wire.
+#:
+#: A consumer that declares ``requires=(...)`` addresses
+#: ``{group}-cap-{sorted capabilities}`` — a name derived from WHAT IT ASKED
+#: FOR, never from which member the derivation happened to pick.
+#:
+#: It used to address ``{group}-{capable[0]}``, and that name means several
+#: things at once: the group's default primary, its streaming primary, its
+#: tool_choice primary. Each meaning carries a different fallback chain under
+#: one key, and whichever the generator wrote last won. Measured live
+#: 2026-09-09 (alpha-engine-config-I10399): the Director's plan call put
+#: ``ultra-glm-5.2-direct`` on the wire and took Zhipu's 429 with
+#: ``Available Model Group Fallbacks=[]`` while ``ultra``'s declared chain —
+#: one key away, in the same config — answered the identical prompt.
+#:
+#: `alpha-engine-config/scripts/generate_litellm_proxy_config.py` emits these
+#: names; this module addresses them. The two derivations are deliberately
+#: separate implementations, held together by a contract test on both sides
+#: rather than by an import (importing would put a krepis version floor on a
+#: script the launchd shim runs at every router start).
+CAPABILITY_NAME_INFIX = "cap"
+
+
+def capability_group_name(group: str, capabilities) -> str:
+    """The wire name for *group* narrowed to *capabilities*.
+
+    ``capability_group_name("ultra", ("streaming",)) -> "ultra-cap-streaming"``
+
+    Capabilities are sorted, so the name depends on the SET a consumer
+    declared and not on the order it listed them in.
+    """
+    return f"{group}-{CAPABILITY_NAME_INFIX}-" + "-".join(sorted(capabilities))
+
+
+def _capability_subsets() -> list:
+    """Every non-empty subset of :data:`ROUTABLE_CAPABILITIES`, each sorted.
+
+    A consumer may declare more than one capability at once, so a name it can
+    address has to exist for the combination too. Three routable capabilities
+    means seven names per group — bounded, deterministic, and derived from the
+    same list both this module and the proxy-config generator read.
+    """
+    from . import model_registry as _mr
+
+    caps = tuple(sorted(_mr.ROUTABLE_CAPABILITIES))
+    out = []
+    for r in range(1, len(caps) + 1):
+        out.extend(itertools.combinations(caps, r))
+    return out
+
+
+def group_wire_model(group: str, requires: tuple = ()) -> str:
+    """The model name a consumer must put on the wire for *group*.
+
+    The bare group when nothing is required; the capability-scoped group name
+    when something is. Both are names LiteLLM applies a fallback chain to — a
+    concrete deployment name is not, which is the whole of I10399.
+    """
+    return group if not requires else capability_group_name(group, requires)
+
 
 # Fields kept only to avoid breaking not-yet-migrated consumers.  Each entry
 # is (deprecated_name, current_name, remove_after_version).
@@ -1085,7 +1147,7 @@ def _parse_registry(
             fallbacks.append({group_name: fallback_chain})
             fallbacks.append({primary_name: fallback_chain})
 
-    # ── Capability-scoped chains ────────────────────────────────────────
+    # ── Capability-scoped groups ────────────────────────────────────────
     #
     # A fallback chain may only contain members that can serve the same call
     # shapes as the deployment they back. A chain that degrades a forced-tool
@@ -1094,29 +1156,41 @@ def _parse_registry(
     # — which is the same wrong answer as I7904, arrived at from the other
     # direction.
     #
-    # So for every group and every routable capability, the qualified name of
-    # the capability-filtered PRIMARY gets a chain built only from the other
-    # capability-filtered members. When that primary is also the group's
-    # unfiltered primary the two keys collide, and the narrower chain wins:
-    # the alternative is a chain whose own members cannot serve the request the
-    # primary just failed.
+    # Each capability SET a consumer may declare gets its OWN name
+    # (:func:`capability_group_name`) and its own chain. It used to reuse the
+    # qualified name of the filtered primary, `{group}-{capable[0]}`, and
+    # where that collided with the group's own primary "the narrower chain
+    # wins" emptied the key the unfiltered resolution addresses. That is the
+    # in-process half of alpha-engine-config-I10399, whose proxy-side twin
+    # left `ultra-glm-5.2-direct` with `Available Model Group Fallbacks=[]`
+    # while `ultra`'s chain worked. One name, one meaning, one chain: nothing
+    # here overwrites a chain another meaning declared.
     for group_name in registry.groups:
-        for capability in _mr.ROUTABLE_CAPABILITIES:
-            capable = registry.live_group_ids(group_name, requires=(capability,))
-            if len(capable) < 2:
+        live_ids = registry.live_group_ids(group_name)
+        if not live_ids:
+            continue
+        capable_by_capability = {
+            cap: registry.live_group_ids(group_name, requires=(cap,))
+            for cap in _mr.ROUTABLE_CAPABILITIES
+        }
+        for caps in _capability_subsets():
+            capable = [
+                mid for mid in live_ids
+                if all(mid in capable_by_capability[c] for c in caps)
+            ]
+            if not capable:
                 continue
-            key = f"{group_name}-{capable[0]}"
+            key = capability_group_name(group_name, caps)
+            primary_deployment = f"{group_name}-{capable[0]}"
+            if key not in seen_models:
+                params = next(
+                    m["litellm_params"] for m in model_list
+                    if m["model_name"] == primary_deployment
+                )
+                model_list.append({"model_name": key, "litellm_params": params})
+                seen_models.add(key)
             chain = [f"{group_name}-{mid}" for mid in capable[1:]]
-            existing = next((f for f in fallbacks if key in f), None)
-            if existing is not None:
-                if existing[key] != chain:
-                    logger.info(
-                        "narrowing the fallback chain for %r to its %s-capable "
-                        "members: %s -> %s",
-                        key, capability, existing[key], chain,
-                    )
-                existing[key] = chain
-            else:
+            if chain:
                 fallbacks.append({key: chain})
 
     return model_list, fallbacks, group_aliases
@@ -1819,26 +1893,53 @@ def _resolve_group_json(
 
         _display_name = f"{_primary_model} ({group})"
 
-        # config-I6727 deliverable 2: the model to ADDRESS on the wire is the
-        # QUALIFIED primary deployment name ({group}-{mid}, the #118 naming),
-        # never the bare group alias. litellm's proxy stamps the CLIENT-
-        # REQUESTED model back onto every non-fallback response
-        # (_override_openai_response_model), so a bare-alias-addressed healthy
-        # call reports the alias as resp.model regardless of server-side
-        # deployment naming — the masquerade the #115 guard rejects. Dual-keyed
-        # fallbacks (#118) keep the chain engaged under the qualified key; the
-        # bare group remains a server-side model_group_alias for callers krepis
-        # does not own. Resolver-owned: consumers address what this dict says.
-        _qualified_primary = f"{group}-{_primary_registry_id}"
+        # The model to ADDRESS on the wire is a MODEL GROUP — the bare group
+        # when the caller required nothing, the capability-scoped group name
+        # when it did. Never a concrete deployment name.
+        #
+        # This reverses config-I6727 deliverable 2, which had this emit the
+        # qualified primary deployment name `{group}-{mid}`. That was chosen
+        # to keep `resp.model` honest: litellm's proxy stamps the CLIENT-
+        # REQUESTED model back onto every response that did not fall back
+        # (`_override_openai_response_model`), so addressing a group makes a
+        # healthy call report the group name as its served model.
+        #
+        # Honesty about what served and engagement of the fallback chain were
+        # traded against each other, and the trade was made the wrong way
+        # round. A fallback chain is declared ON A GROUP; a deployment name is
+        # not a group, so addressing one silently opts out of every fallback
+        # the registry declares. Measured live 2026-09-09
+        # (alpha-engine-config-I10399), through the running router, back to
+        # back: `model="ultra"` fell back to `deepseek-v4-pro` and answered;
+        # `model="ultra-glm-5.2-direct"` returned Zhipu's 429 with
+        # `Available Model Group Fallbacks=[]`. The Director addresses this
+        # field, so `ultra`'s second arm (alpha-engine-config-I8165) was
+        # defeated at the wire.
+        #
+        # The honesty half is not given up: `primary_model` below names the
+        # entry the derivation picked, `_route_to_spec` carries it onto
+        # `ModelSpec.group_primary_model`, and `krepis.llm.
+        # _resolve_group_served_model` bills THAT when the response echoes the
+        # group — which, per litellm's own documented exception, happens
+        # exactly when no fallback occurred. When one did, the response
+        # carries the real model and it is used verbatim.
+        _wire_model = group_wire_model(group, tuple(requires))
 
         return _with_compat_aliases({
             "schema_version": RESOLVE_SCHEMA_VERSION,
-            "model": _qualified_primary,
+            "model": _wire_model,
             "display_name": _display_name,
             "provider": "litellm",
             "route": "litellm_proxy",
             "api_base_url": _litellm_url,
-            "deployment_id": _qualified_primary,
+            "deployment_id": _wire_model,
+            # What KIND of name `model`/`deployment_id` is. A consumer or an
+            # auditor can tell a group-addressed request from a
+            # deployment-addressed one without pattern-matching the string,
+            # and the guard in `tests/test_router.py` asserts on it.
+            "wire_addressing": (
+                "capability_group" if requires else "group"
+            ),
             "auth_token_type": "litellm_master_key",
             "group": group,
             "registry_id": f"litellm:group:{group}",
@@ -2028,6 +2129,10 @@ def _resolve_group_json(
             "route": route,
             "api_base_url": api_base_url,
             "deployment_id": _cli_deployment_id(entry),
+            # A per-provider route addresses the provider's own model name.
+            # There is no group in front of it to carry a chain, which is
+            # exactly why this route is the DEGRADED one (§5).
+            "wire_addressing": "deployment",
             "auth_token_type": auth_token_type,
             "group": group,
             "registry_id": mid,
@@ -2418,10 +2523,13 @@ def _route_to_spec(
     # `_refuse_unauthenticatable_pair` below now makes the difference a raise
     # rather than a 400 on every call.
     #
-    # The edge speaks OpenAI-compatible chat completions with the QUALIFIED
-    # primary deployment name ({group}-{mid}) as the model (config-I6727:
-    # addressing the bare group alias makes litellm's requested-model stamping
-    # report the alias as resp.model on every healthy call).
+    # The edge speaks OpenAI-compatible chat completions with a MODEL GROUP
+    # as the model — the bare group, or the capability-scoped group name when
+    # the caller declared `requires`. Never a deployment name: a fallback
+    # chain is declared on a group, so addressing a deployment opts out of
+    # every fallback the registry declares (alpha-engine-config-I10399, which
+    # reversed config-I6727's deliverable 2; the honesty that change was
+    # bought for now comes from `group_primary_model` below).
     # So the proxy route is emitted as a CUSTOM OpenAI-compatible endpoint —
     # ModelSpec's documented shape for exactly that (any provider name it
     # does not know, plus base_url + api_key_env). The chain is then walked
@@ -2467,6 +2575,18 @@ def _route_to_spec(
             route.get("primary_registry_id")
             if route.get("route") == "litellm_proxy"
             else route.get("registry_id")
+        ),
+        # Which upstream model the derivation named as this group's primary.
+        # Carried onto the spec so `krepis.llm._resolve_group_served_model`
+        # can bill a group-addressed call whose response echoes the group
+        # name — litellm restamps the requested model on every response that
+        # did NOT fall back, so the echo IS the statement "the primary served
+        # it" (alpha-engine-config-I10399). Only for a group route: a pinned
+        # single-model resolution has no group and no primary to name.
+        group_primary_model=(
+            route.get("primary_model")
+            if route.get("wire_addressing") in ("group", "capability_group")
+            else None
         ),
     )
     logger.info(
@@ -2838,6 +2958,12 @@ def _resolve_model_json(
         "route": "litellm_proxy",
         "api_base_url": url,
         "deployment_id": model_id,
+        # DELIBERATE, and the one legitimate deployment address: this resolver
+        # answers "call THIS registry entry", pinned by name. A pinned model
+        # has no group and therefore no chain — see `resolve_model_spec`'s
+        # docstring — and a consumer that wanted availability should have
+        # asked for a group (alpha-engine-config-I10399).
+        "wire_addressing": "deployment",
         "auth_token_type": "litellm_master_key",
         "group": _group,
         "registry_id": model_id,

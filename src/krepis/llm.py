@@ -187,6 +187,22 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
     it does not resolve and falls through to the error below.
     """
     served_model = getattr(resp, "model", "") or ""
+    if served_model and served_model == spec.model and spec.group_primary_model:
+        # GROUP-ADDRESSED call, no fallback. The spec put a model GROUP on the
+        # wire (`ultra`, `ultra-cap-streaming`) because that is the only name
+        # litellm applies a fallback chain to, and litellm restamps the
+        # client-requested model onto every response THAT DID NOT FALL BACK —
+        # its own first documented exception is "if a fallback occurred,
+        # preserve the actual model used"
+        # (`litellm/proxy/common_request_processing.py::
+        # _override_openai_response_model`). So an echo of the group name is
+        # not an absence of information: it is the statement that the group's
+        # PRIMARY served the call, and the resolution already named which
+        # entry that is (alpha-engine-config-I10399).
+        #
+        # A fallback response does not reach here — its `model` differs from
+        # the group name and is returned verbatim below.
+        return spec.group_primary_model
     if served_model and served_model == spec.model and "-" in served_model:
         # Deployment-addressed call: the caller named a concrete deployment
         # and the router served it. Resolve to the billable upstream id.
@@ -251,6 +267,12 @@ def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
         f"alias (model field was {served_model!r}). Refusing to bill or "
         f"record the call under the alias — it is not a real model and "
         f"carries no price card (alpha-engine-config-I6543). "
+        f"A group-addressed spec must carry `group_primary_model` — set by "
+        f"krepis.router.resolve_group_spec() since the I10399 resolver — so "
+        f"an echo of the group name (which litellm sends exactly when NO "
+        f"fallback occurred) can be billed to the primary the resolution "
+        f"named. This spec does not carry one, so it was hand-built or built "
+        f"by an older krepis, and guessing a member is worse than refusing. "
         f"resp._hidden_params={hidden!r}"
     )
 
