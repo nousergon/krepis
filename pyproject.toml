@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.59.54"
+version = "0.59.55"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS/Web Push alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -140,7 +140,12 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed"]
+# `dlp_config/*.toml` is the in-process DLP ruleset. It is package DATA, not a
+# sample: `krepis.session_dlp` resolves it as the last-resort config so no
+# execution context can be missing the control (see that module's docstring).
+# Dropping it from this list restores the outage it exists to close, silently —
+# `tests/test_session_dlp_packaged_config.py` fails if it is unreadable.
+"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed", "dlp_config/*.toml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
