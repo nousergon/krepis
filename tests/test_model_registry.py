@@ -322,3 +322,49 @@ def test_router_does_not_parse_the_registry_itself():
         "krepis.router parses YAML again — the derivation belongs in "
         "krepis.model_registry (model-router-policy R6)"
     )
+
+
+# ── entry_reachable_from (R28) — the public predicate, alpha-engine-config-I10349 ──
+
+
+class TestEntryReachableFromIsPublic:
+    """`entry_reachable_from` is the single implementation of R28.
+
+    Public since `alpha-engine-config-I10349` so a second package (crucible's
+    `registry_preflight`) can import it by name instead of reaching for the
+    private `krepis.router._entry_reachable_from`, or worse, re-deriving the
+    rule. `krepis.router._entry_reachable_from` stays as a thin alias for
+    existing in-module callers; its own tests (`test_router.py`) cover the
+    delegation.
+    """
+
+    def test_declared_context_matches(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
+        assert mr.entry_reachable_from(entry, "laptop") is True
+
+    def test_undeclared_context_is_filtered(self):
+        entry = {"id": "x", "reachable_from": ["laptop", "ec2"]}
+        assert mr.entry_reachable_from(entry, "lambda") is False
+
+    def test_missing_field_is_unreachable_from_everywhere(self, caplog):
+        """An absent declaration is not permission (R20, fail closed).
+
+        The load-bearing case: on 2026-08-03 a stale, hand-published S3 copy
+        of the registry had no `reachable_from` on the `ultra` chain, and a
+        permissive reading of that silence served `glm-5.2` at openrouter.ai
+        from a Lambda, DLP-unscanned, while logging a healthy route
+        (alpha-engine-config-I6183, model-router-policy R26).
+        """
+        entry = {"id": "legacy-row"}
+        with caplog.at_level("ERROR"):
+            assert mr.entry_reachable_from(entry, "lambda") is False
+            assert mr.entry_reachable_from(entry, "laptop") is False
+        assert "reachable_from" in caplog.text
+        assert "legacy-row" in caplog.text
+
+    def test_router_alias_delegates_to_the_public_function(self):
+        from krepis.router import _entry_reachable_from
+
+        entry = {"id": "x", "reachable_from": ["ec2"]}
+        assert _entry_reachable_from(entry, "ec2") is mr.entry_reachable_from(entry, "ec2")
+        assert _entry_reachable_from({}, "ec2") is mr.entry_reachable_from({}, "ec2") is False
