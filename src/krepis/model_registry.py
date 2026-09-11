@@ -244,6 +244,54 @@ def entry_declares_capability(entry: dict, capability: str) -> bool:
     return (entry.get("capabilities") or {}).get(capability) is True
 
 
+def entry_reachable_from(entry: dict, exec_context: str) -> bool:
+    """Whether *entry* declares itself reachable from *exec_context* (R28).
+
+    An entry with no ``reachable_from`` key is **not** reachable from anywhere.
+
+    This branch used to be permissive — an undeclared entry was treated as
+    reachable from every context, with a warning — as the R19
+    additive-then-remove migration position, to be removed "once the validator
+    is enforcing."  The validator has been enforcing since #6203
+    (``scripts/validate_llm_model_registry.py`` fails a pull request on a
+    route-bearing row with no ``reachable_from``, asserted by
+    ``test_missing_reachable_from_fails``), so this is that removal.
+
+    It is not bookkeeping.  On 2026-08-03 the copy of the registry the Director
+    Lambda actually reads — an S3 object published by hand, one day behind the
+    repo — still had no ``reachable_from`` on the ``ultra`` chain.  The
+    permissive branch read that silence as universal reachability and served
+    ``glm-5.2`` at ``openrouter.ai`` from a Lambda, DLP-unscanned, while logging
+    a healthy route (alpha-engine-config-I6183, model-router-policy R26).  A
+    default that turns *absence of a declaration* into *permission* converts a
+    stale artifact into a policy breach, silently, which is what R20 (fail
+    closed) forbids.
+
+    A skipped entry is recorded in ``skipped_entries`` with the reason naming
+    the missing declaration, so this surfaces as a diagnosable resolution
+    failure rather than an unexplained one — and, per R20, resolution raises
+    only when nothing in the chain can serve.
+
+    Public since ``alpha-engine-config-I10349`` — the single implementation of
+    this predicate now has one public name, so a second package (``crucible``)
+    needing it does not have to choose between importing a private symbol or
+    re-deriving the rule. ``krepis.router._entry_reachable_from`` is a thin
+    alias kept for existing in-module callers.
+    """
+    declared = entry.get("reachable_from")
+    if declared is None:
+        logger.error(
+            "Registry entry %r declares no reachable_from and is therefore "
+            "UNREACHABLE from every context. model-router-policy R28 makes the "
+            "field required and the registry validator enforces it, so this "
+            "entry came from a registry copy that is stale or hand-written. "
+            "Fix the registry — do not read the omission as permission.",
+            entry.get("id", "<unknown>"),
+        )
+        return False
+    return exec_context in declared
+
+
 class Registry:
     """A parsed registry: the derivation's shared intermediate representation.
 
