@@ -96,6 +96,22 @@ class ProviderDefaults:
     transport: str  # TRANSPORT_ANTHROPIC | TRANSPORT_OPENAI
     base_url: Optional[str]
     api_key_env: str
+    #: Whether models reached through this provider use mechanism **M1**
+    #: (explicit ``cache_control`` breakpoints) when the spec itself declares
+    #: nothing (``ModelSpec.supports_prompt_caching is None``).
+    #:
+    #: This is a DECLARATION about the provider, made once, here — not a
+    #: transport branch in the request-construction path, which is what
+    #: ``prompt-caching-policy`` §3.6 forbids and krepis-I67 removed. Every
+    #: model on the Anthropic API is M1 by construction, so the default is a
+    #: fact rather than a guess. Every other built-in provider defaults to
+    #: ``False``, the safe direction: a marker sent to a provider that rejects
+    #: unknown fields is an outage, while one withheld from a provider that
+    #: caches transparently costs nothing.
+    #:
+    #: A spec resolved through :mod:`krepis.router` always carries the
+    #: registry's own declaration and never reaches this default.
+    explicit_cache_breakpoints: bool = False
 
 
 # Built-in providers. A ModelSpec may name any OTHER provider (e.g. a
@@ -106,6 +122,7 @@ PROVIDER_REGISTRY: dict = {
         transport=TRANSPORT_ANTHROPIC,
         base_url=None,
         api_key_env="ANTHROPIC_API_KEY",
+        explicit_cache_breakpoints=True,
     ),
     "openai": ProviderDefaults(
         transport=TRANSPORT_OPENAI,
@@ -199,9 +216,31 @@ class ModelSpec:
         or code default when the model is known to support it. Read by
         :class:`krepis.llm.LLMClient` for cache-aware logging; no
         client-side behavior change is required since the caching is
-        automatic. Contrast with ``prompt_caching`` (Anthropic-style
-        explicit ``cache_control`` breakpoints) which is transport-level
-        and needs no ModelSpec field.
+        automatic. Contrast with ``supports_prompt_caching`` below, the
+        mutually exclusive M1 mechanism. (This paragraph used to end "which
+        is transport-level and needs no ModelSpec field" — the doc asserting
+        the defect krepis-I67 fixed.)
+    supports_prompt_caching
+        Whether the model this spec addresses uses mechanism **M1** —
+        explicit ``cache_control`` breakpoints the CLIENT must place
+        (``prompt-caching-policy.md`` §2). ``None`` means UNDECLARED and
+        falls back to the addressed provider's
+        :attr:`ProviderDefaults.explicit_cache_breakpoints`.
+
+        This field exists because marker emission used to key on
+        ``transport``: markers on the Anthropic SDK path, none anywhere
+        else. Transport is a proxy for mechanism that is wrong in exactly
+        the expensive case — an Anthropic (M1) model reached over an
+        OpenAI-shaped route (the router edge, OpenRouter) got no markers
+        and therefore no caching at all, silently, at roughly 10x the
+        cached input rate. Nothing errors; the only signal is the invoice.
+        ``model-portability-policy.md`` §2 classifies that as a
+        Selection -> Transport plane leak (krepis-I67).
+
+        M1 and M2 are mutually exclusive per model. A spec resolved through
+        :mod:`krepis.router` carries the registry's declaration for the
+        group's PRIMARY — the entry that will actually serve — derived by
+        the one reader, ``krepis.router._caching_flags``.
     """
 
     provider: str
@@ -212,6 +251,10 @@ class ModelSpec:
     api_key_env: Optional[str] = None
     reasoning: Optional[dict] = None
     supports_automatic_prefix_caching: bool = False
+    #: ``None`` = undeclared; see the class docstring. Not a plain ``bool``
+    #: because "nobody said" and "said no" must be distinguishable: the first
+    #: defers to the provider's declared default, the second overrides it.
+    supports_prompt_caching: Optional[bool] = None
     supports_streaming: bool = True
     # The registry entry this spec was resolved FROM, when it came from the
     # model registry (``route["registry_id"]``). ``None`` for a hand-built spec.
@@ -299,6 +342,26 @@ class ModelSpec:
         return PROVIDER_REGISTRY.get(self.provider)
 
     @property
+    def explicit_cache_breakpoints(self) -> bool:
+        """Whether this spec's model wants client-placed ``cache_control``.
+
+        The ONE fact request construction reads to decide marker emission. A
+        declared value always wins; ``None`` falls back to the addressed
+        provider's declared default, and an unknown provider (a custom
+        OpenAI-compatible endpoint) to ``False`` — the safe direction, since
+        a marker sent to a provider that rejects unknown fields is an outage
+        while one withheld from a transparently-caching provider costs
+        nothing.
+
+        Nothing here reads :attr:`transport`, and nothing downstream may:
+        that is the whole of krepis-I67.
+        """
+        if self.supports_prompt_caching is not None:
+            return bool(self.supports_prompt_caching)
+        defaults = self._registry_defaults()
+        return bool(defaults is not None and defaults.explicit_cache_breakpoints)
+
+    @property
     def transport(self) -> str:
         """``"anthropic"`` or ``"openai"`` — which SDK drives this spec."""
         defaults = self._registry_defaults()
@@ -341,6 +404,7 @@ _SPEC_JSON_FIELDS = {
     "api_key_env",
     "reasoning",
     "supports_automatic_prefix_caching",
+    "supports_prompt_caching",
     "supports_streaming",
 }
 
