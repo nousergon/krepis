@@ -48,6 +48,33 @@ jobs:
           sparse-checkout-cone-mode: false
           path: .fleet/alpha-engine-predictor
 
+      # Every def test_*/class Test* under tests/ is actually collectible by
+      # pytest (alpha-engine-config-I10005): tests/test_router.py carried four
+      # def test_* for route_is_degraded, nested inside a helper AFTER its
+      # `return` — never collected, indistinguishable from passing on every
+      # surface this job reports. Fixed here by PR203; this step is the guard
+      # for the class. The checker is stdlib-only (ast/pathlib), so it needs
+      # no dependency install — runs once on the py3.9 leg rather than once
+      # per matrix entry, since the finding does not depend on interpreter
+      # version. Script lives in nousergon-lib (policy-shared-code
+      # second-adoption: needed immediately by krepis and crucible CI), fetched
+      # unpinned into a subdirectory — same pattern nousergon-lib's own
+      # action-pin-guard.yml documents: the consumer pins the skeleton, not the
+      # script, so a fix to the checker does not wait on a pin bump here.
+      - name: Checkout the test-shape guard (nousergon-lib, I10005)
+        if: matrix.python-version == '3.9'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: nousergon/nousergon-lib
+          sparse-checkout: |
+            scripts/lint_test_shape.py
+          sparse-checkout-cone-mode: false
+          path: .fleet/nousergon-lib
+
+      - name: Every test_*/Test* is collectible by pytest (I10005)
+        if: matrix.python-version == '3.9'
+        run: python3 .fleet/nousergon-lib/scripts/lint_test_shape.py .
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:
