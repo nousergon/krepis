@@ -2589,6 +2589,24 @@ def _route_to_spec(
         supports_streaming=bool(
             (route.get("capabilities") or {}).get("streaming", False)
         ),
+        # Which CACHING MECHANISM the served model uses. Both flags were
+        # resolved, emitted on the contract, and then dropped on the floor
+        # here: `_caching_flags` has derived them from the group's PRIMARY
+        # since PR69 (alpha-engine-config-I4463), the resolve contract has
+        # carried them since, and this adapter read neither — so every
+        # router-resolved spec reached `krepis.llm` declaring no mechanism at
+        # all, and marker emission fell back to a transport check. That check
+        # gave an Anthropic (M1) model reached over an OpenAI-shaped route
+        # zero caching, silently, at roughly 10x the cached input rate
+        # (krepis-I67).
+        #
+        # Taken from the TOP-LEVEL contract fields, not from `capabilities`:
+        # `capabilities` is the raw per-entry registry block, while these two
+        # are the resolver's answer for the entry that will actually serve.
+        supports_prompt_caching=bool(route.get("supports_prompt_caching", False)),
+        supports_automatic_prefix_caching=bool(
+            route.get("automatic_prefix_caching", False)
+        ),
         # The route already knows which registry entry it picked; discarding it
         # here is what made a cost record unable to name it. For a proxy route
         # `registry_id` is `litellm:group:{group}` and the entry actually
