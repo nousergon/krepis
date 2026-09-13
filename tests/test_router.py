@@ -630,6 +630,58 @@ class TestServedModelForDeployment:
             _router.served_model_for_deployment("low-deepseek-v4-flash")
 
 
+class TestRegistryGroups:
+    """`registry_groups()` — the public enumerator over `model_groups`.
+
+    alpha-engine-config-I9971: no consumer could ask the registry which
+    groups exist, so `crucible/llm.py` approximated the set from
+    `TIER_GROUPS` (a tier->group map) and got it wrong in both directions —
+    admitting `mid` (a tier, not a group) and dropping `ultra` (a real
+    group). This must return exactly what the resolved registry document
+    declares, and must never come back empty."""
+
+    @pytest.fixture(autouse=True)
+    def _registry_env(self, registry_file, monkeypatch):
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(registry_file))
+
+    def test_returns_every_group_the_registry_declares(self):
+        assert set(_router.registry_groups()) == {"low", "med", "high", "ultra"}
+
+    def test_matches_model_groups_in_the_resolved_registry_document(
+        self, registry_file
+    ):
+        """Fails if the returned set diverges from `model_groups` in the
+        actual resolved registry document — not a hardcoded expectation."""
+        import yaml
+
+        doc = yaml.safe_load(registry_file.read_text())
+        assert set(_router.registry_groups()) == set(doc["model_groups"].keys())
+
+    def test_admits_ultra_which_tier_groups_drops(self):
+        assert "ultra" in _router.registry_groups()
+
+    def test_does_not_admit_mid_a_tier_not_a_group(self):
+        """`mid` is a COMPLEXITY_TIERS value, never a registry group — the
+        registry's own group is `med`. registry_groups() must not launder
+        the tier vocabulary into the group vocabulary."""
+        assert "mid" not in _router.registry_groups()
+
+    def test_returned_type_is_a_tuple_of_strings(self):
+        groups = _router.registry_groups()
+        assert isinstance(groups, tuple)
+        assert all(isinstance(g, str) for g in groups)
+
+    def test_missing_registry_raises_rather_than_returning_empty(
+        self, monkeypatch, tmp_path
+    ):
+        """An unresolvable registry RAISES. Returning `()` would make every
+        membership check vacuously pass while looking healthy."""
+        monkeypatch.delenv("LLM_MODEL_REGISTRY_PATH", raising=False)
+        monkeypatch.chdir(tmp_path)
+        with pytest.raises(FileNotFoundError, match="cannot enumerate model groups"):
+            _router.registry_groups()
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────
 
 class TestCLI:
