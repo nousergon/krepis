@@ -2071,6 +2071,87 @@ class LLMClient:
             f"record the drop on the result."
         )
 
+    # ── cache-breakpoint emission (krepis-I67) ────────────────────────
+
+    def _emit_cache_breakpoints(self, cache_system: bool, *, record: bool = True) -> bool:
+        """Whether this call may place explicit ``cache_control`` markers.
+
+        The ONE decision, read by every request-construction path, and it
+        reads the DECLARED capability of the model that will serve —
+        :attr:`krepis.llm_config.ModelSpec.explicit_cache_breakpoints` —
+        never the transport.
+
+        ``prompt-caching-policy.md`` §3.6: "Transport is a proxy for
+        mechanism that is wrong in exactly the case that costs the most: an
+        Anthropic (M1) model reached through an OpenAI-shaped route still
+        needs markers, and gets none if the check keys on transport."
+        ``model-portability-policy.md`` §2 calls that a Selection ->
+        Transport plane leak. krepis had it: markers were constructed if and
+        only if ``spec.transport == TRANSPORT_ANTHROPIC``, so an M1 model on
+        the router edge or OpenRouter got **zero caching, silently, at
+        roughly 10x the cached input rate**. Nothing errors and the output is
+        identical; the only signal is the invoice.
+
+        A caller asking for caching on a route that cannot honour it takes
+        the DECLARED degradation path (``model-portability-policy`` I9):
+        the marker is stripped and the strip is RECORDED on
+        :attr:`LLMResult.dropped_params`, so a degraded call is visible in
+        the artifact and not only in a log line. A caller that passed
+        ``cache_system=False`` declined caching itself and is not degraded,
+        so nothing is recorded.
+
+        ``record=False`` is for the paths where caching is this METHOD's
+        internal preference rather than something the caller asked for —
+        :meth:`structured` takes no ``cache_system`` argument and requests it
+        unconditionally. Recording there would mark every structured call
+        against an M2 model as degraded, which makes ``dropped_params``
+        useless as a signal: it would be non-empty on the healthy majority.
+        The log line still fires, so the strip is never invisible.
+        """
+        if not cache_system:
+            return False
+        if self.spec.explicit_cache_breakpoints:
+            return True
+        if record:
+            self.dropped_params.append("cache_system")
+        logger.info(
+            "dropping cache_system: model %s (provider=%s, registry_id=%s) "
+            "does not declare explicit cache_control breakpoints "
+            "(automatic_prefix_caching=%s). Markers are emitted only for a "
+            "declared M1 model; sending them to a provider that rejects "
+            "unknown fields is an outage.",
+            self.spec.model, self.spec.provider, self.spec.registry_id,
+            self.spec.supports_automatic_prefix_caching,
+        )
+        return False
+
+    @staticmethod
+    def _openai_system_message(system: str, *, cache_breakpoint: bool) -> dict:
+        """The system message, in the OpenAI-compatible wire shape.
+
+        With a breakpoint the content becomes a LIST of typed parts carrying
+        ``cache_control`` — the shape LiteLLM and OpenRouter translate into
+        the upstream provider's native marker. Without one it stays a plain
+        string, which is what every M2/M4 provider expects and what this
+        path has always sent.
+
+        The marker ends the STABLE segment and never the per-turn content
+        (``prompt-caching-policy.md`` §3.1/§3.7): a breakpoint on volatile
+        bytes caches nothing and burns one of four slots.
+        """
+        if not cache_breakpoint:
+            return {"role": "system", "content": system}
+        return {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+
     # ── streaming gates ───────────────────────────────────────────────
 
     def _require_streaming_route(self) -> None:
@@ -2514,13 +2595,15 @@ class LLMClient:
             else None
         )
 
+        cache_breakpoint = self._emit_cache_breakpoints(cache_system)
+
         if self.spec.transport == TRANSPORT_ANTHROPIC:
             payload = build_messages_payload(
                 model=self.spec.model,
                 system_prompt=system,
                 user_content=user_content,
                 max_tokens=limit,
-                cache_system=cache_system,
+                cache_system=cache_breakpoint,
                 extra=extra,
             )
             if stream:
@@ -2552,7 +2635,9 @@ class LLMClient:
             "model": self.spec.model,
             "max_tokens": limit,
             "messages": [
-                {"role": "system", "content": system},
+                self._openai_system_message(
+                    system, cache_breakpoint=cache_breakpoint
+                ),
                 {"role": "user", "content": user_content},
             ],
         }
@@ -2781,7 +2866,10 @@ class LLMClient:
             system_prompt=system,
             user_content=user_content,
             max_tokens=max_tokens,
-            cache_system=True,
+            # The structured path asks for caching unconditionally; whether a
+            # marker is actually placed is the served model's declared
+            # mechanism, not this call's preference (krepis-I67).
+            cache_system=self._emit_cache_breakpoints(True, record=False),
             extra={
                 "tools": [tool],
                 "tool_choice": {"type": "tool", "name": schema_name},
@@ -2898,13 +2986,20 @@ class LLMClient:
         total_timeout: Optional[float] = None,
     ) -> StructuredResult:
         extra_body = self._openai_extra_body()
+        # Decided ONCE per call, not per ladder rung: re-deciding inside
+        # `_build` would also re-record the strip on every descent.
+        cache_breakpoint = self._emit_cache_breakpoints(True, record=False)
 
         def _build(rung: str) -> tuple[List[dict], dict]:
             """Request for one rung of the §7 ladder. The openai transport has
             two reachable rungs (``tool_emulation`` is the anthropic idiom), and
             building both here — rather than at one branch on entry — is what
             lets the descent re-issue instead of aborting the caller's run."""
-            msgs: List[dict] = [{"role": "system", "content": system}]
+            msgs: List[dict] = [
+                self._openai_system_message(
+                    system, cache_breakpoint=cache_breakpoint
+                )
+            ]
             kw: dict = {"model": self.spec.model, "max_tokens": max_tokens}
             if rung == _STRUCTURED_RUNG_NATIVE:
                 msgs.append({"role": "user", "content": user_content})
@@ -3202,7 +3297,7 @@ class LLMClient:
                 system_prompt=system,
                 user_content=user_content,
                 max_tokens=limit,
-                cache_system=cache_system,
+                cache_system=self._emit_cache_breakpoints(cache_system),
                 extra=extra,
             )
             self._dlp_scan_request(payload, context=f"grounded anthropic model={self.spec.model}")
@@ -3251,7 +3346,10 @@ class LLMClient:
             "model": self.spec.model,
             "max_tokens": limit,
             "messages": [
-                {"role": "system", "content": system},
+                self._openai_system_message(
+                    system,
+                    cache_breakpoint=self._emit_cache_breakpoints(cache_system),
+                ),
                 {"role": "user", "content": user_content},
             ],
             "extra_body": extra_body,
