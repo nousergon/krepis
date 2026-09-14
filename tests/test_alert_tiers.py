@@ -15,13 +15,14 @@ import pytest
 from krepis import alert_tiers
 
 
-def _registry(tmp_path, monkeypatch, entries, *, schema_version=1):
+def _registry(tmp_path, monkeypatch, entries, *, schema_version=1, muted_topics=None):
     doc = {
         "schema_version": schema_version,
         "generated_at": "2026-09-09T00:00:00+00:00",
         "source_digest": "sha256:test",
         "colliding_sources": [],
         "entries": entries,
+        "muted_topics": muted_topics if muted_topics is not None else {},
     }
     path = tmp_path / "alert_tier_registry.json"
     path.write_text(json.dumps(doc))
@@ -149,21 +150,74 @@ def test_page_after_consecutive_is_carried_through(tmp_path, monkeypatch):
     assert alert_tiers.resolve_tier("box-health", "critical").page_after_consecutive == 2
 
 
-def test_muted_topic_arn_rewrites_the_fleet_default_only():
+def test_muted_sibling_topic_name_reads_the_declared_registry_map(tmp_path, monkeypatch):
+    """alpha-engine-config-I10382 — a declared map, not a name convention.
+
+    The consumer (`krepis.alert_tiers.muted_sibling_topic_name`) must resolve
+    strictly from the published `muted_topics` block: a topic present and
+    mapped to a name resolves that name; a topic mapped to `null` (declared,
+    no sibling yet) and a topic absent entirely both resolve `None` — the
+    same "keep the caller's topic, warn loudly" outcome either way.
+    """
+    _registry(tmp_path, monkeypatch, [], muted_topics={
+        "alpha-engine-alerts": "alpha-engine-alerts-muted",
+        "crucible-v2-pages": "crucible-v2-pages-muted",
+        "alpha-engine-alarm-backstop": None,
+    })
+    assert alert_tiers.muted_sibling_topic_name("alpha-engine-alerts") == "alpha-engine-alerts-muted"
+    assert alert_tiers.muted_sibling_topic_name("crucible-v2-pages") == "crucible-v2-pages-muted"
+    # Declared with no sibling yet (alarm-backstop is published to directly
+    # by CloudWatch alarms, not through this chokepoint — see I10382).
+    assert alert_tiers.muted_sibling_topic_name("alpha-engine-alarm-backstop") is None
+    # Not in the map at all.
+    assert alert_tiers.muted_sibling_topic_name("some-other-topic") is None
+    assert alert_tiers.muted_sibling_topic_name(None) is None
+    assert alert_tiers.muted_sibling_topic_name("") is None
+
+
+def test_muted_sibling_topic_name_is_none_without_a_readable_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv(alert_tiers.REGISTRY_PATH_ENV, str(tmp_path / "nope.json"))
+    alert_tiers.reset_cache()
+    assert alert_tiers.muted_sibling_topic_name("alpha-engine-alerts") is None
+
+
+def test_muted_topic_arn_rewrites_from_the_declared_registry_map(tmp_path, monkeypatch):
     from krepis import alerts
 
+    _registry(tmp_path, monkeypatch, [], muted_topics={
+        "alpha-engine-alerts": "alpha-engine-alerts-muted",
+        "crucible-v2-pages": "crucible-v2-pages-muted",
+        "alpha-engine-alarm-backstop": None,
+    })
     assert alerts._muted_topic_arn(
         "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
     ) == f"arn:aws:sns:us-east-1:711398986525:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
-    # A topic with no declared muted sibling keeps its email leg rather than
-    # having its durable record published into a topic the caller's role may
-    # not be granted. `crucible-v2-pages` is the live example, and crucible-v2
-    # phase 2's page-counting clauses must keep observing it unchanged through
-    # 2026-09-19.
+    # Closes-when clause of alpha-engine-config-I10382: a tracked-only
+    # emission passing `sns_topic_arn` for `crucible-v2-pages` must land on
+    # its declared zero-subscriber sibling.
     assert alerts._muted_topic_arn(
         "arn:aws:sns:us-east-1:711398986525:crucible-v2-pages"
+    ) == "arn:aws:sns:us-east-1:711398986525:crucible-v2-pages-muted"
+    # Declared with no sibling (alarm-backstop) and an undeclared topic both
+    # keep the caller's own topic rather than dropping the durable record.
+    assert alerts._muted_topic_arn(
+        "arn:aws:sns:us-east-1:711398986525:alpha-engine-alarm-backstop"
+    ) is None
+    assert alerts._muted_topic_arn(
+        "arn:aws:sns:us-east-1:711398986525:some-other-topic"
     ) is None
     assert alerts._muted_topic_arn(None) is None
+
+
+def test_muted_topic_arn_keeps_the_callers_topic_without_a_readable_registry(tmp_path, monkeypatch):
+    """Registry drift must never silently drop the durable SNS record."""
+    from krepis import alerts
+
+    monkeypatch.setenv(alert_tiers.REGISTRY_PATH_ENV, str(tmp_path / "nope.json"))
+    alert_tiers.reset_cache()
+    assert alerts._muted_topic_arn(
+        "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    ) is None
 
 
 def test_episode_override_can_retier_one_episode_of_a_class(tmp_path, monkeypatch):
