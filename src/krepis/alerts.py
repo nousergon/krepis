@@ -513,37 +513,40 @@ def _resolve_sns_topic_arn(explicit: str | None) -> str | None:
 
 
 def _muted_topic_arn(page_arn: str | None) -> str | None:
-    """The zero-subscriber sibling of a resolved topic ARN, or ``None``.
+    """The declared zero-subscriber sibling of a resolved topic ARN, or
+    ``None``.
 
-    ``None`` means "this topic has no known muted sibling — publish to it
+    alpha-engine-config-I10382 — reads :func:`krepis.alert_tiers.
+    muted_sibling_topic_name`, which resolves the topic's sibling from the
+    ``muted_topics`` block of the same published registry document
+    :func:`~krepis.alert_tiers.resolve_tier` reads, rather than the name
+    convention this function used before (only `alpha-engine-alerts` ->
+    `alpha-engine-alerts-muted` was ever covered that way). A hand-kept
+    `<topic>-muted` guess is the recorded fleet bug class
+    `alpha-engine-config-I10121`.
+
+    ``None`` means "this topic has no declared muted sibling — publish to it
     unchanged": the email leg stays, the Telegram leg is still suppressed by
     the tier, and the caller sees a WARNING naming the gap. Losing the durable
-    SNS record to a topic the caller's role cannot publish to would be worse
-    than one extra email.
-
-    ONLY the fleet default (`alpha-engine-alerts`) is rewritten today.
-    Measured 2026-09-09: two other topics carry an unfiltered email
-    subscription to cipher813@gmail.com — `crucible-v2-pages` (54 messages in
-    the seven days to 2026-09-09) and `alpha-engine-alarm-backstop` (13). Both
-    need a muted sibling of their own before they can be covered, and
-    crucible-v2's is env-declared with its own IAM grant
-    (`crucible.alerts.muted_topic`), so guessing `<topic>-muted` here would
-    publish into a topic the v2 RuntimeRole is not granted. Tracked
-    separately; until then those two topics keep today's behaviour, which is
-    also what crucible-v2 phase 2's `pages_within_ceiling` and
-    `pages_commissioned` clauses must keep observing through 2026-09-19.
+    SNS record to a topic the caller's role may not be granted to publish to
+    would be worse than one extra email. As of I10382 this is true for
+    `alpha-engine-alarm-backstop` — published to directly by CloudWatch
+    alarms, not through this chokepoint, so a registry row here cannot
+    suppress its email leg (see that issue for the alarm-layer finding).
     """
     if not page_arn:
         return None
     head, _, name = page_arn.rpartition(":")
-    if name != DEFAULT_SNS_TOPIC_NAME:
+    sibling = alert_tiers.muted_sibling_topic_name(name)
+    if not sibling:
         logger.warning(
-            "alerts: no muted sibling is declared for SNS topic %r, so this "
-            "non-page emission keeps the email leg. Only %r is covered today "
-            "(alpha-engine-config-I6751).", name, DEFAULT_SNS_TOPIC_NAME,
+            "alerts: no muted sibling is declared in the published registry "
+            "for SNS topic %r, so this non-page emission keeps the email leg "
+            "(alpha-engine-config-I10382). Add a `muted_topics` row for it in "
+            "nousergon-data infrastructure/overseer/playbooks.yaml.", name,
         )
         return None
-    return f"{head}:{alert_tiers.MUTED_SNS_TOPIC_NAME}"
+    return f"{head}:{sibling}"
 
 
 def _format_message(

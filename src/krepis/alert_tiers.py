@@ -127,12 +127,20 @@ REGISTRY_PATH_ENV: Final[str] = "KREPIS_ALERT_TIER_REGISTRY_PATH"
 #: costing at most four GETs an hour per process.
 CACHE_TTL_SEC: Final[int] = 900
 
-#: The SNS topic every non-`page` emission is redirected to. Measured
-#: 2026-09-09: it exists in 711398986525/us-east-1 and has ZERO subscriptions,
-#: so it is a durable record with no delivery — which is precisely what
-#: "suppress the notification, keep the recording" means (§7.2a). The record
-#: is NOT dropped: the message still lands on a topic, and the §7.3 bus event
-#: is emitted unchanged.
+#: The SNS topic the fleet-default `alpha-engine-alerts` publisher redirects
+#: non-`page` emissions to. Measured 2026-09-09: it exists in
+#: 711398986525/us-east-1 and has ZERO subscriptions, so it is a durable
+#: record with no delivery — which is precisely what "suppress the
+#: notification, keep the recording" means (§7.2a). The record is NOT
+#: dropped: the message still lands on a topic, and the §7.3 bus event is
+#: emitted unchanged.
+#:
+#: DOCUMENTATION ONLY as of alpha-engine-config-I10382 — the actual routing
+#: decision is :func:`muted_sibling_topic_name`, which reads the published
+#: `muted_topics` block rather than this name convention. A hand-kept
+#: `<topic>-muted` guess is the recorded fleet bug class
+#: `alpha-engine-config-I10121` (a hand-written twin of something readable
+#: went stale and reddened `main` four times in three days).
 MUTED_SNS_TOPIC_NAME: Final[str] = "alpha-engine-alerts-muted"
 
 #: Streak markers for `page_after_consecutive`. Same bucket and shape as the
@@ -261,6 +269,43 @@ def reset_cache() -> None:
     """Drop the in-process registry cache. For tests and long-lived daemons."""
     _cache["doc"] = None
     _cache["fetched_at"] = 0.0
+
+
+def muted_sibling_topic_name(topic_name: str | None) -> str | None:
+    """The declared muted sibling for an SNS topic NAME, or ``None``.
+
+    alpha-engine-config-I10382. Reads the ``muted_topics`` block of the SAME
+    published registry document :func:`resolve_tier` reads — a top-level
+    dict of ``{topic_name: muted_sibling_name | None}`` written by
+    ``nousergon-data infrastructure/overseer/publish_alert_tier_registry.py``
+    — rather than a name convention. A hand-kept `<topic>-muted` guess is the
+    recorded fleet bug class `alpha-engine-config-I10121`: a hand-written
+    twin of a table this code could instead read went stale and reddened
+    `main` four times in three days before the twin was deleted.
+
+    Every "cannot answer" case collapses to ``None`` identically — no topic
+    name, an unreadable/unparseable/wrong-schema registry (see
+    :func:`_load_registry`'s own ERROR logging), a topic absent from
+    ``muted_topics`` entirely, or a topic explicitly mapped to ``null``
+    (declared, but no sibling exists yet, e.g. `alpha-engine-alarm-backstop`
+    as of I10382 — see that issue for why). The caller
+    (:func:`krepis.alerts._muted_topic_arn`) treats every ``None`` alike:
+    keep the emission on its original topic and log a WARNING. Losing the
+    durable SNS record to a topic nothing declares would be worse than one
+    extra email.
+    """
+    if not topic_name:
+        return None
+    doc = _load_registry()
+    if doc is None:
+        return None
+    muted = doc.get("muted_topics")
+    if not isinstance(muted, dict):
+        return None
+    sibling = muted.get(topic_name)
+    if not isinstance(sibling, str) or not sibling:
+        return None
+    return sibling
 
 
 def _match(source: str, entries: list[dict]) -> list[dict]:
