@@ -61,6 +61,73 @@ without paging the operator (PR165 paged Brian with a synthetic ERROR
 because ``publish()`` previously only suppressed fan-out under
 ``PYTEST_CURRENT_TEST``).
 
+**Reaching the dry-run without touching the call site**
+(:data:`DRY_RUN_ENV_VAR` = ``KREPIS_ALERT_DRY_RUN``, metron-ops-I340). The
+``dry_run=`` kwarg only helps a caller who can EDIT the caller. A CLI, a
+systemd unit, a hand-run of a detector module or a one-off shell loop has
+no such edit, and 216 files across 17 repos reach this function — plumbing
+a parameter through each of them is not a fix. Setting
+``KREPIS_ALERT_DRY_RUN`` to ``1``/``true``/``yes`` (case-insensitive,
+surrounding whitespace ignored; every other value, including ``0`` and
+``false``, is OFF) turns the dry-run on for every ``publish`` in that
+process, with zero code change anywhere. The variable is ONE-WAY: an
+explicit ``dry_run=True`` from the caller still wins, and no value of the
+variable can turn a caller's dry-run into a real send. Each suppressed
+publish logs one WARNING naming the variable, so a dry-run is never
+mistaken afterwards for a delivered alert.
+
+**Demonstrating that a detector fires** — the rule this module asks call
+sites to follow. Use ``dry_run`` / ``KREPIS_ALERT_DRY_RUN`` to exercise a
+detector's fire path. NEVER force the detector's input condition true
+against the live transport. Two measured instances of the second thing:
+
+* **metron-ops-I340, 2026-09-17.** A just-corrected compliance detector was
+  re-run against the live box with its input forced true
+  (``ENV=EXTERNAL_DEMO_RELEASED=true ... -m
+  api.services.external_demo_release_gate``). Brian was paged CRITICAL for a
+  compliance state that did not exist and has never existed on any of that
+  detector's 168 recorded runs — a run one second earlier, without the
+  override, reported compliant. Nothing in the delivered page distinguished
+  it from a real detection.
+* **2026-08-21.** A deploy canary invoked a probe purely to test wiring; the
+  probe's ``log.error`` reached flow-doctor and paged as a production alert.
+  Different repo, different mechanism, identical outcome.
+
+**Provenance on an alert that no scheduled unit produced**
+(:data:`PROVENANCE_PREFIX`, metron-ops-I340). The dry-run above only helps
+somebody who remembers to use it, and neither instance did. So the second
+half is passive: when an alert is published from a context that is not a
+scheduled one, a short factual line naming the host and the pid is appended
+to the DELIVERED MESSAGE, and a page like the 09-17 one identifies itself on
+sight. "Scheduled" is decided by the presence of any variable in
+:data:`SCHEDULED_CONTEXT_ENV_VARS` — systemd sets ``JOURNAL_STREAM`` and
+``INVOCATION_ID`` for every unit it runs, GitHub Actions sets
+``GITHUB_ACTIONS``, the Lambda runtime sets ``AWS_LAMBDA_FUNCTION_NAME``,
+and pytest sets ``PYTEST_CURRENT_TEST``. An alert published from ANY of
+those is byte-identical to what it was before this existed — this is not on
+the normal path.
+
+Four properties, each load-bearing:
+
+1. **It marks; it never suppresses.** A hand-run alert is delivered exactly
+   as it would have been. Deciding that a human's alert is unwanted is a
+   different and much worse failure than an unmarked one.
+2. **It is outside the dedup identity.** The dedup key is
+   ``sha1(dedup_key)`` — the caller's own opaque string, never the message
+   text (:func:`_dedup_marker_key`) — so a provenance suffix cannot enter
+   it. If it could, every hand-run would mint its own episode and defeat the
+   dedup this library exists to provide. ``TestProvenanceIsOutsideDedupIdentity``
+   pins it.
+3. **It changes no other field.** Severity, tier, destination, the push
+   decision, ``identity_key``, the dedup window and the ``nousergon.alert.v1``
+   event schema are untouched, and the event's ``body`` stays the caller's
+   raw message.
+4. **It is a statement, not an instruction.** The fleet alert-message lint
+   (``nousergon-data/infrastructure/overseer/alert_message_lint.py``,
+   ALERT001/ALERT002) fails a message that asks the reader for a decision or
+   tells them to go inspect a surface. This line does neither: it names the
+   host and the pid and stops.
+
 **Severity gates DESTINATION and BUZZ. It never gates DELIVERY.**
 ``severity`` is a free-form string prepended to the message (``[ERROR]
 ...`` / ``[WARNING] ...``) for both channels. It decides two things and
@@ -159,6 +226,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import socket
 import sys
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -298,6 +367,136 @@ DEFAULT_DEDUP_WINDOW_MIN: Final[int] = 60
 # ``krepis.router``'s ``ssm.get_parameter`` pattern). One parameter holds a
 # JSON list so an operator edits one value instead of one-param-per-mute.
 DEFAULT_MUTE_SSM_PARAM: Final[str] = "/alpha-engine/alerts/source_mutes"
+
+# ── Environment-reachable dry-run + ad-hoc provenance (metron-ops-I340) ────
+# THE DEFECT, twice measured. To prove a detector fires, someone forced its
+# input condition true against the LIVE transport, and the operator was paged
+# for a condition that did not exist (metron-ops-I340 on 2026-09-17; a deploy
+# canary's wiring probe on 2026-08-21). `publish(dry_run=True)` already existed
+# and would have prevented both — but only for a caller able to EDIT the call
+# site, and 216 non-test files across 17 repos call this function. A per-repo
+# `--dry-run` passthrough fixes the instance; the parameter has to be REACHABLE
+# without a code change for the class to close, and an alert that slips through
+# anyway has to SAY so.
+#
+#: Environment variable that turns the dry-run on for every ``publish`` in the
+#: process. ONE-WAY by construction (see :func:`_env_dry_run`).
+DRY_RUN_ENV_VAR: Final[str] = "KREPIS_ALERT_DRY_RUN"
+#: The exhaustive set of values that mean ON, lower-cased and stripped. A
+#: closed set rather than a truthiness test: `KREPIS_ALERT_DRY_RUN=0` and
+#: `=false` must mean OFF, and an unparseable value must mean OFF, because the
+#: failure mode of guessing wrong here is a SUPPRESSED REAL ALERT.
+DRY_RUN_TRUE_VALUES: Final[frozenset[str]] = frozenset({"1", "true", "yes"})
+
+#: Environment variables whose presence proves a SCHEDULED context ran this
+#: publish, so no provenance line is appended and the delivered bytes are
+#: unchanged. Presence is the signal — the value is never read, because
+#: `GITHUB_ACTIONS=true` and systemd's `JOURNAL_STREAM=8:12345` share nothing
+#: but being set by the thing that started the process.
+#:
+#:   JOURNAL_STREAM / INVOCATION_ID  systemd sets both for every unit it runs
+#:   GITHUB_ACTIONS / CI             GitHub Actions and the generic CI contract
+#:   AWS_LAMBDA_FUNCTION_NAME        the Lambda runtime
+#:   PYTEST_CURRENT_TEST             a test process (which `publish` already
+#:                                   short-circuits unless a suite opts in via
+#:                                   ALPHA_ENGINE_ALLOW_TEST_ALERTS). Listed so
+#:                                   this lib's own suite and every consumer
+#:                                   suite assert on the same bytes on a laptop
+#:                                   and in CI — a message that differs between
+#:                                   the two is a test that grades the runner.
+#:
+#: Additive by design: a new managed runtime adds a row here. The failure mode
+#: of a MISSING row is a scheduled alert wearing an extra factual line; the
+#: failure mode of a WRONG row is an ad-hoc page that stays anonymous, which is
+#: the defect this exists to close. Err toward too few rows.
+SCHEDULED_CONTEXT_ENV_VARS: Final[tuple[str, ...]] = (
+    "JOURNAL_STREAM",
+    "INVOCATION_ID",
+    "GITHUB_ACTIONS",
+    "CI",
+    "AWS_LAMBDA_FUNCTION_NAME",
+    "PYTEST_CURRENT_TEST",
+)
+
+#: Leading marker on the appended provenance line. Deliberately not a severity
+#: word: the alert's severity is the caller's and this must not read as one.
+PROVENANCE_PREFIX: Final[str] = "[ad-hoc]"
+
+#: Characters kept from the hostname. A hostname is attacker-influencable in
+#: principle and lands in a Telegram message and an SNS body; restricting it to
+#: the DNS-label alphabet means nothing in it can be markup, a newline, or a
+#: second line pretending to be part of the alert.
+_HOST_SAFE = re.compile(r"[^A-Za-z0-9._-]")
+_HOST_MAX_CHARS: Final[int] = 63
+
+
+def _env_dry_run() -> bool:
+    """Is the dry-run turned on by :data:`DRY_RUN_ENV_VAR`?
+
+    One-way: this can only return True (turning a real publish into a
+    dry-run). :func:`publish` never consults it to turn a caller's explicit
+    ``dry_run=True`` off, so no environment can make a call site that asked
+    for a dry-run send for real.
+    """
+    raw = os.environ.get(DRY_RUN_ENV_VAR)
+    if raw is None:
+        return False
+    return raw.strip().lower() in DRY_RUN_TRUE_VALUES
+
+
+def _scheduled_context_var() -> str | None:
+    """Name of the variable proving a scheduled context, or ``None``.
+
+    Returns the NAME rather than a bool so the reason is reportable and
+    testable. An empty value does not count as set: systemd, Actions and the
+    Lambda runtime all set a non-empty value, and an exported-but-empty
+    variable is what a shell profile leaves behind.
+    """
+    for name in SCHEDULED_CONTEXT_ENV_VARS:
+        if os.environ.get(name):
+            return name
+    return None
+
+
+def _publishing_host() -> str:
+    """Hostname for the provenance line, sanitised and never raising.
+
+    ``socket.gethostname`` can fail on a misconfigured box. A provenance line
+    is diagnostic metadata on somebody else's alert and must never be the
+    reason that alert does not go out, so the failure is RECORDED (a WARNING
+    naming it, plus a literal ``<host-unavailable>`` in the delivered line
+    that a reader cannot mistake for a machine name) rather than raised.
+    """
+    try:
+        raw = socket.gethostname()
+    except Exception as exc:  # pragma: no cover - platform-dependent
+        logger.warning(
+            "alerts: socket.gethostname() failed (%s); the ad-hoc provenance "
+            "line will name the pid only.", exc,
+        )
+        return "<host-unavailable>"
+    cleaned = _HOST_SAFE.sub("", raw or "")[:_HOST_MAX_CHARS]
+    return cleaned or "<host-unavailable>"
+
+
+def _provenance_suffix() -> str | None:
+    """The line to append, or ``None`` when a scheduled context ran this.
+
+    ``None`` is the normal path and it is the one that must stay free: a
+    scheduled unit's alert is byte-identical to what it was before this
+    function existed.
+
+    The wording is a STATEMENT of two facts and contains no imperative and no
+    named surface to go and read — the two shapes the fleet alert-message lint
+    fails (ALERT001 / ALERT002).
+    """
+    if _scheduled_context_var() is not None:
+        return None
+    return (
+        f"\n{PROVENANCE_PREFIX} published outside a scheduled unit "
+        f"and outside CI — host={_publishing_host()} pid={os.getpid()}"
+    )
+
 
 # ── Condition lifecycle: the open/clear pair (alpha-engine-config-I8105) ────
 # Every alert this module publishes used to be WRITE-ONCE: a publisher emitted
@@ -1090,7 +1289,13 @@ def publish(
         so a live mute doesn't itself look like a problem. Missing,
         expired, or malformed entries never suppress (fail toward
         alerting). See :attr:`PublishResult.muted`.
-    :param dry_run: When ``True``, short-circuits before the dedup
+    :param dry_run: Also turned on, for every ``publish`` in the process,
+        by the ``KREPIS_ALERT_DRY_RUN`` environment variable
+        (``1``/``true``/``yes``, case-insensitive) — the reachable form for
+        a caller that cannot be edited (metron-ops-I340). The variable is
+        one-way: an explicit ``True`` here always wins, and no value of it
+        can turn a caller's dry-run into a real send.
+        When ``True``, short-circuits before the dedup
         check and before any boto3 client construction. Argument
         parsing, ``_format_message``, and (if ``sns`` and an explicit
         ``sns_topic_arn`` were given) topic-ARN echoing still run; no
@@ -1175,6 +1380,34 @@ def publish(
     # none of which may turn it into a quiet `ok=False` (I9925 review A2).
     _validate_parse_mode(parse_mode)
     formatted = _format_message(message, severity, source, state)
+
+    # ── Ad-hoc provenance (metron-ops-I340) ──────────────────────────────
+    # Appended to the DELIVERED TEXT only, and only when no scheduled context
+    # is detectable. It cannot reach the dedup identity, which is
+    # `sha1(dedup_key)` over the caller's own opaque string and never over the
+    # message (see `_dedup_marker_key`), and it cannot reach the bus event,
+    # which carries `body=message` — the caller's raw text — below. Marks,
+    # never suppresses: the alert is delivered exactly as it would have been.
+    provenance = _provenance_suffix()
+    if provenance:
+        formatted = f"{formatted}{provenance}"
+
+    # ── Environment-reachable dry-run (metron-ops-I340) ──────────────────
+    # ONE-WAY, and the direction is the whole design: the variable can only
+    # turn a real publish INTO a dry-run. An explicit `dry_run=True` is never
+    # read back out of the environment, so nothing outside a call site can make
+    # a call site that asked to be silent send for real.
+    if not dry_run and _env_dry_run():
+        dry_run = True
+        # WARNING, not DEBUG. A suppressed publish that logged nothing is
+        # indistinguishable afterwards from a delivered one, which is the
+        # failure this whole change exists to prevent — one level down.
+        logger.warning(
+            "alerts.publish: SUPPRESSED by the environment — %s is set, so "
+            "this alert was NOT delivered to any channel. severity=%r "
+            "source=%r. Unset %s to deliver.",
+            DRY_RUN_ENV_VAR, severity, source, DRY_RUN_ENV_VAR,
+        )
 
     # ── Dry-run short-circuit (config-I6759) ─────────────────────────────
     # Fires before the dedup check and before any boto3 client construction
@@ -1651,7 +1884,12 @@ def main(argv: list[str] | None = None) -> int:
             "attempts no SNS publish, no Telegram call, writes no dedup "
             "marker, and never constructs a boto3 client. Exits 0. "
             "Use this to smoke-test a call site's flags instead of "
-            "issuing a real (or synthetic-ERROR) alert (config-I6759)."
+            "issuing a real (or synthetic-ERROR) alert (config-I6759). "
+            "The environment variable KREPIS_ALERT_DRY_RUN=1 does the same "
+            "for every publish in the process, including from callers that "
+            "expose no flag (metron-ops-I340). Demonstrate that a detector "
+            "FIRES this way; never by forcing its input condition true "
+            "against the live transport."
         ),
     )
     pub.add_argument(
