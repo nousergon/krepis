@@ -193,6 +193,18 @@ cards:
     output_per_1m: 4.40
     cache_read_per_1m: 0.26      # ~81% cache discount (1.40 → 0.26)
     cache_create_per_1m: 1.40    # automatic prefix caching — no write upcharge
+  # ── Zhipu / GLM 5.3 direct API (via egress proxy :8976) ──────────────────
+  # Source: https://docs.z.ai/guides/overview/pricing (Latest Models table,
+  # read 2026-09-19) — input $1.4/1M, output $4.4/1M, cached input $0.26/1M
+  # (cached input storage "Limited-time Free"). Same published rates as
+  # glm-5.2; promoted to the `ultra` registry group's primary 2026-09-12
+  # (I10401/I9486) with no card added at the time — alpha-engine-config-I11100.
+  - model_name: glm-5.3
+    effective_from: 2026-08-14   # z.ai's GLM-5.3 API release date
+    input_per_1m: 1.40
+    output_per_1m: 4.40
+    cache_read_per_1m: 0.26      # ~81% cache discount (1.40 → 0.26)
+    cache_create_per_1m: 1.40    # automatic prefix caching — no write upcharge
 
 # Server-side tool fees (Anthropic ``Message.usage.server_tool_use``).
 # Billed as flat per-request fees, independent of which model invoked

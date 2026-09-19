@@ -148,14 +148,21 @@ class TestRecordLlmCall:
         expected = (1000 / 1e6) * card.input_per_1m + (500 / 1e6) * card.output_per_1m
         assert record["cost_usd"] == pytest.approx(expected)
 
-    def test_unknown_model_no_provider_cost_raises(self):
+    def test_unknown_model_no_price_card_degrades_to_unpriced(self):
+        # A served model with no active price card must degrade the row,
+        # not drop it (alpha-engine-config-I11100) — the caller (e.g.
+        # ``krepis.llm.LLMClient._emit_cost_record``) still gets a record
+        # to write to S3, so fan-in coverage sees an object rather than a
+        # silent hole in the ledger.
         result = LLMResult(
             text="x", model="unknown/model", provider="openrouter",
             usage=LLMUsage(input_tokens=10, output_tokens=10),
             raw_request={},
         )
-        with pytest.raises(PriceCardLookupError):
-            record_llm_call(result, at=AT)
+        record = record_llm_call(result, at=AT)
+        assert record["cost_source"] == "unpriced"
+        assert record["cost_usd"] is None
+        assert record["model"] == "unknown/model"
 
     def test_extra_fields_merge(self):
         record = record_llm_call(

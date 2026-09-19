@@ -123,6 +123,61 @@ class TestStructuredLogLineIsNotAKillLine:
         assert resource_kill.find_kill_line(text) is None
 
 
+class TestOomCorroborationGate:
+    """alpha-engine-config-I11101: a text-only OOM match is vetoed when a
+    measured RSS reading contradicts it. The 2026-09-19 false positive —
+    ``ModelZooSelect`` classified as ``RESOURCE KILL (OOM)`` on ``rc=1``
+    with a genuine ``ArenaSlotUnservable`` exception, because the
+    launcher's own unconditional exit-time banner (``crucible-predictor/
+    infrastructure/_spot_common.sh:297``: "...primary diagnostic on
+    RC=-1/OOM") matched ``\\bOOM\\b`` in prose, not a kill.
+    """
+
+    def test_the_launchers_own_oom_diagnostic_banner_with_rc_1_is_not_a_kill(self):
+        """The exact `_spot_common.sh:297` string, verbatim, with the real
+        rc=1 exception traceback the run actually failed with."""
+        text = (
+            "ssm_log_capture: ERROR: [spot-model-zoo-select] failed (rc=1) "
+            "— raise ArenaSlotUnservable('no servable arm')\n"
+            "    (spot logs above are the FULL workload stdout/stderr — "
+            "primary diagnostic on RC=-1/OOM)\n"
+            "Instance terminated.\n"
+        )
+        assert resource_kill.classify(returncode=1, text=text) is None
+
+    def test_rc_1_with_a_killed_line_but_high_measured_headroom_is_not_oom(self):
+        """A genuine ``Killed`` line, but the harness's own RSS sentinel
+        measured 277MB peak on a 16GB box (98.3% headroom) — the live
+        2026-09-19 numbers. Text alone would say OOM; the measurement says
+        there was no memory pressure to kill over."""
+        text = "bash: line 16: 26748 Killed                  python -u backtest.py\n"
+        assert (
+            resource_kill.classify(
+                returncode=1,
+                text=text,
+                peak_rss_kb=277396,
+                mem_total_kb=16167860,
+            )
+            is None
+        )
+
+    def test_rc_137_with_the_same_low_measured_peak_is_still_oom(self):
+        """The veto NEVER applies to an authoritative SIGKILL returncode —
+        a real kill can carry a stale or short-lived low sampled peak (the
+        allocation spike that caused it may not have been captured by the
+        harness's own periodic sampling), and the returncode wins."""
+        text = "bash: line 16: 26748 Killed                  python -u backtest.py\n"
+        assert (
+            resource_kill.classify(
+                returncode=137,
+                text=text,
+                peak_rss_kb=277396,
+                mem_total_kb=16167860,
+            )
+            == resource_kill.OOM
+        )
+
+
 class TestClassifyFromSsmStatus:
     def test_ssm_timedout_status_is_timeout(self):
         assert (

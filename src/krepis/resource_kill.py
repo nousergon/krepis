@@ -88,7 +88,7 @@ TIMEOUT_STATUSES: Final[frozenset] = frozenset({"TimedOut"})
 #: line; a miss costs the operator the entire diagnosis.
 OOM_LINE_RE: Final = re.compile(
     r"\bKilled\b"
-    r"|\bOOM\b"
+    r"|\boom.?killer\b"
     r"|[Oo]ut of memory"
     r"|oom.?kill"
     r"|Cannot allocate memory"
@@ -186,6 +186,8 @@ def classify(
     status: Optional[str] = None,
     kill_line: Optional[str] = None,
     text: Optional[str] = None,
+    peak_rss_kb: Optional[int] = None,
+    mem_total_kb: Optional[int] = None,
 ) -> Optional[str]:
     """Return :data:`OOM`, :data:`TIMEOUT`, or ``None`` (not a resource kill).
 
@@ -214,12 +216,32 @@ def classify(
     ``137`` into a ``1`` before this layer ever sees it, and the surviving
     kill line is the only honest signal left — see
     :func:`test_kill_line_wins_over_a_laundered_exit_code`.
+
+    **Corroboration gate (alpha-engine-config-I11101).** ``peak_rss_kb`` /
+    ``mem_total_kb`` are the harness's own measured RSS reading (the
+    ``##krepis-rss-reading##`` sentinel — see :mod:`krepis.rss_budget`),
+    threaded through by the caller when one was captured. When both are
+    given and the measured headroom is ABOVE
+    :data:`krepis.rss_budget.HARD_HEADROOM_FLOOR` (the same floor
+    ``rss_budget`` itself uses to call a run "OOM-plausible"), a text-only
+    OOM match is VETOED: a measured 277MB peak on a 16GB box (98.3%
+    headroom, ``rc=1``) is not a resource kill no matter what a launcher's
+    own diagnostic banner says (the 2026-09-19 ``spot-model-zoo-select``
+    false positive this fixes — the banner was
+    ``crucible-predictor/infrastructure/_spot_common.sh:297``'s own
+    unconditional exit-time citation of "RC=-1/OOM", never emitted by a
+    killer). The veto NEVER applies to ``returncode in`` :data:`OOM_RETURNCODES`
+    — that check already returned above, and a real SIGKILL is authoritative
+    even against a stale or short-lived low sampled peak. A vetoed match
+    falls through to the TIMEOUT checks and then to ``None`` (the generic
+    ``ERROR:`` bucket) — never defaulted to OOM or TIMEOUT.
     """
     if returncode in OOM_RETURNCODES:
         return OOM
     line = kill_line if kill_line is not None else find_kill_line(text)
     if line and OOM_LINE_RE.search(line):
-        return OOM
+        if not _oom_vetoed_by_measured_rss(peak_rss_kb, mem_total_kb):
+            return OOM
     if returncode in TIMEOUT_RETURNCODES:
         return TIMEOUT
     if status and status in TIMEOUT_STATUSES:
@@ -227,6 +249,37 @@ def classify(
     if line and TIMEOUT_LINE_RE.search(line):
         return TIMEOUT
     return None
+
+
+def _oom_vetoed_by_measured_rss(
+    peak_rss_kb: Optional[int], mem_total_kb: Optional[int]
+) -> bool:
+    """True when a measured RSS reading contradicts a text-only OOM match.
+
+    Absence of either measurement vetoes nothing — this is corroboration
+    OF a positive signal, not a requirement for one; most captures never
+    carry an RSS reading at all, and that must not change today's coverage.
+
+    The veto floor is :data:`krepis.rss_budget.HARD_HEADROOM_FLOOR` itself
+    (imported, not copied) — the same number ``rss_budget`` uses to call a
+    run's headroom "OOM-plausible" — so there is exactly one place this
+    threshold is declared, not a second driftable copy here. Imported
+    lazily (not at module top) so a caller that never supplies an RSS
+    reading pays no import cost and this module stays usable even in a
+    context where :mod:`krepis.rss_budget` (which imports
+    :mod:`krepis.s3_surface`) is not wanted.
+    """
+    if peak_rss_kb is None or mem_total_kb is None:
+        return False
+    from krepis.rss_budget import HARD_HEADROOM_FLOOR, headroom
+
+    try:
+        free = headroom(peak_rss_kb, mem_total_kb)
+    except ValueError:
+        # mem_total_kb <= 0 — a malformed reading corroborates nothing either
+        # way; do not let a bad measurement suppress a real classification.
+        return False
+    return free > HARD_HEADROOM_FLOOR
 
 
 def format_cause(
