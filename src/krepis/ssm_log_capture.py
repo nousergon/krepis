@@ -146,7 +146,7 @@ from pathlib import Path
 from typing import Final, Optional
 
 from . import resource_kill
-from krepis import s3_surface
+from krepis import rss_budget, s3_surface
 
 logger = logging.getLogger(__name__)
 
@@ -385,7 +385,11 @@ _STRUCTURED_LOG_LINE_RE = resource_kill.STRUCTURED_LOG_LINE_RE
 
 
 def _classify_resource_kill(
-    returncode: int | None, kill_line: str | None
+    returncode: int | None,
+    kill_line: str | None,
+    *,
+    peak_rss_kb: int | None = None,
+    mem_total_kb: int | None = None,
 ) -> str | None:
     """Return ``"OOM"``, ``"TIMEOUT"``, or ``None`` (not a resource kill).
 
@@ -394,8 +398,19 @@ def _classify_resource_kill(
     the real exit code survived to this layer) and ``kill_line`` (useful when
     an intermediate shell collapsed the real code to a bare ``exit 1`` but the
     kernel's own kill message still made it into the captured output).
+
+    ``peak_rss_kb`` / ``mem_total_kb`` — the harness's own measured RSS
+    reading, when the captured output carried one (alpha-engine-config-
+    I11101) — are forwarded so a text-only OOM match can be vetoed by a
+    measured headroom that contradicts it. ``None``/``None`` (the default)
+    reproduces the exact prior behaviour.
     """
-    return resource_kill.classify(returncode=returncode, kill_line=kill_line)
+    return resource_kill.classify(
+        returncode=returncode,
+        kill_line=kill_line,
+        peak_rss_kb=peak_rss_kb,
+        mem_total_kb=mem_total_kb,
+    )
 
 
 #: Cap on either line rendered into a failure message. The whole point is to
@@ -420,6 +435,8 @@ def format_subprocess_failure(
     last_output_line: str | None = None,
     cause_line: str | None = None,
     kill_line: str | None = None,
+    peak_rss_kb: int | None = None,
+    mem_total_kb: int | None = None,
 ) -> str:
     """Format a terminal-failure message naming the failing step + its cause.
 
@@ -472,6 +489,15 @@ def format_subprocess_failure(
             kill is classified — a specific "the kernel SIGKILLed this"
             line is more informative than a generic downstream "ERROR" or
             "terminal status=Failed" line that happens to sort later.
+        peak_rss_kb: the harness's own measured RSS peak, when a
+            ``##krepis-rss-reading##`` sentinel was captured
+            (alpha-engine-config-I11101). Forwarded to
+            :func:`krepis.resource_kill.classify`'s corroboration gate so a
+            text-only OOM match with no real memory pressure behind it is
+            not rendered as one.
+        mem_total_kb: the box's total memory from the same sentinel
+            reading. Both this and ``peak_rss_kb`` must be present for the
+            gate to engage; either missing reproduces prior behaviour.
 
     Returns:
         A single-line string suitable for ``stderr``. New callers should
@@ -482,7 +508,9 @@ def format_subprocess_failure(
 
         ssm_log_capture: RESOURCE KILL (OOM): [evaluate.py] failed (rc=137) — bash: line 31: 26756 Killed   python -u evaluate.py --mode diagnostics (last output: Instance terminated; S3 staging cleaned.)
     """
-    classification = _classify_resource_kill(returncode, kill_line)
+    classification = _classify_resource_kill(
+        returncode, kill_line, peak_rss_kb=peak_rss_kb, mem_total_kb=mem_total_kb
+    )
     if classification:
         head = (
             f"ssm_log_capture: RESOURCE KILL ({classification}): "
@@ -629,6 +657,12 @@ def run(
     # out-compete the one line that actually names a resource kill
     # (alpha-engine-config-I7258).
     last_kill_line: Optional[str] = None
+    # The most recent parsed ``##krepis-rss-reading##`` sentinel, if the
+    # workload ran under krepis.rss_budget's harness (alpha-engine-config-
+    # I11101). Corroborates (or vetoes) a text-only OOM classification —
+    # see resource_kill.classify's corroboration gate. Most captures never
+    # carry one; that is the ordinary case, not a gap.
+    last_rss_reading: Optional[dict] = None
     exit_code = 1
     orphan_note: Optional[str] = None
     try:
@@ -684,6 +718,9 @@ def run(
                                 last_kill_line = stripped
                             elif _CAUSE_RE.search(stripped):
                                 last_cause_line = stripped
+                            reading = rss_budget.parse_reading(stripped)
+                            if reading is not None:
+                                last_rss_reading = reading
                     continue
                 # Pipe quiet. A live child is merely slow — keep waiting, with
                 # no budget consumed; that is the ordinary long-phase case.
@@ -736,6 +773,8 @@ def run(
                 last_output_line=last_output_line,
                 cause_line=last_cause_line,
                 kill_line=last_kill_line,
+                peak_rss_kb=(last_rss_reading or {}).get("peak_rss_kb"),
+                mem_total_kb=(last_rss_reading or {}).get("mem_total_kb"),
             )
             print(failure_msg, file=sys.stderr)
             _append_log(log_path, failure_msg + "\n")

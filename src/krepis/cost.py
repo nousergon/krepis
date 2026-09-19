@@ -1168,9 +1168,12 @@ def record_llm_call(
     ``cost_source: "provider_reported"`` — under ``:floor`` routing the
     actually-billed backend price varies below our card ceilings, so the
     aggregator's number is canonical. Otherwise cost is recomputed from
-    the active :class:`PriceTable` (``cost_source: "price_card"``). If
-    neither is available, :exc:`PriceCardLookupError` propagates — never
-    a silent zero (``feedback_no_silent_fails``).
+    the active :class:`PriceTable` (``cost_source: "price_card"``). If a
+    served model (or a used server-tool) has no active price card,
+    :func:`recompute_cost` raises :exc:`PriceCardLookupError`; the row is
+    still emitted, with ``cost_usd`` set to ``None`` and
+    ``cost_source: "unpriced"`` — the gap is visible in the ledger, never
+    a silently dropped record (``alpha-engine-config-I11100``).
 
     Returns the same flat record shape as :func:`record_anthropic_call`
     plus ``provider`` and ``cost_source``.
@@ -1209,8 +1212,24 @@ def record_llm_call(
     else:
         table = pricing if pricing is not None else load_default_pricing()
         fees = tool_fees if tool_fees is not None else load_default_tool_fees()
-        recompute_cost(metadata, table, tool_fee_table=fees, at=at)
-        cost_source = "price_card"
+        try:
+            recompute_cost(metadata, table, tool_fee_table=fees, at=at)
+            cost_source = "price_card"
+        except PriceCardLookupError:
+            # A served model (or tool) with no active price card must degrade
+            # the row, not drop it. The alternative — letting this propagate
+            # out of record_llm_call — is what actually happened for glm-5.3
+            # after its 2026-09-12 promotion to the `ultra` primary
+            # (alpha-engine-config-I11100): the caller's except swallowed the
+            # whole record, including token counts that do not depend on the
+            # price table, and the provider-billed spend was never written
+            # to _cost_raw at all. Recording surface: the row still reaches
+            # S3 with cost_source == "unpriced" so fan-in coverage (keyed on
+            # object existence) stays satisfied and the gap is visible in the
+            # ledger instead of absent from it — see the module-level alert
+            # requirement in the PR body for how "unpriced" is surfaced.
+            metadata.cost_usd = None
+            cost_source = "unpriced"
 
     record: dict[str, Any] = {
         "ts": datetime.now(timezone.utc).isoformat(),
