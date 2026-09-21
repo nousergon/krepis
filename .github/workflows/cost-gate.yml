@@ -9,10 +9,10 @@ name: cost-gate
 # exit 2 = could not grade; both fail the job, because "the gate could not
 # run" must never look like "the gate ran clean".
 #
-# --warn-only: initial replay over the last 150 commits on main surfaced
-# findings, all one class (a registry.d grant naming a service the cost SSoT
-# doesn't recognise) — an existing-fleet remedy, not a shape to work around
-# here. Reported to alpha-engine-config-I11228 for the private-SSoT fix; this
+# --warn-only: initial replay over the last 150 commits on main surfaced one
+# finding — a client-construction call for a service the cost SSoT doesn't
+# recognise — an existing-fleet remedy, not a shape to work around here.
+# Reported to alpha-engine-config-I11228 for the private-SSoT fix; this
 # workflow starts in observe mode and flips to blocking once that lands.
 #
 # --repo-visibility public: krepis is a public repo, so its Actions crons
