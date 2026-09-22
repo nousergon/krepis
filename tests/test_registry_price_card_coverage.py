@@ -35,7 +35,12 @@ from datetime import datetime as _datetime
 import pytest
 
 from krepis import model_registry as mr
-from krepis.cost import PriceCardLookupError, load_default_pricing
+from krepis.cost import (
+    PriceCardLookupError,
+    live_group_primaries,
+    load_default_pricing,
+    unpriced_live_primaries,
+)
 
 
 def _load_live_registry() -> mr.Registry:
@@ -58,31 +63,15 @@ def _load_live_registry() -> mr.Registry:
     return mr.load_registry(path)
 
 
-def _live_primaries(registry: mr.Registry) -> list[tuple[str, str, str]]:
-    """``(group, model_id, api_model_name)`` for every group with a live primary.
-
-    Excludes any group whose primary declares ``chaos_probe: true`` — per the
-    registry's own schema (``LLM_MODEL_REGISTRY.yaml`` header, "Marks an
-    entry as PART OF A DELIBERATELY, PERMANENTLY BROKEN group") a chaos-probe
-    entry is routed at a permanently-unservable, non-billing model on purpose
-    (fault injection, alpha-engine-config-I10126) and never reaches a real
-    upstream, so it will never generate a real cost record to price. The
-    registry's own validator (invariant 21) already forbids mixing a
-    chaos_probe member into an ordinary group, so this is never a loophole
-    for a real primary to duck the check.
+def _live_primaries(registry: mr.Registry):
+    """Thin alias onto ``krepis.cost.live_group_primaries`` — the SINGLE
+    declared source of the primary-selection + chaos-probe carve-out
+    (alpha-engine-config-I11112 "Non-inferable" §1: the merge-time and
+    run-time enforcers must read the same declared source, not a second copy
+    of the rule). This file used to carry its own copy; the copy in
+    ``alpha-engine-config``'s own CI test would then have been a THIRD.
     """
-    out = []
-    for group in sorted(registry.groups):
-        live = registry.live_group_ids(group)
-        if not live:
-            continue
-        primary_id = live[0]
-        entry = registry.models[primary_id]
-        if entry.get("chaos_probe") is True:
-            continue
-        api_model_name = entry.get("model") or primary_id
-        out.append((group, primary_id, api_model_name))
-    return out
+    return live_group_primaries(registry)
 
 
 def test_every_live_groups_primary_has_an_active_price_card():
@@ -93,24 +82,14 @@ def test_every_live_groups_primary_has_an_active_price_card():
     until the 2026-09-19 weekly run).
     """
     registry = _load_live_registry()
-    pricing = load_default_pricing()
-    today = _datetime.now(timezone.utc)
-
-    missing: list[str] = []
-    for group, model_id, api_model_name in _live_primaries(registry):
-        try:
-            pricing.get(api_model_name, today)
-        except PriceCardLookupError:
-            missing.append(
-                f"group={group!r} primary={model_id!r} "
-                f"(api model_name={api_model_name!r})"
-            )
+    missing = unpriced_live_primaries(registry, load_default_pricing())
 
     assert not missing, (
         "live registry group primary(s) with NO active PriceCard in "
-        f"krepis/model_pricing.yaml: {missing}. Every group's primary must "
-        "have a matching card — add one (see model_pricing.yaml's header "
-        "for schema + sourcing convention) before promoting."
+        f"krepis/model_pricing.yaml: {[str(m) for m in missing]}. Every "
+        "group's primary must have a matching card — add one (see "
+        "model_pricing.yaml's header for schema + sourcing convention) "
+        "before promoting."
     )
 
 
@@ -127,3 +106,86 @@ def test_a_primary_with_no_card_is_caught_by_this_test():
     today = _datetime.now(timezone.utc)
     with pytest.raises(PriceCardLookupError):
         pricing.get("deliberately-unpriced-model-xyz", today)
+
+
+# ── Hermetic tests of the RULE itself (alpha-engine-config-I11112) ────────────
+#
+# The two tests above need the private registry and therefore SKIP on krepis
+# CI (I11109). A rule enforced only where it happens to be runnable is the
+# exact defect I11112 was filed over — ten preflight assertions rendering as
+# a green `OK` because their environment could not reach them. These run
+# everywhere: they pin `unpriced_live_primaries`' behaviour against a fake
+# registry, so a regression in the shared rule reddens krepis CI even though
+# the live-registry assertion above skipped.
+
+
+class _FakeRegistry:
+    """Structural stand-in for ``krepis.model_registry.Registry`` — only the
+    three attributes ``live_group_primaries`` actually reads."""
+
+    def __init__(self, groups: "dict[str, list[str]]", models: dict):
+        self.groups = groups
+        self.models = models
+
+    def live_group_ids(self, group: str) -> "list[str]":
+        return list(self.groups.get(group, []))
+
+
+def test_unpriced_live_primary_is_reported():
+    """NEGATIVE CONTROL for the whole mechanism: a group whose primary has no
+    price card must come back in the list. This is I11100's glm-5.3 shape
+    reproduced without the private registry.
+    """
+    registry = _FakeRegistry(
+        groups={"ultra": ["deliberately-unpriced-model-xyz"]},
+        models={"deliberately-unpriced-model-xyz": {"model": "deliberately-unpriced-model-xyz"}},
+    )
+    missing = unpriced_live_primaries(registry, load_default_pricing())
+    assert [m.model_id for m in missing] == ["deliberately-unpriced-model-xyz"]
+
+
+def test_priced_live_primary_is_not_reported():
+    """The positive half — otherwise the test above passes for a function
+    that returns every primary unconditionally."""
+    pricing = load_default_pricing()
+    priced = pricing.cards[0].model_name
+    registry = _FakeRegistry(
+        groups={"ultra": ["some-id"]},
+        models={"some-id": {"model": priced}},
+    )
+    assert unpriced_live_primaries(registry, pricing) == []
+
+
+def test_chaos_probe_primary_is_excluded():
+    """A deliberately-unservable fault-injection entry never bills, so it can
+    never generate a record to price (alpha-engine-config-I10126)."""
+    registry = _FakeRegistry(
+        groups={"chaos": ["broken-on-purpose"]},
+        models={"broken-on-purpose": {"model": "broken-on-purpose", "chaos_probe": True}},
+    )
+    assert live_group_primaries(registry) == []
+    assert unpriced_live_primaries(registry, load_default_pricing()) == []
+
+
+def test_empty_group_contributes_no_primary():
+    """A group with no live member has no primary to price — and must not
+    raise an IndexError reaching for one."""
+    registry = _FakeRegistry(groups={"retired": []}, models={})
+    assert live_group_primaries(registry) == []
+
+
+def test_price_card_lookup_error_is_the_only_swallowed_exception():
+    """The rule converts a MISSING CARD into a finding; any other failure of
+    the price table is a defect and must propagate. A table that raises
+    something else would otherwise render as full coverage."""
+    class _ExplodingTable:
+        def get(self, name, when):
+            raise RuntimeError("price table is corrupt")
+
+    registry = _FakeRegistry(
+        groups={"ultra": ["some-id"]}, models={"some-id": {"model": "anything"}},
+    )
+    with pytest.raises(RuntimeError, match="price table is corrupt"):
+        unpriced_live_primaries(registry, _ExplodingTable())
+
+    assert PriceCardLookupError is not None  # the caught type, named explicitly

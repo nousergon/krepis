@@ -1261,3 +1261,102 @@ def record_llm_call(
     if extra_fields:
         record.update(extra_fields)
     return _apply_contract_columns(record)
+
+
+# ── Registry-primary price-card coverage (alpha-engine-config-I11100/I11112) ──
+#
+# THE RULE, DECLARED ONCE. Two callers enforce it and neither owns it:
+#
+#   * ``krepis/tests/test_registry_price_card_coverage.py`` — enforces it on a
+#     dev laptop with the private ``alpha-engine-config`` checked out as a
+#     sibling. SKIPS on krepis CI, which cannot sparse-checkout a private repo
+#     (alpha-engine-config-I11109).
+#   * ``alpha-engine-config``'s ``tests/test_registry_price_card_coverage.py``
+#     — enforces it on every PR to the repo that OWNS
+#     ``private-docs/LLM_MODEL_REGISTRY.yaml``, where promotions are actually
+#     authored, with no checkout problem because the registry IS that repo.
+#
+# alpha-engine-config-I11112 "Non-inferable" §1 is explicit that the run-time
+# and merge-time enforcers "must read the same declared source, not a second
+# copy of the rule". This function IS that single declared source: both
+# callers import it, neither reimplements the primary-selection or the
+# chaos-probe carve-out. A third caller (the ``sf_preflight`` run-time check)
+# may adopt it the same way.
+#
+# Import-cycle note: this module deliberately does NOT import
+# ``krepis.model_registry``. ``registry`` is taken structurally (anything with
+# ``.groups``, ``.live_group_ids()`` and ``.models``) so ``cost`` stays a leaf
+# of the import graph, exactly as it does for the anthropic/openai Protocols
+# above.
+
+
+class LivePrimary(BaseModel):
+    """One live registry group's primary, as the coverage rule sees it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group: str
+    model_id: str
+    api_model_name: str
+
+    def __str__(self) -> str:  # pragma: no cover - formatting only
+        return (
+            f"group={self.group!r} primary={self.model_id!r} "
+            f"(api model_name={self.api_model_name!r})"
+        )
+
+
+def live_group_primaries(registry: Any) -> "list[LivePrimary]":
+    """Every live group's primary, with chaos-probe groups excluded.
+
+    A ``chaos_probe: true`` entry is routed at a permanently-unservable,
+    non-billing model ON PURPOSE (fault injection,
+    alpha-engine-config-I10126) and never reaches a real upstream, so it can
+    never generate a cost record to price. The registry's own validator
+    (invariant 21) forbids mixing a chaos_probe member into an ordinary
+    group, so this is never a loophole a real primary can duck through.
+    """
+    out: "list[LivePrimary]" = []
+    for group in sorted(registry.groups):
+        live = registry.live_group_ids(group)
+        if not live:
+            continue
+        primary_id = live[0]
+        entry = registry.models[primary_id]
+        if entry.get("chaos_probe") is True:
+            continue
+        out.append(
+            LivePrimary(
+                group=group,
+                model_id=primary_id,
+                api_model_name=entry.get("model") or primary_id,
+            )
+        )
+    return out
+
+
+def unpriced_live_primaries(
+    registry: Any,
+    pricing: "PriceTable | None" = None,
+    when: "datetime | None" = None,
+) -> "list[LivePrimary]":
+    """Live group primaries with NO active :class:`PriceCard` — the exact
+    condition that made ``glm-5.3`` drop ``director-plan``'s whole cost
+    record for a week (alpha-engine-config-I11100).
+
+    Returns an empty list when every live primary is priced. A non-empty
+    return is a promotion that must not merge: at runtime
+    :func:`record_llm_call` degrades the record to ``cost_source:
+    "unpriced"`` rather than dropping it, which keeps fan-in coverage
+    satisfied — so nothing downstream will ever fail on this again, and this
+    is the only thing that catches it.
+    """
+    table = load_default_pricing() if pricing is None else pricing
+    at = datetime.now(timezone.utc) if when is None else when
+    missing: "list[LivePrimary]" = []
+    for primary in live_group_primaries(registry):
+        try:
+            table.get(primary.api_model_name, at)
+        except PriceCardLookupError:
+            missing.append(primary)
+    return missing
