@@ -17,7 +17,11 @@ extension existed. That golden is also what proves the extension is additive:
 
 from __future__ import annotations
 
+import gzip as gzip_module
 import json
+import os
+import signal
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -302,6 +306,175 @@ def test_a_config_runner_shaped_workload_gets_a_log_and_a_kill_record():
     assert "exec > >(tee -a /var/log/config-runner-run.log)" in script
     assert "config-runner-record-kill budget_exhausted" in script
     assert "config-runner-record-kill deadman" in script
+
+
+# ── 3a. Run-log gzip option (alpha-engine-config-I11359) ─────────────────
+
+
+def test_gzip_defaults_off_so_existing_callers_render_unchanged():
+    """No existing caller changes behaviour on upgrade."""
+    script = render_bootstrap(_overseer_spec())
+    assert "gzip -c" not in script
+    assert ".log.gz" not in script
+
+
+def test_gzip_true_compresses_only_the_final_push():
+    script = render_bootstrap(
+        _overseer_spec(
+            run_log=RunLog(
+                local_path="/var/log/ci-watch-run.log",
+                s3_uri="s3://alpha-engine-research/overseer/run_logs/ci-watch/run.log",
+                gzip=True,
+            )
+        )
+    )
+    ship = script.split("_ship_run_log() {", 1)[1].split("\n}", 1)[0]
+    assert "gzip -c /var/log/ci-watch-run.log > /var/log/ci-watch-run.log.gz" in ship
+    assert (
+        "aws s3 cp /var/log/ci-watch-run.log.gz "
+        "s3://alpha-engine-research/overseer/run_logs/ci-watch/run.log.gz" in ship
+    )
+    assert (
+        "aws s3 rm s3://alpha-engine-research/overseer/run_logs/ci-watch/run.log "
+        in ship
+    )
+    # A failed gzip still ships something rather than nothing.
+    assert "shipping plain instead" in ship
+
+
+def test_gzip_periodic_pushes_stay_plain():
+    """Append semantics: only the final push is compressed, so a box that dies
+    before the trap fires leaves a readable, at-most-stale plain object."""
+    script = render_bootstrap(
+        _overseer_spec(
+            run_log=RunLog(
+                local_path="/var/log/ci-watch-run.log",
+                s3_uri="s3://alpha-engine-research/overseer/run_logs/ci-watch/run.log",
+                gzip=True,
+            )
+        )
+    )
+    loop = script.split("_run_log_shipper_loop() {", 1)[1].split("\n}", 1)[0]
+    assert "gzip" not in loop
+    assert (
+        "aws s3 cp /var/log/ci-watch-run.log "
+        "s3://alpha-engine-research/overseer/run_logs/ci-watch/run.log " in loop
+    )
+
+
+def _ship_functions_only(script: str) -> str:
+    """Self-contained bash: the flush/ship functions, nothing else — no
+    systemd, no clone, no AWS credentials required (aws itself is stubbed)."""
+    tail = script.split("_flush_run_log() {", 1)[1]
+    body = tail.split("_run_log_shipper_loop() {", 1)[0]
+    return "set -eo pipefail\n_flush_run_log() {" + body
+
+
+def _fake_aws_bin(tmp_path: Path) -> Path:
+    """A stub `aws` that mirrors `s3 cp`/`s3 rm` onto the local filesystem
+    under `$AWS_MIRROR`, so the real gzip/rm/cp behaviour is exercised without
+    reaching AWS."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir()
+    aws = bin_dir / "aws"
+    aws.write_text(
+        "#!/bin/sh\n"
+        'echo "$@" >> "$AWS_CALL_LOG"\n'
+        'if [ "$1 $2" = "s3 cp" ]; then\n'
+        '  dst_rel="$(echo "$4" | sed "s#s3://##")"\n'
+        '  mkdir -p "$(dirname "$AWS_MIRROR/$dst_rel")"\n'
+        '  cp "$3" "$AWS_MIRROR/$dst_rel"\n'
+        'elif [ "$1 $2" = "s3 rm" ]; then\n'
+        '  dst_rel="$(echo "$3" | sed "s#s3://##")"\n'
+        '  rm -f "$AWS_MIRROR/$dst_rel"\n'
+        "fi\n"
+        "exit 0\n"
+    )
+    aws.chmod(0o755)
+    return bin_dir
+
+
+def test_gzip_ship_on_clean_exit_writes_gz_and_deletes_the_plain_key(tmp_path):
+    """The EXIT-trap path (`finish()` calls `_ship_run_log` at rc=0): the
+    plain key must be gone and the gz key must hold the log's real content."""
+    local_path = tmp_path / "run.log"
+    local_path.write_text("line one\nline two\n")
+    log = RunLog(
+        local_path=str(local_path),
+        s3_uri="s3://test-bucket/run.log",
+        gzip=True,
+        flush_wait_deciseconds=1,
+    )
+    spec = SpotBootstrapSpec(checkout="/x", clone=False, run_log=log)
+    funcs = _ship_functions_only(render_bootstrap(spec))
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    call_log = tmp_path / "calls.log"
+    call_log.write_text("")
+    env = dict(os.environ)
+    env["PATH"] = f"{_fake_aws_bin(tmp_path)}:{env['PATH']}"
+    env["AWS_MIRROR"] = str(mirror)
+    env["AWS_CALL_LOG"] = str(call_log)
+
+    subprocess.run(
+        ["bash", "-c", f"{funcs}\n_ship_run_log"],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    assert not (mirror / "test-bucket" / "run.log").exists()
+    gz_path = mirror / "test-bucket" / "run.log.gz"
+    assert gz_path.exists()
+    assert gzip_module.decompress(gz_path.read_bytes()) == b"line one\nline two\n"
+    # The local plain file is untouched — only the remote plain KEY is
+    # removed, never the box's own copy.
+    assert local_path.read_text() == "line one\nline two\n"
+
+
+def test_gzip_ship_on_sigterm_writes_gz_and_deletes_the_plain_key(tmp_path):
+    """The TERM-trap path: a signalled process still lands the same gzipped
+    final object, not a truncated or missing one."""
+    local_path = tmp_path / "run.log"
+    local_path.write_text("mid-run output\n")
+    log = RunLog(
+        local_path=str(local_path),
+        s3_uri="s3://test-bucket/run.log",
+        gzip=True,
+        flush_wait_deciseconds=1,
+    )
+    spec = SpotBootstrapSpec(checkout="/x", clone=False, run_log=log)
+    funcs = _ship_functions_only(render_bootstrap(spec))
+
+    mirror = tmp_path / "mirror"
+    mirror.mkdir()
+    call_log = tmp_path / "calls.log"
+    call_log.write_text("")
+    env = dict(os.environ)
+    env["PATH"] = f"{_fake_aws_bin(tmp_path)}:{env['PATH']}"
+    env["AWS_MIRROR"] = str(mirror)
+    env["AWS_CALL_LOG"] = str(call_log)
+
+    script = f"{funcs}\ntrap '_ship_run_log; exit 0' TERM\nwhile true; do sleep 0.05; done\n"
+    proc = subprocess.Popen(
+        ["bash", "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    try:
+        # Give the trap a moment to install before signalling — the process
+        # must still be the infinite `while true` loop, not yet exited.
+        proc.wait(timeout=0.3)
+        raise AssertionError("process exited before the signal was sent")
+    except subprocess.TimeoutExpired:
+        pass
+    os.kill(proc.pid, signal.SIGTERM)
+    proc.wait(timeout=5)
+
+    gz_path = mirror / "test-bucket" / "run.log.gz"
+    assert gz_path.exists()
+    assert gzip_module.decompress(gz_path.read_bytes()) == b"mid-run output\n"
+    assert not (mirror / "test-bucket" / "run.log").exists()
 
 
 # ── 4. Per-workload LLM egress proxy staging ─────────────────────────────

@@ -180,6 +180,26 @@ class RunLog:
     ship_interval_seconds: int = 60
     #: Tenths of a second the flush waits for ``tee`` to drain before giving up.
     flush_wait_deciseconds: int = 20
+    #: Compress only the FINAL push (the one made from the TERM/INT trap or the
+    #: EXIT trap's ``finish()``), as ``<s3_uri>.gz``, deleting the plain key
+    #: once the gzipped one lands. The periodic loop keeps shipping plain —
+    #: append semantics, and readable the instant a reader opens it.
+    #:
+    #: **Trade-off, stated rather than discovered later:** a box that dies
+    #: before either trap runs (SIGKILL, an ungraceful spot reclaim, a hard
+    #: power loss) is read from the last PLAIN periodic push, at most
+    #: ``ship_interval_seconds`` stale — never gzipped, and there is no
+    #: ``.log.gz`` object at all for that run. That is the same staleness
+    #: bound ``RunLog`` already accepted for the periodic path; gzip changes
+    #: only the shape of the terminal object, never the survives-a-crash
+    #: property. A design that gzipped at exit ONLY (no periodic push) would
+    #: reproduce the exact defect this class exists to prevent — see the
+    #: class docstring's point 3 — so that shape was rejected outright rather
+    #: than offered as the other option.
+    #:
+    #: Default ``False``: an existing caller's manifest keeps ending in
+    #: ``.log`` on upgrade, unchanged.
+    gzip: bool = False
 
 
 @dataclass(frozen=True)
@@ -695,9 +715,50 @@ def _deadman_block(spec: SpotBootstrapSpec) -> str:
     )
 
 
+def _plain_ship_body(log: RunLog, region: str) -> str:
+    return f"""\
+  if _err="$(aws s3 cp {_quote(log.local_path)} {_quote(log.s3_uri)} --region {_quote(region)} 2>&1 >/dev/null)"; then
+    echo "run log shipped -> {log.s3_uri} ($(wc -c < {_quote(log.local_path)} 2>/dev/null || echo '?') bytes)"
+  else
+    # Loud, never fatal: the failure being fixed here is silence, not the
+    # fail-open. The box must still wind down and report.
+    echo "WARN: run-log ship FAILED -> {log.s3_uri}: $_err"
+  fi"""
+
+
+def _gzip_ship_body(log: RunLog, region: str) -> str:
+    gz_local = f"{log.local_path}.gz"
+    gz_uri = f"{log.s3_uri}.gz"
+    plain_fallback = _plain_ship_body(log, region)
+    return f"""\
+  # Only the FINAL push is compressed — the periodic loop keeps shipping
+  # plain, so a box that dies before this trap runs still leaves a readable
+  # (uncompressed) object, at most ship_interval_seconds stale.
+  if gzip -c {_quote(log.local_path)} > {_quote(gz_local)} 2>/dev/null; then
+    if _err="$(aws s3 cp {_quote(gz_local)} {_quote(gz_uri)} --region {_quote(region)} 2>&1 >/dev/null)"; then
+      echo "run log shipped -> {gz_uri} ($(wc -c < {_quote(gz_local)} 2>/dev/null || echo '?') bytes gzipped, $(wc -c < {_quote(log.local_path)} 2>/dev/null || echo '?') raw)"
+      # The plain key is superseded now that the gzipped final copy landed —
+      # remove it so a reader does not find two objects for one run, one of
+      # them stale. Best-effort: a failed delete leaves an extra object, never
+      # a missing one.
+      aws s3 rm {_quote(log.s3_uri)} --region {_quote(region)} >/dev/null 2>&1 || true
+    else
+      echo "WARN: run-log ship FAILED -> {gz_uri}: $_err"
+    fi
+  else
+    # gzip itself failed (e.g. disk full mid-compress) — ship the plain log
+    # rather than shipping nothing. A degraded-but-present final object beats
+    # an honestly-reported absence of one.
+    echo "WARN: gzip of run log failed — shipping plain instead"
+{plain_fallback}
+  fi"""
+
+
 def _run_log_block(spec: SpotBootstrapSpec) -> str:
     log = spec.run_log
     assert log is not None
+    region = spec.region
+    ship_body = _gzip_ship_body(log, region) if log.gzip else _plain_ship_body(log, region)
     return f"""
 # Every line of this bootstrap AND its child is captured here and shipped to
 # S3, so the record survives a spot reclaim, a watchdog kill or a crash.
@@ -726,13 +787,7 @@ _ship_run_log() {{
     echo "WARN: run-log ship skipped — {log.local_path} still empty after flush"
     return 0
   fi
-  if _err="$(aws s3 cp {_quote(log.local_path)} {_quote(log.s3_uri)} --region {_quote(spec.region)} 2>&1 >/dev/null)"; then
-    echo "run log shipped -> {log.s3_uri} ($(wc -c < {_quote(log.local_path)} 2>/dev/null || echo '?') bytes)"
-  else
-    # Loud, never fatal: the failure being fixed here is silence, not the
-    # fail-open. The box must still wind down and report.
-    echo "WARN: run-log ship FAILED -> {log.s3_uri}: $_err"
-  fi
+{ship_body}
 }}
 
 # Periodic, not exit-only. An exit-time-only write cannot survive the failure
