@@ -131,12 +131,39 @@ class TestLaunchHappyPath:
             )
         kwargs = ec2.run_instances.call_args.kwargs
         tag_specs = kwargs["TagSpecifications"]
-        assert len(tag_specs) == 1
+        assert len(tag_specs) == 2
         assert tag_specs[0]["ResourceType"] == "instance"
         assert tag_specs[0]["Tags"] == [
             {"Key": "Name", "Value": "alpha-engine-sf-watch-spot"},
             {"Key": "sf-watch-cadence", "Value": "saturday"},
             {"Key": "sf-watch-run-date", "Value": "2026-07-12"},
+        ]
+
+    def test_ebs_volume_tagged_identically_to_instance(self, fake_boto3):
+        """alpha-engine-config-I11273: the EBS volume created via
+        BlockDeviceMappings on the SAME RunInstances call must carry a
+        second TagSpecifications entry (ResourceType: volume) with the
+        identical merged tag set, or its cost is invisible to every
+        cost-allocation-tag CUR query forever. Must stay in the same
+        RunInstances call — a post-launch create_tags reintroduces the
+        untagged-resource race."""
+        fake, ec2 = fake_boto3
+        ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-vol"}]}
+        with patch.dict("sys.modules", {"boto3": fake}):
+            ec2_spot.launch(
+                instance_types=["c5.large"],
+                subnets=["subnet-A"],
+                tag_name="alpha-engine-data-spot",
+                extra_tags={"component": "data-collection"},
+                **_BASE_KWARGS,
+            )
+        kwargs = ec2.run_instances.call_args.kwargs
+        tag_specs = kwargs["TagSpecifications"]
+        by_type = {spec["ResourceType"]: spec["Tags"] for spec in tag_specs}
+        assert set(by_type) == {"instance", "volume"}
+        assert by_type["instance"] == by_type["volume"] == [
+            {"Key": "Name", "Value": "alpha-engine-data-spot"},
+            {"Key": "component", "Value": "data-collection"},
         ]
 
     def test_extra_tags_without_tag_name_still_tag_at_launch(self, fake_boto3):

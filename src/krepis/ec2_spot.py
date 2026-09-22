@@ -273,11 +273,21 @@ def _build_run_instances_kwargs(
     if extra_tags:
         tags.extend({"Key": k, "Value": v} for k, v in extra_tags.items())
     if tags:
+        # Tag the EBS volume too (same RunInstances call, second
+        # TagSpecifications entry) — the volume created via
+        # BlockDeviceMappings is otherwise untagged and invisible to every
+        # cost-allocation-tag CUR query forever (alpha-engine-config-I11273).
+        # A post-launch create_tags call would reintroduce the untagged-box
+        # race this function was built to close above.
         kwargs["TagSpecifications"] = [
             {
                 "ResourceType": "instance",
                 "Tags": tags,
-            }
+            },
+            {
+                "ResourceType": "volume",
+                "Tags": tags,
+            },
         ]
     return kwargs
 
