@@ -315,6 +315,108 @@ def test_an_unmeasured_run_does_not_erase_a_measured_reading_from_the_same_box()
     assert after["peak_rss_kb"] == measured["peak_rss_kb"]
 
 
+# ── A kept peak beside an unobserved step is a lower bound (I11486) ──────────
+
+
+def test_an_unobserved_workload_never_renders_an_earlier_steps_peak_as_ok():
+    """The 2026-09-23 rehearsal: `phase1`'s sentinel was lost and the row
+    showed the 0.06 GiB `gitleaks-dlp` scan that ran before it as an `ok`
+    stage peak. The earlier reading is kept (it is a fact) but only as a
+    lower bound, and the row is not a pass."""
+    earlier = rb.build_envelope(
+        stage="data-phase1",
+        step="some-earlier-step",
+        reading=_reading(headroom=0.985),
+        previous=None,
+        instance_id="i-1",
+    )
+    assert earlier["status"] == rb.ENVELOPE_OK
+    after = rb.build_envelope(
+        stage="data-phase1",
+        step="phase1",
+        reading=None,
+        previous=earlier,
+        instance_id="i-1",
+    )
+    assert after["status"] == rb.ENVELOPE_ATTENTION
+    assert after["peak_is_lower_bound"] is True
+    assert after["unobserved_steps"] == ["phase1"]
+    assert "UNOBSERVED" in after["summary"]
+    assert "LOWER BOUND" in after["summary"]
+
+
+def test_a_lower_bound_that_already_breaches_the_hard_floor_stays_an_error():
+    """A lower bound on the peak that is already past the floor is a real
+    finding — the unobserved step can only have made it worse."""
+    heavy = rb.build_envelope(
+        stage="evaluator", step="a", reading=_reading(headroom=0.05),
+        previous=None, instance_id="i-1",
+    )
+    after = rb.build_envelope(
+        stage="evaluator", step="b", reading=None,
+        previous=heavy, instance_id="i-1",
+    )
+    assert after["status"] == rb.ENVELOPE_ERROR
+    assert after["peak_is_lower_bound"] is True
+
+
+def test_an_unobserved_step_before_a_measured_one_still_marks_a_lower_bound():
+    """Order must not matter: the box's peak is unknown whichever step lost
+    its reading."""
+    lost = rb.build_envelope(
+        stage="evaluator", step="a", reading=None,
+        previous=None, instance_id="i-1",
+    )
+    after = rb.build_envelope(
+        stage="evaluator", step="b", reading=_reading(headroom=0.9),
+        previous=lost, instance_id="i-1",
+    )
+    assert after["peak_is_lower_bound"] is True
+    assert after["unobserved_steps"] == ["a"]
+    assert after["status"] == rb.ENVELOPE_ATTENTION
+
+
+def test_fully_observed_steps_are_not_a_lower_bound():
+    first = rb.build_envelope(
+        stage="evaluator", step="a", reading=_reading(headroom=0.9),
+        previous=None, instance_id="i-1",
+    )
+    second = rb.build_envelope(
+        stage="evaluator", step="b", reading=_reading(headroom=0.8),
+        previous=first, instance_id="i-1",
+    )
+    assert second["peak_is_lower_bound"] is False
+    assert second["unobserved_steps"] == []
+    assert second["status"] == rb.ENVELOPE_OK
+
+
+def test_a_lower_bound_row_is_not_retired_into_the_trend():
+    """An optimistic headroom entering the trend would read as measured."""
+    first = rb.build_envelope(
+        stage="evaluator", step="a", reading=_reading(headroom=0.9),
+        previous=None, instance_id="i-1",
+    )
+    lower = rb.build_envelope(
+        stage="evaluator", step="b", reading=None,
+        previous=first, instance_id="i-1",
+    )
+    nxt = rb.build_envelope(
+        stage="evaluator", step="a", reading=_reading(headroom=0.5),
+        previous=lower, instance_id="i-2",
+    )
+    assert nxt["history"] == []
+    assert nxt["peak_is_lower_bound"] is False, (
+        "unobserved steps belong to one instance and must not follow the "
+        "stage onto the next box"
+    )
+
+
+def test_gitleaks_dlp_is_an_infrastructure_step():
+    """The pre-workload DLP scan on every data/RAG box. Publishing it put a
+    ~57 MiB gitleaks reading on each stage's row before the workload ran."""
+    assert rb.is_publishable_step("gitleaks-dlp") is False
+
+
 # ── publish() — never raises, never publishes an infrastructure step ─────────
 
 
