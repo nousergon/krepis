@@ -40,8 +40,13 @@ class FakeS3:
         # key -> LastModified datetime, or an exception to raise
         self.objects = objects or {}
         self.puts: list[dict[str, Any]] = []
+        self.list_calls: list[str] = []
+        self.list_error: Exception | None = None
+        self.page_size = 1000
+        self.heads: list[str] = []
 
     def head_object(self, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
+        self.heads.append(Key)
         entry = self.objects.get(Key)
         if entry is None:
             raise _ClientError("404", 404)
@@ -53,8 +58,41 @@ class FakeS3:
         self.puts.append(kwargs)
         return {}
 
+    def get_paginator(self, name: str) -> _FakePaginator:
+        assert name == "list_objects_v2"
+        return _FakePaginator(self)
+
     def get_object(self, Bucket: str, Key: str) -> dict[str, Any]:  # noqa: N803
         raise AssertionError("registry should be injected in these tests")
+
+
+class _FakePaginator:
+    """``list_objects_v2`` over :attr:`FakeS3.objects`, ``page_size`` per page.
+
+    ``list_error`` on the owning FakeS3 is raised on iteration, the way
+    botocore raises a LIST ClientError.
+    """
+
+    def __init__(self, s3: FakeS3) -> None:
+        self.s3 = s3
+
+    def paginate(self, Bucket: str, Prefix: str) -> Any:  # noqa: N803
+        self.s3.list_calls.append(Prefix)
+        if self.s3.list_error is not None:
+            raise self.s3.list_error
+        keys = sorted(
+            k
+            for k, v in self.s3.objects.items()
+            if k.startswith(Prefix) and not isinstance(v, Exception)
+        )
+        size = self.s3.page_size
+        for i in range(0, max(len(keys), 1), size):
+            chunk = keys[i : i + size]
+            yield {
+                "Contents": [
+                    {"Key": k, "LastModified": self.s3.objects[k]} for k in chunk
+                ]
+            }
 
 
 class FakeCW:
@@ -917,3 +955,133 @@ def test_cli_omitting_the_reason_forwards_no_declaration(
     )
     sc.main(["assert", "--stage", "MorningEnrich", "--run-date", "2026-09-23"])
     assert seen[0]["not_applicable_reason"] is None
+
+
+# ── Producer-chosen ``*`` segment (alpha-engine-config-I11521) ───────────────
+
+OOS_DATED = "predictor/diagnostics/oos_rows/*/{date}.parquet"
+OOS_PREFIX = "predictor/diagnostics/oos_rows/"
+
+
+def _wildcard_registry(template: str = OOS_DATED) -> dict[str, Any]:
+    return registry(
+        stage_rows=[
+            {
+                "stage": "PredictorTraining",
+                "stage_class": "product",
+                "output": "registered",
+                "artifacts": ["predictor_oos_rows_dated"],
+            }
+        ],
+        artifacts=[
+            {
+                "artifact_id": "predictor_oos_rows_dated",
+                "s3_bucket": "alpha-engine-research",
+                "s3_key_template": template,
+            }
+        ],
+    )
+
+
+def _evaluate_wildcard(s3: FakeS3, template: str = OOS_DATED) -> sc.StageVerdict:
+    return _evaluate(
+        s3, registry=_wildcard_registry(template), stage="PredictorTraining"
+    )
+
+
+def test_a_wildcard_key_written_in_window_is_covered_via_list_not_head() -> None:
+    s3 = FakeS3({f"{OOS_PREFIX}v3.0-meta/2026-08-14.parquet": NOW})
+    v = _evaluate_wildcard(s3)
+    assert v.status == sc.STATUS_COVERED, v.reason
+    assert s3.heads == []  # a literal '*' is never HEADed
+    assert s3.list_calls == [OOS_PREFIX]
+
+
+def test_a_wildcard_key_with_no_match_is_missing() -> None:
+    # Siblings under the prefix that are not this cycle's instance: another
+    # date, and the family's latest.parquet. Neither may satisfy {date}.
+    s3 = FakeS3(
+        {
+            f"{OOS_PREFIX}v3.0-meta/2026-08-13.parquet": NOW,
+            f"{OOS_PREFIX}v3.0-meta/latest.parquet": NOW,
+        }
+    )
+    v = _evaluate_wildcard(s3)
+    assert v.status == sc.STATUS_MISSING
+    assert "predictor_oos_rows_dated" in v.missing
+
+
+def test_a_wildcard_list_access_denied_is_unmeasured_not_missing() -> None:
+    s3 = FakeS3()
+    s3.list_error = _ClientError("AccessDenied", 403)
+    v = _evaluate_wildcard(s3)
+    assert v.status == sc.STATUS_UNMEASURED
+    assert v.missing == [] and v.is_finding is False
+    [(artifact_id, why)] = v.unmeasured
+    assert artifact_id == "predictor_oos_rows_dated" and "AccessDenied" in why
+
+
+def test_a_wildcard_matches_exactly_one_segment_never_two() -> None:
+    s3 = FakeS3({f"{OOS_PREFIX}v3.0-meta/extra/2026-08-14.parquet": NOW})
+    v = _evaluate_wildcard(s3)
+    assert v.status == sc.STATUS_MISSING
+
+
+def test_a_wildcard_takes_the_newest_instance_across_families() -> None:
+    old = WINDOW - timedelta(days=7)
+    s3 = FakeS3(
+        {
+            f"{OOS_PREFIX}v2.9/2026-08-14.parquet": old,
+            f"{OOS_PREFIX}v3.0-meta/2026-08-14.parquet": NOW,
+        }
+    )
+    assert _evaluate_wildcard(s3).status == sc.STATUS_COVERED
+
+    s3_stale = FakeS3({f"{OOS_PREFIX}v2.9/2026-08-14.parquet": old})
+    assert _evaluate_wildcard(s3_stale).status == sc.STATUS_STALE
+
+
+def test_a_wildcard_latest_key_resolves_the_same_way() -> None:
+    s3 = FakeS3({f"{OOS_PREFIX}v3.0-meta/latest.parquet": NOW})
+    v = _evaluate_wildcard(s3, template="predictor/diagnostics/oos_rows/*/latest.parquet")
+    assert v.status == sc.STATUS_COVERED, v.reason
+
+
+def test_a_wildcard_match_is_found_across_pages() -> None:
+    s3 = FakeS3(
+        {
+            f"{OOS_PREFIX}a/2026-08-13.parquet": NOW,
+            f"{OOS_PREFIX}b/2026-08-13.parquet": NOW,
+            f"{OOS_PREFIX}c/2026-08-14.parquet": NOW,
+        }
+    )
+    s3.page_size = 1
+    assert _evaluate_wildcard(s3).status == sc.STATUS_COVERED
+
+
+def test_a_truncated_wildcard_listing_is_unmeasured_not_absent() -> None:
+    s3 = FakeS3(
+        {f"{OOS_PREFIX}f{i}/2026-08-13.parquet": NOW for i in range(3)}
+    )
+    s3.page_size = 1
+    outcome, payload = sc._newest_match(
+        s3, "b", f"{OOS_PREFIX}*/2026-08-14.parquet", cap_pages=2
+    )
+    assert outcome == "probe_failed"
+    assert "cap" in payload
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "predictor/diagnostics/oos_rows/*/*/{date}.parquet",
+        "predictor/diagnostics/oos_rows/v*/{date}.parquet",
+        "predictor/diagnostics/oos_rows/*",
+    ],
+)
+def test_a_malformed_wildcard_template_is_unmeasured(template: str) -> None:
+    s3 = FakeS3()
+    v = _evaluate_wildcard(s3, template=template)
+    assert v.status == sc.STATUS_UNMEASURED
+    assert "wildcard" in v.unmeasured[0][1]
+    assert s3.list_calls == [] and s3.heads == []

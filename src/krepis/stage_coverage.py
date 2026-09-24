@@ -100,6 +100,26 @@ false ``missing`` verdicts. :func:`resolve_cycle_date` defers to
 fleet's artifact-freshness probe substitutes — and returns ``None`` rather
 than guessing when it cannot resolve.
 
+**The producer-chosen ``*`` segment is LISTed, never HEADed.** A registry key
+template may declare one whole path segment whose value the PRODUCER picks at
+write time and no consumer can derive — a single literal ``*``
+(``alpha-engine-config-I10200``); the live instance is
+``predictor/diagnostics/oos_rows/*/{date}.parquet``, scoped by model family.
+Until ``alpha-engine-config-I11521`` this module HEADed that key with the
+``*`` still in it, so both ``predictor_oos_rows_*`` rows read ``absent`` on
+every run whatever training wrote. Such a key is a PATTERN: after the
+ordinary placeholders are substituted, :func:`_newest_match` LISTs the fixed
+prefix before the ``*``, keeps the keys where the ``*`` matched exactly ONE
+path segment and everything else matched literally, and returns the newest
+``LastModified`` — the same payload a HEAD returns, so the verdict logic is
+unchanged. Zero matches is ``absent``; a LIST that failed or was truncated at
+the page cap is ``probe_failed`` (could-not-measure, never a finding); and
+there is **never** a fallback to the unscoped key. This mirrors
+``nousergon-data``'s ``validators/stage_output_sweep._newest_match`` and the
+grammar in ``nousergon_lib.artifact_freshness`` (one ``*``, a whole segment,
+never the last); krepis cannot import that AGPL module, so the rule is
+restated here and a malformed template is ``probe_failed`` naming it.
+
 **Public surface:**
 
 - :data:`STATUS_COVERED` / :data:`STATUS_COVERED_NO_OUTPUT` /
@@ -118,6 +138,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
@@ -194,8 +215,10 @@ S3_SURFACE = (
     s3_surface.literal("_freshness_monitor", s3_surface.MODE_READ),
     s3_surface.caller_supplied(
         "declared artifacts are head_object-probed at keys the artifact "
-        "registry names; the consumer already owns those prefixes because "
-        "they are the ones its own stages write",
+        "registry names (a key carrying the producer-chosen '*' segment is "
+        "list_objects_v2-probed at its fixed prefix instead); the consumer "
+        "already owns those prefixes because they are the ones its own "
+        "stages write",
         s3_surface.MODE_READ,
     ),
 )
@@ -490,6 +513,110 @@ def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
         return "probe_failed", f"{type(exc).__name__}: {code or exc}"
 
 
+#: The registry's producer-chosen path segment (alpha-engine-config-I10200).
+WILDCARD_SEGMENT: Final[str] = "*"
+
+#: Page cap for a wildcard LIST. S3 lists lexically, so the keys past the cap
+#: are not a random sample; a truncated listing is ``probe_failed``, never
+#: ``absent``. Same bound as ``nousergon-data``'s stage-output sweep.
+WILDCARD_LIST_CAP_PAGES: Final[int] = 64
+
+
+def _wildcard_pattern(key: str) -> tuple[str, re.Pattern[str]]:
+    """Return ``(list_prefix, full_match_regex)`` for a ``*``-bearing key.
+
+    ``key`` is the template with its placeholders already substituted, so
+    only the producer-chosen segment is free. The grammar is the registry's
+    (``nousergon_lib.artifact_freshness.validate_key_template``): exactly one
+    ``*``, occupying one whole path segment, never the last segment. Raises
+    :class:`ValueError` naming the key on any other shape.
+    """
+    count = key.count(WILDCARD_SEGMENT)
+    if count != 1:
+        raise ValueError(
+            f"key {key!r} carries {count} '*' segments — exactly one "
+            "producer-chosen segment is expressible"
+        )
+    segments = key.split("/")
+    at = next(i for i, seg in enumerate(segments) if WILDCARD_SEGMENT in seg)
+    if segments[at] != WILDCARD_SEGMENT:
+        raise ValueError(
+            f"key {key!r} uses '*' inside the segment {segments[at]!r} — the "
+            "wildcard must occupy one whole path segment"
+        )
+    if at == len(segments) - 1:
+        raise ValueError(
+            f"key {key!r} ends in '*' — a trailing wildcard names a directory, "
+            "not an artifact"
+        )
+    prefix, rest = key.split(WILDCARD_SEGMENT, 1)
+    # ``[^/]+``: the ``*`` is exactly ONE non-empty segment — a key two
+    # segments deep under the prefix is a different artifact, not a match.
+    regex = re.escape(prefix) + r"[^/]+" + re.escape(rest) + r"\Z"
+    return prefix, re.compile(regex)
+
+
+def _newest_match(
+    s3_client: Any,
+    bucket: str,
+    key: str,
+    *,
+    cap_pages: int = WILDCARD_LIST_CAP_PAGES,
+) -> tuple[str, Any]:
+    """Resolve a ``*``-bearing key to its newest instance by LIST.
+
+    Same ``(outcome, payload)`` contract as :func:`_head`: ``"present"`` with
+    the newest matching ``LastModified``, ``"absent"`` when nothing under the
+    prefix matches, ``"probe_failed"`` with a reason when the key's shape is
+    illegal, the LIST raised (AccessDenied included), or the listing hit
+    ``cap_pages`` — could-not-see-the-whole-prefix is not evidence of absence.
+    Never falls back to the unscoped key (alpha-engine-config-I11521).
+    """
+    try:
+        prefix, pattern = _wildcard_pattern(key)
+    except ValueError as exc:
+        return "probe_failed", f"unresolvable wildcard key: {exc}"
+
+    newest = None
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page_index, page in enumerate(
+            paginator.paginate(Bucket=bucket, Prefix=prefix)
+        ):
+            if page_index >= cap_pages:
+                return "probe_failed", (
+                    f"LIST of {prefix!r} exceeded the {cap_pages}-page cap; "
+                    "a truncated listing cannot establish absence"
+                )
+            for obj in page.get("Contents") or []:
+                if pattern.match(str(obj.get("Key") or "")) is None:
+                    continue
+                last_modified = obj.get("LastModified")
+                if last_modified is None:
+                    continue
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                if newest is None or last_modified > newest:
+                    newest = last_modified
+    except Exception as exc:  # noqa: BLE001 — classified below, never re-raised
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = str((response.get("Error") or {}).get("Code", ""))
+        return "probe_failed", f"{type(exc).__name__}: {code or exc}"
+
+    if newest is None:
+        return "absent", ""
+    return "present", newest
+
+
+def _probe(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
+    """HEAD a fixed key; LIST-and-match a key carrying the ``*`` segment."""
+    if WILDCARD_SEGMENT in key:
+        return _newest_match(s3_client, bucket, key)
+    return _head(s3_client, bucket, key)
+
+
 def evaluate_stage(
     registry: dict[str, Any],
     stage: str,
@@ -609,7 +736,7 @@ def evaluate_stage(
             continue
         bucket = str(spec.get("s3_bucket") or DEFAULT_BUCKET)
         key = format_key(template, cycle_date)
-        outcome, payload = _head(s3_client, bucket, key)
+        outcome, payload = _probe(s3_client, bucket, key)
         if outcome == "absent":
             missing.append(artifact_id)
         elif outcome == "probe_failed":
