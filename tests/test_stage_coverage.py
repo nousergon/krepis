@@ -826,3 +826,94 @@ def test_the_cli_exits_four_and_writes_nothing_without_a_run_date(
 
 def test_the_cli_run_date_exit_code_is_distinct_from_a_coverage_finding() -> None:
     assert sc.EXIT_NO_RUN_DATE != sc.EXIT_COVERAGE_FAILURE
+
+
+# ── Per-run declared skip (alpha-engine-config-I11474) ───────────────────────
+
+_GUARD_REASON = (
+    "stale_overwrite (polygon target=2026-09-22, ArcticDB SPY last=2026-09-23)"
+)
+
+
+def test_a_guard_declared_skip_is_not_graded_stale() -> None:
+    """rehearsal-2026-09-23-2: MorningEnrich's own stale-overwrite guard
+    correctly skipped the enrich, and coverage logged `STALE — WHOLLY STALE —
+    0 of 1 declared artifact(s) refreshed`. A declared, deliberate non-run is
+    not a producer finding; it records COVERED_NO_OUTPUT carrying the guard's
+    reason, with the stale list still on the record."""
+    verdict = _evaluate(
+        FakeS3({KEY: WINDOW - timedelta(days=1)}),
+        not_applicable_reason=_GUARD_REASON,
+    )
+    assert verdict.status == sc.STATUS_COVERED_NO_OUTPUT
+    assert verdict.is_finding is False
+    assert verdict.not_applicable_reason == _GUARD_REASON
+    assert _GUARD_REASON in verdict.reason
+    assert verdict.stale == ["daily_closes_parquet"]
+    assert verdict.to_dict()["not_applicable_reason"] == _GUARD_REASON
+
+
+def test_without_a_declaration_the_same_run_is_still_wholly_stale() -> None:
+    """The other polarity: the declaration is the ONLY thing that moves it."""
+    for blank in (None, "", "   "):
+        verdict = _evaluate(
+            FakeS3({KEY: WINDOW - timedelta(days=1)}), not_applicable_reason=blank,
+        )
+        assert verdict.status == sc.STATUS_STALE
+        assert verdict.is_finding is True
+        assert verdict.not_applicable_reason == ""
+
+
+def test_a_declared_skip_never_excuses_an_absent_artifact() -> None:
+    """A guard can explain not refreshing, never there being nothing to read."""
+    verdict = _evaluate(FakeS3(), not_applicable_reason=_GUARD_REASON)
+    assert verdict.status == sc.STATUS_MISSING
+    assert verdict.is_finding is True
+    assert verdict.not_applicable_reason == _GUARD_REASON
+
+
+def test_a_declared_skip_does_not_turn_unmeasured_into_a_pass() -> None:
+    verdict = _evaluate(
+        FakeS3({KEY: WINDOW - timedelta(days=1)}),
+        cycle_date=None,
+        not_applicable_reason=_GUARD_REASON,
+    )
+    assert verdict.status == sc.STATUS_UNMEASURED
+    assert verdict.not_applicable_reason == _GUARD_REASON
+
+
+def test_a_declared_skip_leaves_an_in_window_write_covered() -> None:
+    verdict = _evaluate(
+        FakeS3({KEY: WINDOW + timedelta(minutes=5)}),
+        not_applicable_reason=_GUARD_REASON,
+    )
+    assert verdict.status == sc.STATUS_COVERED
+
+
+def test_cli_forwards_the_not_applicable_reason(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _patch_assert(
+        monkeypatch,
+        {"status": sc.STATUS_COVERED_NO_OUTPUT, "reason": "", "is_finding": False},
+    )
+    assert (
+        sc.main(
+            [
+                "assert", "--stage", "MorningEnrich", "--run-date", "2026-09-23",
+                "--not-applicable-reason", _GUARD_REASON, "--enforce",
+            ]
+        )
+        == 0
+    )
+    assert seen[0]["not_applicable_reason"] == _GUARD_REASON
+
+
+def test_cli_omitting_the_reason_forwards_no_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _patch_assert(
+        monkeypatch, {"status": sc.STATUS_COVERED, "reason": "", "is_finding": False}
+    )
+    sc.main(["assert", "--stage", "MorningEnrich", "--run-date", "2026-09-23"])
+    assert seen[0]["not_applicable_reason"] is None

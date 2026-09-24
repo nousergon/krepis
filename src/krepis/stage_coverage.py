@@ -73,6 +73,23 @@ stage that writes nothing from a stage nobody ever considered. Eleven of the
 43 weekly stages are in this class; they assert nothing and still record that
 they declared nothing.
 
+**A stage whose own guard skipped this run says so, per run.** The registry
+row is static; it cannot know that THIS run's guard deliberately declined to
+refresh (MorningEnrich's stale-overwrite guard, when the evening launch has
+nothing newer to enrich). Before ``alpha-engine-config-I11474`` that run was
+graded ``STALE — WHOLLY STALE``: a declared, deliberate non-run reported as a
+producer finding, which ``--enforce`` would have turned into a false page. The
+stage's launcher now passes the guard's own reason
+(``--not-applicable-reason``); a verdict that would otherwise be ``STALE`` is
+then :data:`STATUS_COVERED_NO_OUTPUT`, carrying that reason verbatim in
+:attr:`StageVerdict.not_applicable_reason`. It excuses STALENESS only: a
+declared artifact that does not EXIST is still ``MISSING`` (a guard can
+explain not refreshing, never there being nothing to read), and a probe that
+could not measure is still ``UNMEASURED``. The registry cannot carry this
+declaration — ``refresh: conditional`` never excuses a wholly-stale stage
+(``alpha-engine-config-I8166``) — because only the run itself knows its guard
+fired.
+
 **The cycle date is not the run date.** ``{date}`` / ``{trading_day}`` in a key
 template resolve to the *cycle* tick — the last closed trading day — not to
 the execution's ``run_date``. Measured 2026-08-13: the 08-08 execution carries
@@ -276,6 +293,12 @@ class StageVerdict:
             still measurable without a window, so ``MISSING`` still fires.
         recorded_at: ISO-8601 UTC instant the verdict was produced.
         enforce: Whether the caller asked for enforcement.
+        not_applicable_reason: The stage's OWN per-run declaration that its
+            guard deliberately skipped the work this run, verbatim from the
+            caller (``--not-applicable-reason``); ``""`` when none was made.
+            Populated on every verdict the declaration was supplied to, so a
+            stage that declares a skip every cycle is visible as such
+            (``alpha-engine-config-I11474``).
     """
 
     stage: str
@@ -294,6 +317,7 @@ class StageVerdict:
     window_start: str | None = None
     recorded_at: str = ""
     enforce: bool = False
+    not_applicable_reason: str = ""
 
     def __post_init__(self) -> None:
         # Refuse to CONSTRUCT a verdict with no execution identity. The check
@@ -476,6 +500,7 @@ def evaluate_stage(
     cycle_date: date | None = None,
     window_start: datetime | None = None,
     enforce: bool = False,
+    not_applicable_reason: str | None = None,
 ) -> StageVerdict:
     """Return the verdict for ``stage``. Pure but for the injected S3 probes.
 
@@ -483,10 +508,17 @@ def evaluate_stage(
     cycle date. Omitting it is a :class:`TypeError` at the call site and
     passing it blank is a :class:`StageCoverageContractError`.
 
+    ``not_applicable_reason`` is the stage's own per-run declaration that its
+    guard deliberately skipped the work (see the module docstring). A
+    non-blank value turns what would be ``STALE`` into
+    :data:`STATUS_COVERED_NO_OUTPUT` naming the reason; it never downgrades
+    ``MISSING`` or ``UNMEASURED``. Blank or ``None`` is no declaration.
+
     Otherwise never raises: every failure to establish an answer is
     :data:`STATUS_UNMEASURED` with a populated ``reason``.
     """
     run_date = _require_run_date(run_date)
+    declared_skip = " ".join(str(not_applicable_reason or "").split())
     recorded_at = now.astimezone(timezone.utc).isoformat()
     window_iso = (
         window_start.astimezone(timezone.utc).isoformat() if window_start else None
@@ -502,6 +534,7 @@ def evaluate_stage(
             window_start=window_iso,
             recorded_at=recorded_at,
             enforce=enforce,
+            not_applicable_reason=declared_skip,
             **extra,
         )
 
@@ -530,6 +563,7 @@ def evaluate_stage(
             window_start=window_iso,
             recorded_at=recorded_at,
             enforce=enforce,
+            not_applicable_reason=declared_skip,
         )
 
     expected = [str(a) for a in (row.get("artifacts") or [])]
@@ -611,6 +645,18 @@ def evaluate_stage(
     if missing:
         status = STATUS_MISSING
         reason = f"{len(missing)} declared artifact(s) absent: {', '.join(missing)}"
+    elif stale and declared_skip:
+        # The stage's own guard declared THIS run not applicable. Staleness is
+        # exactly what a deliberate skip produces, so it is not a finding —
+        # but it is still recorded, with the stale list intact and the
+        # guard's reason verbatim (alpha-engine-config-I11474).
+        status = STATUS_COVERED_NO_OUTPUT
+        reason = (
+            f"not applicable this run — the stage's own guard skipped it: "
+            f"{declared_skip}. {len(stale)} of {len(expected)} declared "
+            f"artifact(s) not refreshed this run ({', '.join(stale)}); none "
+            "absent."
+        )
     elif stale:
         status = STATUS_STALE
         if not covered:
@@ -668,6 +714,7 @@ def evaluate_stage(
         window_start=window_iso,
         recorded_at=recorded_at,
         enforce=enforce,
+        not_applicable_reason=declared_skip,
     )
 
 
@@ -760,8 +807,12 @@ def assert_stage_coverage(
     cloudwatch_client: Any = None,
     bucket: str = DEFAULT_BUCKET,
     registry_local_path: str | None = None,
+    not_applicable_reason: str | None = None,
 ) -> dict[str, Any]:
     """Assert ``stage`` wrote what it declared. Returns the verdict dict.
+
+    ``not_applicable_reason``: the stage's own per-run declaration that its
+    guard deliberately skipped the work — see :func:`evaluate_stage`.
 
     The front door for **Lambda-backed stages**: call immediately before
     returning, and merge the result into the handler's response payload under
@@ -824,6 +875,7 @@ def assert_stage_coverage(
                 cycle_date=resolve_cycle_date(now),
                 window_start=window_start,
                 enforce=enforce,
+                not_applicable_reason=not_applicable_reason,
             )
 
         record_verdict(
@@ -923,6 +975,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the registry from a local file instead of S3 (tests)",
     )
     assert_cmd.add_argument(
+        "--not-applicable-reason",
+        default="",
+        help=(
+            "the stage's OWN guard deliberately skipped its work this run — "
+            "pass the guard's reason. A verdict that would be STALE becomes "
+            "COVERED_NO_OUTPUT carrying it; MISSING and UNMEASURED are "
+            "unchanged. Omit (or empty) when the stage ran."
+        ),
+    )
+    assert_cmd.add_argument(
         "--enforce",
         action="store_true",
         default=os.environ.get("STAGE_COVERAGE_ENFORCE", "").lower()
@@ -981,6 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
         enforce=args.enforce,
         bucket=args.bucket,
         registry_local_path=args.registry_path,
+        not_applicable_reason=getattr(args, "not_applicable_reason", "") or None,
     )
 
     status = verdict_dict.get("status", STATUS_UNMEASURED)
