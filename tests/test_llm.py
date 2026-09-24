@@ -1434,6 +1434,66 @@ class TestEmptyContentIsVisible:
                 if "EMPTY message.content" in r.getMessage()
                 and r.levelno == logging.ERROR]
 
+    @staticmethod
+    def _tool_call():
+        return SimpleNamespace(
+            id="call_1",
+            type="function",
+            function=SimpleNamespace(name="lookup", arguments='{"q": "x"}'),
+        )
+
+    @pytest.mark.parametrize("content", [None, ""])
+    def test_tool_call_response_is_not_logged_at_ERROR(self, caplog, content):
+        """Empty content beside populated tool_calls is the normal tool-use
+        shape; the payload is in tool_calls. 37 false ERRORs in one EvalJudge
+        run of the weekly rehearsal (alpha-engine-config-I11487)."""
+        fake = FakeOpenAI([_openai_resp(
+            content, finish_reason="tool_calls", tool_calls=[self._tool_call()],
+        )])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            result = _client(OPENROUTER_SPEC, fake).complete(
+                system="s", user_content="u",
+                extra={"tools": [{"type": "function"}]},
+            )
+        assert result.text == ""
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING], (
+            "a tool-call turn is not an empty response and must not reach "
+            "alert-level logging"
+        )
+
+    def test_tool_calls_with_a_stop_finish_are_still_a_tool_call(self, caplog):
+        """The discriminator is the populated field, not the finish label:
+        some routes report `stop` on a tool-use turn."""
+        fake = FakeOpenAI([_openai_resp(
+            "", finish_reason="stop", tool_calls=[self._tool_call()],
+        )])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+    @pytest.mark.parametrize(
+        "finish_reason,tool_calls",
+        [
+            ("stop", None),
+            ("length", None),
+            # A tool_calls finish that carries no tool call is a genuinely
+            # empty response with a tool-use label — still ERROR.
+            ("tool_calls", None),
+            ("tool_calls", []),
+        ],
+    )
+    def test_genuinely_empty_response_still_logs_at_ERROR(
+        self, caplog, finish_reason, tool_calls,
+    ):
+        fake = FakeOpenAI([_openai_resp(
+            "", finish_reason=finish_reason, tool_calls=tool_calls,
+        )])
+        with caplog.at_level(logging.DEBUG, logger="krepis.llm"):
+            _client(OPENROUTER_SPEC, fake).complete(system="s", user_content="u")
+        assert [r for r in caplog.records
+                if "EMPTY message.content" in r.getMessage()
+                and r.levelno == logging.ERROR]
+
     def test_diagnostics_never_mask_the_fault(self):
         """A response the diagnostic cannot introspect must still return ''."""
         from krepis.llm import _choice_text

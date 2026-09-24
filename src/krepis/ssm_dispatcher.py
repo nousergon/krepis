@@ -308,11 +308,72 @@ def _fetch_remote_output_tail(
 
 # Bytes of streamed stdout retained in memory purely so the peak-RSS sentinel
 # (emitted by the on-box harness AFTER the body exits, so always in the tail)
-# can be recovered on Success. Bounded on purpose: the inline SSM field is
-# capped at 24KB and rotates, and an unbounded accumulator on a multi-hour
-# chatty stage is the exact defect class of alpha-engine-config-I7021 (a
-# warning that fills the capture window and evicts the record beside it).
+# can be recovered on Success. Bounded on purpose: an unbounded accumulator on
+# a multi-hour chatty stage is the exact defect class of
+# alpha-engine-config-I7021 (a warning that fills the capture window and
+# evicts the record beside it).
 RSS_SENTINEL_TAIL_BYTES: Final[int] = 64 * 1024
+
+# What SSM appends to ``StandardOutputContent`` once the inline field is full.
+# The inline field keeps the HEAD — it does not rotate — so once this marker
+# appears, nothing written later (the harness sentinel included) will ever be
+# visible inline.
+SSM_OUTPUT_TRUNCATED_MARKER: Final[str] = "--output truncated--"
+
+
+def _recover_rss_stdout(
+    rss_tail: str,
+    *,
+    output_bucket: Optional[str],
+    output_key_prefix: Optional[str],
+    command_id: str,
+    s3_client,
+    sleep,
+    err,
+    description: str,
+) -> str:
+    """Return the stdout the peak-RSS sentinel should be parsed from.
+
+    alpha-engine-config-I11486. ``StandardOutputContent`` holds only the FIRST
+    ~24KB of the remote stdout, and the harness writes its sentinel as the LAST
+    line — so on every stage chatty enough to matter, the sentinel was never
+    visible inline. Measured on the weekly rehearsal ``rehearsal-2026-09-23-2``:
+    ``full-training``, ``model-zoo-spec``, ``phase1``, ``phase2-only`` and
+    ``rag-ingestion`` all hit ``--output truncated--`` and none of their
+    sentinels arrived. The first two rendered UNOBSERVED; the other three
+    silently inherited the 0.06 GiB ``gitleaks-dlp`` reading from earlier on
+    the same box (see :func:`krepis.rss_budget.build_envelope`).
+
+    SSM's S3 upload of the same stdout is not capped, so when the inline copy
+    carries no sentinel, or was truncated, its TAIL is read here — before
+    returning, while the launcher's staging prefix still exists — with the
+    same bounded reader the failure path uses. Never raises: the tail reader
+    swallows and logs its own failures, and an empty tail simply leaves the row
+    UNOBSERVED, which is the honest rendering.
+    """
+    if (
+        rss_budget.parse_reading(rss_tail) is not None
+        and SSM_OUTPUT_TRUNCATED_MARKER not in rss_tail
+    ):
+        return rss_tail
+    if not output_bucket or not output_key_prefix:
+        return rss_tail
+    remote_tail = _fetch_remote_output_tail(
+        bucket=output_bucket,
+        key_prefix=output_key_prefix,
+        command_id=command_id,
+        s3_client=s3_client,
+        sleep=sleep,
+    )
+    if remote_tail:
+        err.write(
+            f"    [ssm {description}] peak-RSS sentinel not in the inline "
+            f"stdout — read from the S3 output copy instead\n"
+        )
+        err.flush()
+    # Appended AFTER the inline text: parse_reading takes the LAST sentinel,
+    # so the harness's own line from the uncapped copy wins.
+    return rss_tail + "\n" + remote_tail
 
 
 class SsmDispatchError(Exception):
@@ -677,11 +738,21 @@ def run(
                 # of (alpha-engine-config-I7260) — so a failed run has nothing
                 # honest to contribute to a budget and must not overwrite the
                 # last row that did.
+                rss_stdout = _recover_rss_stdout(
+                    rss_tail,
+                    output_bucket=output_bucket,
+                    output_key_prefix=output_key_prefix,
+                    command_id=command_id,
+                    s3_client=s3_client,
+                    sleep=sleep,
+                    err=err,
+                    description=description,
+                )
                 body = rss_budget.publish(
                     bucket=diagnostics_bucket,
                     description=description,
                     instance_id=instance_id,
-                    stdout=rss_tail,
+                    stdout=rss_stdout,
                     correlation_id=os.environ.get("RUN_TOKEN") or None,
                     s3_client=s3_client,
                 )

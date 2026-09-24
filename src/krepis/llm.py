@@ -506,16 +506,45 @@ def _choice_text(resp: Any, *, caller_raises_on_empty: bool = False) -> str:
     nothing raises — there this line is the only signal that anything happened,
     and demoting it fleet-wide to buy quiet on the structured path would trade
     a duplicate alert for a missing one.
+
+    **A tool-call response is not an empty response**
+    (alpha-engine-config-I11487). When the message carries populated
+    ``tool_calls``, empty ``content`` is the normal shape of a tool-use turn:
+    the payload is in ``tool_calls`` and the caller reads it from the raw
+    response. Logging that at ERROR produced 37 false errors in one EvalJudge
+    run of the weekly rehearsal (``rehearsal-2026-09-23-2``) and polluted every
+    log-scan alert reading it. It is logged at DEBUG instead. The discriminator
+    is the populated ``tool_calls`` field, NOT ``finish_reason='tool_calls'``
+    alone: a ``tool_calls`` finish whose ``tool_calls`` is absent or empty
+    carries nothing at all, and keeps the ERROR — that is a genuinely empty
+    response wearing a tool-use label.
     """
     choice = _first_choice(resp)
     text = (getattr(choice.message, "content", None) or "").strip()
     if not text:
+        if caller_raises_on_empty:
+            level = logging.WARNING
+        elif _has_tool_calls(choice.message):
+            level = logging.DEBUG
+        else:
+            level = logging.ERROR
         logger.log(
-            logging.WARNING if caller_raises_on_empty else logging.ERROR,
+            level,
             "llm: EMPTY message.content on a successful response — %s",
             _empty_content_diagnostics(resp, choice),
         )
     return text
+
+
+def _has_tool_calls(message: Any) -> bool:
+    """Whether ``message`` carries at least one structured tool call.
+
+    Only a non-empty list/tuple counts: ``None``, ``[]`` and any non-sequence
+    value (a mock, a provider's malformed field) do not, so the doubtful case
+    falls to the ERROR branch of :func:`_choice_text` rather than to silence.
+    """
+    tool_calls = getattr(message, "tool_calls", None)
+    return isinstance(tool_calls, (list, tuple)) and len(tool_calls) > 0
 
 
 class LLMError(RuntimeError):

@@ -1337,6 +1337,113 @@ class TestPeakRssBudget:
         assert body["measured"] is False
 
 
+_RSS_PREFIX = "tmp/spot_data/20260923T233000Z-i-0ab/ssm-output"
+_RSS_STDOUT_KEY = (
+    _RSS_PREFIX + "/cmd-abc/i-0ab/awsrunShellScript/0.awsrunShellScript/stdout"
+)
+
+
+class TestPeakRssSentinelPastTheInlineCap:
+    """alpha-engine-config-I11486.
+
+    ``StandardOutputContent`` keeps the FIRST ~24KB and then stops, ending in
+    ``--output truncated--``; the harness writes its sentinel LAST. On the
+    2026-09-23 rehearsal every heavy stage lost its sentinel this way. The
+    dispatcher now reads the sentinel from SSM's uncapped S3 copy.
+    """
+
+    READING = {
+        "measured": True,
+        "peak_rss_kb": 3 * 1024 * 1024,
+        "mem_total_kb": 3908528,
+        "instance_type": "c6i.large",
+    }
+
+    def _run(self, s3, *, inline, output_bucket="alpha-engine-research"):
+        ssm = _fake_ssm(
+            poll_sequence=[{"Status": "Success", "StandardOutputContent": inline}]
+        )
+        err = io.StringIO()
+        rc = ssm_dispatcher.run(
+            "i-0ab",
+            "data-phase1: phase1",
+            "echo ok",
+            output_bucket=output_bucket,
+            output_key_prefix=_RSS_PREFIX,
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-data",
+            stdout_stream=io.StringIO(),
+            stderr_stream=err,
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        row = [
+            c for c in s3.put_calls
+            if c["Key"] == "ops/checks/ae-rss-data-phase1/latest.json"
+        ]
+        return rc, (json.loads(row[-1]["Body"].decode()) if row else None), err.getvalue()
+
+    def _s3(self):
+        full = (
+            "x" * 30000 + "\n" + rss_budget.SENTINEL + " "
+            + json.dumps(self.READING) + "\n"
+        )
+        s3 = _FakeS3ForTail({_RSS_STDOUT_KEY: full.encode()})
+        s3.get_object = _missing_row_then(s3.get_object)
+        return s3
+
+    def test_a_truncated_inline_stdout_reads_the_sentinel_from_s3(self):
+        s3 = self._s3()
+        rc, row, err = self._run(
+            s3, inline="x" * 24000 + "--output truncated--"
+        )
+        assert rc == 0
+        assert row["measured"] is True
+        assert row["peak_rss_kb"] == self.READING["peak_rss_kb"]
+        assert "read from the S3 output copy" in err
+
+    def test_an_intact_inline_sentinel_needs_no_s3_read(self):
+        s3 = self._s3()
+        inline = "work\n" + rss_budget.SENTINEL + " " + json.dumps(self.READING) + "\n"
+        _, row, _ = self._run(s3, inline=inline)
+        assert row["measured"] is True
+        assert s3.list_calls == 0
+
+    def test_an_unreadable_s3_copy_leaves_the_row_unobserved_and_the_stage_green(self):
+        class Broken(_FakeS3ForTail):
+            def list_objects_v2(self, **kw):
+                raise RuntimeError("AccessDenied")
+
+        s3 = Broken()
+        s3.get_object = _missing_row_then(s3.get_object)
+        rc, row, _ = self._run(s3, inline="x" * 24000 + "--output truncated--")
+        assert rc == 0
+        assert row["measured"] is False
+        assert row["status"] == rss_budget.ENVELOPE_ATTENTION
+
+    def test_no_output_bucket_means_no_s3_read(self):
+        s3 = self._s3()
+        rc, row, _ = self._run(
+            s3, inline="x" * 24000 + "--output truncated--", output_bucket=None
+        )
+        assert rc == 0
+        assert s3.list_calls == 0
+        assert row["measured"] is False
+
+
+def _missing_row_then(get_object):
+    """The stage row does not exist yet (first run); every other key is the
+    wrapped fake's. Mirrors S3's NoSuchKey for the console-row read."""
+
+    def _get(Bucket, Key, Range=None):
+        if Key.startswith("ops/checks/"):
+            raise RuntimeError("NoSuchKey")
+        return get_object(Bucket=Bucket, Key=Key, Range=Range)
+
+    return _get
+
+
 class _FakeS3ForTail:
     """S3 stand-in for the terminal-failure remote-output tail read (I7442)."""
 
