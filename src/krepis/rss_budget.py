@@ -189,8 +189,14 @@ MIN_TREND_SAMPLES: Final[int] = 3
 # an unlisted infrastructure step can only ever make a stage look HEAVIER than
 # it is, never lighter. Adding a new infrastructure step to `_spot_common.sh`
 # should add its name here.
+#
+# `gitleaks-dlp` (alpha-engine-config-I11486): the pre-workload DLP scan
+# `nousergon-data/infrastructure/_spot_common.sh` runs on every data/RAG box
+# before the stage body. Unlisted, it published a ~57 MiB gitleaks reading onto
+# the stage's row BEFORE the workload ran — and when the workload's own
+# sentinel was then lost, that reading is what the row showed as `ok`.
 INFRASTRUCTURE_STEPS: Final[frozenset[str]] = frozenset(
-    {"bootstrap", "deps", "predictor-cache", "preflight-only"}
+    {"bootstrap", "deps", "gitleaks-dlp", "predictor-cache", "preflight-only"}
 )
 
 #: Marker the on-box harness prints so the dispatcher can recover the reading
@@ -434,9 +440,10 @@ def classify(
         return (
             ENVELOPE_ATTENTION,
             "UNOBSERVED — the stage ran but no peak-RSS reading reached the "
-            "dispatcher (the harness sentinel never arrived; the inline SSM "
-            "output cap may have rotated it away). This is not a pass: the "
-            "stage's memory budget is unknown for this run.",
+            "dispatcher (the harness sentinel was in neither the inline SSM "
+            "stdout, which keeps only the first 24KB, nor a readable S3 "
+            "output copy). This is not a pass: the stage's memory budget is "
+            "unknown for this run.",
         )
     if not reading.get("measured"):
         return (
@@ -506,14 +513,37 @@ def build_envelope(
     * **History appends once per instance.** A new ``instance_id`` is a new
       run, so the previous run's reading is retired into ``history`` and the
       trend advances by exactly one point per stage run.
+
+    And one honesty rule on top of the first (alpha-engine-config-I11486):
+
+    * **A kept peak with an unobserved step beside it is a LOWER BOUND, never
+      a pass.** Keeping an earlier step's real measurement when a later step
+      on the same box reports nothing is right — erasing it would discard a
+      fact. Rendering it ``ok`` was not: the unobserved step may have peaked
+      far higher, so the row only knows the box needed AT LEAST that much. On
+      the 2026-09-23 weekly rehearsal ``phase1``, ``phase2-only`` and
+      ``rag-ingestion`` each lost their sentinel and showed the 0.06 GiB
+      ``gitleaks-dlp`` scan that ran before them as an ``ok`` stage peak. Such
+      a row now carries ``peak_is_lower_bound`` plus the ``unobserved_steps``,
+      is never better than ``attention``, and is not retired into the trend,
+      where an optimistic headroom would read as measured.
     """
     ran_at = _now_iso(now)
     previous = previous if isinstance(previous, dict) else {}
     prev_instance = previous.get("instance_id")
     history = [h for h in previous.get("history", []) if isinstance(h, dict)]
 
+    same_box = prev_instance == instance_id
+    unobserved_steps: "list[str]" = (
+        [s for s in previous.get("unobserved_steps") or [] if isinstance(s, str)]
+        if same_box
+        else []
+    )
+    if not (reading and reading.get("measured")) and step not in unobserved_steps:
+        unobserved_steps.append(step)
+
     merged = reading
-    if prev_instance == instance_id and previous.get("reading"):
+    if same_box and previous.get("reading"):
         prev_reading = previous["reading"]
         # Same box, later step: keep whichever peak is higher, and keep a real
         # measurement over an unmeasured one.
@@ -524,10 +554,15 @@ def build_envelope(
                 reading.get("peak_rss_kb", 0)
             ):
                 merged = prev_reading
-    elif previous.get("reading") is not None or previous.get("headroom") is not None:
+    elif not same_box and (
+        previous.get("reading") is not None or previous.get("headroom") is not None
+    ):
         # A different box: the previous row described a finished run. Retire it
-        # into the trend before overwriting.
-        if isinstance(previous.get("headroom"), (int, float)):
+        # into the trend before overwriting — unless its peak was only a lower
+        # bound, which would enter the trend as rosier headroom than the run had.
+        if isinstance(previous.get("headroom"), (int, float)) and not previous.get(
+            "peak_is_lower_bound"
+        ):
             history.append(
                 {
                     "ran_at": previous.get("ran_at"),
@@ -542,6 +577,16 @@ def build_envelope(
     history = history[-HISTORY_LIMIT:]
 
     status, summary = classify(merged, history)
+    lower_bound = bool(unobserved_steps) and bool(merged and merged.get("measured"))
+    if lower_bound:
+        if status == ENVELOPE_OK:
+            status = ENVELOPE_ATTENTION
+        summary = (
+            f"UNOBSERVED for step(s) {', '.join(unobserved_steps)} — no peak-RSS "
+            "reading arrived for them, so the peak below is only what OTHER "
+            "steps on this instance reached: a LOWER BOUND on the stage's "
+            f"peak, not the stage's peak. {summary}"
+        )
     body: "dict[str, Any]" = {
         "schema_version": 1,
         "check_id": check_id(stage),
@@ -576,6 +621,8 @@ def build_envelope(
         "trend_median_headroom": None,
         "trend_samples": 0,
         "reading": merged,
+        "peak_is_lower_bound": lower_bound,
+        "unobserved_steps": unobserved_steps,
         "summary": summary,
         "evidence": f"ssm command on {instance_id}",
     }
