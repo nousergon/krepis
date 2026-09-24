@@ -73,6 +73,23 @@ stage that writes nothing from a stage nobody ever considered. Eleven of the
 43 weekly stages are in this class; they assert nothing and still record that
 they declared nothing.
 
+**A stage whose own guard skipped this run says so, per run.** The registry
+row is static; it cannot know that THIS run's guard deliberately declined to
+refresh (MorningEnrich's stale-overwrite guard, when the evening launch has
+nothing newer to enrich). Before ``alpha-engine-config-I11474`` that run was
+graded ``STALE — WHOLLY STALE``: a declared, deliberate non-run reported as a
+producer finding, which ``--enforce`` would have turned into a false page. The
+stage's launcher now passes the guard's own reason
+(``--not-applicable-reason``); a verdict that would otherwise be ``STALE`` is
+then :data:`STATUS_COVERED_NO_OUTPUT`, carrying that reason verbatim in
+:attr:`StageVerdict.not_applicable_reason`. It excuses STALENESS only: a
+declared artifact that does not EXIST is still ``MISSING`` (a guard can
+explain not refreshing, never there being nothing to read), and a probe that
+could not measure is still ``UNMEASURED``. The registry cannot carry this
+declaration — ``refresh: conditional`` never excuses a wholly-stale stage
+(``alpha-engine-config-I8166``) — because only the run itself knows its guard
+fired.
+
 **The cycle date is not the run date.** ``{date}`` / ``{trading_day}`` in a key
 template resolve to the *cycle* tick — the last closed trading day — not to
 the execution's ``run_date``. Measured 2026-08-13: the 08-08 execution carries
@@ -82,6 +99,26 @@ false ``missing`` verdicts. :func:`resolve_cycle_date` defers to
 :func:`krepis.trading_calendar.last_closed_trading_day` — the same notion the
 fleet's artifact-freshness probe substitutes — and returns ``None`` rather
 than guessing when it cannot resolve.
+
+**The producer-chosen ``*`` segment is LISTed, never HEADed.** A registry key
+template may declare one whole path segment whose value the PRODUCER picks at
+write time and no consumer can derive — a single literal ``*``
+(``alpha-engine-config-I10200``); the live instance is
+``predictor/diagnostics/oos_rows/*/{date}.parquet``, scoped by model family.
+Until ``alpha-engine-config-I11521`` this module HEADed that key with the
+``*`` still in it, so both ``predictor_oos_rows_*`` rows read ``absent`` on
+every run whatever training wrote. Such a key is a PATTERN: after the
+ordinary placeholders are substituted, :func:`_newest_match` LISTs the fixed
+prefix before the ``*``, keeps the keys where the ``*`` matched exactly ONE
+path segment and everything else matched literally, and returns the newest
+``LastModified`` — the same payload a HEAD returns, so the verdict logic is
+unchanged. Zero matches is ``absent``; a LIST that failed or was truncated at
+the page cap is ``probe_failed`` (could-not-measure, never a finding); and
+there is **never** a fallback to the unscoped key. This mirrors
+``nousergon-data``'s ``validators/stage_output_sweep._newest_match`` and the
+grammar in ``nousergon_lib.artifact_freshness`` (one ``*``, a whole segment,
+never the last); krepis cannot import that AGPL module, so the rule is
+restated here and a malformed template is ``probe_failed`` naming it.
 
 **Public surface:**
 
@@ -101,6 +138,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
@@ -177,8 +215,10 @@ S3_SURFACE = (
     s3_surface.literal("_freshness_monitor", s3_surface.MODE_READ),
     s3_surface.caller_supplied(
         "declared artifacts are head_object-probed at keys the artifact "
-        "registry names; the consumer already owns those prefixes because "
-        "they are the ones its own stages write",
+        "registry names (a key carrying the producer-chosen '*' segment is "
+        "list_objects_v2-probed at its fixed prefix instead); the consumer "
+        "already owns those prefixes because they are the ones its own "
+        "stages write",
         s3_surface.MODE_READ,
     ),
 )
@@ -276,6 +316,12 @@ class StageVerdict:
             still measurable without a window, so ``MISSING`` still fires.
         recorded_at: ISO-8601 UTC instant the verdict was produced.
         enforce: Whether the caller asked for enforcement.
+        not_applicable_reason: The stage's OWN per-run declaration that its
+            guard deliberately skipped the work this run, verbatim from the
+            caller (``--not-applicable-reason``); ``""`` when none was made.
+            Populated on every verdict the declaration was supplied to, so a
+            stage that declares a skip every cycle is visible as such
+            (``alpha-engine-config-I11474``).
     """
 
     stage: str
@@ -294,6 +340,7 @@ class StageVerdict:
     window_start: str | None = None
     recorded_at: str = ""
     enforce: bool = False
+    not_applicable_reason: str = ""
 
     def __post_init__(self) -> None:
         # Refuse to CONSTRUCT a verdict with no execution identity. The check
@@ -466,6 +513,110 @@ def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
         return "probe_failed", f"{type(exc).__name__}: {code or exc}"
 
 
+#: The registry's producer-chosen path segment (alpha-engine-config-I10200).
+WILDCARD_SEGMENT: Final[str] = "*"
+
+#: Page cap for a wildcard LIST. S3 lists lexically, so the keys past the cap
+#: are not a random sample; a truncated listing is ``probe_failed``, never
+#: ``absent``. Same bound as ``nousergon-data``'s stage-output sweep.
+WILDCARD_LIST_CAP_PAGES: Final[int] = 64
+
+
+def _wildcard_pattern(key: str) -> tuple[str, re.Pattern[str]]:
+    """Return ``(list_prefix, full_match_regex)`` for a ``*``-bearing key.
+
+    ``key`` is the template with its placeholders already substituted, so
+    only the producer-chosen segment is free. The grammar is the registry's
+    (``nousergon_lib.artifact_freshness.validate_key_template``): exactly one
+    ``*``, occupying one whole path segment, never the last segment. Raises
+    :class:`ValueError` naming the key on any other shape.
+    """
+    count = key.count(WILDCARD_SEGMENT)
+    if count != 1:
+        raise ValueError(
+            f"key {key!r} carries {count} '*' segments — exactly one "
+            "producer-chosen segment is expressible"
+        )
+    segments = key.split("/")
+    at = next(i for i, seg in enumerate(segments) if WILDCARD_SEGMENT in seg)
+    if segments[at] != WILDCARD_SEGMENT:
+        raise ValueError(
+            f"key {key!r} uses '*' inside the segment {segments[at]!r} — the "
+            "wildcard must occupy one whole path segment"
+        )
+    if at == len(segments) - 1:
+        raise ValueError(
+            f"key {key!r} ends in '*' — a trailing wildcard names a directory, "
+            "not an artifact"
+        )
+    prefix, rest = key.split(WILDCARD_SEGMENT, 1)
+    # ``[^/]+``: the ``*`` is exactly ONE non-empty segment — a key two
+    # segments deep under the prefix is a different artifact, not a match.
+    regex = re.escape(prefix) + r"[^/]+" + re.escape(rest) + r"\Z"
+    return prefix, re.compile(regex)
+
+
+def _newest_match(
+    s3_client: Any,
+    bucket: str,
+    key: str,
+    *,
+    cap_pages: int = WILDCARD_LIST_CAP_PAGES,
+) -> tuple[str, Any]:
+    """Resolve a ``*``-bearing key to its newest instance by LIST.
+
+    Same ``(outcome, payload)`` contract as :func:`_head`: ``"present"`` with
+    the newest matching ``LastModified``, ``"absent"`` when nothing under the
+    prefix matches, ``"probe_failed"`` with a reason when the key's shape is
+    illegal, the LIST raised (AccessDenied included), or the listing hit
+    ``cap_pages`` — could-not-see-the-whole-prefix is not evidence of absence.
+    Never falls back to the unscoped key (alpha-engine-config-I11521).
+    """
+    try:
+        prefix, pattern = _wildcard_pattern(key)
+    except ValueError as exc:
+        return "probe_failed", f"unresolvable wildcard key: {exc}"
+
+    newest = None
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page_index, page in enumerate(
+            paginator.paginate(Bucket=bucket, Prefix=prefix)
+        ):
+            if page_index >= cap_pages:
+                return "probe_failed", (
+                    f"LIST of {prefix!r} exceeded the {cap_pages}-page cap; "
+                    "a truncated listing cannot establish absence"
+                )
+            for obj in page.get("Contents") or []:
+                if pattern.match(str(obj.get("Key") or "")) is None:
+                    continue
+                last_modified = obj.get("LastModified")
+                if last_modified is None:
+                    continue
+                if last_modified.tzinfo is None:
+                    last_modified = last_modified.replace(tzinfo=timezone.utc)
+                if newest is None or last_modified > newest:
+                    newest = last_modified
+    except Exception as exc:  # noqa: BLE001 — classified below, never re-raised
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = str((response.get("Error") or {}).get("Code", ""))
+        return "probe_failed", f"{type(exc).__name__}: {code or exc}"
+
+    if newest is None:
+        return "absent", ""
+    return "present", newest
+
+
+def _probe(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
+    """HEAD a fixed key; LIST-and-match a key carrying the ``*`` segment."""
+    if WILDCARD_SEGMENT in key:
+        return _newest_match(s3_client, bucket, key)
+    return _head(s3_client, bucket, key)
+
+
 def evaluate_stage(
     registry: dict[str, Any],
     stage: str,
@@ -476,6 +627,7 @@ def evaluate_stage(
     cycle_date: date | None = None,
     window_start: datetime | None = None,
     enforce: bool = False,
+    not_applicable_reason: str | None = None,
 ) -> StageVerdict:
     """Return the verdict for ``stage``. Pure but for the injected S3 probes.
 
@@ -483,10 +635,17 @@ def evaluate_stage(
     cycle date. Omitting it is a :class:`TypeError` at the call site and
     passing it blank is a :class:`StageCoverageContractError`.
 
+    ``not_applicable_reason`` is the stage's own per-run declaration that its
+    guard deliberately skipped the work (see the module docstring). A
+    non-blank value turns what would be ``STALE`` into
+    :data:`STATUS_COVERED_NO_OUTPUT` naming the reason; it never downgrades
+    ``MISSING`` or ``UNMEASURED``. Blank or ``None`` is no declaration.
+
     Otherwise never raises: every failure to establish an answer is
     :data:`STATUS_UNMEASURED` with a populated ``reason``.
     """
     run_date = _require_run_date(run_date)
+    declared_skip = " ".join(str(not_applicable_reason or "").split())
     recorded_at = now.astimezone(timezone.utc).isoformat()
     window_iso = (
         window_start.astimezone(timezone.utc).isoformat() if window_start else None
@@ -502,6 +661,7 @@ def evaluate_stage(
             window_start=window_iso,
             recorded_at=recorded_at,
             enforce=enforce,
+            not_applicable_reason=declared_skip,
             **extra,
         )
 
@@ -530,6 +690,7 @@ def evaluate_stage(
             window_start=window_iso,
             recorded_at=recorded_at,
             enforce=enforce,
+            not_applicable_reason=declared_skip,
         )
 
     expected = [str(a) for a in (row.get("artifacts") or [])]
@@ -575,7 +736,7 @@ def evaluate_stage(
             continue
         bucket = str(spec.get("s3_bucket") or DEFAULT_BUCKET)
         key = format_key(template, cycle_date)
-        outcome, payload = _head(s3_client, bucket, key)
+        outcome, payload = _probe(s3_client, bucket, key)
         if outcome == "absent":
             missing.append(artifact_id)
         elif outcome == "probe_failed":
@@ -611,6 +772,18 @@ def evaluate_stage(
     if missing:
         status = STATUS_MISSING
         reason = f"{len(missing)} declared artifact(s) absent: {', '.join(missing)}"
+    elif stale and declared_skip:
+        # The stage's own guard declared THIS run not applicable. Staleness is
+        # exactly what a deliberate skip produces, so it is not a finding —
+        # but it is still recorded, with the stale list intact and the
+        # guard's reason verbatim (alpha-engine-config-I11474).
+        status = STATUS_COVERED_NO_OUTPUT
+        reason = (
+            f"not applicable this run — the stage's own guard skipped it: "
+            f"{declared_skip}. {len(stale)} of {len(expected)} declared "
+            f"artifact(s) not refreshed this run ({', '.join(stale)}); none "
+            "absent."
+        )
     elif stale:
         status = STATUS_STALE
         if not covered:
@@ -668,6 +841,7 @@ def evaluate_stage(
         window_start=window_iso,
         recorded_at=recorded_at,
         enforce=enforce,
+        not_applicable_reason=declared_skip,
     )
 
 
@@ -760,8 +934,12 @@ def assert_stage_coverage(
     cloudwatch_client: Any = None,
     bucket: str = DEFAULT_BUCKET,
     registry_local_path: str | None = None,
+    not_applicable_reason: str | None = None,
 ) -> dict[str, Any]:
     """Assert ``stage`` wrote what it declared. Returns the verdict dict.
+
+    ``not_applicable_reason``: the stage's own per-run declaration that its
+    guard deliberately skipped the work — see :func:`evaluate_stage`.
 
     The front door for **Lambda-backed stages**: call immediately before
     returning, and merge the result into the handler's response payload under
@@ -824,6 +1002,7 @@ def assert_stage_coverage(
                 cycle_date=resolve_cycle_date(now),
                 window_start=window_start,
                 enforce=enforce,
+                not_applicable_reason=not_applicable_reason,
             )
 
         record_verdict(
@@ -923,6 +1102,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="read the registry from a local file instead of S3 (tests)",
     )
     assert_cmd.add_argument(
+        "--not-applicable-reason",
+        default="",
+        help=(
+            "the stage's OWN guard deliberately skipped its work this run — "
+            "pass the guard's reason. A verdict that would be STALE becomes "
+            "COVERED_NO_OUTPUT carrying it; MISSING and UNMEASURED are "
+            "unchanged. Omit (or empty) when the stage ran."
+        ),
+    )
+    assert_cmd.add_argument(
         "--enforce",
         action="store_true",
         default=os.environ.get("STAGE_COVERAGE_ENFORCE", "").lower()
@@ -981,6 +1170,7 @@ def main(argv: list[str] | None = None) -> int:
         enforce=args.enforce,
         bucket=args.bucket,
         registry_local_path=args.registry_path,
+        not_applicable_reason=getattr(args, "not_applicable_reason", "") or None,
     )
 
     status = verdict_dict.get("status", STATUS_UNMEASURED)
