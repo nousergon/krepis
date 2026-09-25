@@ -137,3 +137,97 @@ def test_over_the_user_data_limit_says_to_fetch_instead():
 
 def test_typical_job_leaves_most_of_the_budget():
     assert len(_render().encode()) < USER_DATA_MAX_BYTES // 4
+
+
+# ── Launch record (alpha-engine-config-I5752 / I11597) ─────────────────────
+
+_URI = "s3://alpha-engine-research/thinktank/_control/launched/2026-09-25-abc.json"
+_RECORD = {
+    "run_token": "abc",
+    "trading_day": "2026-09-25",
+    "budget_seconds": 5400,
+    "note": 'quote \' dq " pct 100% bs \\ uni é',
+}
+
+
+def _record_block(rendered: str) -> str:
+    after_unit = rendered.split("\nKREPIS_SELF_START_UNIT_EOF\n", 1)[1]
+    return after_unit.split("systemctl daemon-reload", 1)[0]
+
+
+def _run_record_block(tmp_path, rendered: str, *, aws_fails: bool = False):
+    """Execute the record block with curl/aws shimmed on PATH; return
+    (parsed record or None, stderr)."""
+    import json
+    import os
+
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    (shims / "curl").write_text(
+        '#!/bin/sh\ncase "$*" in *api/token*) echo tok;; *instance-id*) echo i-0abc123;; esac\n'
+    )
+    out = tmp_path / "record.json"
+    (shims / "aws").write_text(
+        "#!/bin/sh\nexit 1\n" if aws_fails else f'#!/bin/sh\necho "$@" > {tmp_path}/argv\ncat > {out}\n'
+    )
+    for f in shims.iterdir():
+        f.chmod(0o755)
+    env = dict(os.environ, PATH=f"{shims}:{os.environ['PATH']}")
+    script = "set -euo pipefail\n" + _record_block(rendered)
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+    record = json.loads(out.read_text()) if out.exists() else None
+    return record, proc.stderr
+
+
+def test_no_launch_record_unless_asked():
+    assert "aws s3 cp" not in _render()
+
+
+def test_box_writes_the_launch_record_before_starting_the_job(tmp_path):
+    import datetime
+
+    rendered = _render(launch_record_uri=_URI, launch_record=_RECORD, timeout_seconds=7200)
+    assert rendered.index("aws s3 cp") < rendered.index("systemctl start --no-block")
+    record, _ = _run_record_block(tmp_path, rendered)
+    assert record["schema"] == "krepis_self_start_launch.v1"
+    assert record["unit"] == "alpha-engine-thinktank-run"
+    assert record["timeout_seconds"] == 7200
+    assert record["instance_id"] == "i-0abc123"
+    for key, value in _RECORD.items():
+        assert record[key] == value, key  # static fields survive printf verbatim
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    booted = datetime.datetime.strptime(record["booted_at"], fmt)
+    deadline = datetime.datetime.strptime(record["deadline_at"], fmt)
+    assert (deadline - booted).total_seconds() == 7200
+    argv = (tmp_path / "argv").read_text()
+    assert f"s3 cp - {_URI} --region us-east-1" in argv
+
+
+def test_a_failed_record_write_is_reported_and_the_job_still_starts(tmp_path):
+    rendered = _render(launch_record_uri=_URI, launch_record=_RECORD)
+    record, stderr = _run_record_block(tmp_path, rendered, aws_fails=True)
+    assert record is None
+    assert f"launch record NOT written to {_URI}" in stderr
+
+
+def test_the_rendering_is_clock_free():
+    """A replayed launch must present byte-identical user-data, or EC2 refuses
+    its ClientToken. Nothing time-dependent may be rendered on this side."""
+    a = _render(launch_record_uri=_URI, launch_record=_RECORD)
+    b = _render(launch_record_uri=_URI, launch_record=dict(_RECORD))
+    assert a == b
+
+
+@pytest.mark.parametrize(
+    "kw, match",
+    [
+        ({"launch_record_uri": "https://example.com/x"}, "s3://"),
+        ({"launch_record_uri": "s3://bucket/key with space"}, "s3://"),
+        ({"launch_record_uri": _URI, "launch_record": {"instance_id": "x"}}, "box-filled"),
+        ({"launch_record": {"a": 1}}, "without launch_record_uri"),
+    ],
+)
+def test_launch_record_inputs_are_checked(kw, match):
+    with pytest.raises(ValueError, match=match):
+        _render(**kw)

@@ -1131,6 +1131,66 @@ _SELF_START_UNIT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
 _JOB_EOF = "KREPIS_SELF_START_JOB_EOF"
 _UNIT_EOF = "KREPIS_SELF_START_UNIT_EOF"
 
+#: Schema of the launch record a self-starting box writes at boot.
+LAUNCH_RECORD_SCHEMA = "krepis_self_start_launch.v1"
+
+#: Keys the box fills in itself; a caller's static record may not claim them.
+_LAUNCH_RECORD_RESERVED = frozenset(
+    {"schema", "unit", "timeout_seconds", "instance_id", "booted_at", "deadline_at"}
+)
+
+_S3_URI = re.compile(r"^s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]/[A-Za-z0-9._/-]+$")
+
+
+def _launch_record_block(
+    uri: str,
+    record: "dict[str, object]",
+    *,
+    unit: str,
+    timeout_seconds: int,
+    region: str,
+) -> str:
+    """Shell that writes the launch record, best-effort, before the job starts.
+
+    The static fields are rendered here (``json.dumps``); the three only the
+    box knows — its instance id (IMDSv2), its boot time and the deadline
+    derived from it — are filled in on the box. Nothing clock-dependent is
+    rendered, so the user-data stays a pure function of its inputs, which is
+    what lets a replayed RunInstances match its ClientToken.
+
+    Best-effort by design, and said so on the console: the record is how a
+    completion reconciler finds the run (alpha-engine-config-I5752), but a
+    failed write must not cost the run itself.
+    """
+    if not _S3_URI.match(uri):
+        raise ValueError(f"launch_record_uri {uri!r} is not a plain s3:// object URI")
+    clash = sorted(_LAUNCH_RECORD_RESERVED & set(record))
+    if clash:
+        raise ValueError(f"launch_record may not set box-filled keys: {clash}")
+    static = dict(record)
+    static.update(
+        schema=LAUNCH_RECORD_SCHEMA, unit=unit, timeout_seconds=int(timeout_seconds)
+    )
+    # printf interprets backslash escapes and %-directives in its FORMAT, and
+    # json.dumps emits backslashes (unicode and quote escapes); both are doubled so the
+    # static JSON reaches the object byte for byte.
+    head = json.dumps(static, sort_keys=True)[:-1].replace("\\", "\\\\").replace("%", "%%")
+    fmt = head + ', "instance_id": "%s", "booted_at": "%s", "deadline_at": "%s"}\\n'
+    imds = "http://169.254.169.254/latest"
+    return (
+        f"_krepis_tok=$(curl -sf -m 5 -X PUT {imds}/api/token "
+        "-H 'X-aws-ec2-metadata-token-ttl-seconds: 60' || true)\n"
+        f"_krepis_iid=$(curl -sf -m 5 -H \"X-aws-ec2-metadata-token: ${{_krepis_tok}}\" "
+        f"{imds}/meta-data/instance-id || echo unknown)\n"
+        "_krepis_now=$(date -u +%s)\n"
+        f"printf {_quote(fmt)} \"$_krepis_iid\" "
+        '"$(date -u -d "@$_krepis_now" +%Y-%m-%dT%H:%M:%SZ)" '
+        f'"$(date -u -d "@$((_krepis_now + {int(timeout_seconds)}))" +%Y-%m-%dT%H:%M:%SZ)" \\\n'
+        f"  | timeout 60 aws s3 cp - {_quote(uri)} --region {_quote(region)} --quiet "
+        "--content-type application/json \\\n"
+        f"  || echo \"krepis self-start: launch record NOT written to {uri}\" >&2\n"
+    )
+
 
 def render_self_starting_user_data(
     job_script: str,
@@ -1139,6 +1199,9 @@ def render_self_starting_user_data(
     description: str,
     timeout_seconds: int,
     stop_grace_seconds: int = 120,
+    launch_record_uri: "str | None" = None,
+    launch_record: "dict[str, object] | None" = None,
+    region: str = "us-east-1",
 ) -> str:
     """EC2 user-data that runs ``job_script`` as a oneshot systemd unit at boot.
 
@@ -1169,6 +1232,20 @@ def render_self_starting_user_data(
     If anything in the user-data itself fails before the job starts, the ERR
     trap powers the box off rather than leaving it idle.
 
+    **Launch record** (``launch_record_uri``). With no SSM command there is no
+    ``command_id`` for a completion reconciler to follow
+    (alpha-engine-config-I5752), so the box writes one JSON object at boot,
+    before the job starts: the caller's static ``launch_record`` fields (run
+    token, trading day, budget, ...) plus ``schema``
+    (:data:`LAUNCH_RECORD_SCHEMA`), ``unit``, ``timeout_seconds`` and the three
+    only the box knows: ``instance_id``, ``booted_at`` and ``deadline_at``
+    (``booted_at + timeout_seconds``, when the unit's cap fires), all UTC.
+    Put it beside the workload's completion marker, keyed the same way, so a
+    reconciler pairs "launched" with "completed" by key. The write is
+    best-effort (a failure is printed to the console and the job still
+    starts). A box that never boots writes nothing, so the dispatcher's own
+    return value and instance tags stay the record of the launch itself.
+
     NOTHING SECRET may be in ``job_script``: user-data is readable by anyone
     holding ``ec2:DescribeInstanceAttribute``. Pass references (SSM parameter
     names, S3 keys, a run token) and let the job resolve them on the box.
@@ -1197,6 +1274,19 @@ def render_self_starting_user_data(
         raise ValueError("timeout_seconds must be positive — an uncapped job is not allowed")
     if int(stop_grace_seconds) <= 0:
         raise ValueError("stop_grace_seconds must be positive")
+    if launch_record is not None and launch_record_uri is None:
+        raise ValueError("launch_record given without launch_record_uri")
+    record_block = (
+        _launch_record_block(
+            launch_record_uri,
+            dict(launch_record or {}),
+            unit=unit,
+            timeout_seconds=int(timeout_seconds),
+            region=region,
+        )
+        if launch_record_uri is not None
+        else ""
+    )
 
     script_path = f"{SELF_START_DIR}/{unit}.sh"
     # systemd expands %-specifiers in Description=; a literal % must be doubled.
@@ -1230,6 +1320,7 @@ def render_self_starting_user_data(
         "StandardOutput=journal+console\n"
         "StandardError=journal+console\n"
         f"{_UNIT_EOF}\n"
+        f"{record_block}"
         "systemctl daemon-reload\n"
         f"systemctl start --no-block {unit}.service\n"
         f"echo \"krepis self-start: {unit} started\"\n"
