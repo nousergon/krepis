@@ -80,6 +80,7 @@ __all__ = [
     "load_workloads",
     "render_bootstrap",
     "render_install_deps",
+    "render_self_starting_user_data",
     "scan_for_inline_bootstraps",
 ]
 
@@ -1106,6 +1107,141 @@ fi
 # here in full, one step before the import that would have failed on it.
 {PYTHON} -m pip check || echo "WARNING: pip check reports an inconsistent environment (above)"
 """
+
+
+# ── Self-starting boxes (alpha-engine-config-I11597) ────────────────────────
+#
+# Everything above renders a script that a dispatcher SENDS over SSM after the
+# box registers Online. For a one-shot job that is two non-atomic steps inside
+# a timeout-bounded Lambda: on 2026-09-23 (alpha-engine-config-I11532) the
+# Lambda was killed between the launch and the send, and the box it launched
+# never received its job.
+#
+# A self-starting box receives its job IN the launch: user-data installs it as
+# a systemd unit and starts it at first boot. ``krepis.ec2_spot.
+# launch_self_starting`` makes that one launch replay-safe. The dispatcher
+# returns in seconds and never talks to SSM.
+
+#: Directory the job script is written to on the box.
+SELF_START_DIR = "/usr/local/lib/krepis-self-start"
+
+#: A unit name that is safe unquoted in a path, a unit file and a shell word.
+_SELF_START_UNIT = re.compile(r"^[a-z0-9][a-z0-9-]{0,62}$")
+
+_JOB_EOF = "KREPIS_SELF_START_JOB_EOF"
+_UNIT_EOF = "KREPIS_SELF_START_UNIT_EOF"
+
+
+def render_self_starting_user_data(
+    job_script: str,
+    *,
+    unit: str,
+    description: str,
+    timeout_seconds: int,
+    stop_grace_seconds: int = 120,
+) -> str:
+    """EC2 user-data that runs ``job_script`` as a oneshot systemd unit at boot.
+
+    What the box does, in order, once, at first boot (cloud-init runs a
+    user-data script once per instance):
+
+    1. writes ``job_script`` VERBATIM to ``SELF_START_DIR/<unit>.sh`` (a quoted
+       heredoc: nothing in it is expanded at render time or by cloud-init);
+    2. writes ``/etc/systemd/system/<unit>.service``;
+    3. ``systemctl start --no-block`` — never a blocking start. A oneshot's
+       ``systemctl start`` waits for ``ExecStart`` to exit (the defect
+       ``_watchdog_block`` documents), which would hold cloud-init for the
+       whole job.
+
+    The unit:
+
+    * ``Type=oneshot`` with ``TimeoutStartSec=timeout_seconds`` — the job's
+      hard cap, the role SSM's ``executionTimeout`` played. ``RuntimeMaxSec``
+      would be wrong here: it has no effect on a oneshot.
+    * default ``KillMode=control-group``, so the cap's SIGTERM reaches the
+      workload's children, and an EXIT trap in the job gets
+      ``stop_grace_seconds`` to report before SIGKILL.
+    * ``ExecStopPost=/sbin/shutdown -h now`` — the box powers off however the
+      job ends, including a job that exits without shutting down itself. With
+      ``InstanceInitiatedShutdownBehavior=terminate`` that ends the billing.
+    * **Not enabled.** A reboot does not re-run a half-finished job.
+
+    If anything in the user-data itself fails before the job starts, the ERR
+    trap powers the box off rather than leaving it idle.
+
+    NOTHING SECRET may be in ``job_script``: user-data is readable by anyone
+    holding ``ec2:DescribeInstanceAttribute``. Pass references (SSM parameter
+    names, S3 keys, a run token) and let the job resolve them on the box.
+
+    Raises ``ValueError`` on an unsafe unit name, a multi-line description, a
+    job script containing the heredoc terminator, a non-positive timeout, or a
+    rendering over EC2's 16 KB user-data limit — in which case the user-data
+    should fetch the job script (git checkout or S3) rather than inline it.
+    """
+    from krepis.ec2_spot import USER_DATA_MAX_BYTES
+
+    if not _SELF_START_UNIT.match(unit):
+        raise ValueError(
+            f"unit {unit!r} must match {_SELF_START_UNIT.pattern} "
+            "(lowercase, digits, hyphens)"
+        )
+    if not description.strip() or "\n" in description or "\r" in description:
+        raise ValueError("description must be a single non-empty line")
+    if not job_script.strip():
+        raise ValueError("job_script is empty — the box would boot and do nothing")
+    if any(line.strip() in (_JOB_EOF, _UNIT_EOF) for line in job_script.splitlines()):
+        raise ValueError(
+            f"job_script contains a heredoc terminator line ({_JOB_EOF} / {_UNIT_EOF})"
+        )
+    if int(timeout_seconds) <= 0:
+        raise ValueError("timeout_seconds must be positive — an uncapped job is not allowed")
+    if int(stop_grace_seconds) <= 0:
+        raise ValueError("stop_grace_seconds must be positive")
+
+    script_path = f"{SELF_START_DIR}/{unit}.sh"
+    # systemd expands %-specifiers in Description=; a literal % must be doubled.
+    unit_description = description.strip().replace("%", "%%")
+    body = job_script if job_script.endswith("\n") else job_script + "\n"
+    rendered = (
+        "#!/bin/bash\n"
+        "# Rendered by krepis.spot_bootstrap.render_self_starting_user_data\n"
+        "# (alpha-engine-config-I11597). Runs once, at first boot.\n"
+        "set -euo pipefail\n"
+        f"trap 'echo \"krepis self-start: user-data failed before {unit} started "
+        f"- powering off\" >&2; /sbin/shutdown -h now' ERR\n"
+        f"install -d -m 0700 {SELF_START_DIR}\n"
+        f"cat > {script_path} <<'{_JOB_EOF}'\n"
+        f"{body}"
+        f"{_JOB_EOF}\n"
+        f"chmod 0700 {script_path}\n"
+        f"cat > /etc/systemd/system/{unit}.service <<'{_UNIT_EOF}'\n"
+        "[Unit]\n"
+        f"Description={unit_description}\n"
+        "After=network-online.target\n"
+        "Wants=network-online.target\n"
+        "\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"ExecStart=/bin/bash {script_path}\n"
+        f"TimeoutStartSec={int(timeout_seconds)}\n"
+        f"TimeoutStopSec={int(stop_grace_seconds)}\n"
+        "KillMode=control-group\n"
+        "ExecStopPost=/sbin/shutdown -h now\n"
+        "StandardOutput=journal+console\n"
+        "StandardError=journal+console\n"
+        f"{_UNIT_EOF}\n"
+        "systemctl daemon-reload\n"
+        f"systemctl start --no-block {unit}.service\n"
+        f"echo \"krepis self-start: {unit} started\"\n"
+    )
+    size = len(rendered.encode("utf-8"))
+    if size > USER_DATA_MAX_BYTES:
+        raise ValueError(
+            f"rendered user-data is {size} bytes; EC2 accepts at most "
+            f"{USER_DATA_MAX_BYTES}. Have the job script fetch its body from the "
+            "box's git checkout or S3 instead of inlining it."
+        )
+    return rendered
 
 
 # ── Fork detection ───────────────────────────────────────────────────────────
