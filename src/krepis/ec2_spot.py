@@ -81,10 +81,12 @@ shape we use in the fleet:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from typing import Final, Sequence
 
 logger = logging.getLogger(__name__)
@@ -218,6 +220,343 @@ class SpotQuotaExceededError(SpotLaunchError):
     ordinary capacity rotation exhaustion does not)."""
 
 
+class IdempotencyConflict(SpotLaunchError):
+    """RunInstances refused a ``ClientToken`` it had already seen with
+    different parameters (``IdempotentParameterMismatch``). The token already
+    launched an instance, so this is never grounds for launching another one:
+    :func:`launch_self_starting` answers it by finding that instance."""
+
+
+# ── Idempotent, self-starting launch (alpha-engine-config-I11597) ────────────
+#
+# The dispatcher pattern this replaces for a one-shot job was
+# ``launch`` -> wait for SSM Online -> ``send-command``: two non-atomic steps
+# inside a timeout-bounded Lambda. On 2026-09-23 (alpha-engine-config-I11532)
+# SSM registered slowly, the Lambda was killed between the launch and the
+# send, and the async retry found a running box that had never been given
+# its job. The box idled; the day's run was lost.
+#
+# A self-starting box carries its own work: ONE RunInstances whose user-data
+# installs and starts the job as a systemd unit at boot
+# (``krepis.spot_bootstrap.render_self_starting_user_data``). There is no
+# second step to lose. What remains is making the one step replay-safe, which
+# is what EC2's ``ClientToken`` is for.
+
+#: RunInstances error code for a reused ClientToken with different parameters.
+IDEMPOTENT_MISMATCH_CODE: Final[str] = "IdempotentParameterMismatch"
+
+#: EC2 caps a ClientToken at 64 ASCII characters.
+CLIENT_TOKEN_MAX_LEN: Final[int] = 64
+
+#: EC2's user-data ceiling: 16 KB of RAW data (the limit applies before the
+#: base64 encoding boto3 adds). A job whose script would exceed it must have
+#: its user-data FETCH the script (a git checkout or an S3 object) instead of
+#: inlining it.
+USER_DATA_MAX_BYTES: Final[int] = 16 * 1024
+
+#: Launch provenance tags. The VALUES are a contract shared with
+#: ``nousergon_lib.spot_dispatch`` (LAUNCH_MARKET_TAG / LAUNCH_REASON_TAG and
+#: its REASON_* vocabulary, alpha-engine-config-I5727): consumers classify
+#: launches by these strings, so a self-starting launch must be countable in
+#: exactly the same terms as an SSM-dispatched one.
+#: ``tests/test_ec2_spot_self_starting.py`` pins the literals.
+LAUNCH_MARKET_TAG: Final[str] = "LaunchMarket"
+LAUNCH_REASON_TAG: Final[str] = "LaunchReason"
+REASON_SPOT_OK: Final[str] = "spot_ok"
+REASON_CAPACITY: Final[str] = "capacity_exhausted"
+REASON_QUOTA: Final[str] = "quota_exceeded"
+REASON_FORCED: Final[str] = "force_on_demand"
+
+#: Filter values per DescribeInstances call when probing by client token.
+#: Conservative: a dispatcher rotating 9 types x 6 subnets x 2 markets has 108
+#: tokens, and one oversized filter must not become a probe failure.
+_PROBE_CHUNK = 50
+
+
+def _check_user_data(user_data: str | None) -> None:
+    if user_data is None:
+        return
+    if not user_data.strip():
+        raise ValueError("user_data must be non-empty when given")
+    size = len(user_data.encode("utf-8"))
+    if size > USER_DATA_MAX_BYTES:
+        raise ValueError(
+            f"user_data is {size} bytes; EC2 accepts at most "
+            f"{USER_DATA_MAX_BYTES}. Have the user-data fetch the job script "
+            "(from the box's git checkout or S3) instead of inlining it."
+        )
+
+
+def client_token(
+    idempotency_key: str, *, spot: bool, instance_type: str, subnet_id: str
+) -> str:
+    """The RunInstances ``ClientToken`` for one launch attempt.
+
+    Deterministic in all four inputs. The attempt's parameters are part of it
+    because EC2 rejects a token reused with DIFFERENT parameters
+    (``IdempotentParameterMismatch``): one token per (market, type, subnet)
+    lets rotation proceed normally, while a replay that reaches the same
+    attempt gets the same instance back instead of launching a second one.
+    """
+    if not idempotency_key:
+        raise ValueError("idempotency_key must be non-empty")
+    market = "spot" if spot else "on-demand"
+    digest = hashlib.sha256(
+        f"{idempotency_key}|{market}|{instance_type}|{subnet_id}".encode("utf-8")
+    ).hexdigest()
+    # 7 + 48 = 55 characters: inside CLIENT_TOKEN_MAX_LEN, pure ASCII.
+    return f"krepis-{digest[:48]}"
+
+
+def _all_tokens(
+    idempotency_key: str, instance_types: Sequence[str], subnets: Sequence[str]
+) -> dict[str, str]:
+    """``{token: market}`` for every attempt a self-starting launch can make."""
+    return {
+        client_token(
+            idempotency_key, spot=spot, instance_type=itype, subnet_id=subnet
+        ): ("spot" if spot else "on-demand")
+        for spot in (True, False)
+        for itype in instance_types
+        for subnet in subnets
+    }
+
+
+def find_by_idempotency_key(
+    idempotency_key: str,
+    instance_types: Sequence[str],
+    subnets: Sequence[str],
+    *,
+    region: str = "us-east-1",
+) -> tuple[str, str] | None:
+    """``(instance_id, market)`` of the instance an earlier launch with this
+    key created, in ANY state, or ``None`` if the probe found none.
+
+    Needed on top of the per-attempt ``ClientToken``: a replay walks the same
+    rotation, but capacity may have come back in a pool the first call was
+    refused, so the replay's first successful attempt can carry a different
+    token than the original's. Every token the key could have produced is
+    looked up by DescribeInstances' ``client-token`` filter.
+
+    A terminated instance counts: the key already had its launch, and whether
+    that box finished is for the completion marker and the reaper to judge,
+    not grounds for a second launch.
+
+    Raises whatever DescribeInstances raised. A failed probe is not "no
+    instance" — :func:`launch_self_starting` records it and relies on the
+    per-attempt tokens alone.
+    """
+    import boto3
+
+    tokens = _all_tokens(idempotency_key, instance_types, subnets)
+    ec2 = boto3.client("ec2", region_name=region)
+    ordered = sorted(tokens)
+    for start in range(0, len(ordered), _PROBE_CHUNK):
+        chunk = ordered[start : start + _PROBE_CHUNK]
+        next_token: str | None = None
+        while True:
+            call: dict = {"Filters": [{"Name": "client-token", "Values": chunk}]}
+            if next_token:
+                call["NextToken"] = next_token
+            resp = ec2.describe_instances(**call)
+            for reservation in resp.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    iid = inst.get("InstanceId")
+                    if not iid:
+                        continue
+                    market = tokens.get(inst.get("ClientToken", ""))
+                    if market is None:
+                        tags = {
+                            t.get("Key"): t.get("Value")
+                            for t in inst.get("Tags", []) or []
+                        }
+                        market = tags.get(LAUNCH_MARKET_TAG, "unknown")
+                    return iid, market
+            next_token = resp.get("NextToken")
+            if not next_token:
+                break
+    return None
+
+
+@dataclass(frozen=True)
+class SelfStartingLaunch:
+    """What :func:`launch_self_starting` did.
+
+    ``replayed`` is True when the key had ALREADY launched this instance — the
+    caller is a retry of an invocation that got as far as RunInstances.
+    ``probe_degraded`` is True when the lookup by key failed and the launch
+    relied on the per-attempt ClientTokens alone (recorded, never silent).
+    """
+
+    instance_id: str
+    market: str
+    replayed: bool
+    probe_degraded: bool
+
+
+def launch_self_starting(
+    instance_types: Sequence[str],
+    subnets: Sequence[str],
+    *,
+    idempotency_key: str,
+    user_data: str,
+    image_id: str,
+    key_name: str,
+    security_group_ids: Sequence[str],
+    iam_instance_profile: str,
+    tag_name: str,
+    volume_size_gb: int = 30,
+    extra_tags: dict[str, str] | None = None,
+    force_on_demand: bool = False,
+    region: str = "us-east-1",
+) -> SelfStartingLaunch:
+    """Launch a box that runs its own job from user-data, replay-safely.
+
+    One call does the whole dispatch: there is no SSM wait and no command to
+    send, so there is no half-done state for a killed caller to leave behind.
+    Built for a Lambda dispatcher passing its invocation's request id as
+    ``idempotency_key``: Lambda's async retries of one event carry that
+    event's request id, so a retry gets back the box its killed predecessor
+    launched instead of launching a second one.
+
+    Order of operations:
+
+    1. :func:`find_by_idempotency_key` — if this key already launched a box,
+       return it (``replayed=True``) and launch nothing.
+    2. Spot, rotating types x subnets (:func:`launch`), each attempt with its
+       own ClientToken.
+    3. On capacity exhaustion or an account-wide spot quota, on-demand across
+       the same rotation — the fallback ``nousergon_lib.spot_dispatch.
+       launch_with_fallback`` applies, with the same ``LaunchMarket`` /
+       ``LaunchReason`` provenance tags and the same operator page on a quota
+       ceiling. ``force_on_demand`` skips straight to this step.
+    4. :class:`IdempotencyConflict` from either step means a token already
+       launched a box with different parameters: that box is looked up and
+       returned (``replayed=True``); if it cannot be found, the conflict
+       raises rather than launching again.
+
+    ``user_data`` is normally ``krepis.spot_bootstrap.
+    render_self_starting_user_data(...)``. It is readable through
+    ``DescribeInstanceAttribute``, so it must carry references, never secrets.
+
+    Raises :class:`SpotLaunchError` (or a subclass) when spot and on-demand are
+    both exhausted, or on any non-capacity RunInstances error.
+    """
+    if not idempotency_key:
+        raise ValueError("idempotency_key must be non-empty")
+    if not tag_name:
+        raise ValueError("tag_name must be non-empty")
+    if not user_data:
+        raise ValueError("user_data must be non-empty")
+    _check_user_data(user_data)
+
+    probe_degraded = False
+    try:
+        found = find_by_idempotency_key(
+            idempotency_key, instance_types, subnets, region=region
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded on the result + logged; tokens still hold
+        # The per-attempt ClientTokens remain in force, so a replay reaching
+        # the same attempt still gets the same box back; what is lost is only
+        # the cross-attempt case. Recorded on the result the caller returns.
+        logger.error(
+            "ec2_spot: idempotency probe for %s failed (%s: %s) — launching "
+            "with per-attempt ClientTokens only",
+            tag_name,
+            type(exc).__name__,
+            exc,
+        )
+        probe_degraded = True
+        found = None
+    if found is not None:
+        iid, market = found
+        logger.warning(
+            "ec2_spot: idempotency key already launched %s (%s) for %s — "
+            "returning it, launching nothing",
+            iid,
+            market,
+            tag_name,
+        )
+        return SelfStartingLaunch(iid, market, True, probe_degraded)
+
+    def attempt(spot: bool, reason: str) -> str:
+        tags = dict(extra_tags or {})
+        # Library keys win on collision: measured facts about the launch.
+        tags[LAUNCH_MARKET_TAG] = "spot" if spot else "on-demand"
+        tags[LAUNCH_REASON_TAG] = reason
+        return launch(
+            list(instance_types),
+            list(subnets),
+            image_id=image_id,
+            key_name=key_name,
+            security_group_ids=list(security_group_ids),
+            iam_instance_profile=iam_instance_profile,
+            spot=spot,
+            volume_size_gb=volume_size_gb,
+            shutdown_behavior="terminate",
+            tag_name=tag_name,
+            extra_tags=tags,
+            region=region,
+            user_data=user_data,
+            idempotency_key=idempotency_key,
+        )
+
+    try:
+        if force_on_demand:
+            logger.warning("ec2_spot: force_on_demand set — launching ON-DEMAND directly")
+            return SelfStartingLaunch(
+                attempt(False, REASON_FORCED), "on-demand", False, probe_degraded
+            )
+        try:
+            return SelfStartingLaunch(
+                attempt(True, REASON_SPOT_OK), "spot", False, probe_degraded
+            )
+        except SpotCapacityExhausted:
+            logger.warning(
+                "ec2_spot: spot capacity exhausted for %s — relaunching ON-DEMAND",
+                tag_name,
+            )
+            return SelfStartingLaunch(
+                attempt(False, REASON_CAPACITY), "on-demand", False, probe_degraded
+            )
+        except SpotQuotaExceededError as exc:
+            logger.warning(
+                "ec2_spot: spot quota exceeded (%s) — relaunching ON-DEMAND", exc
+            )
+            _page_quota(tag_name, region, exc)
+            return SelfStartingLaunch(
+                attempt(False, REASON_QUOTA), "on-demand", False, probe_degraded
+            )
+    except IdempotencyConflict:
+        found = find_by_idempotency_key(
+            idempotency_key, instance_types, subnets, region=region
+        )
+        if found is None:
+            raise
+        iid, market = found
+        logger.warning(
+            "ec2_spot: ClientToken conflict resolved to the key's existing "
+            "instance %s (%s) — launching nothing",
+            iid,
+            market,
+        )
+        return SelfStartingLaunch(iid, market, True, probe_degraded)
+
+
+def _page_quota(tag_name: str, region: str, exc: Exception) -> None:
+    """Same operator page ``nousergon_lib.spot_dispatch`` sends: a quota
+    ceiling only clears when a human requests an increase."""
+    from krepis import alerts
+
+    alerts.publish(
+        f"EC2 spot quota exceeded for {tag_name!r} in {region} — "
+        f"falling back to on-demand: {exc}",
+        severity="warning",
+        source="krepis.ec2_spot.launch_self_starting",
+        dedup_key=f"spot-quota-exceeded-{region}",
+    )
+
+
 def _build_run_instances_kwargs(
     *,
     image_id: str,
@@ -232,6 +571,8 @@ def _build_run_instances_kwargs(
     shutdown_behavior: str,
     tag_name: str | None,
     extra_tags: dict[str, str] | None = None,
+    user_data: str | None = None,
+    client_token: str | None = None,
 ) -> dict:
     kwargs: dict = {
         "ImageId": image_id,
@@ -289,6 +630,13 @@ def _build_run_instances_kwargs(
                 "Tags": tags,
             },
         ]
+    # Both keys are ABSENT unless asked for, so every existing caller's
+    # RunInstances request is byte-for-byte what it was before they existed.
+    if user_data is not None:
+        # boto3 base64-encodes UserData for RunInstances itself; pass it raw.
+        kwargs["UserData"] = user_data
+    if client_token is not None:
+        kwargs["ClientToken"] = client_token
     return kwargs
 
 
@@ -307,6 +655,8 @@ def launch(
     tag_name: str | None = None,
     extra_tags: dict[str, str] | None = None,
     region: str = "us-east-1",
+    user_data: str | None = None,
+    idempotency_key: str | None = None,
 ) -> str:
     """Launch a spot, rotating across instance_types × subnets on capacity error.
 
@@ -319,6 +669,19 @@ def launch(
             discriminator tags via a separate, post-launch ``create_tags``
             call (with its own bounded retry) should pass them here instead
             and delete that retry path entirely — one mechanism, not two.
+        user_data: script the instance runs at first boot (cloud-init). At
+            most :data:`USER_DATA_MAX_BYTES` raw bytes. Readable by anyone
+            holding ``ec2:DescribeInstanceAttribute`` — never put a secret in
+            it; pass references (SSM parameter names, S3 keys) instead.
+        idempotency_key: makes the launch replay-safe (alpha-engine-config-
+            I11597). Every RunInstances attempt carries a ``ClientToken``
+            derived from this key AND the attempt's (market, type, subnet) —
+            see :func:`client_token` — so a caller retried with the same key
+            gets back the instance its earlier attempt created instead of a
+            second box. Rotation never reuses a token across different
+            parameters, which EC2 would reject as ``IdempotentParameterMismatch``.
+            Callers that also rotate markets should use
+            :func:`launch_self_starting`, which probes every token first.
 
     Returns:
         Instance ID of the first successful launch.
@@ -334,6 +697,7 @@ def launch(
         raise ValueError("instance_types must be non-empty")
     if not subnets:
         raise ValueError("subnets must be non-empty")
+    _check_user_data(user_data)
 
     import boto3
     from botocore.exceptions import ClientError
@@ -357,6 +721,17 @@ def launch(
                 shutdown_behavior=shutdown_behavior,
                 tag_name=tag_name,
                 extra_tags=extra_tags,
+                user_data=user_data,
+                client_token=(
+                    client_token(
+                        idempotency_key,
+                        spot=spot,
+                        instance_type=instance_type,
+                        subnet_id=subnet_id,
+                    )
+                    if idempotency_key is not None
+                    else None
+                ),
             )
             try:
                 resp = ec2.run_instances(**kwargs)
@@ -397,6 +772,16 @@ def launch(
                         file=sys.stderr,
                     )
                     continue
+                if code == IDEMPOTENT_MISMATCH_CODE:
+                    # This attempt's token already launched something, with
+                    # different parameters (e.g. a tag value that moved between
+                    # the original call and the retry). The box exists; it is
+                    # the caller's to find, never a reason to launch another.
+                    raise IdempotencyConflict(
+                        f"RunInstances refused a reused ClientToken with "
+                        f"different parameters ({instance_type}@{subnet_id}): "
+                        f"{msg}"
+                    ) from exc
                 raise SpotLaunchError(
                     f"RunInstances failed with non-capacity error "
                     f"{code} ({instance_type}@{subnet_id}): {msg}"
