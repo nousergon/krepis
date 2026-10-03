@@ -135,6 +135,34 @@ class _RelentlessStream:
         self._stop.set()
 
 
+class _ReasoningOnlyStream:
+    """Yields REASONING deltas every *interval* seconds, forever — no content.
+
+    alpha-engine-config-I11936's shape: a reasoning model still thinking when
+    the total budget ran out. Every chunk carries ``reasoning_content`` and an
+    empty ``content``, so a content-only count reports "0 character(s)".
+    """
+
+    def __init__(self, interval, field="reasoning_content"):
+        self.interval = interval
+        self.field = field
+        self.closed = False
+        self._stop = threading.Event()
+
+    def __iter__(self):
+        while not self._stop.wait(self.interval):
+            delta = SimpleNamespace(content="", **{self.field: "think"})
+            yield SimpleNamespace(
+                choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+                usage=None,
+                model="moonshotai/kimi-k2.6",
+            )
+
+    def close(self):
+        self.closed = True
+        self._stop.set()
+
+
 class FakeOpenAI:
     def __init__(self, responses):
         self._responses = list(responses)
@@ -280,6 +308,44 @@ class TestTotalDurationBoundFires:
         )
         assert err.chunks > 0
         assert stream.closed, "the abandoned stream must be closed, not leaked"
+
+    @pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+    def test_a_reasoning_only_overrun_counts_its_reasoning(self, field):
+        """alpha-engine-config-I11936: 19,440 chunks and "0 character(s)" read
+        as an empty stream when the model was reasoning the whole time. The
+        reasoning is counted — and kept OUT of the answer text."""
+        stream = _ReasoningOnlyStream(0.02, field=field)
+        fake = FakeOpenAI([stream])
+        client = _client(OPENROUTER_SPEC, fake)
+
+        with pytest.raises(StreamTotalTimeoutError) as excinfo:
+            client.complete(
+                system="s", user_content="u", stream=True,
+                idle_timeout=0.25, total_timeout=0.3,
+            )
+
+        err = excinfo.value
+        assert err.partial_text == "", "reasoning is not answer content"
+        assert err.chunks > 0
+        assert err.reasoning_chars == err.chunks * len("think")
+        msg = str(err)
+        assert "0 character(s) (+ " in msg and "reasoning character(s))" in msg
+        assert "past its total_timeout=" in msg, (
+            "consumers' retry classifiers substring-match this; it must survive"
+        )
+        assert stream.closed
+
+    def test_a_content_only_overrun_message_is_unchanged(self):
+        stream = _RelentlessStream(0.02)
+        fake = FakeOpenAI([stream])
+        client = _client(OPENROUTER_SPEC, fake)
+        with pytest.raises(StreamTotalTimeoutError) as excinfo:
+            client.complete(
+                system="s", user_content="u", stream=True,
+                idle_timeout=0.25, total_timeout=0.3,
+            )
+        assert excinfo.value.reasoning_chars == 0
+        assert "reasoning character" not in str(excinfo.value)
 
     def test_the_idle_bound_still_fires_when_a_generous_total_is_set(self):
         """Setting a total budget must not disarm the idle budget — they are
