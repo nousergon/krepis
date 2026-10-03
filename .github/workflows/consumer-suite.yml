@@ -1,0 +1,149 @@
+name: Consumer suite
+
+# Runs each DECLARED consumer's own test suite against this krepis candidate,
+# before it can publish (alpha-engine-config-I7487).
+#
+# Merge-time autobump publishes krepis to PyPI within a minute of a merge, and a
+# floor-pinned consumer installs it on its next build with no opt-in. Nothing on
+# this side ever ran a consumer first, so twice a release broke one:
+# nous-ergon-ops-I710 (stricter MetricRecord validation, 338 evaluator tests
+# red) and nous-ergon-ops-I738 (a gitleaks prerequisite no consumer carried).
+#
+# The consumer list, and the runtime prerequisites each consumer provides, live
+# in ONE file: .github/consumers.yaml. The matrix is built from it here rather
+# than repeated, and tests/test_consumer_suite_manifest.py holds that file to
+# krepis's own source.
+#
+# Each consumer's `main` is checked out as it stands, its requirements are
+# installed, then THIS checkout of krepis is installed over its pinned krepis,
+# and only the runtime prerequisites the consumer declares it `provides` are put
+# on PATH. So a krepis change that breaks a consumer's behaviour, or needs a
+# program a consumer does not carry, is red here instead of in that consumer.
+#
+# A consumer whose own `main` is red makes this job red for a reason krepis did
+# not cause; the job log names the consumer SHA it ran, so that case is
+# checkable against the consumer's own CI before anything is concluded.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+jobs:
+  plan:
+    name: consumer-suite plan
+    runs-on: ubuntu-latest
+    outputs:
+      consumers: ${{ steps.plan.outputs.consumers }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          sparse-checkout: .github/consumers.yaml
+          sparse-checkout-cone-mode: false
+
+      - id: plan
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pyyaml
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import yaml
+
+          doc = yaml.safe_load(open(".github/consumers.yaml"))
+          prereqs = doc["runtime_prerequisites"]
+          rows = []
+          for c in doc["consumers"]:
+              rows.append({
+                  "repo": c["repo"],
+                  "name": c["repo"].split("/", 1)[1],
+                  "python": c["python"],
+                  "extras": ",".join(c.get("extras") or []),
+                  "requirements": c["requirements"],
+                  "test_deps": " ".join(c.get("test_deps") or []),
+                  "test": c["test"],
+                  "gitleaks": "gitleaks" in c["provides"],
+                  "gitleaks_version": prereqs["gitleaks"]["version"],
+                  "gitleaks_sha256": prereqs["gitleaks"]["sha256"],
+              })
+          print("consumers=" + json.dumps(rows))
+          PY
+
+  consumer-suite:
+    name: consumer-suite (${{ matrix.consumer.name }})
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        consumer: ${{ fromJSON(needs.plan.outputs.consumers) }}
+    steps:
+      - name: Check out the krepis candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          path: krepis
+
+      - name: Check out ${{ matrix.consumer.repo }} (main)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          repository: ${{ matrix.consumer.repo }}
+          ref: main
+          path: consumer
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: ${{ matrix.consumer.python }}
+
+      - name: Install the consumer, then the krepis candidate over its pin
+        env:
+          REQUIREMENTS: ${{ matrix.consumer.requirements }}
+          TEST_DEPS: ${{ matrix.consumer.test_deps }}
+          EXTRAS: ${{ matrix.consumer.extras }}
+        run: |
+          set -euo pipefail
+          echo "consumer ${{ matrix.consumer.repo }} @ $(git -C consumer rev-parse HEAD)"
+          python -m pip install --upgrade pip
+          python -m pip install -r "consumer/${REQUIREMENTS}"
+          if [ -n "${TEST_DEPS}" ]; then
+            # shellcheck disable=SC2086  # a space-separated list, split on purpose
+            python -m pip install ${TEST_DEPS}
+          fi
+          # AFTER the consumer's requirements, so the candidate replaces the
+          # consumer's pinned krepis rather than being replaced by it.
+          if [ -n "${EXTRAS}" ]; then
+            python -m pip install "./krepis[${EXTRAS}]"
+          else
+            python -m pip install ./krepis
+          fi
+          python - <<'PY'
+          import importlib.metadata as md
+          print("krepis under test:", md.version("krepis"))
+          PY
+
+      # Only when the consumer declares it provides gitleaks — the same pinned
+      # binary krepis's own test.yml installs (lockstep asserted by
+      # tests/test_consumer_suite_manifest.py).
+      - name: Install gitleaks (declared provided by this consumer)
+        if: ${{ matrix.consumer.gitleaks }}
+        env:
+          GITLEAKS_VERSION: ${{ matrix.consumer.gitleaks_version }}
+          GITLEAKS_SHA256: ${{ matrix.consumer.gitleaks_sha256 }}
+        run: |
+          set -euo pipefail
+          curl -sSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          chmod +x gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Run ${{ matrix.consumer.repo }}'s suite against the candidate
+        working-directory: consumer
+        env:
+          PYTHONPATH: .
+          TEST_CMD: ${{ matrix.consumer.test }}
+        run: bash -c "${TEST_CMD}"
