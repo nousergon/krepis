@@ -1,0 +1,62 @@
+# Declared consumers of krepis whose test suites run against every krepis
+# candidate (.github/workflows/consumer-suite.yml), and the runtime
+# prerequisites krepis needs on the host it is imported on.
+#
+# ONE list (alpha-engine-config-I7487). The workflow builds its matrix from
+# this file and tests/test_consumer_suite_manifest.py holds it to krepis's own
+# source, so there is no second hand-kept list to drift.
+#
+# Why this exists: a krepis release reaches a floor-pinned consumer within
+# minutes of the merge (merge-time autobump publishes to PyPI), with no
+# consumer opt-in. Twice that shipped a break nobody had run a consumer
+# against:
+#   - nous-ergon-ops-I710: krepis-PR158 tightened MetricRecord validation;
+#     crucible-evaluator's `>=` floor took 0.59.11 and 338 tests went red.
+#   - nous-ergon-ops-I738: krepis-PR95 made LLMClient shell out to gitleaks
+#     and fail closed when it is absent; six consumers had no gitleaks.
+#
+# runtime_prerequisites: every external program krepis itself executes BY
+# NAME. A new one is a change to krepis's runtime contract, not to its tests,
+# so tests/test_consumer_suite_manifest.py fails until it is declared here AND
+# every consumer below declares it `provides` it. That is the authoring-time
+# question I738 never asked: "does every consumer's test job and deploy image
+# carry this?"
+runtime_prerequisites:
+  gitleaks:
+    # session_dlp: LLMClient's outbound DLP scan. Absent -> DLP_SCAN_ERROR ->
+    # LLMError on every krepis.llm call (fail closed, by design).
+    version: "8.30.1"
+    sha256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+    used_by: [krepis.session_dlp]
+  bash:
+    # rss_budget runs its generated wrapper under bash. Present on every
+    # runner and image the fleet builds on; declared so the guard below has
+    # nothing undeclared, not because it needs installing.
+    preinstalled: true
+    used_by: [krepis.rss_budget]
+
+# Each consumer's suite runs exactly the way its own CI runs it, with the
+# krepis candidate installed OVER its pinned krepis. `provides` lists the
+# runtime prerequisites that consumer's own CI and deploy image carry; the
+# workflow installs exactly those, so a prerequisite krepis adds that a
+# consumer does not carry fails here, before release, instead of in that
+# consumer after it.
+#
+# Public repositories only: actions/checkout reads them with the workflow's
+# own read-only token. A private consumer needs a checkout credential this
+# repo does not hold, and is a separate change.
+consumers:
+  - repo: nousergon/crucible-evaluator
+    # The I710 consumer: the only MetricRecord producer fleet-wide (measured
+    # 2026-08-17). Exact-pins krepis since crucible-evaluator#239.
+    python: "3.12"
+    extras: [flow_doctor, openai]
+    requirements: requirements.txt
+    test_deps: [pytest, moto]
+    test: pytest tests/ -q
+    provides: [gitleaks, bash]
+# Next to add: nousergon/crucible-backtester. It floor-pins krepis
+# (`krepis[openai]>=0.59.53`, measured 2026-10-03), so it is the consumer most
+# exposed to a release on publish; its suite also needs crucible-executor and
+# nousergon-data sibling checkouts (EXECUTOR_ROOT_DIR / SF_DEFS_DIR), which
+# this workflow does not model yet.
