@@ -763,9 +763,18 @@ class StreamIdleTimeoutError(LLMError):
         idle_timeout: float = 0.0,
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
+        reasoning_chars: int = 0,
     ):
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
+        #: Characters of REASONING delta (``reasoning_content`` /
+        #: ``reasoning``) received before the abort. Kept apart from
+        #: ``partial_text``, which is answer content only: a reasoning
+        #: model that spent the whole budget thinking otherwise reports
+        #: "N chunks and 0 characters", which reads as an empty stream
+        #: when the model was in fact still reasoning
+        #: (alpha-engine-config-I11936).
+        self.reasoning_chars = reasoning_chars
         self.chunks = chunks
         self.idle_timeout = idle_timeout
         self.elapsed = elapsed
@@ -800,9 +809,18 @@ class StreamTotalTimeoutError(LLMError):
         total_timeout: float = 0.0,
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
+        reasoning_chars: int = 0,
     ):
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
+        #: Characters of REASONING delta (``reasoning_content`` /
+        #: ``reasoning``) received before the abort. Kept apart from
+        #: ``partial_text``, which is answer content only: a reasoning
+        #: model that spent the whole budget thinking otherwise reports
+        #: "N chunks and 0 characters", which reads as an empty stream
+        #: when the model was in fact still reasoning
+        #: (alpha-engine-config-I11936).
+        self.reasoning_chars = reasoning_chars
         self.chunks = chunks
         self.total_timeout = total_timeout
         self.elapsed = elapsed
@@ -1011,6 +1029,34 @@ class _StreamedMessage:
         self.krepis_usage_reported = usage_reported
 
 
+def _reasoning_delta_len(delta: Any) -> int:
+    """Length of the reasoning text carried by one OpenAI-wire delta.
+
+    OpenAI-compatible reasoning routes stream the trace on a field beside
+    ``content``: ``reasoning_content`` (Zhipu, DeepSeek, LiteLLM's normalised
+    form) or ``reasoning`` (OpenRouter). Only strings count; a provider that
+    sends a structured object there is not guessed at.
+    """
+    if delta is None:
+        return 0
+    for attr in ("reasoning_content", "reasoning"):
+        value = getattr(delta, attr, None)
+        if isinstance(value, str) and value:
+            return len(value)
+    return 0
+
+
+def _reasoning_clause(reasoning_chars: int) -> str:
+    """``"(+ N reasoning character(s)) "`` when any reasoning arrived, else ``""``.
+
+    Appended after the content-character count so the existing message shape,
+    which consumers' retry classifiers substring-match, is unchanged.
+    """
+    if not reasoning_chars:
+        return ""
+    return f"(+ {reasoning_chars} reasoning character(s)) "
+
+
 def _accumulate_openai_stream(
     stream: Any,
     *,
@@ -1025,6 +1071,11 @@ def _accumulate_openai_stream(
     served_provider: Optional[str] = None
     usage_obj: Any = None
     chunks = 0
+    # Reasoning deltas are COUNTED, never joined into the answer text: they
+    # are not the completion, and a structured parse must not see them. The
+    # count is what lets a timeout say "still reasoning" rather than "empty"
+    # (alpha-engine-config-I11936).
+    reasoning_chars = 0
     started = _time.monotonic()
     try:
         for chunk in _iter_with_idle_timeout(
@@ -1044,6 +1095,7 @@ def _accumulate_openai_stream(
                 piece = getattr(delta, "content", None) if delta is not None else None
                 if piece:
                     parts.append(piece)
+                reasoning_chars += _reasoning_delta_len(delta)
                 reason = getattr(choice, "finish_reason", None)
                 if reason:
                     finish_reason = reason
@@ -1054,10 +1106,12 @@ def _accumulate_openai_stream(
         raise StreamIdleTimeoutError(
             f"provider={spec.provider} model={spec.model}: the stream produced "
             f"no chunk for {idle_timeout:.0f}s after {chunks} chunk(s) and "
-            f"{len(partial)} character(s) over {elapsed:.0f}s — aborting on the "
+            f"{len(partial)} character(s) "
+            f"{_reasoning_clause(reasoning_chars)}over {elapsed:.0f}s — aborting on the "
             f"inter-chunk idle budget, not on total duration. The partial "
             f"generation is on this exception as ``partial_text``.",
             partial_text=partial,
+            reasoning_chars=reasoning_chars,
             chunks=chunks,
             idle_timeout=idle_timeout,
             elapsed=elapsed,
@@ -1070,10 +1124,12 @@ def _accumulate_openai_stream(
             f"provider={spec.provider} model={spec.model}: the stream ran for "
             f"{elapsed:.0f}s, past its total_timeout={total_timeout:.0f}s "
             f"budget, after {chunks} chunk(s) and {len(partial)} character(s) "
+            f"{_reasoning_clause(reasoning_chars)}"
             f"— aborting on TOTAL duration, not on inter-chunk silence (the "
             f"stream kept producing chunks). The partial generation is on "
             f"this exception as ``partial_text``.",
             partial_text=partial,
+            reasoning_chars=reasoning_chars,
             chunks=chunks,
             total_timeout=total_timeout or 0.0,
             elapsed=elapsed,
