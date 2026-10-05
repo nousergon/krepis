@@ -68,6 +68,7 @@ jobs:
                   "gitleaks": "gitleaks" in c["provides"],
                   "gitleaks_version": prereqs["gitleaks"]["version"],
                   "gitleaks_sha256": prereqs["gitleaks"]["sha256"],
+                  "siblings": json.dumps(c.get("siblings") or []),
               })
           print("consumers=" + json.dumps(rows))
           PY
@@ -93,6 +94,33 @@ jobs:
           repository: ${{ matrix.consumer.repo }}
           ref: main
           path: consumer
+
+      # Other public repositories the consumer's suite reads (consumers.yaml
+      # `siblings`), cloned sparse beside it with their paths exported under the
+      # env names its own CI uses. Plain HTTPS clones of public repositories:
+      # no token is used.
+      - name: Check out declared sibling repositories
+        if: ${{ matrix.consumer.siblings != '[]' }}
+        env:
+          SIBLINGS: ${{ matrix.consumer.siblings }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' > siblings.tsv
+          import json, os, re
+          for s in json.loads(os.environ["SIBLINGS"]):
+              assert re.fullmatch(r"nousergon/[A-Za-z0-9._-]+", s["repo"]), s
+              assert re.fullmatch(r"[A-Za-z0-9._/-]+", s["sparse"]), s
+              assert re.fullmatch(r"[A-Z][A-Z0-9_]*", s["env"]), s
+              print(s["repo"], s["sparse"], s["env"], sep="\t")
+          PY
+          while IFS=$'\t' read -r repo sparse var; do
+            dest="${GITHUB_WORKSPACE}/siblings/${repo#*/}"
+            git clone --quiet --depth 1 --filter=blob:none --sparse "https://github.com/${repo}.git" "${dest}"
+            git -C "${dest}" sparse-checkout set --no-cone "${sparse}"
+            test -e "${dest}/${sparse}"
+            echo "sibling ${repo} @ $(git -C "${dest}" rev-parse HEAD) -> ${var}=${dest}"
+            echo "${var}=${dest}" >> "${GITHUB_ENV}"
+          done < siblings.tsv
 
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
         with:

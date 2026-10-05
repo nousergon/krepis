@@ -140,3 +140,23 @@ def test_the_workflow_builds_its_matrix_from_the_manifest():
     assert workflow.index('pip install -r "consumer/${REQUIREMENTS}"') < workflow.index(
         'pip install "./krepis[${EXTRAS}]"'
     )
+
+
+def test_declared_siblings_are_well_formed_and_cloned_by_the_workflow():
+    """``siblings`` lets a consumer whose suite reads other public repositories
+    (crucible-backtester: crucible-executor and nousergon-data) run here the
+    way its own CI runs it, instead of being left uncovered (nous-ergon-ops-I710).
+    """
+    for consumer in _manifest()["consumers"]:
+        for sib in consumer.get("siblings") or []:
+            assert set(sib) == {"repo", "sparse", "env"}, sib
+            assert re.fullmatch(r"nousergon/[A-Za-z0-9._-]+", sib["repo"]), sib
+            assert re.fullmatch(r"[A-Za-z0-9._/-]+", sib["sparse"]), sib
+            assert re.fullmatch(r"[A-Z][A-Z0-9_]*", sib["env"]), sib
+    workflow = SUITE_WORKFLOW.read_text()
+    assert '"siblings": json.dumps(c.get("siblings") or [])' in workflow
+    assert 'echo "${var}=${dest}" >> "${GITHUB_ENV}"' in workflow
+    # Siblings must be on disk before the suite runs.
+    assert workflow.index("Check out declared sibling repositories") < workflow.index(
+        "suite against the candidate"
+    )
