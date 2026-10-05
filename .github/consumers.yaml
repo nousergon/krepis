@@ -45,6 +45,10 @@ runtime_prerequisites:
 # Public repositories only: actions/checkout reads them with the workflow's
 # own read-only token. A private consumer needs a checkout credential this
 # repo does not hold, and is a separate change.
+#
+# `siblings` (optional): other public repositories the consumer's suite reads,
+# each cloned sparse (`sparse` path only) beside the consumer, with its absolute
+# path exported as `env` -- the same layout the consumer's own CI builds.
 consumers:
   - repo: nousergon/crucible-evaluator
     # The I710 consumer: the only MetricRecord producer fleet-wide (measured
@@ -55,8 +59,31 @@ consumers:
     test_deps: [pytest, moto]
     test: pytest tests/ -q
     provides: [gitleaks, bash]
-# Next to add: nousergon/crucible-backtester. It floor-pins krepis
-# (`krepis[openai]>=0.59.53`, measured 2026-10-03), so it is the consumer most
-# exposed to a release on publish; its suite also needs crucible-executor and
-# nousergon-data sibling checkouts (EXECUTOR_ROOT_DIR / SF_DEFS_DIR), which
-# this workflow does not model yet.
+  - repo: nousergon/crucible-backtester
+    # Floor-pins krepis (`krepis[openai]>=0.59.53`, measured 2026-10-04), so it
+    # is the consumer most exposed to a release on publish: it takes the
+    # candidate on its next install with no opt-in (nous-ergon-ops-I710).
+    # gitleaks: its CI test job installs it, and the one runtime LLMClient
+    # caller (replay/runner.py) ships in lambda_concordance's image, which
+    # installs it too.
+    python: "3.12"
+    extras: [openai]
+    requirements: requirements.txt
+    test_deps: [pytest, hypothesis]
+    test: pytest tests/ -q
+    provides: [gitleaks, bash]
+    # Its suite imports live crucible-executor source and reads nousergon-data's
+    # Step Function definitions, exactly as its own ci.yml checks them out.
+    siblings:
+      - repo: nousergon/crucible-executor
+        sparse: executor
+        env: EXECUTOR_ROOT_DIR
+      - repo: nousergon/nousergon-data
+        sparse: infrastructure
+        env: SF_DEFS_DIR
+# Still floor-pinned and NOT covered here:
+#   - nousergon-data's Lambda requirements files (e.g. `krepis>=0.14.0`,
+#     `>=0.15.0`, `>=0.59.6`; measured 2026-10-04), which have no per-Lambda
+#     suite this workflow can run as-is;
+#   - morning-signal (`>=0.48.0,<0.60.0` when measured 2026-10-03); its
+#     ceiling bounds the exposure, and its suite has not been evaluated here.
