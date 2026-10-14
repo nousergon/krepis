@@ -147,5 +147,17 @@ where = ["src"]
 # `tests/test_session_dlp_packaged_config.py` fails if it is unreadable.
 "krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed", "dlp_config/*.toml"]
 
+[tool.uv]
+# uv.lock is the DEV lockfile only: CI (test.yml's 3.9-3.13 matrix) and every
+# consumer install with pip against the ranges above, never from this lock.
+# Dependabot's `uv` updater pins each proposed version EXACTLY and re-locks
+# across every interpreter requires-python admits, so any release that drops
+# 3.9 (pydantic 2.14, requests 2.34.2, pytest 9.1, anthropic 1.13, ...) or
+# crosses the litellm <1.97 py<3.11 cap was unresolvable, and the weekly
+# Dependabot run on main went red (krepis run 38598730004, 2026-10-14).
+# Locking only the interpreters development actually uses ends that without
+# touching requires-python: the 3.9 dashboard box still installs krepis.
+environments = ["python_full_version >= '3.11'"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
