@@ -110,18 +110,18 @@ class TestEveryCallIsTraced:
         )
         (row,) = sink.rows
         assert row["schema_version"] == "llm_trace.v1"
-        assert row["callsite_id"] == "krepis-trace-test"
+        assert row["krepis"]["callsite_id"] == "krepis-trace-test"
         assert row["trace_id"] == result.trace_id and len(result.trace_id) == 32
         assert row["span_id"] == result.span_id and len(result.span_id) == 16
         assert result.duration_ms is not None and result.duration_ms >= 0
         assert result.response_id == "gen-123"
         assert row["gen_ai"]["response.id"] == "gen-123"
         assert row["gen_ai"]["request.model"] == "moonshotai/kimi-k2.6"
-        assert row["subject"] == {"kind": "ticker", "id": "QLYS"}
-        assert row["prompt"]["template_id"] == "p"
-        assert row["prompt"]["system_sha256"] == lt.sha256_hex("sys")
-        assert row["content"]["capture"] == "full"
-        sent = json.loads(sink.blobs[row["content"]["input_sha256"]].data)
+        assert row["krepis"]["subject"] == {"kind": "ticker", "id": "QLYS"}
+        assert row["krepis"]["prompt"]["template_id"] == "p"
+        assert row["krepis"]["prompt"]["system_sha256"] == lt.sha256_hex("sys")
+        assert row["krepis"]["content"]["capture"] == "full"
+        sent = json.loads(sink.blobs[row["krepis"]["content"]["input_sha256"]].data)
         assert sent == fake.kwargs[0]
 
     def test_ids_are_stamped_even_with_no_trace_sink(self):
@@ -142,7 +142,7 @@ class TestEveryCallIsTraced:
         first, second = sink.rows
         assert first["trace_id"] == second["trace_id"] == lt.derive_trace_id("run-42")
         assert first["span_id"] != second["span_id"]
-        assert first["run_id"] == "run-42"
+        assert first["krepis"]["run_id"] == "run-42"
 
     def test_structured_is_traced_and_data_citations_resolve(self):
         sink = ts.InMemoryTraceSink()
@@ -153,8 +153,8 @@ class TestEveryCallIsTraced:
         )
         (row,) = sink.rows
         assert result.data == {"claim": "guidance raised [c2]"}
-        assert [c["cited_in_output"] for c in row["citations"]] == [False, True]
-        assert row["route"]["structured_output_rung"] == "native"
+        assert [c["cited_in_output"] for c in row["krepis"]["citations"]] == [False, True]
+        assert row["krepis"]["route"]["structured_output_rung"] == "native"
 
     def test_grounded_is_traced_with_its_web_citations(self):
         sink = ts.InMemoryTraceSink()
@@ -186,12 +186,12 @@ class TestSourcesReachTheWire:
         sent = fake.kwargs[0]["messages"][1]["content"]
         assert sent.endswith("What happened?")
         (row,) = sink.rows
-        for citation, block in zip(row["citations"], _blocks()):
+        for citation, block in zip(row["krepis"]["citations"], _blocks()):
             span = citation["span"]
             assert sent[span["char_start"]:span["char_end"]] == block.text
             assert citation["content_sha256"] == lt.sha256_hex(block.text)
             assert sink.blobs[citation["content_sha256"]].data == block.text.encode()
-        assert [c["cited_in_output"] for c in row["citations"]] == [True, False]
+        assert [c["cited_in_output"] for c in row["krepis"]["citations"]] == [True, False]
 
     def test_a_pre_rendered_section_is_located_in_the_callers_template(self):
         sink = ts.InMemoryTraceSink()
@@ -203,7 +203,7 @@ class TestSourcesReachTheWire:
         )
         sent = fake.kwargs[0]["messages"][1]["content"]
         assert sent == template
-        span = sink.rows[0]["citations"][1]["span"]
+        span = sink.rows[0]["krepis"]["citations"][1]["span"]
         assert sent[span["char_start"]:span["char_end"]] == _blocks()[1].text
 
     def test_a_misplaced_pre_rendered_section_fails_before_any_spend(self):
@@ -231,9 +231,9 @@ class TestSourcesReachTheWire:
         )
         sent = fake.payloads[0]["messages"][0]["content"]
         assert sent.startswith('<source cid="c1">')
-        span = sink.rows[0]["citations"][0]["span"]
+        span = sink.rows[0]["krepis"]["citations"][0]["span"]
         assert sent[span["char_start"]:span["char_end"]] == _blocks()[0].text
-        assert [c["cited_in_output"] for c in sink.rows[0]["citations"]] == [False, True]
+        assert [c["cited_in_output"] for c in sink.rows[0]["krepis"]["citations"]] == [False, True]
 
 
 class TestDlpInterplay:
@@ -246,9 +246,9 @@ class TestDlpInterplay:
         )
         (row,) = sink.rows
         assert sink.blobs == {}
-        assert row["content"]["capture"] == "hash_only"
-        assert row["content"]["capture_reason"] == "dlp_verdict=dlp_disabled"
-        assert row["dlp"]["verdict"] == "dlp_disabled"
+        assert row["krepis"]["content"]["capture"] == "hash_only"
+        assert row["krepis"]["content"]["capture_reason"] == "dlp_verdict=dlp_disabled"
+        assert row["krepis"]["dlp"]["verdict"] == "dlp_disabled"
 
     def test_the_capture_env_can_restrict_to_hashes(self, monkeypatch):
         monkeypatch.setenv("KREPIS_TRACE_CAPTURE", "hash_only")
@@ -257,7 +257,7 @@ class TestDlpInterplay:
             system="s", user_content="u",
         )
         assert sink.blobs == {}
-        assert sink.rows[0]["content"]["capture"] == "hash_only"
+        assert sink.rows[0]["krepis"]["content"]["capture"] == "hash_only"
 
 
 class TestRouterEdgeAttribution:
@@ -276,7 +276,7 @@ class TestRouterEdgeAttribution:
             "trace_id": result.trace_id,
             "span_id": result.span_id,
         }
-        assert sink.rows[0]["route"]["edge_request_id"] == "chatcmpl-9"
+        assert sink.rows[0]["krepis"]["route"]["edge_request_id"] == "chatcmpl-9"
 
     def test_structured_edge_requests_are_tagged_too(self):
         fake = FakeOpenAI([_resp('{"a": 1}', model="deepseek/deepseek-v4-flash")])
@@ -318,7 +318,7 @@ class TestJoins:
                                                    stream=True)
         assert result.text == "hey"
         assert result.response_id == "chatcmpl-s1"
-        assert sink.rows[0]["route"]["streamed"] is True
+        assert sink.rows[0]["krepis"]["route"]["streamed"] is True
 
 
 class TestEmissionNeverRaises:
@@ -388,3 +388,108 @@ class TestEnvironmentActivation:
 
     def test_unconfigured_means_no_sink(self):
         assert LLMClient(OPENROUTER_SPEC, callsite_id="c")._trace_sink is None
+
+
+class TestRaisedCallsAreTraced:
+    def test_a_transport_failure_is_one_record_with_what_was_sent(self):
+        class Boom(Exception):
+            pass
+
+        class Failing(FakeOpenAI):
+            def _create(self, **kwargs):
+                self.kwargs.append(kwargs)
+                raise Boom("upstream 503")
+
+        sink = ts.InMemoryTraceSink()
+        fake = Failing([])
+        with pytest.raises(Boom):
+            _client(OPENROUTER_SPEC, fake, trace_sink=sink).complete(
+                system="s", user_content="u", sources=_blocks(),
+            )
+        (row,) = sink.rows
+        assert row["error"] == {"type": "Boom", "message": "upstream 503"}
+        content = row["krepis"]["content"]
+        assert content["output_sha256"] is None
+        assert json.loads(sink.blobs[content["input_sha256"]].data) == fake.kwargs[0]
+        assert len(row["krepis"]["citations"]) == 2
+
+    def test_a_dlp_block_is_traced_without_a_body_or_the_reason(self, monkeypatch):
+        monkeypatch.setattr(
+            _llm, "check_request",
+            lambda _b: DLPVerdict("dlp_block", "matched AKIA-something", 1.0, 0.0),
+        )
+        sink = ts.InMemoryTraceSink()
+        fake = FakeOpenAI([])
+        with pytest.raises(_llm.LLMError, match="DLP"):
+            _client(OPENROUTER_SPEC, fake, trace_sink=sink).complete(
+                system="s", user_content="AKIA-something",
+            )
+        (row,) = sink.rows
+        assert row["error"] == {"type": "LLMError", "message": None}
+        assert row["krepis"]["content"]["input_sha256"] is None
+        assert row["krepis"]["content"]["capture"] == "hash_only"
+        assert sink.blobs == {}
+        assert "AKIA" not in json.dumps(row)
+
+    def test_a_trace_failure_never_masks_the_calls_own_error(self, monkeypatch, caplog):
+        class Boom(Exception):
+            pass
+
+        class Failing(FakeOpenAI):
+            def _create(self, **kwargs):
+                raise Boom("original")
+
+        monkeypatch.setattr(_llm, "LLMResult", None)  # stand-in construction fails
+        with pytest.raises(Boom, match="original"):
+            _client(OPENROUTER_SPEC, Failing([]), trace_sink=ts.InMemoryTraceSink()).complete(
+                system="s", user_content="u",
+            )
+        assert "trace emission failed for a raised call" in caplog.text
+
+    def test_no_sink_means_no_failed_call_trace_work(self):
+        class Failing(FakeOpenAI):
+            def _create(self, **kwargs):
+                raise RuntimeError("x")
+
+        client = LLMClient(OPENROUTER_SPEC, callsite_id="c",
+                           client_factory=lambda _s, _k: Failing([]))
+        with pytest.raises(RuntimeError):
+            client.complete(system="s", user_content="u")
+
+
+class TestDeclaredCapture:
+    def test_declared_capture_without_a_sink_fails_before_any_spend(self):
+        with pytest.raises(ts.TraceSinkConfigError, match="declares trace capture"):
+            LLMClient(OPENROUTER_SPEC, callsite_id="c", trace_capture="full")
+
+    def test_off_disables_tracing_even_with_a_sink(self):
+        sink = ts.InMemoryTraceSink()
+        client = _client(OPENROUTER_SPEC, FakeOpenAI([_resp("x")]), trace_sink=sink,
+                         trace_capture="off")
+        client.complete(system="s", user_content="u")
+        assert sink.rows == []
+
+    def test_declared_hash_only_keeps_no_body(self):
+        sink = ts.InMemoryTraceSink()
+        _client(OPENROUTER_SPEC, FakeOpenAI([_resp("x")]), trace_sink=sink,
+                trace_capture="hash_only").complete(system="s", user_content="u")
+        content = sink.rows[0]["krepis"]["content"]
+        assert (content["capture"], content["capture_reason"]) == (
+            "hash_only", "callsite declared hash_only")
+        assert sink.blobs == {}
+
+    def test_an_unknown_capture_level_is_rejected(self):
+        with pytest.raises(ValueError, match="trace_capture"):
+            LLMClient(OPENROUTER_SPEC, callsite_id="c", trace_capture="partial")
+
+
+def test_only_otel_and_w3c_fields_sit_beside_the_extension():
+    sink = ts.InMemoryTraceSink()
+    _client(OPENROUTER_SPEC, FakeOpenAI([_resp("x")]), trace_sink=sink).complete(
+        system="s", user_content="u",
+    )
+    assert set(sink.rows[0]) == {
+        "schema_version", "trace_id", "span_id", "parent_span_id",
+        "started_at", "ended_at", "duration_ms", "gen_ai", "error", "krepis",
+    }
+    assert all(not k.startswith("gen_ai") for k in sink.rows[0]["krepis"])

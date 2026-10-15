@@ -54,10 +54,9 @@ class FakeS3:
 
 
 def _row(callsite="cs", started="2026-10-14T13:30:00.000Z", **extra):
-    row = {"schema_version": "llm_trace.v1", "callsite_id": callsite,
-           "started_at": started}
-    row.update(extra)
-    return row
+    ext = {"callsite_id": callsite}
+    ext.update(extra)
+    return {"schema_version": "llm_trace.v1", "started_at": started, "krepis": ext}
 
 
 def _blob(text):
@@ -125,7 +124,15 @@ class TestFlush:
         sink = _sink(s3)
         sink(_row(run_id="other"), {})
         sink.flush()
-        assert s3.rows()[0]["run_id"] == "other"
+        assert s3.rows()[0]["krepis"]["run_id"] == "other"
+
+    def test_a_row_without_the_extension_gets_one(self):
+        s3 = FakeS3()
+        sink = _sink(s3)
+        sink({"started_at": "2026-10-14T00:00:00.000Z"}, {})
+        sink.flush()
+        assert s3.rows()[0]["krepis"] == {"run_id": "run-1"}
+        assert any("callsite=unknown" in k for k in s3.objects)
 
     def test_groups_split_by_date_and_callsite(self):
         s3 = FakeS3()

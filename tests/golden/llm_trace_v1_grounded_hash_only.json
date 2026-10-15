@@ -1,60 +1,9 @@
 {
   "blob_shas": [],
   "row": {
-    "callsite_id": "morning-signal-generation",
-    "citations": [
-      {
-        "cid": "web1",
-        "cited_in_output": true,
-        "content_sha256": "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
-        "document_id": null,
-        "kind": "web",
-        "meta": {
-          "title": "A"
-        },
-        "retrieval": {
-          "method": "web_search"
-        },
-        "source_id": "https://example.com/a",
-        "span": null,
-        "uri": "https://example.com/a",
-        "version": null
-      },
-      {
-        "cid": "web2",
-        "cited_in_output": true,
-        "content_sha256": null,
-        "document_id": null,
-        "kind": "web",
-        "meta": {
-          "title": null
-        },
-        "retrieval": {
-          "method": "web_search"
-        },
-        "source_id": "https://example.com/b",
-        "span": null,
-        "uri": "https://example.com/b",
-        "version": null
-      }
-    ],
-    "code": {
-      "krepis": "0.0.0-test"
-    },
-    "content": {
-      "capture": "hash_only",
-      "capture_reason": "dlp_verdict=dlp_disabled",
-      "input_sha256": "f3626f1f612c152541aa302e7660a4295693c290662a15e04d442113d27eed2e",
-      "media_type": "application/json",
-      "output_sha256": "75f04609404328c91a943873d4bebce2306c7c9c216f712a0f2f138e161db579"
-    },
-    "dlp": {
-      "proxy_redaction": "unknown",
-      "redactions": [],
-      "verdict": "dlp_disabled"
-    },
     "duration_ms": 10.0,
     "ended_at": "2026-10-14T13:30:02.456Z",
+    "error": null,
     "gen_ai": {
       "operation.name": "chat",
       "provider.name": "anthropic",
@@ -68,36 +17,90 @@
       "usage.input_tokens": 50,
       "usage.output_tokens": 20
     },
+    "krepis": {
+      "callsite_id": "morning-signal-generation",
+      "citations": [
+        {
+          "cid": "web1",
+          "cited_in_output": true,
+          "content_sha256": "8ed3f6ad685b959ead7022518e1af76cd816f8e8ec7ccdda1ed4018e8f2223f8",
+          "document_id": null,
+          "kind": "web",
+          "meta": {
+            "title": "A"
+          },
+          "retrieval": {
+            "method": "web_search"
+          },
+          "source_id": "https://example.com/a",
+          "span": null,
+          "uri": "https://example.com/a",
+          "version": null
+        },
+        {
+          "cid": "web2",
+          "cited_in_output": true,
+          "content_sha256": null,
+          "document_id": null,
+          "kind": "web",
+          "meta": {
+            "title": null
+          },
+          "retrieval": {
+            "method": "web_search"
+          },
+          "source_id": "https://example.com/b",
+          "span": null,
+          "uri": "https://example.com/b",
+          "version": null
+        }
+      ],
+      "code": {
+        "krepis": "0.0.0-test"
+      },
+      "content": {
+        "capture": "hash_only",
+        "capture_reason": "dlp_verdict=dlp_disabled",
+        "input_sha256": "f3626f1f612c152541aa302e7660a4295693c290662a15e04d442113d27eed2e",
+        "media_type": "application/json",
+        "output_sha256": "75f04609404328c91a943873d4bebce2306c7c9c216f712a0f2f138e161db579"
+      },
+      "dlp": {
+        "proxy_redaction": "unknown",
+        "redactions": [],
+        "verdict": "dlp_disabled"
+      },
+      "prompt": {
+        "system_sha256": null,
+        "template_id": null,
+        "template_version": null
+      },
+      "route": {
+        "dropped_params": [],
+        "edge_request_id": null,
+        "fallback_used": false,
+        "registry_id": null,
+        "served_deployment": null,
+        "served_provider": null,
+        "stream_chunks": 0,
+        "streamed": false,
+        "structured_output_rung": null
+      },
+      "run_id": null,
+      "subject": null,
+      "trace_id_source": "env",
+      "usage": {
+        "attempts": 0,
+        "budget_escalations": 0,
+        "reasoning_tokens": 0,
+        "usage_unknown": false,
+        "web_search_requests": 1
+      }
+    },
     "parent_span_id": null,
-    "prompt": {
-      "system_sha256": null,
-      "template_id": null,
-      "template_version": null
-    },
-    "route": {
-      "dropped_params": [],
-      "edge_request_id": null,
-      "fallback_used": false,
-      "registry_id": null,
-      "served_deployment": null,
-      "served_provider": null,
-      "stream_chunks": 0,
-      "streamed": false,
-      "structured_output_rung": null
-    },
-    "run_id": null,
     "schema_version": "llm_trace.v1",
     "span_id": "cdcdcdcdcdcdcdcd",
     "started_at": "2026-10-14T13:30:00.123Z",
-    "subject": null,
-    "trace_id": "abababababababababababababababab",
-    "trace_id_source": "env",
-    "usage": {
-      "attempts": 0,
-      "budget_escalations": 0,
-      "reasoning_tokens": 0,
-      "usage_unknown": false,
-      "web_search_requests": 1
-    }
+    "trace_id": "abababababababababababababababab"
   }
 }

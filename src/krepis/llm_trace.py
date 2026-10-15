@@ -52,6 +52,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TRACE_SCHEMA_VERSION",
+    "EXTENSION_NAMESPACE",
+    "row_extension",
     "TRACE_ID_ENV_VAR",
     "TRACEPARENT_ENV_VAR",
     "CAPTURE_ENV_VAR",
@@ -82,6 +84,10 @@ __all__ = [
 #: Version tag carried on every row. Readers dispatch on it; a change to the
 #: row's meaning is a new version, never an edit to this one.
 TRACE_SCHEMA_VERSION = "llm_trace.v1"
+
+#: The namespace every fleet-specific field lives under, so nothing outside
+#: OpenTelemetry's own vocabulary sits beside ``gen_ai.*``.
+EXTENSION_NAMESPACE = "krepis"
 
 #: An orchestrator that already has a W3C trace id exports it here, so every
 #: call in its run joins the same trace.
@@ -572,11 +578,26 @@ def build_trace_record(
     prompt_id: Optional[str] = None,
     prompt_version: Optional[str] = None,
     capture: str = CAPTURE_FULL,
+    capture_reason: Optional[str] = None,
     library_version: Optional[str] = None,
+    error: Optional[BaseException] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, TraceBlob]]:
     """Build one ``llm_trace.v1`` row and the blobs it references.
 
     Pure: every non-deterministic input (clock, span id) is a parameter.
+
+    **Shape** (llm-platform-policy § Call trace record). The top level holds
+    what OpenTelemetry and W3C trace context define: ``trace_id``,
+    ``span_id``, ``parent_span_id``, timing, ``gen_ai`` (GenAI semantic
+    convention attribute names, verbatim) and ``error`` (``error.type``).
+    Everything fleet-specific — call site, run, subject, route facts, content
+    hashes, citations, DLP — sits under the ``krepis`` extension namespace
+    and never renames a ``gen_ai.*`` field.
+
+    **A call that raised is traced too** (``error`` set): ``result`` is then
+    a stand-in carrying the request that reached the transport, if any, and
+    there is no output. ``error.message`` is omitted whenever the DLP scan
+    blocked or errored, so a matched value can never reach a trace.
 
     **Content is the post-DLP body.** ``raw_request`` is the exact payload
     :meth:`krepis.llm.LLMClient._dlp_scan_request` scanned and the transport
@@ -600,23 +621,27 @@ def build_trace_record(
         raise ValueError(f"capture must be one of {sorted(_CAPTURE_MODES)}")
 
     dlp_verdict = getattr(result, "dlp_verdict", None)
-    capture_reason = None
     if capture == CAPTURE_FULL and dlp_verdict != "ok":
         capture = CAPTURE_HASH_ONLY
         capture_reason = f"dlp_verdict={dlp_verdict}"
-    elif capture == CAPTURE_HASH_ONLY:
+    elif capture == CAPTURE_HASH_ONLY and not capture_reason:
         capture_reason = "configured"
 
-    request_bytes = canonical_json_bytes(getattr(result, "raw_request", None) or {})
-    output_bytes = canonical_json_bytes(_output_body(result))
-    input_sha = sha256_hex(request_bytes)
-    output_sha = sha256_hex(output_bytes)
+    raw_request = getattr(result, "raw_request", None) or {}
+    request_bytes = canonical_json_bytes(raw_request)
+    # A call that raised before reaching the transport (a DLP block, a
+    # config error) sent nothing; it has no input to hash.
+    input_sha = sha256_hex(request_bytes) if (raw_request or error is None) else None
+    output_bytes = canonical_json_bytes(_output_body(result)) if error is None else None
+    output_sha = sha256_hex(output_bytes) if output_bytes is not None else None
     system_sha = sha256_hex(system) if isinstance(system, str) else None
 
     blobs: Dict[str, TraceBlob] = {}
     if capture == CAPTURE_FULL:
-        blobs[input_sha] = TraceBlob(request_bytes, "application/json")
-        blobs[output_sha] = TraceBlob(output_bytes, "application/json")
+        if input_sha is not None:
+            blobs[input_sha] = TraceBlob(request_bytes, "application/json")
+        if output_sha is not None and output_bytes is not None:
+            blobs[output_sha] = TraceBlob(output_bytes, "application/json")
         for rendered in sources:
             blobs[rendered.content_sha256] = TraceBlob(
                 rendered.block.text.encode("utf-8"), "text/plain; charset=utf-8"
@@ -658,7 +683,6 @@ def build_trace_record(
 
     gen_usage, usage_ext = _usage_fields(getattr(result, "usage", None))
     finish = getattr(result, "finish_reason", None)
-    raw_request = getattr(result, "raw_request", None) or {}
     max_tokens = raw_request.get("max_tokens") if isinstance(raw_request, dict) else None
     response_id = getattr(result, "response_id", None)
     provider = getattr(result, "provider", None)
@@ -673,19 +697,18 @@ def build_trace_record(
     }
     gen_ai.update(gen_usage)
 
-    row: Dict[str, Any] = {
-        "schema_version": TRACE_SCHEMA_VERSION,
-        "trace_id": context.trace_id,
-        "span_id": span_id,
-        "parent_span_id": context.parent_span_id,
-        "trace_id_source": context.source,
-        "run_id": context.run_id,
+    error_entry = None
+    if error is not None:
+        message: Optional[str] = str(error)[:500]
+        if dlp_verdict in ("dlp_block", "scan_error"):
+            message = None  # a DLP reason may quote what it matched
+        error_entry = {"type": type(error).__name__, "message": message}
+
+    extension: Dict[str, Any] = {
         "callsite_id": callsite_id,
+        "run_id": context.run_id,
+        "trace_id_source": context.source,
         "subject": dict(subject) if subject else None,
-        "started_at": isoformat_utc(started_at),
-        "ended_at": isoformat_utc(ended_at),
-        "duration_ms": round(float(duration_ms), 3),
-        "gen_ai": gen_ai,
         "usage": usage_ext,
         "route": {
             "registry_id": getattr(result, "registry_id", None),
@@ -722,4 +745,22 @@ def build_trace_record(
         },
         "code": {"krepis": library_version},
     }
+    row: Dict[str, Any] = {
+        "schema_version": TRACE_SCHEMA_VERSION,
+        "trace_id": context.trace_id,
+        "span_id": span_id,
+        "parent_span_id": context.parent_span_id,
+        "started_at": isoformat_utc(started_at),
+        "ended_at": isoformat_utc(ended_at),
+        "duration_ms": round(float(duration_ms), 3),
+        "gen_ai": gen_ai,
+        "error": error_entry,
+        EXTENSION_NAMESPACE: extension,
+    }
     return row, blobs
+
+
+def row_extension(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The ``krepis`` extension object of a row (empty if absent)."""
+    ext = row.get(EXTENSION_NAMESPACE)
+    return ext if isinstance(ext, Mapping) else {}

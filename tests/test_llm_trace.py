@@ -360,27 +360,27 @@ class TestRecordContract:
         (row, blobs), _ = _build_complete()
         for sha, blob in blobs.items():
             assert lt.sha256_hex(blob.data) == sha
-        assert row["content"]["input_sha256"] in blobs
-        assert row["content"]["output_sha256"] in blobs
-        for citation in row["citations"]:
+        assert row["krepis"]["content"]["input_sha256"] in blobs
+        assert row["krepis"]["content"]["output_sha256"] in blobs
+        for citation in row["krepis"]["citations"]:
             assert citation["content_sha256"] in blobs
 
     def test_the_input_blob_is_the_exact_request(self):
         (row, blobs), result = _build_complete()
-        body = json.loads(blobs[row["content"]["input_sha256"]].data)
+        body = json.loads(blobs[row["krepis"]["content"]["input_sha256"]].data)
         assert body == result.raw_request
 
     def test_spans_index_the_sent_user_message(self):
         (row, _), result = _build_complete()
         sent = result.raw_request["messages"][1]["content"]
-        for citation, block in zip(row["citations"], _blocks()):
+        for citation, block in zip(row["krepis"]["citations"], _blocks()):
             span = citation["span"]
             assert span["message_index"] == 1
             assert sent[span["char_start"]:span["char_end"]] == block.text
 
     def test_citation_in_output_is_parsed_not_judged(self):
         (row, _), _ = _build_complete()
-        assert [c["cited_in_output"] for c in row["citations"]] == [True, True]
+        assert [c["cited_in_output"] for c in row["krepis"]["citations"]] == [True, True]
 
     def test_structured_data_citations_count(self):
         user_content, sources = lt.bind_sources("q", _blocks())
@@ -394,10 +394,10 @@ class TestRecordContract:
             span_id=SPAN, started_at=T0, ended_at=T1, duration_ms=1,
             request_model="m", sources=sources,
         )
-        assert [c["cited_in_output"] for c in row["citations"]] == [False, True]
-        output = json.loads(blobs[row["content"]["output_sha256"]].data)
+        assert [c["cited_in_output"] for c in row["krepis"]["citations"]] == [False, True]
+        output = json.loads(blobs[row["krepis"]["content"]["output_sha256"]].data)
         assert output["data"] == result.data
-        assert row["route"]["structured_output_rung"] == "native"
+        assert row["krepis"]["route"]["structured_output_rung"] == "native"
 
     def test_hash_only_writes_no_blobs_but_keeps_every_hash(self):
         user_content, sources = lt.bind_sources("q", _blocks())
@@ -408,9 +408,9 @@ class TestRecordContract:
             request_model="m", sources=sources, capture=lt.CAPTURE_HASH_ONLY,
         )
         assert blobs == {}
-        assert row["content"]["capture"] == "hash_only"
-        assert row["content"]["capture_reason"] == "configured"
-        assert all(c["content_sha256"] for c in row["citations"])
+        assert row["krepis"]["content"]["capture"] == "hash_only"
+        assert row["krepis"]["content"]["capture_reason"] == "configured"
+        assert all(c["content_sha256"] for c in row["krepis"]["citations"])
 
     @pytest.mark.parametrize("verdict", [None, "dlp_disabled", "scan_error"])
     def test_an_unscanned_body_is_never_kept(self, verdict):
@@ -422,13 +422,13 @@ class TestRecordContract:
             request_model="m",
         )
         assert blobs == {}
-        assert row["content"]["capture_reason"] == f"dlp_verdict={verdict}"
+        assert row["krepis"]["content"]["capture_reason"] == f"dlp_verdict={verdict}"
 
     def test_the_edge_request_id_is_set_only_on_the_router_edge(self):
         (row, _), _ = _build_complete()
-        assert row["route"]["edge_request_id"] == "chatcmpl-abc123"
+        assert row["krepis"]["route"]["edge_request_id"] == "chatcmpl-abc123"
         grounded_row, _ = _build_grounded()
-        assert grounded_row["route"]["edge_request_id"] is None
+        assert grounded_row["krepis"]["route"]["edge_request_id"] is None
 
     def test_a_bad_span_id_or_capture_mode_raises(self):
         result = LLMResult(text="t", model="m", provider="p", usage=LLMUsage(),

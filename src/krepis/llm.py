@@ -1651,10 +1651,15 @@ def _finalize_result(method):
                 kwargs["user_content"], kwargs["sources"]
             )
             kwargs["sources"] = None
+        self._trace_last_request = None
         started_at = _utcnow()
         t0 = _time.perf_counter()
+        error: Optional[BaseException] = None
         try:
             result = method(self, *args, **kwargs)
+        except Exception as exc:
+            error = exc
+            raise
         finally:
             # Cleared even when the call RAISES: a drop recorded on a failed
             # call must not attach itself to the next successful one. The DLP
@@ -1668,6 +1673,23 @@ def _finalize_result(method):
             self._dlp_facts = {}
             trace_ctx = self._trace_ctx
             self._trace_ctx = None
+            last_request = self._trace_last_request
+            self._trace_last_request = None
+            if error is not None:
+                # A call that RAISED is traced too — one record per call,
+                # every return path (llm-platform-policy § Call trace record).
+                # Never raises: the caller must see the original exception.
+                self._emit_failed_call_trace(
+                    error,
+                    trace_ctx=trace_ctx,
+                    started_at=started_at,
+                    duration_ms=(_time.perf_counter() - t0) * 1000.0,
+                    dlp_facts=dlp_facts,
+                    dropped=dropped,
+                    last_request=last_request,
+                    kwargs=kwargs,
+                    sources=rendered_sources,
+                )
         duration_ms = (_time.perf_counter() - t0) * 1000.0
         ended_at = _utcnow()
         result.dropped_params = dropped
@@ -1807,6 +1829,7 @@ class LLMClient:
         stream_total_timeout: Optional[float] = None,
         budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
         trace_sink: Optional[Callable[..., None]] = None,
+        trace_capture: Optional[str] = None,
     ):
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
@@ -1862,7 +1885,31 @@ class LLMClient:
             from krepis.trace_sink import default_trace_sink_from_env
 
             trace_sink = default_trace_sink_from_env()
+        # The call site's DECLARED capture level (its call-site registry row),
+        # when the caller passes it. ``off`` disables tracing for this client;
+        # ``full`` / ``hash_only`` with no sink configured is a deploy defect
+        # and raises here, before any spend — a declared capture that writes
+        # nowhere is the silent gap the policy forbids.
+        if trace_capture is not None:
+            if trace_capture not in ("full", "hash_only", "off"):
+                raise ValueError(
+                    "trace_capture must be 'full', 'hash_only' or 'off'; "
+                    f"got {trace_capture!r}"
+                )
+            if trace_capture == "off":
+                trace_sink = None
+            elif trace_sink is None:
+                from krepis.trace_sink import TraceSinkConfigError
+
+                raise TraceSinkConfigError(
+                    f"callsite_id={callsite_id!r} declares trace capture "
+                    f"{trace_capture!r} but no trace sink is configured: set "
+                    f"KREPIS_TRACE_SINK_BUCKET and KREPIS_TRACE_SINK_PREFIX, "
+                    f"pass trace_sink=, or declare trace_capture='off'."
+                )
+        self._trace_capture = trace_capture
         self._trace_sink = trace_sink
+        self._trace_last_request: Any = None
         # (TraceContext, span_id) for the in-flight public call, set and
         # cleared by ``_finalize_result``.
         self._trace_ctx: Any = None
@@ -2140,6 +2187,61 @@ class LLMClient:
             "spend_logs_metadata": fields,
         }
 
+    def _emit_failed_call_trace(
+        self,
+        error: BaseException,
+        *,
+        trace_ctx: Any,
+        started_at: datetime,
+        duration_ms: float,
+        dlp_facts: dict,
+        dropped: list,
+        last_request: Any,
+        kwargs: dict,
+        sources: tuple,
+    ) -> None:
+        """Trace a call that raised. Never raises."""
+        if getattr(self, "_trace_sink", None) is None:
+            return
+        try:
+            context, span_id = trace_ctx
+            usage = getattr(error, "usage", None)
+            stand_in = LLMResult(
+                text="",
+                model=self.spec.model,
+                provider=self.spec.provider,
+                usage=usage if isinstance(usage, LLMUsage) else LLMUsage(),
+                raw_request=last_request if isinstance(last_request, dict) else {},
+                registry_id=self.spec.registry_id,
+                dropped_params=list(dropped),
+                trace_id=context.trace_id,
+                span_id=span_id,
+                duration_ms=round(duration_ms, 3),
+            )
+            for _field, _value in dlp_facts.items():
+                setattr(stand_in, _field, _value)
+            self._emit_trace_record(
+                stand_in,
+                context=context,
+                started_at=started_at,
+                ended_at=_utcnow(),
+                sources=sources,
+                system=kwargs.get("system"),
+                subject=kwargs.get("subject"),
+                prompt_id=kwargs.get("prompt_id"),
+                prompt_version=kwargs.get("prompt_version"),
+                error=error,
+            )
+        except Exception as exc:  # noqa: BLE001 — never mask the call's own error
+            # (a) swallowed: building the stand-in for a failed call failed;
+            # (b) the caller still receives its original exception;
+            # (c) recorded on this ERROR line and the emission-failure count.
+            record_emission_failure()
+            logger.error(
+                "trace emission failed for a raised call callsite_id=%s: %s",
+                self.callsite_id, exc,
+            )
+
     def _emit_trace_record(
         self,
         result: Any,
@@ -2152,6 +2254,7 @@ class LLMClient:
         subject: Optional[dict] = None,
         prompt_id: Optional[str] = None,
         prompt_version: Optional[str] = None,
+        error: Optional[BaseException] = None,
     ) -> None:
         """Build the ``llm_trace.v1`` row for *result* and hand it to the sink.
 
@@ -2164,6 +2267,10 @@ class LLMClient:
         try:
             from krepis import __version__ as _krepis_version
 
+            capture = resolve_capture_mode()
+            capture_reason = None
+            if getattr(self, "_trace_capture", None) == "hash_only":
+                capture, capture_reason = "hash_only", "callsite declared hash_only"
             row, blobs = build_trace_record(
                 result,
                 callsite_id=self.callsite_id,
@@ -2178,8 +2285,10 @@ class LLMClient:
                 subject=subject,
                 prompt_id=prompt_id,
                 prompt_version=prompt_version,
-                capture=resolve_capture_mode(),
+                capture=capture,
+                capture_reason=capture_reason,
                 library_version=_krepis_version,
+                error=error,
             )
             sink(row, blobs)
         except Exception as exc:  # noqa: BLE001
@@ -2312,6 +2421,10 @@ class LLMClient:
         """
         from .llm_errors import raise_if_permanent_contract_error
 
+        # The exact payload handed to the transport — necessarily one the DLP
+        # scan already released — kept so a call that raises AFTER reaching
+        # the wire can still be traced with what it sent.
+        self._trace_last_request = kwargs
         try:
             return fn(**kwargs)
         except Exception as exc:

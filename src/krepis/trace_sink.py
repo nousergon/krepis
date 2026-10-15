@@ -54,7 +54,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from krepis import s3_surface
 from krepis.cost_sink import resolve_run_id
-from krepis.llm_trace import TraceBlob
+from krepis.llm_trace import EXTENSION_NAMESPACE, TraceBlob
 
 logger = logging.getLogger(__name__)
 
@@ -221,9 +221,12 @@ class S3JsonlTraceSink:
 
     def __call__(self, row: Dict[str, Any], blobs: Mapping[str, TraceBlob]) -> None:
         """Accept one row and the blobs it references."""
-        if not row.get("run_id"):
-            row["run_id"] = self.run_id
-        group = (_row_date(row), str(row.get("callsite_id") or "unknown"))
+        ext = row.get(EXTENSION_NAMESPACE)
+        if not isinstance(ext, dict):
+            ext = row[EXTENSION_NAMESPACE] = {}
+        if not ext.get("run_id"):
+            ext["run_id"] = self.run_id
+        group = (_row_date(row), str(ext.get("callsite_id") or "unknown"))
         with self._lock:
             for sha, blob in blobs.items():
                 if sha in self._stored or sha in self._blobs:
