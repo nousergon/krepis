@@ -1,9 +1,32 @@
-# PACKAGED DLP RULESET — krepis package data (`krepis/dlp_config/`).
-# Chain-extended by gitleaks-egress.toml in this same directory (see that
-# file's header for why this ships inside the wheel and what it replaces).
-# Content byte-copied 2026-09-09 from
-# `alpha-engine-config/infrastructure/groom-llm-routing/gitleaks-custom.toml`.
-# Original header follows verbatim:
+# CANONICAL DLP RULESET -- krepis package data (`krepis/dlp_config/`).
+#
+# This file is the ONE source of the fleet's custom secret-shape rules, and
+# is shipped byte-identical to every other place that scans with them:
+#   nousergon/krepis              src/krepis/dlp_config/gitleaks-custom.toml   <- CANONICAL
+#   nousergon/alpha-engine-config infrastructure/groom-llm-routing/gitleaks-custom.toml
+#   nousergon/claude-code-config  llm-routing/gitleaks-custom.toml
+#   nousergon/nousergon-lib       src/nousergon_lib/egress/gitleaks-custom.toml
+# If you are reading this anywhere but krepis, you are reading a COPY.
+#
+# Each copy's own CI parses its copy and the one on krepis `main` and FAILS on
+# any rule-level difference (ids, regexes, allowlists, entropy, keywords,
+# tags, [extend]) -- comments are ignored (alpha-engine-config-I9712). So a
+# rule change lands here first, and every copy stays red until it follows.
+# Never edit a copy alone: that is how both halves of I9712 lived for a month
+# on one side only, each side missing a real fix the other had.
+#
+# Reconciled 2026-10-15 (alpha-engine-config-I9712) as the UNION of the fixes
+# from the two diverged copies -- all four deltas ADOPTED:
+#   - Telegram: trailing \b removed (claude-code-config-I112)
+#   - nousergon-aws-access-key-id added (claude-code-config-I112)
+#   - Anthropic: >=8 body chars, `{8,}` (alpha-engine-config-I4946)
+#   - IBKR: `<...>` documentation placeholders excluded (alpha-engine-config-I4946)
+#
+# CONSTRAINT THAT MUST NOT BE LOST: a LONG BOUNDED quantifier (e.g. `{93}`)
+# silently fails to fire under `useDefault = true` on gitleaks 8.30.1 (see the
+# Anthropic rule's comment). Several rules below are shaped around that
+# measured engine defect, not around what reads well. A "cleanup" that
+# tightens a quantifier here silently disables the rule.
 #
 title = "Fleet-specific secret-shape rules (config-I3011)"
 
@@ -16,9 +39,10 @@ title = "Fleet-specific secret-shape rules (config-I3011)"
 #     one instance per provider)
 # Both already point at gitleaks-egress.toml; only the toml wiring changed.
 #
-# Each rule below has a positive+negative fixture pair under
-# gitleaks-custom-fixtures/{positive,negative}/<rule-id>.txt, exercised by
-# test_gitleaks_custom_rules.sh. Fixture secrets are OBVIOUSLY fake (FAKE/TEST
+# Each rule below has a positive+negative fixture pair in claude-code-config
+# under llm-routing/gitleaks-custom-fixtures/{positive,negative}/<rule-id>.txt,
+# exercised by test_gitleaks_custom_rules.sh, plus randomised class fixtures in
+# test_gitleaks_class_coverage.py. Fixture secrets are OBVIOUSLY fake (FAKE/TEST
 # markers baked into the matched span) — never a real credential shape copied
 # from a live key.
 [extend]
@@ -32,7 +56,15 @@ useDefault = true
 [[rules]]
 id = "nousergon-telegram-bot-token"
 description = "Telegram bot token (BotFather format: <numeric id>:<35-char secret>)"
-regex = '''\b\d{8,10}:[A-Za-z0-9_-]{35}\b'''
+# The trailing \b was REMOVED 2026-07-29 (claude-code-config-I112). A token
+# whose 35th character is '-' cannot be matched with a trailing \b: '-' is a
+# non-word character, so no word boundary exists between it and the following
+# newline. BotFather issues tokens containing '-', so roughly 1 in 64 real
+# tokens was silently unmatched by this rule. Found by
+# test_gitleaks_class_coverage.py, which is why that test uses randomised
+# fixtures rather than one fixed string. Go's RE2 has no lookahead, so there
+# is no negative-lookahead alternative -- dropping the anchor is the fix.
+regex = '''\b\d{8,10}:[A-Za-z0-9_-]{35}'''
 tags = ["telegram", "fleet-custom"]
 
 # ------------------------------------------------------------------
@@ -116,8 +148,17 @@ tags = ["deepseek", "fleet-custom", "unverified-format"]
 # ------------------------------------------------------------------
 # AWS temporary session-token shape (STS AssumeRole / GetSessionToken)
 # ------------------------------------------------------------------
-# Long-lived AWS keys are already covered by gitleaks' default aws-access-
-# token / aws-secret-key rules (useDefault above). Temporary STS credentials
+# MEASURED FALSE, 2026-07-29 (claude-code-config-I112). This comment used to
+# read "Long-lived AWS keys are already covered by gitleaks' default aws-
+# access-token / aws-secret-key rules (useDefault above)". They are not:
+# over 20 randomised `AWS_ACCESS_KEY_ID=AKIA<16>` fixtures the stock
+# aws-access-token rule fired 5/20 on one seed and 1/20 on another, identically
+# under `useDefault` alone and under the full gitleaks-egress.toml chain -- so
+# this is the stock rule's own entropy gate, not our config. The same regex
+# declared as a fleet rule WITHOUT an entropy gate fires 20/20 (see
+# nousergon-aws-access-key-id below). Same failure class as the Anthropic
+# comment above: a stock rule that silently detects a fraction of the time.
+# Temporary STS credentials
 # add a THIRD value, the session token: a long base64-ish blob that is high
 # entropy but otherwise looks like nothing else. It reliably starts with one
 # of a small set of magic-byte prefixes baked into AWS's internal protobuf
@@ -144,12 +185,17 @@ tags = ["aws", "sts", "fleet-custom"]
 # gets copied to the laptop, not evidence it currently is here).
 [[rules]]
 id = "nousergon-ibkr-config-credential-line"
-description = "IBC config.ini credential line (IbLoginId/IbPassword/FIXLoginId/FIXPassword = real-value)"
+description = "IBC config.ini credential line (one of IbLoginId/IbPassword/FIXLoginId/FIXPassword, then an equals sign and a real value)"
 # 2026-07-28 (alpha-engine-config-I4946): the value must not be a `<...>`
 # DOCUMENTATION PLACEHOLDER. This rule's own description used to end
 # `... = <value>)` and therefore matched ITSELF -- any diff of this file blocked
 # the request carrying it. gitleaks uses RE2, which has no lookahead, so the
 # exclusion is a leading character class rather than `(?!<)`.
+# 2026-10-15 (alpha-engine-config-I9712): I4946 rewrote that description to end
+# `... = real-value)`, which STILL matched itself -- `real-value` is not a
+# placeholder. The description now names the shape in words, with no field
+# name followed by `=`, and krepis's tests scan this whole file and require it
+# to come back clean.
 regex = '''(?i)\b(IbLoginId|IbPassword|FIXLoginId|FIXPassword)\s*=\s*[^<\s]\S*'''
 tags = ["ibkr", "fleet-custom"]
 
@@ -173,3 +219,35 @@ id = "nousergon-ssm-secure-string-response"
 description = "AWS SSM GetParameter --with-decryption JSON response body (SecureString value)"
 regex = '''"Name"\s*:\s*"/[^"]+"\s*,\s*"Type"\s*:\s*"SecureString"\s*,\s*"Value"\s*:\s*"[^"]{8,}"'''
 tags = ["aws", "ssm", "fleet-custom"]
+
+# ------------------------------------------------------------------
+# AWS access key id (long-lived and STS), explicit
+# ------------------------------------------------------------------
+# Exists because the stock aws-access-token rule is unreliable -- see the
+# corrected comment above. Deliberately carries NO entropy threshold and no
+# keyword gate: an AWS key id is a fixed 4-char prefix plus exactly 16
+# uppercase-alphanumerics, so the shape alone is specific enough and an
+# entropy floor is the exact thing that makes the stock rule flaky.
+#
+# Scope note: a key ID is an identifier, not by itself an authenticator --
+# the secret is the paired secret access key. It is still treated as a block
+# signal because its presence means credential material is in context, and
+# because that is the pre-existing production behaviour (blocked-events shows
+# 748 findings on Lambda REPORT lines and presigned S3 URLs). This rule does
+# not widen what gets blocked; it makes the existing intent actually work.
+#
+# Allowlisted: AWS's own published example values, which appear in
+# documentation the agents legitimately read.
+[[rules]]
+id = "nousergon-aws-access-key-id"
+description = "AWS access key id (AKIA/ASIA/ABIA/ACCA/A3T prefix + 16 uppercase alnum) -- explicit because the stock rule fires ~5-25% of the time"
+regex = '''\b(AKIA|ASIA|ABIA|ACCA|A3T[A-Z0-9])[A-Z0-9]{16}\b'''
+tags = ["aws", "fleet-custom"]
+  # regexTarget = "match" is REQUIRED and not the default. Verified 2026-07-29
+  # against gitleaks 8.30.1: with the default target (the extracted secret)
+  # this allowlist has NO effect -- nor do `stopwords`, nor the older
+  # singular [rules.allowlist] form. Only "match" suppresses. Do not drop it.
+  [[rules.allowlists]]
+  description = "AWS published documentation example key ids"
+  regexTarget = "match"
+  regexes = ['''(AKIA|ASIA)IOSFODNN7EXAMPLE''']
