@@ -1,0 +1,120 @@
+{
+  "blob_shas": [
+    "6afd328969d325a30cf5d17211d9b96aefd36b2a9982a84c6bd21029073d4eec",
+    "9eb976f299d4a0ba746edd96120aaf8868ccfabda37dc905a7f2dba652505542",
+    "a476c0f4970ebf2704cfb5dbbf37082e2731fe03c4308224adebfd5111a75996",
+    "cd2912b6aac1c2c70f9b770a353290651a72246a07069834ec6aee9e6738f0e9"
+  ],
+  "row": {
+    "duration_ms": 2332.544,
+    "ended_at": "2026-10-14T13:30:02.456Z",
+    "error": null,
+    "gen_ai": {
+      "operation.name": "chat",
+      "provider.name": "litellm_proxy",
+      "request.max_tokens": 2048,
+      "request.model": "med-deepseek-v4-flash-max",
+      "response.finish_reasons": [
+        "stop"
+      ],
+      "response.id": "chatcmpl-abc123",
+      "response.model": "deepseek-v4-flash",
+      "usage.cache_creation.input_tokens": 0,
+      "usage.cache_read.input_tokens": 800,
+      "usage.input_tokens": 1200,
+      "usage.output_tokens": 300
+    },
+    "krepis": {
+      "callsite_id": "thinktank-thesis",
+      "citations": [
+        {
+          "cid": "c1",
+          "cited_in_output": true,
+          "content_sha256": "9eb976f299d4a0ba746edd96120aaf8868ccfabda37dc905a7f2dba652505542",
+          "document_id": "rag.documents/41aa",
+          "kind": "rag_chunk",
+          "meta": null,
+          "retrieval": {
+            "method": "hybrid",
+            "rank": 1,
+            "score": 0.81
+          },
+          "source_id": "rag.chunks/8d0c1f2e",
+          "span": {
+            "char_end": 69,
+            "char_start": 18,
+            "message_index": 1
+          },
+          "uri": "https://www.sec.gov/Archives/example-8k.htm",
+          "version": "filed:2026-09-04"
+        },
+        {
+          "cid": "c2",
+          "cited_in_output": true,
+          "content_sha256": "6afd328969d325a30cf5d17211d9b96aefd36b2a9982a84c6bd21029073d4eec",
+          "document_id": null,
+          "kind": "s3_object",
+          "meta": null,
+          "retrieval": null,
+          "source_id": "s3://bucket/news/QLYS.json",
+          "span": {
+            "char_end": 137,
+            "char_start": 99,
+            "message_index": 1
+          },
+          "uri": null,
+          "version": "3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY"
+        }
+      ],
+      "code": {
+        "krepis": "0.0.0-test"
+      },
+      "content": {
+        "capture": "full",
+        "capture_reason": null,
+        "input_sha256": "a476c0f4970ebf2704cfb5dbbf37082e2731fe03c4308224adebfd5111a75996",
+        "media_type": "application/json",
+        "output_sha256": "cd2912b6aac1c2c70f9b770a353290651a72246a07069834ec6aee9e6738f0e9"
+      },
+      "dlp": {
+        "proxy_redaction": "unknown",
+        "redactions": [],
+        "verdict": "ok"
+      },
+      "prompt": {
+        "system_sha256": "750b6374dad74f99b60615275a1c7ae09574c2fa5c56a52f0b74ac29312150cc",
+        "template_id": "thinktank_thesis",
+        "template_version": "0.3.0"
+      },
+      "route": {
+        "dropped_params": [],
+        "edge_request_id": "chatcmpl-abc123",
+        "fallback_used": false,
+        "registry_id": "deepseek-v4-flash-max",
+        "served_deployment": "med-deepseek-v4-flash-max",
+        "served_provider": null,
+        "stream_chunks": 0,
+        "streamed": false,
+        "structured_output_rung": null
+      },
+      "run_id": "a2e236a07e24",
+      "subject": {
+        "id": "QLYS",
+        "kind": "ticker"
+      },
+      "trace_id_source": "run_id",
+      "usage": {
+        "attempts": 1,
+        "budget_escalations": 0,
+        "reasoning_tokens": 40,
+        "usage_unknown": false,
+        "web_search_requests": 0
+      }
+    },
+    "parent_span_id": null,
+    "schema_version": "llm_trace.v1",
+    "span_id": "00f067aa0ba902b7",
+    "started_at": "2026-10-14T13:30:00.123Z",
+    "trace_id": "4bf92f3577b34da6a3ce929d0e0e4736"
+  }
+}
