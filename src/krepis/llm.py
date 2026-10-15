@@ -40,6 +40,7 @@ import re
 import threading
 import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, Callable, List, Optional
 
@@ -73,7 +74,23 @@ from krepis.session_dlp import (
     dlp_enabled,
 )
 
+from krepis.llm_trace import (
+    TraceContext,
+    bind_sources,
+    build_trace_record,
+    new_span_id,
+    record_emission_failure,
+    resolve_capture_mode,
+    resolve_trace_context,
+)
+
 logger = logging.getLogger(__name__)
+
+
+def _utcnow() -> datetime:
+    """The wall clock trace timestamps read. A seam for tests."""
+    return datetime.now(timezone.utc)
+
 
 # Per-group fallback-state tracker so callers can detect sign-on / sign-off
 # transitions.  Keyed by group name ("low", "med", "high", "ultra"); True
@@ -963,7 +980,11 @@ class _StreamedChatCompletion:
         served_provider: Optional[str],
         chunks: int,
         usage_reported: bool,
+        response_id: Optional[str] = None,
     ) -> None:
+        # The provider's response id, as every chunk of one stream carries it.
+        # A ``ChatCompletion`` has it as ``id``; so does this.
+        self.id = response_id
         self.choices = [
             _StreamedChoice(
                 message=SimpleNamespace(content=text),
@@ -1019,7 +1040,9 @@ class _StreamedMessage:
         stop_reason: Optional[str],
         chunks: int,
         usage_reported: bool,
+        message_id: Optional[str] = None,
     ) -> None:
+        self.id = message_id
         self.content = content
         self.model = model
         self.usage = usage
@@ -1069,6 +1092,7 @@ def _accumulate_openai_stream(
     finish_reason: Optional[str] = None
     model: Optional[str] = None
     served_provider: Optional[str] = None
+    response_id: Optional[str] = None
     usage_obj: Any = None
     chunks = 0
     # Reasoning deltas are COUNTED, never joined into the answer text: they
@@ -1084,6 +1108,7 @@ def _accumulate_openai_stream(
             chunks += 1
             model = getattr(chunk, "model", None) or model
             served_provider = getattr(chunk, "provider", None) or served_provider
+            response_id = getattr(chunk, "id", None) or response_id
             # The usage-bearing final chunk carries an EMPTY ``choices`` on
             # every OpenAI-compatible route, so this must precede any choice
             # read rather than living inside one.
@@ -1142,6 +1167,7 @@ def _accumulate_openai_stream(
         served_provider=served_provider,
         chunks=chunks,
         usage_reported=usage_obj is not None,
+        response_id=response_id,
     )
 
 
@@ -1162,6 +1188,7 @@ def _accumulate_anthropic_stream(
     blocks: dict[int, dict] = {}
     order: List[int] = []
     model: Optional[str] = None
+    message_id: Optional[str] = None
     stop_reason: Optional[str] = None
     start_usage: Any = None
     output_tokens: Optional[int] = None
@@ -1183,6 +1210,7 @@ def _accumulate_anthropic_stream(
                 message = getattr(event, "message", None)
                 model = getattr(message, "model", None) or model
                 start_usage = getattr(message, "usage", None)
+                message_id = getattr(message, "id", None) or message_id
             elif etype == "content_block_start":
                 index = int(getattr(event, "index", 0) or 0)
                 block = getattr(event, "content_block", None)
@@ -1291,6 +1319,7 @@ def _accumulate_anthropic_stream(
         stop_reason=stop_reason,
         chunks=chunks,
         usage_reported=usage_reported,
+        message_id=message_id,
     )
 
 
@@ -1503,6 +1532,26 @@ class LLMResult:
     # non-streamed call. Together with the duration this is the tokens-per-
     # second signal that a non-streamed call can only ever reconstruct.
     stream_chunks: int = 0
+    # ── trace facts (llm_trace.v1, alpha-engine-config-I12312) ──
+    # Stamped by :func:`_finalize_result` on EVERY result, whether or not a
+    # trace sink is configured: they cost nothing and are the join keys from
+    # an artifact back to its trace row, its cost row and the router edge.
+    #
+    # W3C trace id (32 hex) — shared by every call in one run.
+    trace_id: Optional[str] = None
+    # W3C span id (16 hex) — this logical call.
+    span_id: Optional[str] = None
+    # Wall-clock milliseconds of the whole logical call, every attempt and
+    # retry included. No latency was recorded anywhere before this.
+    duration_ms: Optional[float] = None
+    # The provider's own id for the response that was returned (``id`` on a
+    # ChatCompletion or Message); on the router edge, the key LiteLLM files
+    # its spend row under. ``None`` when the route reported none.
+    response_id: Optional[str] = None
+    # Set when trace emission failed for this call. ``None`` on success and
+    # on clients with no trace sink. Emission never raises — see
+    # ``LLMClient._emit_trace_record``.
+    trace_emission_error: Optional[str] = None
 
 
 @dataclass
@@ -1578,12 +1627,32 @@ def _finalize_result(method):
     Snapshot-and-clear, not just snapshot: ``self.dropped_params`` lives on the
     client, so without the reset a drop on one call would ride along on every
     later result from the same client and misreport it as degraded.
+
+    The ``llm_trace.v1`` record is emitted here too, right after the cost
+    record and for the same reason: a trace that each method had to remember
+    to write would cover exactly the methods somebody remembered
+    (alpha-engine-config-I12312). The trace context and span id are minted
+    BEFORE the call, because the router-edge request carries them; ``sources``
+    are bound here, so their offsets are into the user content actually sent.
     """
 
     @functools.wraps(method)
     def _wrapped(self, *args, **kwargs):
         self.dropped_params = []
         self._dlp_facts = {}
+        # Trace context first: the router-edge request carries its ids, so
+        # they must exist before the method builds a payload. Sources are
+        # bound here, at the one boundary, so their offsets are into the
+        # exact user content the method sends.
+        self._trace_ctx = self._new_trace_context()
+        rendered_sources: tuple = ()
+        if kwargs.get("sources") is not None and "user_content" in kwargs:
+            kwargs["user_content"], rendered_sources = bind_sources(
+                kwargs["user_content"], kwargs["sources"]
+            )
+            kwargs["sources"] = None
+        started_at = _utcnow()
+        t0 = _time.perf_counter()
         try:
             result = method(self, *args, **kwargs)
         finally:
@@ -1597,12 +1666,31 @@ def _finalize_result(method):
             self.dropped_params = []
             dlp_facts = self._dlp_facts
             self._dlp_facts = {}
+            trace_ctx = self._trace_ctx
+            self._trace_ctx = None
+        duration_ms = (_time.perf_counter() - t0) * 1000.0
+        ended_at = _utcnow()
         result.dropped_params = dropped
         for _field, _value in dlp_facts.items():
             setattr(result, _field, _value)
         _stamp_response_facts(result)
         self._stamp_fallback_facts(result)
+        context, span_id = trace_ctx
+        result.trace_id = context.trace_id
+        result.span_id = span_id
+        result.duration_ms = round(duration_ms, 3)
         self._emit_cost_record(result)
+        self._emit_trace_record(
+            result,
+            context=context,
+            started_at=started_at,
+            ended_at=ended_at,
+            sources=rendered_sources,
+            system=kwargs.get("system"),
+            subject=kwargs.get("subject"),
+            prompt_id=kwargs.get("prompt_id"),
+            prompt_version=kwargs.get("prompt_version"),
+        )
         return result
 
     return _wrapped
@@ -1628,6 +1716,9 @@ def _stamp_response_facts(result: Any) -> None:
     reason = _finish_reason_of(resp)
     if reason is not None:
         result.finish_reason = reason
+    response_id = getattr(resp, "id", None)
+    if isinstance(response_id, str) and response_id:
+        result.response_id = response_id
     if getattr(resp, "krepis_streamed", False):
         result.streamed = True
         result.stream_chunks = getattr(resp, "krepis_stream_chunks", 0)
@@ -1715,6 +1806,7 @@ class LLMClient:
         stream_idle_timeout: float = DEFAULT_STREAM_IDLE_TIMEOUT_S,
         stream_total_timeout: Optional[float] = None,
         budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
+        trace_sink: Optional[Callable[..., None]] = None,
     ):
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
@@ -1764,6 +1856,16 @@ class LLMClient:
 
             cost_sink = default_sink_from_env()
         self._cost_sink = cost_sink
+        if trace_sink is None:
+            # Same rule as the cost sink: resolved from the environment, and a
+            # half-configured environment raises here, before any spend.
+            from krepis.trace_sink import default_trace_sink_from_env
+
+            trace_sink = default_trace_sink_from_env()
+        self._trace_sink = trace_sink
+        # (TraceContext, span_id) for the in-flight public call, set and
+        # cleared by ``_finalize_result``.
+        self._trace_ctx: Any = None
         self._client: Any = None
         if spec.supports_automatic_prefix_caching:
             logger.info(
@@ -1956,6 +2058,9 @@ class LLMClient:
                     "callsite_id": self.callsite_id,
                     "fallback_used": bool(getattr(result, "fallback_used", False)),
                     "dlp_verdict": getattr(result, "dlp_verdict", None),
+                    # The join from a cost row to its llm_trace.v1 row.
+                    "trace_id": getattr(result, "trace_id", None),
+                    "span_id": getattr(result, "span_id", None),
                 },
             )
             self._cost_sink(record)
@@ -1985,6 +2090,114 @@ class LLMClient:
             )
             try:
                 result.cost_emission_error = str(exc)
+            except Exception:  # noqa: BLE001 — frozen/exotic result type
+                pass
+
+    # ── trace emission (llm_trace.v1) ─────────────────────────────────
+
+    def _trace_run_id(self) -> Optional[str]:
+        run_id = getattr(getattr(self, "_trace_sink", None), "run_id", None)
+        if isinstance(run_id, str) and run_id:
+            return run_id
+        return os.environ.get("KREPIS_RUN_ID", "").strip() or None
+
+    def _new_trace_context(self) -> tuple:
+        """``(TraceContext, span_id)`` for one public call. Never raises: a
+        context that cannot be resolved is a random one, not a failed call."""
+        try:
+            return resolve_trace_context(self._trace_run_id()), new_span_id()
+        except Exception as exc:  # noqa: BLE001 — telemetry never fails the call
+            # (a) swallowed: an exotic environment value broke resolution;
+            # (b) the call is unaffected — it gets a random trace id;
+            # (c) recorded on this ERROR line and the emission-failure count.
+            record_emission_failure()
+            logger.error("llm trace: could not resolve trace context: %s", exc)
+            return TraceContext(trace_id=os.urandom(16).hex()), new_span_id()
+
+    def _edge_metadata(self) -> Optional[dict]:
+        """Attribution for a router-edge request: call site, run and trace.
+
+        Sent as the LiteLLM proxy's request ``metadata`` — ``tags`` and
+        ``spend_logs_metadata`` are the two keys its spend log persists — so
+        an edge spend row joins to the call site that caused it and to its
+        trace row. The proxy consumes ``metadata`` itself; it is not
+        forwarded upstream. Before this every edge row carried the shared
+        consumer key and no call site at all.
+        """
+        if self.spec.provider != ROUTER_EDGE_PROVIDER:
+            return None
+        fields: dict = {"callsite_id": self.callsite_id}
+        run_id = self._trace_run_id()
+        if run_id:
+            fields["run_id"] = run_id
+        trace_ctx = getattr(self, "_trace_ctx", None)
+        if trace_ctx is not None:
+            context, span_id = trace_ctx
+            fields["trace_id"] = context.trace_id
+            fields["span_id"] = span_id
+        return {
+            "tags": [f"callsite:{self.callsite_id}"],
+            "spend_logs_metadata": fields,
+        }
+
+    def _emit_trace_record(
+        self,
+        result: Any,
+        *,
+        context: Any,
+        started_at: datetime,
+        ended_at: datetime,
+        sources: tuple = (),
+        system: Optional[str] = None,
+        subject: Optional[dict] = None,
+        prompt_id: Optional[str] = None,
+        prompt_version: Optional[str] = None,
+    ) -> None:
+        """Build the ``llm_trace.v1`` row for *result* and hand it to the sink.
+
+        No-op when no trace sink is configured. **Never raises**, on the same
+        reasoning as :meth:`_emit_cost_record`.
+        """
+        sink = getattr(self, "_trace_sink", None)
+        if sink is None:
+            return
+        try:
+            from krepis import __version__ as _krepis_version
+
+            row, blobs = build_trace_record(
+                result,
+                callsite_id=self.callsite_id,
+                context=context,
+                span_id=result.span_id,
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_ms=result.duration_ms or 0.0,
+                request_model=self.spec.model,
+                sources=sources,
+                system=system,
+                subject=subject,
+                prompt_id=prompt_id,
+                prompt_version=prompt_version,
+                capture=resolve_capture_mode(),
+                library_version=_krepis_version,
+            )
+            sink(row, blobs)
+        except Exception as exc:  # noqa: BLE001
+            # DELIBERATE non-raising degradation, per the fail-loud rule:
+            # (a) swallowed: building the row or handing it to the sink failed;
+            # (b) the call already returned its answer — a telemetry fault
+            #     must not become an outage of the work it describes;
+            # (c) recorded on this ERROR line, the process-wide count
+            #     (`krepis.llm_trace.emission_failures()`), and
+            #     ``result.trace_emission_error`` on the artifact itself.
+            count = record_emission_failure()
+            logger.error(
+                "trace emission failed for callsite_id=%s model=%s "
+                "(failures this process=%d): %s",
+                self.callsite_id, getattr(result, "model", "?"), count, exc,
+            )
+            try:
+                result.trace_emission_error = str(exc)
             except Exception:  # noqa: BLE001 — frozen/exotic result type
                 pass
 
@@ -2603,6 +2816,9 @@ class LLMClient:
             # production prompt: finish_reason="stop", ~15K reasoning
             # chars, ~1 char of actual content. See ModelSpec.reasoning.
             body["reasoning"] = self.spec.reasoning
+        edge_metadata = self._edge_metadata()
+        if edge_metadata:
+            body["metadata"] = edge_metadata
         return body or None
 
     def _choice_text_or_llm_error(self, resp: Any) -> str:
@@ -2637,6 +2853,10 @@ class LLMClient:
         stream: bool = False,
         idle_timeout: Optional[float] = None,
         total_timeout: Optional[float] = None,
+        sources: Optional[Any] = None,
+        subject: Optional[dict] = None,
+        prompt_id: Optional[str] = None,
+        prompt_version: Optional[str] = None,
     ) -> LLMResult:
         """One plain text generation. Returns normalized :class:`LLMResult`.
 
@@ -2668,7 +2888,28 @@ class LLMClient:
         a distinct type from :exc:`StreamIdleTimeoutError` so a caller's
         retry classifier can treat "went silent" and "ran too long"
         differently — carrying the same partial-generation evidence.
+
+        **Trace inputs** (``llm_trace.v1``; the same four on every public
+        method, consumed at the :func:`_finalize_result` boundary):
+
+        - ``sources`` — what the prompt cites. A sequence of
+          :class:`~krepis.llm_trace.SourceBlock` is rendered with stable
+          ``<source cid="…">`` delimiters and PREPENDED to ``user_content``;
+          a :class:`~krepis.llm_trace.RenderedSources` the caller already
+          embedded in its own template is located in ``user_content`` (it
+          must occur exactly once). Either way the trace records each
+          source's id, the sha256 of its exact text and its offsets, and
+          whether the answer cited it (``[c1]`` markers).
+        - ``subject`` — what the call is about, as a typed key
+          (``{"kind": "ticker", "id": "QLYS"}``); the attribution key evals
+          group by.
+        - ``prompt_id`` / ``prompt_version`` — the template this prompt was
+          rendered from.
+
+        None of them changes anything unless a trace sink is configured,
+        except ``sources``, which (as a sequence) changes the prompt.
         """
+        del sources, subject, prompt_id, prompt_version  # bound in _finalize_result
         self._reject_reasoning_on_anthropic()
         limit = self._effective_max_tokens(max_tokens)
         if stream:
@@ -2776,6 +3017,10 @@ class LLMClient:
         stream: bool = False,
         idle_timeout: Optional[float] = None,
         total_timeout: Optional[float] = None,
+        sources: Optional[Any] = None,
+        subject: Optional[dict] = None,
+        prompt_id: Optional[str] = None,
+        prompt_version: Optional[str] = None,
     ) -> StructuredResult:
         """One schema-constrained call. Validates or raises :exc:`LLMError`.
 
@@ -2834,7 +3079,12 @@ class LLMClient:
         streamed attempt gets its own fresh ``total_timeout`` budget, not a
         budget shared across ``attempts``. A route that keeps producing
         chunks past ``total_timeout`` raises :exc:`StreamTotalTimeoutError`.
+
+        ``sources`` / ``subject`` / ``prompt_id`` / ``prompt_version`` are
+        the trace inputs documented on :meth:`complete`. A structured answer
+        cites a source by carrying ``[c1]`` in any string field.
         """
+        del sources, subject, prompt_id, prompt_version  # bound in _finalize_result
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
@@ -3311,6 +3561,10 @@ class LLMClient:
         max_tokens: Optional[int] = None,
         cache_system: bool = True,
         attempts: int = 2,
+        sources: Optional[Any] = None,
+        subject: Optional[dict] = None,
+        prompt_id: Optional[str] = None,
+        prompt_version: Optional[str] = None,
     ) -> GroundedResult:
         """One web-search-grounded generation.
 
@@ -3365,7 +3619,12 @@ class LLMClient:
         :exc:`~krepis.llm_config.LLMConfigError` — plain OpenAI-compatible
         endpoints have no server-side search; grounding there is the
         caller's job (fetch + inject context).
+
+        ``sources`` / ``subject`` / ``prompt_id`` / ``prompt_version`` are
+        the trace inputs documented on :meth:`complete`. The web citations
+        the search RETURNS are traced too, as ``kind: "web"`` entries.
         """
+        del sources, subject, prompt_id, prompt_version  # bound in _finalize_result
         if attempts < 1:
             raise ValueError("attempts must be >= 1")
         self._reject_reasoning_on_anthropic()
