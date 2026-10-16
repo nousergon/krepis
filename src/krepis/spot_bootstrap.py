@@ -148,6 +148,8 @@ class Clone:
     repo_url: str
     checkout: str
     branch: str | None = None
+    #: Exact commit to run (40 hex). See :attr:`SpotBootstrapSpec.pin_sha`.
+    pin_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -313,6 +315,17 @@ class SpotBootstrapSpec:
     exports: dict[str, str] = field(default_factory=dict)
     branch: str = "main"
     region: str = "us-east-1"
+    #: Exact commit (40 hex) the PRIMARY checkout must run, or None for the
+    #: branch tip. A clone at ``--branch main`` resolves main at the moment the
+    #: box boots, so a workload that is retried, re-issued or run as the second
+    #: of several boxes in one execution runs whatever main is THEN: one
+    #: execution, two code SHAs, results that cannot be tied to either
+    #: (alpha-engine-config-I11570). The launcher resolves the SHA once per
+    #: execution and passes it here; the bootstrap checks it out and ASSERTS
+    #: ``HEAD`` equals it, exiting non-zero otherwise. It never falls back to
+    #: the branch tip, because a silent fallback is exactly how the defect
+    #: arises. The pin also holds on an already-present checkout.
+    pin_sha: str | None = None
     #: Repos cloned in ADDITION to the primary one, in order.
     extra_clones: tuple[Clone, ...] = ()
     #: Hard runtime cap. Arms a transient ``systemd-run --on-active`` timer
@@ -392,6 +405,23 @@ class SpotBootstrapSpec:
     def __post_init__(self) -> None:
         if not self.checkout:
             raise ValueError("checkout is required (the workload's path on the spot)")
+        pins = [("pin_sha", self.pin_sha)] + [
+            (f"extra_clones[{c.checkout}].pin_sha", c.pin_sha) for c in self.extra_clones
+        ]
+        for label, value in pins:
+            if value is None:
+                continue
+            if not _SHA40.fullmatch(value):
+                raise ValueError(
+                    f"{label} must be a full 40-hex commit SHA, got {value!r} — a "
+                    "branch name or abbreviated SHA would be re-resolved on the box, "
+                    "which is the drift a pin exists to prevent"
+                )
+            if not self.clone:
+                raise ValueError(
+                    f"{label} is set but clone=False: the dispatcher placed the "
+                    "checkout, so this bootstrap would silently ignore the pin"
+                )
         if self.clone and not self.repo_url:
             raise ValueError(
                 "repo_url is required when clone is True; pass clone=False for a "
@@ -418,6 +448,9 @@ class SpotBootstrapSpec:
                     )
             if not self.privilege_drop.command:
                 raise ValueError("privilege_drop.command is empty — nothing would run")
+
+
+_SHA40 = re.compile(r"[0-9a-f]{40}")
 
 
 def _quote(value: str) -> str:
@@ -517,14 +550,43 @@ def _hard_timeout_block(spec: SpotBootstrapSpec) -> str:
     )
 
 
-def _one_clone(repo_url: str, checkout: str, branch: str) -> str:
+def _pin_block(checkout: str, sha: str) -> str:
+    """Check ``checkout`` out at exactly ``sha`` and assert it landed there.
+
+    Runs OUTSIDE the clone's idempotency guard: a checkout that already exists
+    (a re-issued stage on a reused box) must be moved to the pin too, not left
+    wherever an earlier call put it. The object is fetched by exact SHA only
+    when it is not already present; ``HEAD`` is then compared, so a fetch that
+    quietly produced a different commit still fails the bootstrap.
+    """
     q = _quote(checkout)
+    s = _quote(sha)
     return (
+        f"if ! git -C {q} cat-file -e {s}^{{commit}} 2>/dev/null; then\n"
+        f"  git -C {q} fetch -q --depth 1 origin {s}\n"
+        f"fi\n"
+        f"git -C {q} -c advice.detachedHead=false checkout -q --detach {s}\n"
+        f'if [ "$(git -C {q} rev-parse HEAD)" != {s} ]; then\n'
+        f'  echo "ERROR: {checkout} is not at pinned commit {sha}" >&2\n'
+        f"  exit 1\n"
+        f"fi\n"
+        f'echo "spot-bootstrap: {checkout} pinned at {sha}"'
+    )
+
+
+def _one_clone(
+    repo_url: str, checkout: str, branch: str, pin_sha: "str | None" = None
+) -> str:
+    q = _quote(checkout)
+    block = (
         f"if [ ! -d {q}/.git ]; then\n"
         f"  rm -rf {q}\n"
         f"  git clone --depth 1 --branch {_quote(branch)} {_quote(repo_url)} {q}\n"
         f"fi"
     )
+    if pin_sha:
+        block += "\n" + _pin_block(checkout, pin_sha)
+    return block
 
 
 def _clone_block(spec: SpotBootstrapSpec) -> str:
@@ -548,10 +610,15 @@ def _clone_block(spec: SpotBootstrapSpec) -> str:
             "  exit 1\n"
             "fi"
         )
-    blocks = [_one_clone(spec.repo_url, spec.checkout, spec.branch)]
+    blocks = [_one_clone(spec.repo_url, spec.checkout, spec.branch, spec.pin_sha)]
     for clone in spec.extra_clones:
         blocks.append(
-            _one_clone(clone.repo_url, clone.checkout, clone.branch or spec.branch)
+            _one_clone(
+                clone.repo_url,
+                clone.checkout,
+                clone.branch or spec.branch,
+                clone.pin_sha,
+            )
         )
     return "\n".join(blocks)
 
@@ -1668,6 +1735,28 @@ def _spec_from_args(args: argparse.Namespace) -> SpotBootstrapSpec:
             if head and "/" in head:
                 url, branch = head, tail
         clones.append(Clone(repo_url=url, checkout=checkout, branch=branch))
+    pins: dict[str, str] = {}
+    for raw in getattr(args, "pin_sha", None) or []:
+        if "=" not in raw:
+            raise SystemExit(f"--pin-sha expects CHECKOUT=SHA, got {raw!r}")
+        checkout, sha = raw.split("=", 1)
+        if not _SHA40.fullmatch(sha):
+            raise SystemExit(f"--pin-sha expects a full 40-hex SHA, got {raw!r}")
+        pins[checkout] = sha
+    known = {args.checkout} | {c.checkout for c in clones}
+    unknown = sorted(set(pins) - known)
+    if unknown:
+        # A pin for a checkout that is not rendered would be a guarantee that
+        # silently never armed.
+        raise SystemExit(
+            f"--pin-sha names checkout(s) {unknown} that are neither --checkout "
+            f"nor an --extra-clone (known: {sorted(known)})"
+        )
+    clones = [
+        Clone(repo_url=c.repo_url, checkout=c.checkout, branch=c.branch,
+              pin_sha=pins.get(c.checkout))
+        for c in clones
+    ]
     exports: dict[str, str] = {}
     for raw in args.export or []:
         if "=" not in raw:
@@ -1681,6 +1770,7 @@ def _spec_from_args(args: argparse.Namespace) -> SpotBootstrapSpec:
         exports=exports,
         branch=args.branch,
         region=args.region,
+        pin_sha=pins.get(args.checkout),
         extra_clones=tuple(clones),
         max_runtime_seconds=getattr(args, "max_runtime_seconds", None),
     )
@@ -1744,6 +1834,17 @@ def main(argv: list[str] | None = None) -> int:
             help=(
                 "Clone a sibling repo in addition to the primary one, for a "
                 "workload that imports another repo's modules. Repeatable."
+            ),
+        )
+        p.add_argument(
+            "--pin-sha",
+            action="append",
+            metavar="CHECKOUT=SHA",
+            help=(
+                "Check CHECKOUT (the primary or an --extra-clone) out at this "
+                "full 40-hex commit and assert HEAD equals it, instead of "
+                "running the branch tip. Resolve the SHA once per execution in "
+                "the launcher. Repeatable."
             ),
         )
         p.add_argument(
