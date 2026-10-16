@@ -768,3 +768,144 @@ git clone https://x/y.git /home/ec2-user/y
 """)
     found = scan_for_inline_bootstraps(tmp_path)
     assert [f.path.name for f in found] == ["rogue.sh"]
+
+
+# ── Per-execution code pin (alpha-engine-config-I11570) ──────────────────────
+#
+# A clone at `--branch main` resolves main when the box boots. The weekly data
+# collection boots one box per workload, and a retry boots another, so one
+# execution ran two nousergon-data SHAs. `pin_sha` makes the launcher's choice
+# the bootstrap's contract, and these tests execute the rendered clone block
+# against a real local repository rather than only grepping its text.
+
+_SHA_A = "a" * 40
+_SHA_B = "b" * 40
+
+
+def test_no_pin_renders_nothing_extra():
+    """Additive: a spec written before the pin existed renders as before."""
+    script = render_bootstrap(_spec(extra_clones=(Clone(repo_url="u", checkout="/c/x"),)))
+    assert "pinned" not in script
+    assert "--detach" not in script
+
+
+def test_a_pin_is_checked_out_and_asserted_for_the_primary_and_each_clone():
+    script = render_bootstrap(
+        _spec(
+            pin_sha=_SHA_A,
+            extra_clones=(
+                Clone(repo_url="https://x/e.git", checkout="/c/e", pin_sha=_SHA_B),
+                Clone(repo_url="https://x/p.git", checkout="/c/p"),
+            ),
+        )
+    )
+    assert f"checkout -q --detach {_SHA_A}" in script
+    assert f"checkout -q --detach {_SHA_B}" in script
+    # The unpinned sibling keeps the branch tip and gets no pin step.
+    assert script.count("--detach") == 2
+    assert f'!= {_SHA_A} ]' in script and "exit 1" in script
+
+
+def test_the_pin_sits_outside_the_clone_guard_so_an_existing_checkout_is_moved():
+    """A re-issued stage on a reused box finds the checkout already present."""
+    script = render_bootstrap(_spec(pin_sha=_SHA_A))
+    guard_end = script.index("fi", script.index("git clone"))
+    assert script.index("--detach") > guard_end
+
+
+@pytest.mark.parametrize("bad", ["main", "abc1234", "A" * 40, "g" * 40, ""])
+def test_a_pin_that_is_not_a_full_lowercase_sha_is_refused(bad):
+    with pytest.raises(ValueError, match="40-hex"):
+        _spec(pin_sha=bad)
+    with pytest.raises(ValueError, match="40-hex"):
+        _spec(extra_clones=(Clone(repo_url="u", checkout="/c", pin_sha=bad),))
+
+
+def test_a_pin_with_no_clone_is_refused_not_ignored():
+    with pytest.raises(ValueError, match="clone=False"):
+        _spec(clone=False, repo_url="", pin_sha=_SHA_A)
+
+
+def test_cli_pin_sha_reaches_the_primary_and_an_extra_clone(capsys):
+    rc = main([
+        "render", "--repo-url", "https://x/a.git", "--checkout", "/a",
+        "--extra-clone", "/b=https://x/b.git",
+        "--pin-sha", f"/a={_SHA_A}", "--pin-sha", f"/b={_SHA_B}",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"git -C /a" in out and f"checkout -q --detach {_SHA_A}" in out
+    assert f"checkout -q --detach {_SHA_B}" in out
+
+
+def test_cli_rejects_a_pin_for_a_checkout_that_is_not_rendered():
+    with pytest.raises(SystemExit):
+        main(["render", "--repo-url", "u", "--checkout", "/a", "--pin-sha", f"/zzz={_SHA_A}"])
+
+
+def test_cli_rejects_a_malformed_or_abbreviated_pin():
+    with pytest.raises(SystemExit):
+        main(["render", "--repo-url", "u", "--checkout", "/a", "--pin-sha", "/a"])
+    with pytest.raises(SystemExit):
+        main(["render", "--repo-url", "u", "--checkout", "/a", "--pin-sha", "/a=abc123"])
+
+
+def _git(cwd, *args):
+    import subprocess
+
+    return subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+         "-c", "commit.gpgsign=false", *args],
+        cwd=cwd, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def _origin_with_two_commits(tmp_path):
+    origin = tmp_path / "origin"
+    origin.mkdir()
+    _git(origin, "init", "-q", "-b", "main")
+    (origin / "f").write_text("one")
+    _git(origin, "add", "f")
+    _git(origin, "commit", "-q", "-m", "one")
+    first = _git(origin, "rev-parse", "HEAD")
+    (origin / "f").write_text("two")
+    _git(origin, "commit", "-q", "-am", "two")
+    return origin, first, _git(origin, "rev-parse", "HEAD")
+
+
+def _run_clone_block(spec):
+    import subprocess
+
+    from krepis.spot_bootstrap import _clone_block
+
+    return subprocess.run(
+        ["bash", "-c", "set -eo pipefail\n" + _clone_block(spec)],
+        capture_output=True, text=True,
+    )
+
+
+def test_executed_pin_runs_the_older_commit_not_the_branch_tip(tmp_path):
+    origin, first, tip = _origin_with_two_commits(tmp_path)
+    checkout = tmp_path / "co"
+    r = _run_clone_block(_spec(repo_url=f"file://{origin}", checkout=str(checkout), pin_sha=first))
+    assert r.returncode == 0, r.stderr
+    assert _git(checkout, "rev-parse", "HEAD") == first != tip
+    assert (checkout / "f").read_text() == "one"
+
+
+def test_executed_pin_moves_an_existing_checkout_that_is_ahead(tmp_path):
+    """The re-issue case: the box already holds a later main."""
+    origin, first, tip = _origin_with_two_commits(tmp_path)
+    checkout = tmp_path / "co"
+    assert _run_clone_block(_spec(repo_url=f"file://{origin}", checkout=str(checkout))).returncode == 0
+    assert _git(checkout, "rev-parse", "HEAD") == tip
+    r = _run_clone_block(_spec(repo_url=f"file://{origin}", checkout=str(checkout), pin_sha=first))
+    assert r.returncode == 0, r.stderr
+    assert _git(checkout, "rev-parse", "HEAD") == first
+
+
+def test_executed_unreachable_pin_fails_the_bootstrap_instead_of_running_the_tip(tmp_path):
+    origin, _, _ = _origin_with_two_commits(tmp_path)
+    checkout = tmp_path / "co"
+    r = _run_clone_block(_spec(repo_url=f"file://{origin}", checkout=str(checkout), pin_sha=_SHA_A))
+    assert r.returncode != 0
