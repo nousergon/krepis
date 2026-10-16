@@ -18,12 +18,13 @@
 # used and whether it differs from this packaged copy.
 #
 # Content provenance: byte-copied 2026-09-09 from
-# `alpha-engine-config/infrastructure/groom-llm-routing/gitleaks-egress.toml`,
-# the maintained variant (alpha-engine-config-I4946's false-positive fixes are
-# in it; the nousergon-lib copy predates them — that divergence is
-# alpha-engine-config-I9712 and is NOT resolved here). Changing a rule is a
-# change to a security control: edit here, and let the drift test in
-# alpha-engine-config fail until the other copies follow.
+# `alpha-engine-config/infrastructure/groom-llm-routing/gitleaks-egress.toml`.
+# Since 2026-10-15 (alpha-engine-config-I9712) THIS directory is the canonical
+# copy of both files: alpha-engine-config, claude-code-config and nousergon-lib
+# each carry a copy, and each of their CIs parses its copy and the one on
+# krepis `main` and fails on any rule-level difference (comments ignored).
+# Changing a rule is a change to a security control: edit here first, and the
+# other copies stay red until they follow.
 #
 # Original file's own header follows verbatim:
 title = "LLM egress session content-scan config (DeepSeek, xAI, ...)"
