@@ -597,7 +597,12 @@ def build_trace_record(
     **A call that raised is traced too** (``error`` set): ``result`` is then
     a stand-in carrying the request that reached the transport, if any, and
     there is no output. ``error.message`` is omitted whenever the DLP scan
-    blocked or errored, so a matched value can never reach a trace.
+    blocked or errored, so a matched value can never reach a trace, and
+    whenever the record is ``hash_only`` (declared, or downgraded from
+    ``full``): an exception's text can quote the model's output or the
+    prompt (a structured-output ``LLMError`` names the invalid payload, a
+    provider 400 can echo the request), and ``hash_only`` promises no body
+    text of either. ``error.type`` is always kept.
 
     **Content is the post-DLP body.** ``raw_request`` is the exact payload
     :meth:`krepis.llm.LLMClient._dlp_scan_request` scanned and the transport
@@ -702,6 +707,11 @@ def build_trace_record(
         message: Optional[str] = str(error)[:500]
         if dlp_verdict in ("dlp_block", "scan_error"):
             message = None  # a DLP reason may quote what it matched
+        elif capture == CAPTURE_HASH_ONLY:
+            # An exception's text can quote the output or the prompt
+            # (alpha-engine-config-I12312, found building metron-ops-PR367);
+            # hash_only writes no body text, so it writes no message either.
+            message = None
         error_entry = {"type": type(error).__name__, "message": message}
 
     extension: Dict[str, Any] = {

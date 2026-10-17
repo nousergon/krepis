@@ -412,6 +412,28 @@ class TestRecordContract:
         assert row["krepis"]["content"]["capture_reason"] == "configured"
         assert all(c["content_sha256"] for c in row["krepis"]["citations"])
 
+    @pytest.mark.parametrize(
+        "capture, verdict, kept",
+        [
+            (lt.CAPTURE_FULL, "ok", True),            # control: full keeps it
+            (lt.CAPTURE_HASH_ONLY, "ok", False),      # declared hash_only
+            (lt.CAPTURE_FULL, "dlp_disabled", False),  # downgraded to hash_only
+            (lt.CAPTURE_FULL, None, False),           # downgraded to hash_only
+        ],
+    )
+    def test_a_hash_only_error_record_keeps_no_message(self, capture, verdict, kept):
+        quoted = "LLMError: invalid tool payload {'holding': 'ACME 1200'}"
+        result = LLMResult(text="", model="m", provider="p", usage=LLMUsage(),
+                           raw_request={"messages": []}, dlp_verdict=verdict)
+        row, _ = lt.build_trace_record(
+            result, callsite_id="x", context=lt.TraceContext(trace_id="ab" * 16),
+            span_id=SPAN, started_at=T0, ended_at=T1, duration_ms=1,
+            request_model="m", capture=capture, error=RuntimeError(quoted),
+        )
+        assert row["error"]["type"] == "RuntimeError"
+        assert row["error"]["message"] == (quoted if kept else None)
+        assert ("ACME" in json.dumps(row)) is kept
+
     @pytest.mark.parametrize("verdict", [None, "dlp_disabled", "scan_error"])
     def test_an_unscanned_body_is_never_kept(self, verdict):
         result = LLMResult(text="t", model="m", provider="p", usage=LLMUsage(),
