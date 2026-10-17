@@ -413,6 +413,31 @@ class TestRaisedCallsAreTraced:
         assert json.loads(sink.blobs[content["input_sha256"]].data) == fake.kwargs[0]
         assert len(row["krepis"]["citations"]) == 2
 
+    def test_a_hash_only_failure_keeps_the_type_but_not_the_message(self):
+        # An exception's text can quote the model's output or the prompt (a
+        # structured-output LLMError names the invalid payload, a provider 400
+        # can echo the request). hash_only promises no body text, so the
+        # record keeps error.type and drops error.message
+        # (alpha-engine-config-I12312, found building metron-ops-PR367).
+        class Boom(Exception):
+            pass
+
+        class Failing(FakeOpenAI):
+            def _create(self, **kwargs):
+                raise Boom("invalid payload: tenant holds 1200 ACME")
+
+        sink = ts.InMemoryTraceSink()
+        with pytest.raises(Boom):
+            _client(OPENROUTER_SPEC, Failing([]), trace_sink=sink,
+                    trace_capture="hash_only").complete(
+                system="s", user_content="u",
+            )
+        (row,) = sink.rows
+        assert row["krepis"]["content"]["capture"] == "hash_only"
+        assert row["error"] == {"type": "Boom", "message": None}
+        assert "ACME" not in json.dumps(row)
+        assert sink.blobs == {}
+
     def test_a_dlp_block_is_traced_without_a_body_or_the_reason(self, monkeypatch):
         monkeypatch.setattr(
             _llm, "check_request",
