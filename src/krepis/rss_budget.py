@@ -99,6 +99,7 @@ import re
 import statistics
 from datetime import datetime, timezone
 from typing import Any, Final, Optional
+from krepis import rehearsal as rehearsal_ns
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
@@ -658,6 +659,14 @@ def publish(
     infrastructure step, or an S3 failure that was swallowed). The return value
     exists for tests and for the caller's log line; no caller may branch its
     exit code on it.
+
+    **A rehearsal never touches the console row** (`alpha-engine-config-I12351`).
+    When ``correlation_id`` — the orchestrator execution name, or ``$RUN_TOKEN``
+    when it is absent — names a rehearsal (:mod:`krepis.rehearsal`), both the
+    read of the previous row and the write go to the rehearsal's own copy
+    (``ops/.rehearsal/<token>/checks/<id>/latest.json``). The live row keeps
+    production's trend, and the console's ``ops/checks/`` listing never shows
+    the rehearsal's reading.
     """
     try:
         stage, step = split_description(description)
@@ -667,7 +676,9 @@ def publish(
             return None
 
         reading = parse_reading(stdout)
-        key = envelope_key(stage, prefix)
+        key = rehearsal_ns.namespaced_key(
+            envelope_key(stage, prefix), rehearsal_ns.rehearsal_token(correlation_id)
+        )
 
         if s3_client is None:
             import boto3

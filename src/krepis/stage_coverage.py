@@ -144,6 +144,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Final
 
+from krepis import rehearsal as rehearsal_ns
 from krepis import s3_surface
 from krepis.trading_calendar import last_closed_trading_day
 
@@ -848,7 +849,12 @@ def evaluate_stage(
 # ── Recording surface ────────────────────────────────────────────────────────
 
 
-def verdict_key(verdict: StageVerdict, *, prefix: str = VERDICT_PREFIX) -> str:
+def verdict_key(
+    verdict: StageVerdict,
+    *,
+    prefix: str = VERDICT_PREFIX,
+    rehearsal: str | None = None,
+) -> str:
     """S3 key the verdict record is written to.
 
     The date component is the execution's ``run_date`` and nothing else.
@@ -857,8 +863,14 @@ def verdict_key(verdict: StageVerdict, *, prefix: str = VERDICT_PREFIX) -> str:
     prefixes and left the question "did every stage of THIS run report?" with
     no answerable form (`alpha-engine-config-I8155`). ``StageVerdict`` cannot
     be constructed without a ``run_date``, so this cannot be reached blank.
+
+    ``rehearsal`` is a rehearsal's token (:func:`krepis.rehearsal.rehearsal_token`).
+    A rehearsal's verdict goes under ``{prefix}/.rehearsal/<token>/``, never
+    at the live ``{prefix}/{run_date}/`` key a production run's verdict for
+    the same date would hold (`alpha-engine-config-I12351`).
     """
-    return f"{prefix}/{_require_run_date(verdict.run_date)}/{verdict.stage}.json"
+    key = f"{prefix}/{_require_run_date(verdict.run_date)}/{verdict.stage}.json"
+    return rehearsal_ns.namespaced_key(key, rehearsal)
 
 
 def record_verdict(
@@ -868,6 +880,7 @@ def record_verdict(
     cloudwatch_client: Any = None,
     bucket: str = DEFAULT_BUCKET,
     prefix: str = VERDICT_PREFIX,
+    execution_name: str | None = None,
 ) -> None:
     """Persist the verdict to S3 and publish its metric. Never raises.
 
@@ -876,12 +889,22 @@ def record_verdict(
     destroy it — but a silent swallow would make the coverage surface report
     a smaller denominator with no signal, which is the defect this whole
     mechanism exists to remove.
+
+    **A rehearsal records nothing live** (`alpha-engine-config-I12351`). When
+    ``execution_name`` — or, absent it, ``$RUN_TOKEN`` — names a rehearsal
+    (:mod:`krepis.rehearsal`), the verdict is written under the rehearsal's
+    own ``{prefix}/.rehearsal/<token>/`` namespace and the CloudWatch metric
+    is NOT published: the metric carries no execution dimension, so a
+    rehearsal's ``0`` would be read by the coverage alarm as a production
+    stage that failed to cover. The skip is logged at INFO, never silent.
     """
+    rehearsal = rehearsal_ns.rehearsal_token(execution_name)
     if s3_client is not None:
+        key = verdict_key(verdict, prefix=prefix, rehearsal=rehearsal)
         try:
             s3_client.put_object(
                 Bucket=bucket,
-                Key=verdict_key(verdict, prefix=prefix),
+                Key=key,
                 Body=json.dumps(verdict.to_dict(), indent=2, default=str).encode(),
                 ContentType="application/json",
             )
@@ -890,11 +913,20 @@ def record_verdict(
                 "stage_coverage: FAILED to write verdict for %s to s3://%s/%s",
                 verdict.stage,
                 bucket,
-                verdict_key(verdict, prefix=prefix),
+                key,
                 exc_info=True,
             )
 
-    if cloudwatch_client is not None:
+    if rehearsal is not None:
+        logger.info(
+            "stage_coverage: %s verdict for %s recorded under the rehearsal "
+            "namespace only; the %s/%s metric is not published for a rehearsal",
+            verdict.status,
+            verdict.stage,
+            METRIC_NAMESPACE,
+            METRIC_NAME,
+        )
+    elif cloudwatch_client is not None:
         try:
             cloudwatch_client.put_metric_data(
                 Namespace=METRIC_NAMESPACE,
@@ -935,11 +967,17 @@ def assert_stage_coverage(
     bucket: str = DEFAULT_BUCKET,
     registry_local_path: str | None = None,
     not_applicable_reason: str | None = None,
+    execution_name: str | None = None,
 ) -> dict[str, Any]:
     """Assert ``stage`` wrote what it declared. Returns the verdict dict.
 
     ``not_applicable_reason``: the stage's own per-run declaration that its
     guard deliberately skipped the work — see :func:`evaluate_stage`.
+
+    ``execution_name``: the orchestrator execution this stage belongs to (a
+    bare name or an execution ARN). A rehearsal's verdict is recorded in the
+    rehearsal namespace only — see :func:`record_verdict`. Absent, the
+    process's ``$RUN_TOKEN`` decides.
 
     The front door for **Lambda-backed stages**: call immediately before
     returning, and merge the result into the handler's response payload under
@@ -1010,6 +1048,7 @@ def assert_stage_coverage(
             s3_client=s3_client,
             cloudwatch_client=cloudwatch_client,
             bucket=bucket,
+            execution_name=execution_name,
         )
         return verdict.to_dict()
     except Exception as exc:  # noqa: BLE001 — the assertion may never escape
@@ -1112,6 +1151,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     assert_cmd.add_argument(
+        "--execution-name",
+        default="",
+        help=(
+            "the orchestrator execution name or ARN (defaults to $RUN_TOKEN, "
+            "which krepis.ssm_log_capture exports). A rehearsal's verdict is "
+            "recorded in the rehearsal namespace only, with no metric."
+        ),
+    )
+    assert_cmd.add_argument(
         "--enforce",
         action="store_true",
         default=os.environ.get("STAGE_COVERAGE_ENFORCE", "").lower()
@@ -1171,6 +1219,7 @@ def main(argv: list[str] | None = None) -> int:
         bucket=args.bucket,
         registry_local_path=args.registry_path,
         not_applicable_reason=getattr(args, "not_applicable_reason", "") or None,
+        execution_name=getattr(args, "execution_name", "") or None,
     )
 
     status = verdict_dict.get("status", STATUS_UNMEASURED)
