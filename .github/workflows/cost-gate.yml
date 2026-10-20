@@ -116,5 +116,5 @@ jobs:
     needs: [cost-gate]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     permissions: {}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@6aeb9f99ea103d58ee7b024b8afa952ec98c357b
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@d86ca2dd43149079f77fb308b18bb6f0032fca9c
     secrets: inherit
