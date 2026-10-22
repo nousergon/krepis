@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 15,
+    "account_files": 6,
+    "bucket_hits": 88,
+    "bucket_files": 28,
+    "files": 32
+  },
+  "files": {
+    "src/krepis/_dedup.py": {
+      "bucket": 1
+    },
+    "src/krepis/alert_tiers.py": {
+      "account": 1,
+      "bucket": 3
+    },
+    "src/krepis/alerts.py": {
+      "bucket": 1
+    },
+    "src/krepis/anthropic_payload.py": {
+      "bucket": 1
+    },
+    "src/krepis/cost.py": {
+      "bucket": 2
+    },
+    "src/krepis/email_sender.py": {
+      "bucket": 2
+    },
+    "src/krepis/fleet_events.py": {
+      "bucket": 1
+    },
+    "src/krepis/locks.py": {
+      "bucket": 3
+    },
+    "src/krepis/model_pricing.yaml": {
+      "bucket": 1
+    },
+    "src/krepis/rss_budget.py": {
+      "bucket": 1
+    },
+    "src/krepis/spot_evidence.py": {
+      "bucket": 2
+    },
+    "src/krepis/ssm_log_capture.py": {
+      "bucket": 4
+    },
+    "src/krepis/stage_coverage.py": {
+      "bucket": 1
+    },
+    "src/krepis/telegram.py": {
+      "bucket": 1
+    },
+    "tests/golden/pre_extension_bootstrap.sh": {
+      "bucket": 1
+    },
+    "tests/test_alert_tiers.py": {
+      "account": 7
+    },
+    "tests/test_alert_total_delivery_failure.py": {
+      "account": 1
+    },
+    "tests/test_alerts.py": {
+      "account": 4,
+      "bucket": 10
+    },
+    "tests/test_alerts_provenance.py": {
+      "account": 1
+    },
+    "tests/test_anthropic_payload.py": {
+      "bucket": 1
+    },
+    "tests/test_aws.py": {
+      "bucket": 4
+    },
+    "tests/test_cost_record_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_cost_sink.py": {
+      "bucket": 2
+    },
+    "tests/test_fleet_events.py": {
+      "account": 1
+    },
+    "tests/test_llm_trace_emission.py": {
+      "bucket": 2
+    },
+    "tests/test_metrics.py": {
+      "bucket": 1
+    },
+    "tests/test_spot_bootstrap_overseer.py": {
+      "bucket": 8
+    },
+    "tests/test_spot_bootstrap_self_start.py": {
+      "bucket": 1
+    },
+    "tests/test_spot_evidence.py": {
+      "bucket": 2
+    },
+    "tests/test_ssm_dispatcher.py": {
+      "bucket": 24
+    },
+    "tests/test_ssm_log_capture.py": {
+      "bucket": 2
+    },
+    "tests/test_stage_coverage.py": {
+      "bucket": 5
+    }
+  }
+}
