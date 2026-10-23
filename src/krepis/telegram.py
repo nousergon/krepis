@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Final
 
 import requests
@@ -94,6 +95,85 @@ _HTML_TAGS: Final[frozenset] = frozenset({
     "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span",
     "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote",
 })
+
+
+#: The label every Telegram alert body carries (Brian, 2026-10-23: "when we
+#: post any alert or error in telegram i want a description of what solution
+#: is being automatically implemented"). Rule: observability-policy.md
+#: § Notification — auto-fix line. :func:`send_message` guarantees it: a body
+#: without the line gets one appended, so no sender can skip it.
+AUTO_FIX_LABEL: Final[str] = "Auto-fix:"
+#: Appended when the sender declared nothing. Honest about what happens by
+#: default: every send lands on the overseer alert intake, and the nightly
+#: sweep owns failures nobody else owns. A sender that has a real automatic
+#: fix (a retry, a self-heal, a filed issue with an owner) passes
+#: ``auto_fix=`` to say so; this default is the fallback, not the target.
+DEFAULT_AUTO_FIX: Final[str] = (
+    "none declared by this sender. If this is a failure, tonight's nightly "
+    "sweep (7pm PT) picks it up from the alert intake, finds the root cause "
+    "and opens the fix."
+)
+#: What an informational message (a report, a recovery, a digest) says when
+#: its sender declared nothing more specific.
+AUTO_FIX_NOT_NEEDED: Final[str] = "none needed (informational, nothing is broken)."
+# A caller-written line counts in any of the three body formats:
+# `Auto-fix: x`, `*Auto-fix:* x`, `<b>Auto-fix:</b> x` (case-insensitive,
+# at the start of a line, optionally after an emoji/bullet).
+_AUTO_FIX_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-•*_]|[^\w\s<]{1,2})?[ \t]*(?:<b>|<strong>)?[*_]?"
+    r"auto-fix[*_]?[ \t]*:"
+)
+
+
+def has_auto_fix_line(text: str) -> bool:
+    """True when ``text`` already carries an ``Auto-fix:`` line."""
+    return bool(_AUTO_FIX_RE.search(text or ""))
+
+
+def auto_fix_line(auto_fix: str | None = None, parse_mode: str | None = PARSE_MODE) -> str:
+    """Render the ``Auto-fix:`` line for ``parse_mode``.
+
+    ``auto_fix`` is plain text; under HTML it is escaped here. An empty or
+    missing value falls back to :data:`DEFAULT_AUTO_FIX` — the field is never
+    blank.
+    """
+    detail = (auto_fix or "").strip() or DEFAULT_AUTO_FIX
+    if parse_mode == PARSE_MODE_HTML:
+        return f"<b>{AUTO_FIX_LABEL}</b> {escape_html(detail)}"
+    if parse_mode == PARSE_MODE:
+        return f"*{AUTO_FIX_LABEL}* {detail}"
+    return f"{AUTO_FIX_LABEL} {detail}"
+
+
+def with_auto_fix(
+    text: str,
+    auto_fix: str | None = None,
+    parse_mode: str | None = PARSE_MODE,
+) -> str:
+    """Return ``text`` with an ``Auto-fix:`` line, appending one if absent.
+
+    A line the caller already wrote wins over ``auto_fix``: the body is the
+    caller's, and two contradictory lines are worse than one.
+    """
+    if has_auto_fix_line(text):
+        return text
+    return f"{text}\n\n{auto_fix_line(auto_fix, parse_mode)}"
+
+
+def _split_auto_fix_line(text: str) -> tuple[str, str | None]:
+    """Pull the caller's ``Auto-fix:`` line out of ``text``.
+
+    Used only when a body is over the size limit, so the line can be re-added
+    after truncation instead of being cut off with the tail.
+    """
+    m = _AUTO_FIX_RE.search(text)
+    if not m:
+        return text, None
+    end = text.find("\n", m.start())
+    end = len(text) if end == -1 else end
+    line = text[m.start():end]
+    rest = (text[: m.start()] + text[end:]).rstrip("\n")
+    return rest, line
 
 
 def _is_entity_parse_error(description: str) -> bool:
@@ -147,7 +227,7 @@ def _validate_parse_mode(parse_mode: "str | None") -> None:
         )
 
 
-def _truncate_for_telegram(text: str) -> str:
+def _truncate_for_telegram(text: str, limit: int = TELEGRAM_MESSAGE_MAX_CHARS) -> str:
     """Truncate ``text`` to fit Telegram's ``TELEGRAM_MESSAGE_MAX_CHARS``
     hard limit, appending a marker noting how much was cut. No-op when
     already within the limit.
@@ -159,14 +239,14 @@ def _truncate_for_telegram(text: str) -> str:
     trimming the tail preserves the part an operator needs to triage at a
     glance, at the cost of the least-essential detail.
     """
-    if len(text) <= TELEGRAM_MESSAGE_MAX_CHARS:
+    if len(text) <= limit:
         return text
-    suffix = f"\n…(truncated, showing {TELEGRAM_MESSAGE_MAX_CHARS} of {len(text)} chars)"
-    keep = TELEGRAM_MESSAGE_MAX_CHARS - len(suffix)
+    suffix = f"\n…(truncated, showing {limit} of {len(text)} chars)"
+    keep = limit - len(suffix)
     return text[:keep] + suffix
 
 
-def _truncate_html(text: str) -> str:
+def _truncate_html(text: str, limit: int = TELEGRAM_MESSAGE_MAX_CHARS) -> str:
     """Truncate an HTML-mode body to a TAG BOUNDARY, then close what is open.
 
     :func:`_truncate_for_telegram` cuts at a character count. Under
@@ -187,10 +267,10 @@ def _truncate_html(text: str) -> str:
     inside ``&am`` renders those characters literally, which is ugly and
     accepted, not a rejection.
     """
-    if len(text) <= TELEGRAM_MESSAGE_MAX_CHARS:
+    if len(text) <= limit:
         return text
-    suffix = f"\n…(truncated, showing {TELEGRAM_MESSAGE_MAX_CHARS} of {len(text)} chars)"
-    keep = TELEGRAM_MESSAGE_MAX_CHARS - len(suffix)
+    suffix = f"\n…(truncated, showing {limit} of {len(text)} chars)"
+    keep = limit - len(suffix)
     # Reserve room for the closers of the deepest nesting in the whole body:
     # cheaper than iterating, and the over-reservation is at most a few tags.
     keep -= _max_open_tag_closer_length(text)
@@ -333,6 +413,7 @@ def send_message(
     chat_id: str | int | None = None,
     message_thread_id: int | None = None,
     parse_mode: str | None = PARSE_MODE,
+    auto_fix: str | None = None,
 ) -> bool:
     """Send a single Telegram message to the channel resolved from secrets.
 
@@ -375,6 +456,12 @@ def send_message(
     :param message_thread_id: Optional forum-topic id for supergroup routing.
     :param parse_mode: ``"Markdown"`` (default), ``"HTML"`` or ``None`` for
         plain text — see above.
+    :param auto_fix: Plain-text description of what is being fixed
+        automatically, who owns it and when. Rendered as the message's
+        ``Auto-fix:`` line. Every message carries that line: if ``text``
+        already has one it is kept, otherwise this value (or
+        :data:`DEFAULT_AUTO_FIX` when ``None``) is appended. The line is kept
+        through truncation.
     :returns: ``True`` if the Telegram API returned HTTP 200, ``False``
         otherwise (missing secrets, network error, non-200 response). A 400
         caused by unparseable entities (Markdown or HTML) is retried once as
@@ -396,12 +483,34 @@ def send_message(
     # sequences the transport adds are never what pushes a body over the
     # limit, and never what gets cut in half). HTML is the one mode where the
     # cut itself must respect structure — see `_truncate_html`.
-    if parse_mode == PARSE_MODE:
-        body_text = _escape_markdown(_truncate_for_telegram(text))
-    elif parse_mode == PARSE_MODE_HTML:
-        body_text = _truncate_html(text)
+    # ── Auto-fix line (observability-policy § Notification — auto-fix line)
+    # Every message says what is being fixed automatically. The line is kept
+    # OUT of the truncation budget and appended after the cut, so a long body
+    # (journal excerpts, tracebacks) can never push it off the tail.
+    if has_auto_fix_line(text):
+        main_text, fix_line = text, None
+        if len(text) > TELEGRAM_MESSAGE_MAX_CHARS:
+            main_text, fix_line = _split_auto_fix_line(text)
     else:
-        body_text = _truncate_for_telegram(text)
+        main_text, fix_line = text, auto_fix_line(auto_fix, parse_mode)
+    budget = TELEGRAM_MESSAGE_MAX_CHARS
+    if fix_line is not None:
+        budget = max(TELEGRAM_MESSAGE_MAX_CHARS - len(fix_line) - 2, 200)
+    full_text = main_text if fix_line is None else f"{main_text}\n\n{fix_line}"
+
+    if parse_mode == PARSE_MODE:
+        body_text = _truncate_for_telegram(main_text, budget)
+        if fix_line is not None:
+            body_text = f"{body_text}\n\n{fix_line}"
+        body_text = _escape_markdown(body_text)
+    elif parse_mode == PARSE_MODE_HTML:
+        body_text = _truncate_html(main_text, budget)
+        if fix_line is not None:
+            body_text = f"{body_text}\n\n{fix_line}"
+    else:
+        body_text = _truncate_for_telegram(main_text, budget)
+        if fix_line is not None:
+            body_text = f"{body_text}\n\n{fix_line}"
 
     # Key ORDER is preserved from before I9925 (chat_id, text, parse_mode,
     # disable_notification) so the default call is byte-identical on the
@@ -511,7 +620,7 @@ def send_message(
     if not fleet_events.emission_suppressed():
         fleet_events.emit_alert_event(
             origin="telegram.send_message",
-            body=text,
+            body=full_text,
             severity_raw=None,
             dedup_key=None,
             channels={"sns": None, "telegram": ok},
@@ -526,6 +635,7 @@ def send_rollup(
     *,
     header: str | None = None,
     disable_notification: bool = True,
+    auto_fix: str | None = None,
 ) -> bool:
     """Send a bulleted rollup of N findings as a single message.
 
@@ -542,6 +652,8 @@ def send_rollup(
     :param header: Optional bold header rendered above the bullets.
     :param disable_notification: Default ``True`` (silent). Pass ``False`` to
         push.
+    :param auto_fix: What is being fixed automatically; see
+        :func:`send_message`. ``None`` lets the transport append its default.
     :returns: ``True`` if no findings (no-op) or Telegram returned 200,
         ``False`` on send failure.
     """
@@ -554,4 +666,8 @@ def send_rollup(
     lines.extend(f"- {item}" for item in findings)
     text = "\n".join(lines)
 
-    return send_message(text, disable_notification=disable_notification)
+    if auto_fix is None:
+        return send_message(text, disable_notification=disable_notification)
+    return send_message(
+        text, disable_notification=disable_notification, auto_fix=auto_fix
+    )

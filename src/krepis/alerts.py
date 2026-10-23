@@ -234,8 +234,13 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from krepis import _dedup, alert_tiers, fleet_events
+from krepis.telegram import (
+    AUTO_FIX_NOT_NEEDED,
+    _validate_parse_mode,
+    has_auto_fix_line,
+    with_auto_fix,
+)
 from krepis.telegram import PARSE_MODE as TELEGRAM_PARSE_MODE
-from krepis.telegram import _validate_parse_mode
 
 logger = logging.getLogger(__name__)
 
@@ -748,6 +753,13 @@ def _muted_topic_arn(page_arn: str | None) -> str | None:
     return f"{head}:{sibling}"
 
 
+#: Severities whose default ``Auto-fix:`` line is "none needed" rather than
+#: the nightly-sweep fallback: nothing failed.
+_AUTO_FIX_INFORMATIONAL_SEVERITIES: Final[frozenset[str]] = frozenset(
+    {"info", "debug", "notice", "ok", "success"}
+)
+
+
 def _format_message(
     message: str,
     severity: str,
@@ -1208,6 +1220,7 @@ def publish(
     episode_attributes: dict | None = None,
     raise_on_total_failure: bool = True,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
+    auto_fix: str | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1337,6 +1350,14 @@ def publish(
         interpolated string through :func:`krepis.telegram.escape_html`,
         INCLUDING ``source``, which this function splices into the prefix
         verbatim. ``None`` sends plain text with no ``parse_mode`` key.
+    :param auto_fix: Plain text saying what is being fixed automatically, who
+        owns it and when — for example ``"retrying at 06:10 UTC; filed as
+        alpha-engine-config#123 for tonight's sweep"``. Rendered as the
+        ``Auto-fix:`` line on every channel (observability-policy
+        § Notification — auto-fix line). ``None`` falls back to
+        :data:`krepis.telegram.AUTO_FIX_NOT_NEEDED` for a recovery or an
+        info/debug message, and to :data:`krepis.telegram.DEFAULT_AUTO_FIX`
+        otherwise. A body that already carries an ``Auto-fix:`` line keeps it.
     :param destination: Explicit override of the severity-derived Telegram
         destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
         derives it from ``severity``. An override is honoured where it can
@@ -1388,6 +1409,20 @@ def publish(
     # message (see `_dedup_marker_key`), and it cannot reach the bus event,
     # which carries `body=message` — the caller's raw text — below. Marks,
     # never suppresses: the alert is delivered exactly as it would have been.
+    # ── Auto-fix line (Brian, 2026-10-23) ────────────────────────────────
+    # Every alert says what is being fixed automatically. Added to the
+    # delivered text on every channel (SNS email included), never to the bus
+    # event's raw `body` or the dedup identity. Before the provenance suffix,
+    # which stays the last line.
+    if not has_auto_fix_line(formatted):
+        fix_detail = auto_fix
+        if not fix_detail and (
+            state == ALERT_STATE_CLEARED
+            or severity.lower() in _AUTO_FIX_INFORMATIONAL_SEVERITIES
+        ):
+            fix_detail = AUTO_FIX_NOT_NEEDED
+        formatted = with_auto_fix(formatted, fix_detail, parse_mode)
+
     provenance = _provenance_suffix()
     if provenance:
         formatted = f"{formatted}{provenance}"
@@ -1873,6 +1908,15 @@ def main(argv: list[str] | None = None) -> int:
             "rendered between the severity tag and the message body."
         ),
     )
+    pub.add_argument(
+        "--auto-fix",
+        default=None,
+        help=(
+            "What is being fixed automatically, who owns it and when. "
+            "Rendered as the alert's 'Auto-fix:' line; omitted means the "
+            "default line (nightly sweep) is used."
+        ),
+    )
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
@@ -2083,6 +2127,7 @@ def main(argv: list[str] | None = None) -> int:
             identity_key=args.identity_key,
             destination=args.destination,
             console_artifact=args.console_artifact,
+            auto_fix=args.auto_fix,
         )
     except AlertDeliveryError as exc:
         # The CLI is the Bash-caller surface, so the diagnosis goes to stderr

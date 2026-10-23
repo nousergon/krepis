@@ -206,7 +206,10 @@ class TestEnvDryRunReachesPublish:
 # ── 2. Provenance: the normal path is untouched ────────────────────────────
 
 
-_EXPECTED_TODAY = "[ERROR] metron: boom"
+_EXPECTED_TODAY = (
+    "[ERROR] metron: boom\n\n"
+    f"*Auto-fix:* {__import__('krepis.telegram').telegram.DEFAULT_AUTO_FIX}"
+)
 
 
 class TestScheduledContextIsByteIdentical:
@@ -287,7 +290,7 @@ class TestAdHocPublishCarriesProvenance:
         fake, _sts, sns = fake_boto3
         _publish(fake, message="boom", source="metron")
         lines = sns.publish.call_args.kwargs["Message"].splitlines()
-        assert lines[0] == _EXPECTED_TODAY
+        assert "\n".join(lines[:3]) == _EXPECTED_TODAY
         assert lines[-1].startswith(alerts.PROVENANCE_PREFIX)
 
     def test_it_marks_and_never_suppresses(
@@ -470,4 +473,4 @@ class TestProvenanceChangesNothingElse:
         """The formatter is a pure function and stays one — the suffix is
         applied by ``publish``, so every consumer that calls ``_format_message``
         (or asserts on it) sees exactly what it saw before."""
-        assert alerts._format_message("boom", "error", "metron") == _EXPECTED_TODAY
+        assert alerts._format_message("boom", "error", "metron") == "[ERROR] metron: boom"
