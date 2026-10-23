@@ -132,5 +132,8 @@ class TestPublishEndToEnd:
         assert post.call_count == 1
         payload = post.call_args.kwargs["json"]
         assert payload["parse_mode"] == "HTML"
-        assert payload["text"] == "[INFO] crucible/report.morning: <b>LADDER</b> phase&lt;0&gt;"
+        assert payload["text"] == (
+            "[INFO] crucible/report.morning: <b>LADDER</b> phase&lt;0&gt;\n\n"
+            "<b>Auto-fix:</b> none needed (informational, nothing is broken)."
+        )
         assert result.telegram.ok is True

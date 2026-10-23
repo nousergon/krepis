@@ -18,6 +18,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+import krepis.telegram as alerts_mod_tg
+
 from krepis import alerts
 
 
@@ -195,7 +197,14 @@ class TestPublish:
                 # No-push, not no-send: disable_notification=True, message sent.
                 assert send.call_args.kwargs.get("disable_notification") is True
                 sent_text = send.call_args.args[0] if send.call_args.args else send.call_args.kwargs.get("message")
-                assert sent_text == f"[{sev.upper()}] test: x"
+                assert sent_text == (
+                    f"[{sev.upper()}] test: x\n\n*Auto-fix:* "
+                    + (
+                        alerts_mod_tg.AUTO_FIX_NOT_NEEDED
+                        if sev.lower() in {"info", "debug", "notice"}
+                        else alerts_mod_tg.DEFAULT_AUTO_FIX
+                    )
+                )
 
     def test_severity_phone_push_alias_matches_canonical(self):
         """SEVERITY_PUSH is a deprecated alias (CONTRIBUTING.md additive-only

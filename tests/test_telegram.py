@@ -9,6 +9,7 @@ empty-list / header / default-silent semantics.
 
 from __future__ import annotations
 
+import re
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -16,6 +17,14 @@ import requests
 
 from krepis import telegram as tg
 from krepis.secrets import clear_cache
+
+_FIX_TAIL = re.compile(r"\n\n(?:\*Auto-fix:\*|<b>Auto-fix:</b>|Auto-fix:) [^\n]*\Z")
+
+
+def _body(text: str) -> str:
+    """The message body without the transport-appended ``Auto-fix:`` line."""
+    assert _FIX_TAIL.search(text), f"no Auto-fix line appended: {text!r}"
+    return _FIX_TAIL.sub("", text)
 
 
 @pytest.fixture(autouse=True)
@@ -117,7 +126,7 @@ class TestSendMessageHappyPath:
     def test_payload_shape(self, configured_env, mock_post):
         tg.send_message("hello world")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload == {
+        assert {**payload, "text": _body(payload["text"])} == {
             "chat_id": "12345",
             "text": "hello world",
             "parse_mode": "Markdown",
@@ -131,13 +140,13 @@ class TestSendMessageHappyPath:
     def test_escapes_markdown_in_text(self, configured_env, mock_post):
         tg.send_message("ticker_AAPL [BUY]")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "ticker\\_AAPL \\[BUY\\]"
-        assert payload["text"].replace("\\", "") == "ticker_AAPL [BUY]"
+        assert _body(payload["text"]) == "ticker\\_AAPL \\[BUY\\]"
+        assert _body(payload["text"]).replace("\\", "") == "ticker_AAPL [BUY]"
 
     def test_preserves_bold_markers(self, configured_env, mock_post):
         tg.send_message("*BUY AAPL*")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "*BUY AAPL*"
+        assert _body(payload["text"]) == "*BUY AAPL*"
 
     def test_oversized_text_is_truncated_before_send(self, configured_env, mock_post):
         # config-I3301: alert_on_failure.sh dumped 30 raw journal lines with
@@ -256,17 +265,17 @@ class TestSendRollup:
     def test_single_finding_renders_as_bullet(self, configured_env, mock_post):
         tg.send_rollup(["AMAT untouched 14 days"])
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "- AMAT untouched 14 days"
+        assert _body(payload["text"]) == "- AMAT untouched 14 days"
 
     def test_multiple_findings_render_as_bullets(self, configured_env, mock_post):
         tg.send_rollup(["one", "two", "three"])
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "- one\n- two\n- three"
+        assert _body(payload["text"]) == "- one\n- two\n- three"
 
     def test_header_prepended_as_bold(self, configured_env, mock_post):
         tg.send_rollup(["finding"], header="Surveillance Digest")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "*Surveillance Digest*\n- finding"
+        assert _body(payload["text"]) == "*Surveillance Digest*\n- finding"
 
     def test_defaults_to_silent_delivery(self, configured_env, mock_post):
         tg.send_rollup(["finding"])
@@ -365,7 +374,7 @@ class TestParseModeHtml:
         # to escape (see TestEscapeHtml).
         tg.send_message("<b>LADDER</b> phase_0 [x] `ok`", parse_mode="HTML")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "<b>LADDER</b> phase_0 [x] `ok`"
+        assert _body(payload["text"]) == "<b>LADDER</b> phase_0 [x] `ok`"
 
     def test_html_mode_applies_no_markdown_escaping(self, configured_env, mock_post):
         tg.send_message("ticker_AAPL [BUY]", parse_mode="HTML")
@@ -399,7 +408,7 @@ class TestParseModeNone:
     def test_none_applies_no_escaping(self, configured_env, mock_post):
         tg.send_message("a_b [c] `d` <e>", parse_mode=None)
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"] == "a_b [c] `d` <e>"
+        assert _body(payload["text"]) == "a_b [c] `d` <e>"
 
     def test_none_is_not_retried_on_a_parse_error(self, configured_env, mock_post):
         # Plain text was never sent with a parse mode, so there is nothing to
@@ -434,7 +443,7 @@ class TestParseModeMarkdownIsUnchanged:
         explicit_payload = mock_post.call_args.kwargs["json"]
         assert explicit_payload == default_payload
         assert explicit_payload["parse_mode"] == "Markdown"
-        assert explicit_payload["text"] == "ticker\\_AAPL \\[BUY\\] *bold*"
+        assert _body(explicit_payload["text"]) == "ticker\\_AAPL \\[BUY\\] *bold*"
 
     def test_the_wire_body_is_byte_identical_including_key_order(self, configured_env, mock_post):
         # "Byte-identical" means the serialised JSON, not a dict comparison
@@ -442,12 +451,12 @@ class TestParseModeMarkdownIsUnchanged:
         # the payload is BUILT in is the order on the wire.
         import json
 
-        tg.send_message("hello world")
+        tg.send_message("hello world\n\nAuto-fix: none needed.")
         payload = mock_post.call_args.kwargs["json"]
         assert list(payload) == ["chat_id", "text", "parse_mode", "disable_notification"]
         assert json.dumps(payload) == (
-            '{"chat_id": "12345", "text": "hello world", "parse_mode": "Markdown", '
-            '"disable_notification": false}'
+            '{"chat_id": "12345", "text": "hello world\\n\\nAuto-fix: none needed.", '
+            '"parse_mode": "Markdown", "disable_notification": false}'
         )
 
     def test_the_module_default_constant_is_still_markdown(self):
@@ -480,7 +489,7 @@ class TestEscapeHtml:
     def test_escaped_text_survives_an_html_send_verbatim(self, configured_env, mock_post):
         body = "<b>DETAIL</b> " + tg.escape_html("gates/<phase>/gate.json & more")
         tg.send_message(body, parse_mode="HTML")
-        assert mock_post.call_args.kwargs["json"]["text"] == body
+        assert _body(mock_post.call_args.kwargs["json"]["text"]) == body
 
 
 class TestHtmlTruncation:
@@ -522,9 +531,11 @@ class TestHtmlTruncation:
     def test_send_under_html_uses_tag_aware_truncation(self, configured_env, mock_post):
         tg.send_message("<pre>" + "z" * 6000 + "</pre>", parse_mode="HTML")
         payload = mock_post.call_args.kwargs["json"]
-        assert payload["text"].endswith(
-            f"</pre>\n…(truncated, showing {tg.TELEGRAM_MESSAGE_MAX_CHARS} of 6011 chars)"
-        )
+        # The Auto-fix line is reserved out of the budget and appended after
+        # the cut, so the truncation marker reports the smaller budget.
+        body = _body(payload["text"])
+        assert "</pre>\n…(truncated, showing " in body
+        assert body.endswith(" of 6011 chars)")
         assert len(payload["text"]) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
 
 
