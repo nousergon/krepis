@@ -204,7 +204,32 @@ class TestPublish:
                         if sev.lower() in {"info", "debug", "notice"}
                         else alerts_mod_tg.DEFAULT_AUTO_FIX
                     )
+                    + "\n*Resolution:* "
+                    + (
+                        alerts_mod_tg.RESOLUTION_NOT_NEEDED
+                        if sev.lower() in {"info", "debug", "notice"}
+                        else alerts_mod_tg.DEFAULT_RESOLUTION
+                    )
                 )
+
+    def test_declared_resolution_reaches_every_channel(self, fake_boto3):
+        """Brian 2026-10-24: every alert names the issue that resolves it."""
+        fake, _sts, sns = fake_boto3
+        from krepis import telegram as tg_mod
+
+        with patch.dict("sys.modules", {"boto3": fake}):
+            with patch.object(tg_mod, "send_message", return_value=True) as send:
+                alerts.publish(
+                    "x", severity="error", source="test",
+                    auto_fix="retry at 06:10",
+                    resolution="alpha-engine-config#123 — widen the window",
+                )
+        sent = send.call_args.args[0]
+        assert sent.endswith(
+            "*Auto-fix:* retry at 06:10\n"
+            "*Resolution:* alpha-engine-config#123 — widen the window"
+        )
+        assert "Resolution: alpha-engine-config#123" in sns.publish.call_args.kwargs["Message"].replace("*", "")
 
     def test_severity_phone_push_alias_matches_canonical(self):
         """SEVERITY_PUSH is a deprecated alias (CONTRIBUTING.md additive-only

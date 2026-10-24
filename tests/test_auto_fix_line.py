@@ -34,8 +34,19 @@ def post():
         yield mocked
 
 
+def _drop_resolution(text: str) -> str:
+    """Remove the ``Resolution:`` line the transport adds beside ``Auto-fix:``.
+
+    That line has its own guard (``tests/test_telegram.py::TestResolutionLine``);
+    these tests pin the Auto-fix half only.
+    """
+    return "\n".join(
+        line for line in text.split("\n") if not tg.has_resolution_line(line)
+    )
+
+
 def _sent(post) -> str:
-    return post.call_args.kwargs["json"]["text"]
+    return _drop_resolution(post.call_args.kwargs["json"]["text"])
 
 
 class TestDetection:
@@ -99,7 +110,8 @@ class TestSendMessage:
     def test_bus_event_body_carries_the_line(self, post):
         tg.send_message("boom", auto_fix="retrying")
         body = tg.fleet_events.emit_alert_event.call_args.kwargs["body"]
-        assert body.endswith("Auto-fix:* retrying")
+        assert _drop_resolution(body).endswith("Auto-fix:* retrying")
+        assert tg.has_resolution_line(body)
 
     def test_rollup_passes_auto_fix_through(self, post):
         tg.send_rollup(["a"], auto_fix="none needed")
@@ -137,7 +149,7 @@ def _publish(**kwargs):
          patch.object(alerts, "_resolve_sns_topic_arn", return_value="arn:aws:sns:us-east-1:1:t"), \
          patch.object(alerts, "_resolve_log_chat", return_value=(None, None)):
         alerts.publish(**kwargs)
-    return sns.call_args.args[1], tgm.call_args.args[0]
+    return _drop_resolution(sns.call_args.args[1]), _drop_resolution(tgm.call_args.args[0])
 
 
 class TestPublish:

@@ -208,7 +208,8 @@ class TestEnvDryRunReachesPublish:
 
 _EXPECTED_TODAY = (
     "[ERROR] metron: boom\n\n"
-    f"*Auto-fix:* {__import__('krepis.telegram').telegram.DEFAULT_AUTO_FIX}"
+    f"*Auto-fix:* {__import__('krepis.telegram').telegram.DEFAULT_AUTO_FIX}\n"
+    f"*Resolution:* {__import__('krepis.telegram').telegram.DEFAULT_RESOLUTION}"
 )
 
 
@@ -290,7 +291,7 @@ class TestAdHocPublishCarriesProvenance:
         fake, _sts, sns = fake_boto3
         _publish(fake, message="boom", source="metron")
         lines = sns.publish.call_args.kwargs["Message"].splitlines()
-        assert "\n".join(lines[:3]) == _EXPECTED_TODAY
+        assert "\n".join(lines[:4]) == _EXPECTED_TODAY
         assert lines[-1].startswith(alerts.PROVENANCE_PREFIX)
 
     def test_it_marks_and_never_suppresses(
