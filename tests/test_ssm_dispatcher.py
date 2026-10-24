@@ -1592,6 +1592,55 @@ class TestRemoteOutputTail:
         assert "Killed" in payload["remote_tail"]
 
 
+    def test_the_cause_survives_a_warning_that_fills_the_tails(self):
+        """alpha-engine-config-I7021: the weekly DataPhase1 of 2026-08-11 died
+        on an early ERROR, then a huge warning and the teardown filled both
+        tails. The envelope must still carry the failing line."""
+        cause = (
+            "ERROR [data-collector] historical_constituents phase failed: No "
+            "'Selected changes to the list' table found"
+        )
+        noise = "WARNING Split-jump audit: 617 ticker(s) " + "AAPL:[...] " * 400
+        inline = "INFO [data-collector] start\n" + cause + "\n" + noise + "\n"
+        s3 = _FakeS3ForTail({_STDOUT_KEY: b"ERROR: DataPhase1 failed\n"})
+        ssm = _fake_ssm(
+            poll_sequence=[
+                {
+                    "Status": "Failed",
+                    "StandardOutputContent": inline,
+                    "StandardErrorContent": "failed to run commands: exit status 1",
+                    "ResponseCode": 1,
+                }
+            ]
+        )
+        ssm_dispatcher.run(
+            "i-08a",
+            "data-weekly: DataPhase1",
+            "x",
+            output_bucket="alpha-engine-research",
+            output_key_prefix=_TAIL_PREFIX,
+            diagnostics_bucket="alpha-engine-research",
+            diagnostics_prefix="_spot_diagnostics/ae-data",
+            stdout_stream=io.StringIO(),
+            stderr_stream=io.StringIO(),
+            sleep=lambda s: None,
+            boto3_client=ssm,
+            s3_client=s3,
+        )
+        payload = json.loads(s3.put_calls[-1]["Body"].decode("utf-8"))
+        assert payload["first_cause_line"] == cause
+        assert payload["last_cause_line"] == "ERROR: DataPhase1 failed"
+        assert "historical_constituents" not in payload["stdout_tail"]
+
+    def test_cause_lines_skip_info_lines_and_are_clipped(self):
+        first, last = ssm_dispatcher._cause_lines(
+            "INFO [x] no ERROR here really\n", None, "ValueError: " + "z" * 1000
+        )
+        assert first == last
+        assert first.startswith("ValueError: ") and len(first) < 500
+        assert ssm_dispatcher._cause_lines("", None) == (None, None)
+
+
 class TestResourceLimitIsNamed:
     """sf-pipeline-policy §3 obligation 3 — name the stage, the LIMIT and the
     observed value in what the operator reads."""

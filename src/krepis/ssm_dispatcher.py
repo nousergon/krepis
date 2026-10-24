@@ -118,6 +118,7 @@ from datetime import datetime, timezone
 from typing import Final, Optional
 
 from . import resource_kill, rss_budget, s3_surface
+from .ssm_log_capture import CAUSE_RE, clip_failure_line
 
 logger = logging.getLogger(__name__)
 
@@ -380,6 +381,33 @@ class SsmDispatchError(Exception):
     """Non-recoverable SSM send-command / poll failure."""
 
 
+def _cause_lines(*texts: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """The FIRST and LAST cause-shaped lines across ``texts``, in order.
+
+    alpha-engine-config-I7021. A tail keeps whatever happened last, and on a
+    failing run that is the exit path: the weekly DataPhase1 of 2026-08-11
+    died on line 79 of 255, while both of its diagnostics tails held a
+    capped warning and ``failed to run commands: exit status 1``. The first
+    cause-shaped line is usually the real one; the last is kept beside it,
+    because a run that recovers from an early error and then fails late
+    would otherwise lose the late one. Uses ``ssm_log_capture``'s own
+    ``CAUSE_RE`` so the two capture paths cannot disagree about what a
+    cause looks like. INFO/DEBUG structured lines are skipped, as in
+    ``resource_kill.find_kill_line``.
+    """
+    first: Optional[str] = None
+    last: Optional[str] = None
+    for text in texts:
+        for line in (text or "").splitlines():
+            stripped = line.strip()
+            if not stripped or resource_kill.STRUCTURED_LOG_LINE_RE.search(stripped):
+                continue
+            if CAUSE_RE.search(stripped):
+                first = first or clip_failure_line(stripped)
+                last = clip_failure_line(stripped)
+    return first, last
+
+
 def _tail_bytes(text: str, max_bytes: int = DIAGNOSTICS_TAIL_BYTES) -> str:
     """Return the last ``max_bytes`` of ``text``, snapping to a line boundary.
 
@@ -418,6 +446,8 @@ def _ship_diagnostics(
     classification: Optional[str] = None,
     kill_line: Optional[str] = None,
     remote_tail: Optional[str] = None,
+    first_cause_line: Optional[str] = None,
+    last_cause_line: Optional[str] = None,
 ) -> tuple[bool, str]:
     """Write the terminal-non-Success diagnostics JSON to S3.
 
@@ -457,6 +487,10 @@ def _ship_diagnostics(
         # 4-hour failure was a truncated capture pointing at an emptied prefix.
         "kill_line": kill_line,
         "remote_tail": remote_tail,
+        # alpha-engine-config-I7021: the tails above keep what happened LAST,
+        # which on a failing run is the teardown. These keep the cause.
+        "first_cause_line": first_cause_line,
+        "last_cause_line": last_cause_line,
     }
     try:
         if boto3_client is None:
@@ -786,6 +820,12 @@ def run(
             classification = _classify_terminal_failure(
                 status, response_code, kill_line=kill_line
             )
+            # Inline stdout keeps the HEAD of the run and the remote tail keeps
+            # its END, so that order is chronological at the two ends. Stderr
+            # is a separate stream and sits between them.
+            first_cause_line, last_cause_line = _cause_lines(
+                str(std_out), str(std_err), remote_tail
+            )
             # Nested-log location is one copy-paste away rather than three
             # inferences (alpha-engine-config-I7258 obligation 4): the full
             # remote stdout/stderr — where a bash "Killed" line actually
@@ -884,6 +924,8 @@ def run(
                     classification=classification,
                     kill_line=kill_line,
                     remote_tail=_tail_bytes(remote_tail),
+                    first_cause_line=first_cause_line,
+                    last_cause_line=last_cause_line,
                 )
                 if ok:
                     err.write(

@@ -428,6 +428,13 @@ def _clip(line: str | None) -> str:
     return line[:_FAILURE_LINE_CLIP] + f"… (+{len(line) - _FAILURE_LINE_CLIP} chars)"
 
 
+#: Public names for the two pieces ``krepis.ssm_dispatcher`` shares, so its
+#: diagnostics envelope and this module's failure message agree on what a
+#: cause line looks like and how long it may be (alpha-engine-config-I7021).
+CAUSE_RE: Final = _CAUSE_RE
+clip_failure_line = _clip
+
+
 def format_subprocess_failure(
     step_name: str,
     *,
