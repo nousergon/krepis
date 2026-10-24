@@ -18,11 +18,14 @@ import requests
 from krepis import telegram as tg
 from krepis.secrets import clear_cache
 
-_FIX_TAIL = re.compile(r"\n\n(?:\*Auto-fix:\*|<b>Auto-fix:</b>|Auto-fix:) [^\n]*\Z")
+_FIX_TAIL = re.compile(
+    r"\n\n(?:\*Auto-fix:\*|<b>Auto-fix:</b>|Auto-fix:) [^\n]*"
+    r"\n(?:\*Resolution:\*|<b>Resolution:</b>|Resolution:) [^\n]*\Z"
+)
 
 
 def _body(text: str) -> str:
-    """The message body without the transport-appended ``Auto-fix:`` line."""
+    """The body without the transport-appended ``Auto-fix:``/``Resolution:`` footer."""
     assert _FIX_TAIL.search(text), f"no Auto-fix line appended: {text!r}"
     return _FIX_TAIL.sub("", text)
 
@@ -451,11 +454,11 @@ class TestParseModeMarkdownIsUnchanged:
         # the payload is BUILT in is the order on the wire.
         import json
 
-        tg.send_message("hello world\n\nAuto-fix: none needed.")
+        tg.send_message("hello world\n\nAuto-fix: none needed.\nResolution: none needed.")
         payload = mock_post.call_args.kwargs["json"]
         assert list(payload) == ["chat_id", "text", "parse_mode", "disable_notification"]
         assert json.dumps(payload) == (
-            '{"chat_id": "12345", "text": "hello world\\n\\nAuto-fix: none needed.", '
+            '{"chat_id": "12345", "text": "hello world\\n\\nAuto-fix: none needed.\\nResolution: none needed.", '
             '"parse_mode": "Markdown", "disable_notification": false}'
         )
 
@@ -676,3 +679,66 @@ class TestDestinationOverrides:
         assert retry_payload["chat_id"] == "-1001234"
         assert retry_payload["message_thread_id"] == 7
         assert "parse_mode" not in retry_payload
+
+
+class TestResolutionLine:
+    """Every message names what will END the problem (Brian, 2026-10-24).
+
+    observability-policy § Notification — auto-fix line (§7.4b, resolution half).
+    """
+
+    def _sent(self, mock_post) -> str:
+        return mock_post.call_args.kwargs["json"]["text"]
+
+    def test_default_resolution_appended_under_auto_fix(self, configured_env, mock_post):
+        tg.send_message("boom", parse_mode=None)
+        text = self._sent(mock_post)
+        fix_at = text.index("Auto-fix:")
+        res_at = text.index("Resolution:")
+        assert res_at > fix_at
+        assert text.endswith(f"Resolution: {tg.DEFAULT_RESOLUTION}")
+
+    def test_declared_resolution_is_rendered(self, configured_env, mock_post):
+        tg.send_message(
+            "boom", parse_mode=None,
+            resolution="alpha-engine-config#123 — widen the retry window",
+        )
+        assert self._sent(mock_post).endswith(
+            "Resolution: alpha-engine-config#123 — widen the retry window"
+        )
+
+    def test_callers_line_wins_and_is_not_duplicated(self, configured_env, mock_post):
+        tg.send_message("boom\nResolution: aec#9 — fix it", parse_mode=None, resolution="other")
+        text = self._sent(mock_post)
+        assert text.count("Resolution:") == 1
+        assert "aec#9" in text
+
+    def test_inserted_directly_under_callers_auto_fix_line(self, configured_env, mock_post):
+        tg.send_message("boom\n\nAuto-fix: retry at 06:10\n\nmore detail", parse_mode=None)
+        lines = self._sent(mock_post).splitlines()
+        i = next(n for n, line in enumerate(lines) if line.startswith("Auto-fix:"))
+        assert lines[i + 1].startswith("Resolution:")
+
+    def test_html_escapes_resolution(self, configured_env, mock_post):
+        tg.send_message("x", parse_mode="HTML", resolution="a<b")
+        assert self._sent(mock_post).endswith("<b>Resolution:</b> a&lt;b")
+
+    def test_survives_truncation(self, configured_env, mock_post):
+        long_body = "y" * (tg.TELEGRAM_MESSAGE_MAX_CHARS + 500)
+        tg.send_message(long_body, parse_mode=None, resolution="aec#1 — plan")
+        text = self._sent(mock_post)
+        assert len(text) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert text.endswith("Resolution: aec#1 — plan")
+
+    def test_callers_lines_survive_truncation(self, configured_env, mock_post):
+        body = (
+            "head\nAuto-fix: retry\nResolution: aec#2 — plan\n"
+            + "z" * (tg.TELEGRAM_MESSAGE_MAX_CHARS + 500)
+        )
+        tg.send_message(body, parse_mode=None)
+        text = self._sent(mock_post)
+        assert len(text) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert text.endswith("Auto-fix: retry\nResolution: aec#2 — plan")
+
+    def test_default_never_invents_an_issue_number(self):
+        assert "#" not in tg.DEFAULT_RESOLUTION

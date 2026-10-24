@@ -160,13 +160,67 @@ def with_auto_fix(
     return f"{text}\n\n{auto_fix_line(auto_fix, parse_mode)}"
 
 
-def _split_auto_fix_line(text: str) -> tuple[str, str | None]:
-    """Pull the caller's ``Auto-fix:`` line out of ``text``.
+#: The second footer label (Brian, 2026-10-24: "All errors and alerts from
+#: now on should be paired with an issue/method for resolution"). Rule:
+#: observability-policy.md § Notification — auto-fix line (§7.4b, the
+#: resolution half). ``Auto-fix:`` says what runs by itself; ``Resolution:``
+#: names the tracked issue or in-flight PR that will END the problem, or says
+#: none is tracked and who files one with the options and a recommendation.
+#: :func:`send_message` guarantees it exactly as it guarantees ``Auto-fix:``.
+RESOLUTION_LABEL: Final[str] = "Resolution:"
+#: Appended when the sender declared nothing. It never invents an issue
+#: number: it says plainly that none is tracked and names the lane that files
+#: one. A sender that knows its tracked item passes ``resolution=``.
+DEFAULT_RESOLUTION: Final[str] = (
+    "none tracked yet. Tonight's nightly sweep (7pm PT) files an issue that "
+    "lists the options and a recommended fix, and later alerts name it."
+)
+#: What an informational message says when its sender declared nothing.
+RESOLUTION_NOT_NEEDED: Final[str] = "none needed (informational, nothing is broken)."
+_RESOLUTION_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-•*_]|[^\w\s<]{1,2})?[ \t]*(?:<b>|<strong>)?[*_]?"
+    r"resolution[*_]?[ \t]*:"
+)
 
-    Used only when a body is over the size limit, so the line can be re-added
-    after truncation instead of being cut off with the tail.
+
+def has_resolution_line(text: str) -> bool:
+    """True when ``text`` already carries a ``Resolution:`` line."""
+    return bool(_RESOLUTION_RE.search(text or ""))
+
+
+def resolution_line(
+    resolution: str | None = None, parse_mode: str | None = PARSE_MODE
+) -> str:
+    """Render the ``Resolution:`` line for ``parse_mode``.
+
+    ``resolution`` is plain text; under HTML it is escaped here. An empty or
+    missing value falls back to :data:`DEFAULT_RESOLUTION`.
     """
-    m = _AUTO_FIX_RE.search(text)
+    detail = (resolution or "").strip() or DEFAULT_RESOLUTION
+    if parse_mode == PARSE_MODE_HTML:
+        return f"<b>{RESOLUTION_LABEL}</b> {escape_html(detail)}"
+    if parse_mode == PARSE_MODE:
+        return f"*{RESOLUTION_LABEL}* {detail}"
+    return f"{RESOLUTION_LABEL} {detail}"
+
+
+def with_resolution(
+    text: str,
+    resolution: str | None = None,
+    parse_mode: str | None = PARSE_MODE,
+) -> str:
+    """Return ``text`` with a ``Resolution:`` line, appending one if absent.
+
+    A line the caller already wrote wins over ``resolution``.
+    """
+    if has_resolution_line(text):
+        return text
+    return f"{text}\n{resolution_line(resolution, parse_mode)}"
+
+
+def _split_line(text: str, pattern: "re.Pattern[str]") -> tuple[str, str | None]:
+    """Pull the first line matching ``pattern`` out of ``text``."""
+    m = pattern.search(text)
     if not m:
         return text, None
     end = text.find("\n", m.start())
@@ -174,6 +228,17 @@ def _split_auto_fix_line(text: str) -> tuple[str, str | None]:
     line = text[m.start():end]
     rest = (text[: m.start()] + text[end:]).rstrip("\n")
     return rest, line
+
+
+def _insert_after_line(text: str, pattern: "re.Pattern[str]", line: str) -> str:
+    """Insert ``line`` right after the first line matching ``pattern``."""
+    m = pattern.search(text)
+    if not m:
+        return f"{text}\n{line}"
+    end = text.find("\n", m.start())
+    if end == -1:
+        return f"{text}\n{line}"
+    return f"{text[:end]}\n{line}{text[end:]}"
 
 
 def _is_entity_parse_error(description: str) -> bool:
@@ -414,6 +479,7 @@ def send_message(
     message_thread_id: int | None = None,
     parse_mode: str | None = PARSE_MODE,
     auto_fix: str | None = None,
+    resolution: str | None = None,
 ) -> bool:
     """Send a single Telegram message to the channel resolved from secrets.
 
@@ -467,6 +533,12 @@ def send_message(
         caused by unparseable entities (Markdown or HTML) is retried once as
         plain text before ``False`` is returned — see the fallback comment in
         the body.
+    :param resolution: Plain text naming the tracked issue or in-flight PR
+        that will resolve the problem, with a one-line plan — or, when none
+        exists, the options and a recommendation. Rendered as the
+        ``Resolution:`` line under ``Auto-fix:``; kept when ``text`` already
+        has one, else this value (or :data:`DEFAULT_RESOLUTION`) is appended.
+        Kept through truncation.
     """
     _validate_parse_mode(parse_mode)
     token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", required=False)
@@ -487,12 +559,31 @@ def send_message(
     # Every message says what is being fixed automatically. The line is kept
     # OUT of the truncation budget and appended after the cut, so a long body
     # (journal excerpts, tracebacks) can never push it off the tail.
-    if has_auto_fix_line(text):
-        main_text, fix_line = text, None
-        if len(text) > TELEGRAM_MESSAGE_MAX_CHARS:
-            main_text, fix_line = _split_auto_fix_line(text)
+    # ── Resolution line (same section, Brian 2026-10-24) — kept with the
+    # Auto-fix line in one footer that sits outside the truncation budget.
+    main_text = text
+    footer: list[str] = []
+    over = len(text) > TELEGRAM_MESSAGE_MAX_CHARS
+    if has_auto_fix_line(main_text):
+        if over:
+            main_text, line = _split_line(main_text, _AUTO_FIX_RE)
+            footer.append(line or "")
     else:
-        main_text, fix_line = text, auto_fix_line(auto_fix, parse_mode)
+        footer.append(auto_fix_line(auto_fix, parse_mode))
+    if has_resolution_line(main_text):
+        if over:
+            main_text, line = _split_line(main_text, _RESOLUTION_RE)
+            footer.append(line or "")
+    elif not over and has_auto_fix_line(main_text):
+        # The caller wrote its own Auto-fix line: the Resolution line goes
+        # directly under it, so the pair reads together.
+        main_text = _insert_after_line(
+            main_text, _AUTO_FIX_RE, resolution_line(resolution, parse_mode)
+        )
+    else:
+        footer.append(resolution_line(resolution, parse_mode))
+    footer = [f for f in footer if f]
+    fix_line = "\n".join(footer) if footer else None
     budget = TELEGRAM_MESSAGE_MAX_CHARS
     if fix_line is not None:
         budget = max(TELEGRAM_MESSAGE_MAX_CHARS - len(fix_line) - 2, 200)
@@ -636,6 +727,7 @@ def send_rollup(
     header: str | None = None,
     disable_notification: bool = True,
     auto_fix: str | None = None,
+    resolution: str | None = None,
 ) -> bool:
     """Send a bulleted rollup of N findings as a single message.
 
@@ -654,6 +746,8 @@ def send_rollup(
         push.
     :param auto_fix: What is being fixed automatically; see
         :func:`send_message`. ``None`` lets the transport append its default.
+    :param resolution: The tracked item that resolves the findings; see
+        :func:`send_message`.
     :returns: ``True`` if no findings (no-op) or Telegram returned 200,
         ``False`` on send failure.
     """
@@ -666,8 +760,9 @@ def send_rollup(
     lines.extend(f"- {item}" for item in findings)
     text = "\n".join(lines)
 
-    if auto_fix is None:
-        return send_message(text, disable_notification=disable_notification)
     return send_message(
-        text, disable_notification=disable_notification, auto_fix=auto_fix
+        text,
+        disable_notification=disable_notification,
+        auto_fix=auto_fix,
+        resolution=resolution,
     )

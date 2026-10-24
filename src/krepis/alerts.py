@@ -236,9 +236,12 @@ from typing import Final
 from krepis import _dedup, alert_tiers, fleet_events
 from krepis.telegram import (
     AUTO_FIX_NOT_NEEDED,
+    RESOLUTION_NOT_NEEDED,
     _validate_parse_mode,
     has_auto_fix_line,
+    has_resolution_line,
     with_auto_fix,
+    with_resolution,
 )
 from krepis.telegram import PARSE_MODE as TELEGRAM_PARSE_MODE
 
@@ -1037,7 +1040,7 @@ def _publish_telegram(
         # list, and an unexpected kwarg there would read as "Telegram
         # fan-out failed" — a fake transport failure manufactured by a
         # signature change).
-        transport_kwargs: dict = {}
+        transport_kwargs: dict[str, str | None] = {}
         if parse_mode != TELEGRAM_PARSE_MODE:
             transport_kwargs["parse_mode"] = parse_mode
         ok = send_message(
@@ -1221,6 +1224,7 @@ def publish(
     raise_on_total_failure: bool = True,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
     auto_fix: str | None = None,
+    resolution: str | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1358,6 +1362,16 @@ def publish(
         :data:`krepis.telegram.AUTO_FIX_NOT_NEEDED` for a recovery or an
         info/debug message, and to :data:`krepis.telegram.DEFAULT_AUTO_FIX`
         otherwise. A body that already carries an ``Auto-fix:`` line keeps it.
+    :param resolution: Plain text naming the tracked issue or in-flight PR
+        that will end the problem, with a one-line plan — for example
+        ``"alpha-engine-config#123 — widen the retry window"`` — or, when none
+        exists, the options and a recommendation. Rendered as the
+        ``Resolution:`` line directly under ``Auto-fix:`` on every channel
+        (observability-policy § Notification — auto-fix line; Brian,
+        2026-10-24). ``None`` falls back to
+        :data:`krepis.telegram.RESOLUTION_NOT_NEEDED` for a recovery or an
+        info/debug message, and to :data:`krepis.telegram.DEFAULT_RESOLUTION`
+        otherwise. A body that already carries a ``Resolution:`` line keeps it.
     :param destination: Explicit override of the severity-derived Telegram
         destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
         derives it from ``severity``. An override is honoured where it can
@@ -1422,6 +1436,15 @@ def publish(
         ):
             fix_detail = AUTO_FIX_NOT_NEEDED
         formatted = with_auto_fix(formatted, fix_detail, parse_mode)
+    # ── Resolution line (Brian, 2026-10-24) — directly under Auto-fix.
+    if not has_resolution_line(formatted):
+        res_detail = resolution
+        if not res_detail and (
+            state == ALERT_STATE_CLEARED
+            or severity.lower() in _AUTO_FIX_INFORMATIONAL_SEVERITIES
+        ):
+            res_detail = RESOLUTION_NOT_NEEDED
+        formatted = with_resolution(formatted, res_detail, parse_mode)
 
     provenance = _provenance_suffix()
     if provenance:
@@ -1917,6 +1940,16 @@ def main(argv: list[str] | None = None) -> int:
             "default line (nightly sweep) is used."
         ),
     )
+    pub.add_argument(
+        "--resolution",
+        default=None,
+        help=(
+            "The tracked issue or PR that will resolve the problem, with a "
+            "one-line plan. Rendered as the alert's 'Resolution:' line; "
+            "omitted means the default line (none tracked yet; nightly sweep "
+            "files one) is used."
+        ),
+    )
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
@@ -2128,6 +2161,7 @@ def main(argv: list[str] | None = None) -> int:
             destination=args.destination,
             console_artifact=args.console_artifact,
             auto_fix=args.auto_fix,
+            resolution=args.resolution,
         )
     except AlertDeliveryError as exc:
         # The CLI is the Bash-caller surface, so the diagnosis goes to stderr

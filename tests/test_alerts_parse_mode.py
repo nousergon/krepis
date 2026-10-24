@@ -134,6 +134,7 @@ class TestPublishEndToEnd:
         assert payload["parse_mode"] == "HTML"
         assert payload["text"] == (
             "[INFO] crucible/report.morning: <b>LADDER</b> phase&lt;0&gt;\n\n"
-            "<b>Auto-fix:</b> none needed (informational, nothing is broken)."
+            "<b>Auto-fix:</b> none needed (informational, nothing is broken).\n"
+            "<b>Resolution:</b> none needed (informational, nothing is broken)."
         )
         assert result.telegram.ok is True
