@@ -56,8 +56,12 @@ import os
 import re
 import sys
 import urllib.parse
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from krepis.llm_config import ModelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ RESOLVE_SCHEMA_VERSION = 2
 CAPABILITY_NAME_INFIX = "cap"
 
 
-def capability_group_name(group: str, capabilities) -> str:
+def capability_group_name(group: str, capabilities: Iterable[str]) -> str:
     """The wire name for *group* narrowed to *capabilities*.
 
     ``capability_group_name("ultra", ("streaming",)) -> "ultra-cap-streaming"``
@@ -130,7 +134,7 @@ def _capability_subsets() -> list:
     return out
 
 
-def group_wire_model(group: str, requires: tuple = ()) -> str:
+def group_wire_model(group: str, requires: tuple[str, ...] = ()) -> str:
     """The model name a consumer must put on the wire for *group*.
 
     The bare group when nothing is required; the capability-scoped group name
@@ -1162,9 +1166,12 @@ def _contract_aware_router_class() -> Any:
         #: object actually serving calls, not merely defined in this module.
         krepis_contract_aware = True
 
+        # *args/**kwargs stay an opaque passthrough on purpose: litellm calls this
+        # helper both all-keyword and all-positional, and its parameter list moves
+        # between releases, so mirroring it would pin a litellm version here.
         async def async_function_with_fallbacks_common_utils(  # type: ignore[override]
-            self, e, disable_fallbacks, *args, **kwargs
-        ):
+            self, e: Exception, disable_fallbacks: bool, *args: Any, **kwargs: Any  # pyright: ignore[reportExplicitAny]
+        ) -> Any:  # pyright: ignore[reportExplicitAny]
             # litellm calls this helper BOTH all-keyword and all-positional
             # (two call sites, one of each, in the installed release), so the
             # model group is read from whichever form arrived. Only used to
@@ -2375,7 +2382,7 @@ def _route_to_spec(
     requested: str,
     max_tokens: int | None = None,
     structured_outputs: bool | None = None,
-):
+) -> ModelSpec:
     """Adapt a resolution *route* to a ``ModelSpec``. The ONE adapter.
 
     Shared by :func:`resolve_group_spec` and :func:`resolve_model_spec`.  It
