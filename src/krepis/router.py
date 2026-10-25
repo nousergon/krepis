@@ -56,8 +56,12 @@ import os
 import re
 import sys
 import urllib.parse
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
+
+if TYPE_CHECKING:
+    from krepis.llm_config import ModelSpec
 
 logger = logging.getLogger(__name__)
 
@@ -102,7 +106,7 @@ RESOLVE_SCHEMA_VERSION = 2
 CAPABILITY_NAME_INFIX = "cap"
 
 
-def capability_group_name(group: str, capabilities) -> str:
+def capability_group_name(group: str, capabilities: Iterable[str]) -> str:
     """The wire name for *group* narrowed to *capabilities*.
 
     ``capability_group_name("ultra", ("streaming",)) -> "ultra-cap-streaming"``
@@ -130,7 +134,7 @@ def _capability_subsets() -> list:
     return out
 
 
-def group_wire_model(group: str, requires: tuple = ()) -> str:
+def group_wire_model(group: str, requires: tuple[str, ...] = ()) -> str:
     """The model name a consumer must put on the wire for *group*.
 
     The bare group when nothing is required; the capability-scoped group name
@@ -256,25 +260,16 @@ WIRE_OPENAI = "openai"
 WIRE_FORMATS = (WIRE_ANTHROPIC, WIRE_OPENAI)
 DEFAULT_WIRE = WIRE_ANTHROPIC
 
-# LEGACY — remove once every registry entry declares an `endpoints` block.
-#
-# This is the table model-router-policy R7 forbids ("no hardcoded hosts or
-# ports anywhere in library code") and R29 names directly: a resolver that
-# drops an entry because its own code lacks a row for that provider has
-# invented a routing fact at layer 3.  It is retained ONLY as the migration
-# shim for registry entries that predate `endpoints`, is consulted only when
-# an entry carries no `endpoints` block, and warns on every use naming the
-# entry that still needs migrating.
-#
-# Removal condition: `LLM_MODEL_REGISTRY.yaml` declares `endpoints` on every
-# route-bearing row and the registry validator requires it.  Tracked as
-# alpha-engine-config-I6186.
-_LEGACY_CLI_ENDPOINTS: dict[tuple[str, str | None], str] = {
-    ("egress_proxy", "deepseek"): "http://127.0.0.1:8971",
-    ("openrouter", None):         "https://openrouter.ai/api",
-    ("direct", "anthropic"):      "",
-    ("litellm_proxy", None):      LITELLM_PROXY_URL,
-}
+# The `(route, provider) -> URL` table this module used to carry
+# (`_CLI_COMPATIBLE_ENDPOINTS`, later the `_LEGACY_CLI_ENDPOINTS` migration
+# shim) is GONE (alpha-engine-config-I6186).  model-router-policy R7 forbids
+# hardcoded hosts or ports in library code, and R29 names the failure it
+# caused: a resolver that dropped an entry because its own table lacked a row
+# for that provider had invented a routing fact at layer 3.  Its removal
+# condition held: every route-bearing `LLM_MODEL_REGISTRY.yaml` row declares
+# `endpoints`, and the registry validator fails a row that does not.  An entry
+# that declares no endpoint for the caller's wire is now skipped with a
+# reason naming the entry — a registry fact, never a dict lookup.
 
 
 def _resolve_litellm_proxy_url() -> str:
@@ -366,7 +361,6 @@ def _entry_endpoint(entry: dict, wire: str) -> str:
     2. ``entry["endpoints"][wire]`` — the declared endpoint for this format.
     3. ``entry["api_base"]`` when *wire* is the OpenAI format — the pre-
        ``endpoints`` spelling of the same fact.
-    4. :data:`_LEGACY_CLI_ENDPOINTS` — the migration shim, warned on.
 
     Raises :exc:`ValueError` if the entry declares no endpoint for *wire*.
     The caller records that in ``skipped_entries`` and moves on, so "this
@@ -398,66 +392,11 @@ def _entry_endpoint(entry: dict, wire: str) -> str:
     if wire == WIRE_OPENAI and entry.get("api_base"):
         return entry["api_base"]
 
-    # 4. Migration shim.
-    for key in ((route, provider), (route, None)):
-        if key in _LEGACY_CLI_ENDPOINTS:
-            logger.warning(
-                "Registry entry %r has no `endpoints` block; falling back to "
-                "krepis' legacy hardcoded endpoint table, which "
-                "model-router-policy R7 forbids. Declare "
-                "endpoints.{anthropic,openai} on this row "
-                "(alpha-engine-config-I6186).",
-                entry.get("id", "<unknown>"),
-            )
-            return _LEGACY_CLI_ENDPOINTS[key]
-
     raise ValueError(
         f"registry entry {entry.get('id', '<unknown>')!r} "
         f"(route={route!r}, provider={provider!r}) declares no endpoint for "
-        f"the {wire!r} wire format, and no legacy default applies"
-    )
-
-
-def _resolve_cli_endpoint(route: str, provider: str | None) -> str:
-    """Resolve a CLI-compatible endpoint for *(route, provider)* at call time.
-
-    DEPRECATED — superseded by :func:`_entry_endpoint`, which reads the
-    endpoint the registry declares instead of choosing one from a table in
-    library code.  Retained because the ``(route, provider)`` shape is what
-    the legacy shim is keyed on and existing tests bind to this name.
-
-    Resolution order:
-    1. Per-route env var (``_ENV_OVERRIDE_MAP`` → ``os.environ``)
-    2. Module-level :data:`_LEGACY_CLI_ENDPOINTS` default
-
-    Returns the endpoint URL or ``""`` for provider-default routes (``direct``).
-    Raises :exc:`ValueError` if the combination is not CLI-compatible.
-    """
-    # 1. Check env override by exact (route, provider) key
-    precise_key = (route, provider)
-    if provider is not None and precise_key in _ENV_OVERRIDE_MAP:
-        override = os.environ.get(_ENV_OVERRIDE_MAP[precise_key])
-        if override:
-            return override
-
-    # 2. Check env override by (route, None) key (catch-all for the route)
-    catchall_key = (route, None)
-    if catchall_key in _ENV_OVERRIDE_MAP:
-        override = os.environ.get(_ENV_OVERRIDE_MAP[catchall_key])
-        if override:
-            return override
-
-    # 3. Check exact match in the default map
-    if precise_key in _LEGACY_CLI_ENDPOINTS:
-        return _LEGACY_CLI_ENDPOINTS[precise_key]
-
-    # 4. Check catch-all by route
-    if catchall_key in _LEGACY_CLI_ENDPOINTS:
-        return _LEGACY_CLI_ENDPOINTS[catchall_key]
-
-    raise ValueError(
-        f"({route!r}, {provider!r}) is not a CLI-compatible endpoint "
-        "and cannot be resolved"
+        f"the {wire!r} wire format — declare endpoints.{wire} on the row "
+        "(model-router-policy R7; alpha-engine-config-I6186)"
     )
 
 
@@ -465,7 +404,7 @@ def _probe_egress_proxy(url: str, timeout: int = 3) -> bool:
     """Probe an egress proxy's health endpoint.
 
     Returns ``True`` if the proxy responds with ``200`` at ``/__proxy_health__``.
-    Used by :func:`_cli_endpoint_for` to fail at resolve time rather than
+    Used by :func:`_resolve_group_json` to fail at resolve time rather than
     returning a dead endpoint (config#4923).
 
     Pure / no side-effects beyond the network call.  Tested by mocking
@@ -976,45 +915,6 @@ def _caching_flags(entry: dict) -> tuple[bool, bool]:
     return explicit, automatic
 
 
-def _cli_endpoint_for(entry: dict) -> str:
-    """Return the CLI-compatible base URL for a registry model entry.
-
-    Resolves the endpoint from env var overrides first (config#4923), then
-    falls back to the legacy ``_LEGACY_CLI_ENDPOINTS`` literal.
-
-    For ``egress_proxy`` routes: probes the resolved proxy at
-    ``/__proxy_health__`` before returning.  An unreachable proxy raises
-    :exc:`ValueError` with a message naming the URL and the env override var
-    — so the caller falls through to the next model (same pattern as the
-    LiteLLM health check) rather than returning a dead endpoint that would
-    surface later as an opaque ConnectionRefused inside an LLM agent.
-
-    Raises :exc:`ValueError` if this entry's route+provider cannot serve
-    the wire format the Claude CLI expects (e.g. Gemini/xAI/Moonshot/Zhipu
-    egress proxies are OpenAI-format only — use LiteLLM for format translation).
-    """
-    route = entry.get("route", "")
-    provider = entry.get("provider", "")
-
-    endpoint = _resolve_cli_endpoint(route, provider)
-
-    # For egress_proxy routes: probe the proxy before returning.
-    # A dead proxy means the route is unusable — fail at resolve time
-    # rather than returning an endpoint nobody verified (config#4923).
-    if route == "egress_proxy" and endpoint:
-        env_var_key = _ENV_OVERRIDE_MAP.get((route, provider))
-        env_var_hint = f" (override: ${env_var_key})" if env_var_key else ""
-        if not _probe_egress_proxy(endpoint):
-            raise ValueError(
-                f"Egress proxy at {endpoint!r} is not reachable"
-                f"{env_var_hint}. "
-                "Set the override to a healthy proxy address, or ensure the "
-                "local proxy is running on the configured port."
-            )
-
-    return endpoint
-
-
 def _cli_deployment_id(entry: dict) -> str:
     """Return the model string to set as the CLI model identifier.
 
@@ -1266,9 +1166,12 @@ def _contract_aware_router_class() -> Any:
         #: object actually serving calls, not merely defined in this module.
         krepis_contract_aware = True
 
+        # *args/**kwargs stay an opaque passthrough on purpose: litellm calls this
+        # helper both all-keyword and all-positional, and its parameter list moves
+        # between releases, so mirroring it would pin a litellm version here.
         async def async_function_with_fallbacks_common_utils(  # type: ignore[override]
-            self, e, disable_fallbacks, *args, **kwargs
-        ):
+            self, e: Exception, disable_fallbacks: bool, *args: Any, **kwargs: Any  # pyright: ignore[reportExplicitAny]
+        ) -> Any:  # pyright: ignore[reportExplicitAny]
             # litellm calls this helper BOTH all-keyword and all-positional
             # (two call sites, one of each, in the installed release), so the
             # model group is read from whichever form arrived. Only used to
@@ -2479,7 +2382,7 @@ def _route_to_spec(
     requested: str,
     max_tokens: int | None = None,
     structured_outputs: bool | None = None,
-):
+) -> ModelSpec:
     """Adapt a resolution *route* to a ``ModelSpec``. The ONE adapter.
 
     Shared by :func:`resolve_group_spec` and :func:`resolve_model_spec`.  It
