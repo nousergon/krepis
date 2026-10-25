@@ -65,6 +65,10 @@ import shlex
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import TYPE_CHECKING, Iterable, TypeVar, cast
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 __all__ = [
     "BOOTSTRAP_SIGNATURES",
@@ -1625,13 +1629,15 @@ _NESTED = {
     "privilege_drop": PrivilegeDrop,
 }
 _TUPLE_FIELDS = {"config_copies", "extra_clones", "secrets"}
+_Built = TypeVar("_Built", bound="DataclassInstance")
 
 
-def _build(cls, value):
+def _build(cls: type[_Built], value: object) -> _Built:
     if not isinstance(value, dict):
         raise ValueError(f"{cls.__name__} expects a mapping, got {type(value).__name__}")
+    mapping = cast("dict[str, object]", value)
     known = {f.name for f in fields(cls)}
-    unknown = sorted(set(value) - known)
+    unknown = sorted(set(mapping) - known)
     if unknown:
         # Fail loud. A misspelled parameter that silently does nothing is the
         # exact shape of a declared guarantee that was never armed — which is
@@ -1640,27 +1646,28 @@ def _build(cls, value):
             f"{cls.__name__}: unknown key(s) {unknown} — known keys are "
             f"{sorted(known)}"
         )
-    return cls(**{key: _coerce(cls, key, raw) for key, raw in value.items()})
+    return cls(**{key: _coerce(cls, key, raw) for key, raw in mapping.items()})
 
 
-def _coerce(cls, key: str, raw):
+def _coerce(cls: type, key: str, raw: object) -> object:
     nested = _NESTED.get(key) if cls is SpotBootstrapSpec else None
     if nested is None:
         if key in ("files", "base_url_envs", "required_binaries", "extra_args", "command", "chown", "secret_env_vars"):
-            return tuple(raw)
+            return tuple(cast("Iterable[object]", raw))
         if key == "env":
             # A mapping preserves insertion order in the file; a list of pairs
             # is accepted too, for a table that wants a duplicate-free diff.
             if isinstance(raw, dict):
-                return tuple(raw.items())
-            return tuple((str(k), str(v)) for k, v in raw)
+                return tuple(cast("dict[str, str]", raw).items())
+            pairs = cast("Iterable[tuple[object, object]]", raw)
+            return tuple((str(k), str(v)) for k, v in pairs)
         return raw
     if key in _TUPLE_FIELDS:
-        return tuple(_build(nested, item) for item in raw)
+        return tuple(_build(nested, item) for item in cast("Iterable[object]", raw))
     return _build(nested, raw)
 
 
-def spec_from_mapping(mapping: dict) -> SpotBootstrapSpec:
+def spec_from_mapping(mapping: "dict[str, object]") -> SpotBootstrapSpec:
     """One :class:`SpotBootstrapSpec` from a plain mapping (JSON/YAML row)."""
     return _build(SpotBootstrapSpec, mapping)
 
