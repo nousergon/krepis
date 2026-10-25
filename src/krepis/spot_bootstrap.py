@@ -65,6 +65,10 @@ import shlex
 import sys
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from typing import TYPE_CHECKING, Iterable, TypeVar, cast
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 __all__ = [
     "BOOTSTRAP_SIGNATURES",
@@ -394,6 +398,23 @@ class SpotBootstrapSpec:
     #: shutdown is scheduled — the workload's own run record, lane telemetry,
     #: completion marker. ``rc`` is in scope.
     finish_hook: "str | None" = None
+
+    #: Extra shell the bootstrap runs as ROOT after the clone, the config
+    #: copies, the secret fetch and the egress-proxy staging, and immediately
+    #: BEFORE the privilege drop (``runuser``) — rendered verbatim, under the
+    #: script's ``set -eo pipefail``, so a failing hook aborts the bootstrap
+    #: instead of handing a half-prepared box to the workload.
+    #:
+    #: This is the root-side setup no other field expresses: building a venv
+    #: the dropped user will pip into at runtime and chowning it, installing a
+    #: policy layer, a final ``chown -R`` of the checkout
+    #: (alpha-engine-config-I8131 — the ``custom_executor`` escape hatch).
+    #: ``PrivilegeDrop.chown`` covers path ownership only, and ``finish_hook``
+    #: runs in the EXIT trap, which is too late. A hook placed AFTER the drop
+    #: would run as the wrong user and mostly degrade quietly, so the
+    #: insertion point is asserted in tests rather than assumed. The module
+    #: still knows no workload: the shell comes from the spec.
+    pre_exec_hook: "str | None" = None
 
     #: **No-clone mode.** Six of the seven Overseer bootstraps never clone:
     #: their dispatcher's SSM prelude already placed the checkout, and they
@@ -1011,6 +1032,17 @@ def _egress_proxy_block(spec: SpotBootstrapSpec) -> str:
     return "\n".join(lines)
 
 
+def _pre_exec_block(spec: SpotBootstrapSpec) -> str:
+    assert spec.pre_exec_hook
+    return "\n".join(
+        [
+            "# spec.pre_exec_hook — the workload's root-side setup. Runs as ROOT,",
+            "# after clone/config/secrets and before the privilege drop.",
+            spec.pre_exec_hook,
+        ]
+    )
+
+
 def _privilege_drop_block(spec: SpotBootstrapSpec) -> str:
     drop = spec.privilege_drop
     assert drop is not None
@@ -1107,6 +1139,8 @@ def render_bootstrap(spec: SpotBootstrapSpec) -> str:
         blocks.append(_secrets_block(spec))
     if spec.egress_proxy is not None:
         blocks.append(_egress_proxy_block(spec))
+    if spec.pre_exec_hook:
+        blocks.append(_pre_exec_block(spec))
     if spec.privilege_drop is not None:
         blocks.append(_privilege_drop_block(spec))
     return "\n\n".join(blocks) + "\n"
@@ -1595,13 +1629,15 @@ _NESTED = {
     "privilege_drop": PrivilegeDrop,
 }
 _TUPLE_FIELDS = {"config_copies", "extra_clones", "secrets"}
+_Built = TypeVar("_Built", bound="DataclassInstance")
 
 
-def _build(cls, value):
+def _build(cls: type[_Built], value: object) -> _Built:
     if not isinstance(value, dict):
         raise ValueError(f"{cls.__name__} expects a mapping, got {type(value).__name__}")
+    mapping = cast("dict[str, object]", value)
     known = {f.name for f in fields(cls)}
-    unknown = sorted(set(value) - known)
+    unknown = sorted(set(mapping) - known)
     if unknown:
         # Fail loud. A misspelled parameter that silently does nothing is the
         # exact shape of a declared guarantee that was never armed — which is
@@ -1610,27 +1646,28 @@ def _build(cls, value):
             f"{cls.__name__}: unknown key(s) {unknown} — known keys are "
             f"{sorted(known)}"
         )
-    return cls(**{key: _coerce(cls, key, raw) for key, raw in value.items()})
+    return cls(**{key: _coerce(cls, key, raw) for key, raw in mapping.items()})
 
 
-def _coerce(cls, key: str, raw):
+def _coerce(cls: type, key: str, raw: object) -> object:
     nested = _NESTED.get(key) if cls is SpotBootstrapSpec else None
     if nested is None:
         if key in ("files", "base_url_envs", "required_binaries", "extra_args", "command", "chown", "secret_env_vars"):
-            return tuple(raw)
+            return tuple(cast("Iterable[object]", raw))
         if key == "env":
             # A mapping preserves insertion order in the file; a list of pairs
             # is accepted too, for a table that wants a duplicate-free diff.
             if isinstance(raw, dict):
-                return tuple(raw.items())
-            return tuple((str(k), str(v)) for k, v in raw)
+                return tuple(cast("dict[str, str]", raw).items())
+            pairs = cast("Iterable[tuple[object, object]]", raw)
+            return tuple((str(k), str(v)) for k, v in pairs)
         return raw
     if key in _TUPLE_FIELDS:
-        return tuple(_build(nested, item) for item in raw)
+        return tuple(_build(nested, item) for item in cast("Iterable[object]", raw))
     return _build(nested, raw)
 
 
-def spec_from_mapping(mapping: dict) -> SpotBootstrapSpec:
+def spec_from_mapping(mapping: "dict[str, object]") -> SpotBootstrapSpec:
     """One :class:`SpotBootstrapSpec` from a plain mapping (JSON/YAML row)."""
     return _build(SpotBootstrapSpec, mapping)
 
