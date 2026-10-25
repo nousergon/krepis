@@ -64,8 +64,9 @@ SCHEMA_ID = (
 )
 
 #: Routes a resolution may name. Not derived from a router constant because
-#: there is no single one: ``_LEGACY_CLI_ENDPOINTS`` keys the migration shim,
-#: not the vocabulary, and the registry's own ``route`` field is the authority.
+#: there is no single one: the router carries no route-keyed table (endpoints
+#: are registry-owned, alpha-engine-config-I6186), and the registry's own
+#: ``route`` field is the authority.
 RESOLVE_ROUTES = ("litellm_proxy", "egress_proxy", "openrouter", "direct")
 
 #: What KIND of name ``model``/``deployment_id`` carries.

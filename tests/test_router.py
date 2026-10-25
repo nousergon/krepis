@@ -50,6 +50,7 @@ models:
     name: DeepSeek V4 Flash
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8972/v1"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
@@ -65,6 +66,7 @@ models:
     name: Gemini 2.5 Flash
     provider: gemini
     route: egress_proxy
+    endpoints: {openai: "http://127.0.0.1:8974/v1beta/openai"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-flash
@@ -78,6 +80,7 @@ models:
     name: GPT-OSS 120B
     provider: openrouter
     route: openrouter
+    endpoints: {anthropic: "https://openrouter.ai/api", openai: "https://openrouter.ai/api"}
     reachable_from: [laptop, ec2]
     model: openai/gpt-oss-120b
     group: low
@@ -90,6 +93,7 @@ models:
     name: Gemini 2.5 Pro
     provider: gemini
     route: egress_proxy
+    endpoints: {openai: "http://127.0.0.1:8974/v1beta/openai"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8974/v1beta/openai
     model: gemini-2.5-pro
@@ -103,6 +107,7 @@ models:
     name: DeepSeek V4 Flash Max
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8972/v1"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-flash
@@ -118,6 +123,7 @@ models:
     name: DeepSeek V4 Flash (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    endpoints: {anthropic: "https://openrouter.ai/api", openai: "https://openrouter.ai/api"}
     reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-flash
     group: med
@@ -131,6 +137,7 @@ models:
     name: DeepSeek V4 Pro
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8972/v1"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
@@ -144,6 +151,7 @@ models:
     name: DeepSeek V4 Pro Max
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8972/v1"}
     reachable_from: [laptop, ec2]
     api_base: http://127.0.0.1:8972/v1
     model: deepseek-v4-pro
@@ -158,6 +166,7 @@ models:
     name: DeepSeek V4 Pro (OpenRouter, reasoning=max)
     provider: openrouter
     route: openrouter
+    endpoints: {anthropic: "https://openrouter.ai/api", openai: "https://openrouter.ai/api"}
     reachable_from: [laptop, ec2]
     model: deepseek/deepseek-v4-pro
     group: high
@@ -171,6 +180,7 @@ models:
     name: Kimi K3
     provider: openrouter
     route: openrouter
+    endpoints: {anthropic: "https://openrouter.ai/api", openai: "https://openrouter.ai/api"}
     reachable_from: [laptop, ec2]
     model: moonshotai/kimi-k3
     group: ultra
@@ -183,6 +193,7 @@ models:
     name: GLM 5.2
     provider: openrouter
     route: openrouter
+    endpoints: {anthropic: "https://openrouter.ai/api", openai: "https://openrouter.ai/api"}
     reachable_from: [laptop, ec2]
     model: zhipuai/glm-5.2
     group: ultra
@@ -218,6 +229,7 @@ models:
     name: GLM 5.2
     provider: zhipu
     route: egress_proxy
+    endpoints: {openai: "http://127.0.0.1:8981/v1"}
     reachable_from: [laptop, ec2, lambda]
     api_base: http://127.0.0.1:8981/v1
     upstream_host: api.z.ai
@@ -236,6 +248,7 @@ models:
     name: DeepSeek V4 Pro
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8972/v1"}
     reachable_from: [laptop, ec2, lambda]
     api_base: http://127.0.0.1:8972/v1
     upstream_host: api.deepseek.com
@@ -704,42 +717,51 @@ class TestCLI:
             assert exc.value.code == 1
 
 
-# ── _cli_endpoint_for ───────────────────────────────────────────────
+# ── endpoint env overrides & LiteLLM URL ───────────────────────────
+# The `(route, provider) -> URL` table these tests used to exercise through
+# `_cli_endpoint_for` is gone (alpha-engine-config-I6186); endpoints are read
+# from the registry entry by `_entry_endpoint`.  The box-level env overrides
+# are a deployment fact and survive, so they are pinned here against it.
 
-class TestAnthropicEndpointFor:
-    def test_deepseek_egress_proxy_returns_8971(self):
-        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
-        assert _router._cli_endpoint_for(entry) == "http://127.0.0.1:8971"
-
-    def test_openrouter_returns_openrouter_api(self):
-        entry = {"route": "openrouter", "provider": "openrouter", "id": "test-or"}
-        assert _router._cli_endpoint_for(entry) == "https://openrouter.ai/api"
-
-    def test_openrouter_any_provider_returns_openrouter_api(self):
-        """OpenRouter route matches on route alone, regardless of provider."""
-        entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2"}
-        assert _router._cli_endpoint_for(entry) == "https://openrouter.ai/api"
-
-    def test_anthropic_direct_returns_empty(self):
-        entry = {"route": "direct", "provider": "anthropic", "id": "test-an"}
-        assert _router._cli_endpoint_for(entry) == ""
-
-    def test_gemini_egress_proxy_raises_valueerror(self):
-        entry = {"route": "egress_proxy", "provider": "gemini", "id": "test-gem"}
-        with pytest.raises(ValueError, match="not a CLI-compatible endpoint"):
-            _router._cli_endpoint_for(entry)
-
-    def test_xai_egress_proxy_raises_valueerror(self):
-        entry = {"route": "egress_proxy", "provider": "xai", "id": "test-xai"}
-        with pytest.raises(ValueError, match="not a CLI-compatible endpoint"):
-            _router._cli_endpoint_for(entry)
-
+class TestEndpointEnvOverrides:
     def test_egress_proxy_env_override_wins(self):
-        """KREPIS_DEEPSEEK_EGRESS_URL env var overrides the hardcoded default."""
-        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
+        """KREPIS_DEEPSEEK_EGRESS_URL overrides the declared endpoint."""
+        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds",
+                 "endpoints": {"anthropic": "http://127.0.0.1:8971"}}
         with mock.patch.dict(os.environ, {"KREPIS_DEEPSEEK_EGRESS_URL": "http://127.0.0.1:9999"}):
-            result = _router._cli_endpoint_for(entry)
+            result = _router._entry_endpoint(entry, "anthropic")
         assert result == "http://127.0.0.1:9999"
+
+    def test_egress_proxy_env_override_empty_string_ignored(self):
+        """An empty override is treated as unset — the declared endpoint wins."""
+        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds",
+                 "endpoints": {"anthropic": "http://127.0.0.1:8971"}}
+        with mock.patch.dict(os.environ, {"KREPIS_DEEPSEEK_EGRESS_URL": ""}):
+            result = _router._entry_endpoint(entry, "anthropic")
+        assert result == "http://127.0.0.1:8971"
+
+    def test_openrouter_env_override_catchall_any_provider(self):
+        """KREPIS_OPENROUTER_API_URL applies to any provider on the openrouter route."""
+        entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2",
+                 "endpoints": {"anthropic": "https://openrouter.ai/api"}}
+        with mock.patch.dict(os.environ, {"KREPIS_OPENROUTER_API_URL": "https://custom.example.com/api"}):
+            result = _router._entry_endpoint(entry, "anthropic")
+        assert result == "https://custom.example.com/api"
+
+    def test_litellm_proxy_env_override(self):
+        """KREPIS_LITELLM_PROXY_URL overrides a litellm_proxy entry's endpoint."""
+        entry = {"route": "litellm_proxy", "provider": "litellm", "id": "test-lm",
+                 "endpoints": {"anthropic": "http://127.0.0.1:8980"}}
+        with mock.patch.dict(os.environ, {"KREPIS_LITELLM_PROXY_URL": "http://127.0.0.1:9990"}):
+            result = _router._entry_endpoint(entry, "anthropic")
+        assert result == "http://127.0.0.1:9990"
+
+    def test_declared_empty_endpoint_means_provider_default(self):
+        """A direct route declaring "" keeps the SDK's own default base URL."""
+        entry = {"route": "direct", "provider": "anthropic", "id": "test-an",
+                 "endpoints": {"anthropic": ""}}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            assert _router._entry_endpoint(entry, "anthropic") == ""
 
     def test_litellm_proxy_url_resolved_from_env(self):
         """KREPIS_LITELLM_PROXY_URL env var overrides the LITELLM_PROXY_URL constant."""
@@ -752,35 +774,6 @@ class TestAnthropicEndpointFor:
         with mock.patch.dict(os.environ, {}, clear=True):
             result = _router._resolve_litellm_proxy_url()
         assert result == _router.LITELLM_PROXY_URL
-
-
-    def test_openrouter_env_override_wins(self):
-        """KREPIS_OPENROUTER_API_URL env var overrides the hardcoded default."""
-        entry = {"route": "openrouter", "provider": "openrouter", "id": "test-or"}
-        with mock.patch.dict(os.environ, {"KREPIS_OPENROUTER_API_URL": "https://custom.example.com/api"}):
-            result = _router._cli_endpoint_for(entry)
-        assert result == "https://custom.example.com/api"
-
-    def test_openrouter_env_override_catchall_any_provider(self):
-        """KREPIS_OPENROUTER_API_URL applies to any provider on the openrouter route."""
-        entry = {"route": "openrouter", "provider": "unknown", "id": "test-or2"}
-        with mock.patch.dict(os.environ, {"KREPIS_OPENROUTER_API_URL": "https://custom.example.com/api"}):
-            result = _router._cli_endpoint_for(entry)
-        assert result == "https://custom.example.com/api"
-
-    def test_litellm_proxy_env_override_in_endpoint_for(self):
-        """KREPIS_LITELLM_PROXY_URL is used as the litellm_proxy route endpoint."""
-        entry = {"route": "litellm_proxy", "provider": "litellm", "id": "test-lm"}
-        with mock.patch.dict(os.environ, {"KREPIS_LITELLM_PROXY_URL": "http://127.0.0.1:9990"}):
-            result = _router._cli_endpoint_for(entry)
-        assert result == "http://127.0.0.1:9990"
-
-    def test_egress_proxy_env_override_empty_string_ignored(self):
-        """An empty env var override string is treated as unset — falls back to default."""
-        entry = {"route": "egress_proxy", "provider": "deepseek", "id": "test-ds"}
-        with mock.patch.dict(os.environ, {"KREPIS_DEEPSEEK_EGRESS_URL": ""}):
-            result = _router._cli_endpoint_for(entry)
-        assert result == "http://127.0.0.1:8971"
 
 
 # ── _probe_egress_proxy ──────────────────────────────────────────────────
@@ -1846,7 +1839,6 @@ class TestEntryEndpoint:
             "id": "kimi-direct", "route": "egress_proxy", "provider": "moonshot",
             "endpoints": {"openai": "http://127.0.0.1:8990"},
         }
-        assert ("egress_proxy", "moonshot") not in _router._LEGACY_CLI_ENDPOINTS
         assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
 
     def test_undeclared_wire_raises_naming_what_is_declared(self):
@@ -1862,13 +1854,30 @@ class TestEntryEndpoint:
                  "api_base": "http://127.0.0.1:8990"}
         assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8990"
 
-    def test_legacy_shim_warns_and_names_the_entry(self, caplog):
+    def test_entry_without_endpoints_raises_naming_the_entry(self):
+        """The migration shim is gone (I6186): an undeclared endpoint is a
+        registry fact surfaced as an error naming the row, never a fallback
+        to a URL krepis chose."""
         entry = {"id": "unmigrated", "route": "openrouter", "provider": "openrouter"}
-        with caplog.at_level("WARNING"):
-            url = _router._entry_endpoint(entry, "anthropic")
-        assert url == "https://openrouter.ai/api"
-        assert "unmigrated" in caplog.text
-        assert "R7" in caplog.text
+        with pytest.raises(ValueError, match="unmigrated") as exc:
+            _router._entry_endpoint(entry, "anthropic")
+        assert "endpoints.anthropic" in str(exc.value)
+
+    def test_no_route_keyed_endpoint_table_in_library_code(self):
+        """I6186 closes-when: the hardcoded tables no longer exist."""
+        for name in ("_LEGACY_CLI_ENDPOINTS", "_CLI_COMPATIBLE_ENDPOINTS",
+                     "_resolve_cli_endpoint", "_cli_endpoint_for"):
+            assert not hasattr(_router, name), name
+
+    def test_new_provider_resolves_with_zero_code_change(self):
+        """I6186 regression: a provider krepis has never heard of, on any
+        route, resolves to exactly what its registry row declares."""
+        entry = {"id": "brand-new", "route": "egress_proxy",
+                 "provider": "never-seen-provider",
+                 "endpoints": {"anthropic": "http://127.0.0.1:8123",
+                               "openai": "http://127.0.0.1:8124"}}
+        assert _router._entry_endpoint(entry, "anthropic") == "http://127.0.0.1:8123"
+        assert _router._entry_endpoint(entry, "openai") == "http://127.0.0.1:8124"
 
     def test_env_override_beats_the_declared_endpoint(self, monkeypatch):
         monkeypatch.setenv("KREPIS_OPENROUTER_API_URL", "http://localhost:9999")
@@ -2897,6 +2906,7 @@ models:
   - id: dead-leader
     provider: zhipu
     route: egress_proxy
+    endpoints: {openai: "http://127.0.0.1:8974/v1"}
     model: qwen3-max
     api_base: http://127.0.0.1:8974/v1
     reachable_from: [laptop, ec2]
@@ -2904,6 +2914,7 @@ models:
   - id: live-follower
     provider: deepseek
     route: egress_proxy
+    endpoints: {anthropic: "http://127.0.0.1:8971", openai: "http://127.0.0.1:8971/v1"}
     model: deepseek-v4-flash
     api_base: http://127.0.0.1:8971/v1
     reachable_from: [laptop, ec2]
