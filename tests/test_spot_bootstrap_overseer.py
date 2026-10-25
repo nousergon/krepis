@@ -17,6 +17,7 @@ extension existed. That golden is also what proves the extension is additive:
 
 from __future__ import annotations
 
+import dataclasses
 import gzip as gzip_module
 import json
 import os
@@ -871,6 +872,61 @@ class TestEveryCapabilityIsNew:
     @pytest.mark.parametrize("capability,marker", sorted(MARKERS.items()))
     def test_the_capability_is_present_once_declared(self, capability, marker):
         assert marker in render_bootstrap(_overseer_spec()), capability
+
+
+# ── 10. Pre-exec hook (alpha-engine-config-I8131) ─────────────────────────
+
+_PRE_EXEC_MARKER = "# spec.pre_exec_hook"
+_HOOK = 'install -d -o ec2-user "$HOME/.workload-venv" && touch /tmp/pre-exec-ran'
+
+
+class TestPreExecHook:
+    """Root-side setup between the secret fetch and the privilege drop."""
+
+    def test_the_pre_extension_golden_did_not_already_carry_it(self):
+        assert _PRE_EXEC_MARKER not in _GOLDEN.read_text(), (
+            "the pre-extension golden already carries the pre-exec marker — the "
+            "golden is stale; re-derive it before trusting any test here"
+        )
+
+    def test_unset_renders_nothing(self):
+        script = render_bootstrap(_overseer_spec())
+        assert _PRE_EXEC_MARKER not in script
+        assert render_bootstrap(_overseer_spec(pre_exec_hook="")) == script
+
+    def test_declared_renders_the_shell_verbatim(self):
+        script = render_bootstrap(_overseer_spec(pre_exec_hook=_HOOK))
+        assert _PRE_EXEC_MARKER in script
+        assert f"\n{_HOOK}\n" in script
+
+    def test_it_runs_after_the_secret_fetch_and_before_the_privilege_drop(self):
+        """After the drop it would run as the wrong user, and that failure is
+        silent — so the position is asserted, not assumed."""
+        script = render_bootstrap(_overseer_spec(pre_exec_hook=_HOOK))
+        hook_at = script.index(_PRE_EXEC_MARKER)
+        assert script.index("get_secret()") < hook_at
+        assert script.rindex("get_secret /alpha-engine/") < hook_at
+        assert script.index("__proxy_health__") < hook_at
+        assert hook_at < script.index("runuser -u")
+
+    def test_it_runs_after_the_clone_and_config_copies(self):
+        script = render_bootstrap(
+            dataclasses.replace(_pre_extension_spec(), pre_exec_hook=_HOOK)
+        )
+        hook_at = script.index(_PRE_EXEC_MARKER)
+        assert script.index("git clone") < hook_at
+        assert script.rindex("aws s3 cp") < hook_at
+
+    def test_it_is_expressible_as_workload_table_data(self, tmp_path):
+        """The escape hatch is a ROW field, not a fork in the renderer."""
+        table = json.loads(json.dumps(_TABLE))
+        table["workloads"]["ci-watch"]["pre_exec_hook"] = _HOOK
+        path = tmp_path / "workloads.json"
+        path.write_text(json.dumps(table))
+        specs = load_workloads(path)
+        assert specs["ci-watch"].pre_exec_hook == _HOOK
+        assert _HOOK in render_bootstrap(specs["ci-watch"])
+        assert _PRE_EXEC_MARKER not in render_bootstrap(specs["config-runner"])
 
 
 def test_a_secret_value_can_never_reach_the_rendered_script():

@@ -395,6 +395,23 @@ class SpotBootstrapSpec:
     #: completion marker. ``rc`` is in scope.
     finish_hook: "str | None" = None
 
+    #: Extra shell the bootstrap runs as ROOT after the clone, the config
+    #: copies, the secret fetch and the egress-proxy staging, and immediately
+    #: BEFORE the privilege drop (``runuser``) — rendered verbatim, under the
+    #: script's ``set -eo pipefail``, so a failing hook aborts the bootstrap
+    #: instead of handing a half-prepared box to the workload.
+    #:
+    #: This is the root-side setup no other field expresses: building a venv
+    #: the dropped user will pip into at runtime and chowning it, installing a
+    #: policy layer, a final ``chown -R`` of the checkout
+    #: (alpha-engine-config-I8131 — the ``custom_executor`` escape hatch).
+    #: ``PrivilegeDrop.chown`` covers path ownership only, and ``finish_hook``
+    #: runs in the EXIT trap, which is too late. A hook placed AFTER the drop
+    #: would run as the wrong user and mostly degrade quietly, so the
+    #: insertion point is asserted in tests rather than assumed. The module
+    #: still knows no workload: the shell comes from the spec.
+    pre_exec_hook: "str | None" = None
+
     #: **No-clone mode.** Six of the seven Overseer bootstraps never clone:
     #: their dispatcher's SSM prelude already placed the checkout, and they
     #: derive a repo root from ``$0``. Deriving is not asserting — a prelude
@@ -1011,6 +1028,17 @@ def _egress_proxy_block(spec: SpotBootstrapSpec) -> str:
     return "\n".join(lines)
 
 
+def _pre_exec_block(spec: SpotBootstrapSpec) -> str:
+    assert spec.pre_exec_hook
+    return "\n".join(
+        [
+            "# spec.pre_exec_hook — the workload's root-side setup. Runs as ROOT,",
+            "# after clone/config/secrets and before the privilege drop.",
+            spec.pre_exec_hook,
+        ]
+    )
+
+
 def _privilege_drop_block(spec: SpotBootstrapSpec) -> str:
     drop = spec.privilege_drop
     assert drop is not None
@@ -1107,6 +1135,8 @@ def render_bootstrap(spec: SpotBootstrapSpec) -> str:
         blocks.append(_secrets_block(spec))
     if spec.egress_proxy is not None:
         blocks.append(_egress_proxy_block(spec))
+    if spec.pre_exec_hook:
+        blocks.append(_pre_exec_block(spec))
     if spec.privilege_drop is not None:
         blocks.append(_privilege_drop_block(spec))
     return "\n\n".join(blocks) + "\n"
