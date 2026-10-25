@@ -114,12 +114,14 @@ jobs:
           chmod +x gitleaks
           sudo mv gitleaks /usr/local/bin/gitleaks
           gitleaks version
-          # Minimal config so session_dlp scan-integration tests don't skip.
-          # The fleet's real gitleaks-egress.toml chain (with custom Anthropic
-          # key rules) is NOT committed here — session_dlp's test_secret_in_body
-          # _is_blocked gracefully skips when the fake key doesn't match any rule.
-          sudo mkdir -p /opt/groom-llm-routing
-          printf '[extend]\nuseDefault = true\n' | sudo tee /opt/groom-llm-routing/gitleaks-egress.toml > /dev/null
+          # alpha-engine-config-I8058: no /opt ruleset stub here. The fleet's
+          # real chain ships as package data (src/krepis/dlp_config/, PR211),
+          # and a stub in an operator dir outranks it, so the suite scanned
+          # with stock rules only. Assert the runner resolves the packaged
+          # ruleset, so a reintroduced stub fails this step.
+          dlp_preflight="$(python -m krepis.session_dlp preflight)"
+          echo "$dlp_preflight"
+          grep -qx 'ruleset_matches_packaged: True' <<<"$dlp_preflight"
 
       # Strict typing, BLOCKING (alpha-engine-config-I12607). Errors recorded in
       # `.basedpyright/baseline.json` are tolerated; any new one fails. On a PR the
