@@ -108,32 +108,36 @@ class TestScanIntegration:
         assert scan_ms >= 0
 
     def test_secret_in_body_is_blocked(self):
-        """A body with an embedded fake Anthropic API key should be blocked.
+        """A body with an embedded fake Anthropic API key must be blocked.
 
-        The custom rules in gitleaks-custom.toml match the Anthropic key
-        prefix — a fresh fake key with the right prefix triggers the rule.
+        The key body is derived at runtime from fixed digests, so it has a
+        real key's shape and entropy without a key-shaped literal in this
+        file for the repo's own gitleaks scan to flag. The old literal
+        (``FAKEtestKEY...ABCDEF...``) never fired a rule, so this test only
+        ever skipped; under the packaged ruleset a realistic body fires
+        ``nousergon-anthropic-api-key`` (alpha-engine-config-I8058).
         """
+        import base64
+        import hashlib
+
+        key_body = "".join(
+            c
+            for i in range(4)
+            for c in base64.b64encode(
+                hashlib.sha256(f"krepis-dlp-fixture-{i}".encode()).digest()
+            ).decode()
+            if c.isalnum()
+        )[:93] + "AA"
         body = _body(
             [
                 {"role": "system", "content": "You are a helpful assistant."},
                 {
                     "role": "user",
-                    "content": "Here is my API key: sk-ant-api03-"
-                    "FAKEtestKEYmaterialNOTreal1234567890ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                    "content": "Here is my API key: sk-ant-api03-" + key_body,
                 },
             ]
         )
         verdict, reason, scan_ms, cache_ratio = scan_request(body)
-        # This might be DLP_OK if the fake key doesn't match the gitleaks
-        # rules exactly — the Anthropic custom rule is prefix-based and
-        # the fake above has the correct prefix. If it doesn't match, the
-        # rule may need adjusting; this test documents the expected
-        # behaviour rather than enforcing a precise regex.
-        if verdict == DLP_OK:
-            pytest.skip(
-                "fake Anthropic key did not trigger a rule — "
-                "the custom rule regex may need tuning for this pattern"
-            )
         assert verdict == DLP_BLOCKED, f"expected block, got {verdict}: {reason}"
 
     def test_non_json_body_blocked(self):
