@@ -24,6 +24,7 @@ Key layout under ``{prefix}`` (nothing fleet-specific is baked in)::
 
     rows/date=YYYY-MM-DD/callsite=<id>/<run_id>.<writer>.<seq>.jsonl.gz
     blobs/sha256/<ab>/<sha256>.gz
+    status/<name>.json          (opt-in; see below)
 
 Rows are hive-partitioned, so a reader can prune by date and call site
 (``read_json_auto('s3://…/rows/date=2026-10-*/callsite=*/*.jsonl.gz',
@@ -36,6 +37,16 @@ bytes, written with ``If-None-Match: *``, so a repeated system prompt or a
 re-cited chunk is stored once no matter how many calls reference it. The
 object's ``media-type`` metadata says how to read the decompressed bytes.
 Gzip is written with ``mtime=0``, so the stored bytes are deterministic too.
+
+**The status pointer is the one fixed key.** Every other key is per-day or
+per-run, so nothing can HEAD "the sink's latest state" without listing. A
+sink given a ``status_name`` (or :data:`STATUS_ENV_VAR` for the process
+default) overwrites ``{prefix}/status/<name>.json`` after every flush that
+did work: when it ran, the last rows key it wrote, and its cumulative
+counters and last error. One name per producer family, so two families
+never overwrite each other's pointer. It is opt-in because a producer whose
+grant covers only its own ``rows/…/callsite=<id>/`` partition could not
+write it, and would log a failure on every flush.
 """
 
 from __future__ import annotations
@@ -50,6 +61,7 @@ import re
 import threading
 import uuid
 from collections import OrderedDict, defaultdict
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from krepis import s3_surface
@@ -68,13 +80,21 @@ __all__ = [
     "reset_default_trace_sink_for_tests",
     "BUCKET_ENV_VAR",
     "PREFIX_ENV_VAR",
+    "STATUS_ENV_VAR",
+    "STATUS_SCHEMA_VERSION",
     "rows_key",
     "blob_key",
+    "status_key",
 ]
 
 #: Environment variables that switch the process-default trace sink on.
 BUCKET_ENV_VAR = "KREPIS_TRACE_SINK_BUCKET"
 PREFIX_ENV_VAR = "KREPIS_TRACE_SINK_PREFIX"
+#: Optional: the producer family's name for the fixed status pointer.
+STATUS_ENV_VAR = "KREPIS_TRACE_SINK_STATUS_NAME"
+STATUS_SCHEMA_VERSION = "krepis.trace_sink_status.v1"
+#: Bound on the recorded error text, so a verbose exception cannot bloat it.
+_MAX_ERROR_CHARS = 500
 
 #: Declared S3 surface (``krepis.s3_surface``): the VARIABLE, not a prefix,
 #: because where traces go is the consumer's deploy configuration.
@@ -95,7 +115,7 @@ _SAFE_SEGMENT_RE = re.compile(r"[^A-Za-z0-9_.\-]")
 TraceSinkCallable = Callable[[Dict[str, Any], Mapping[str, TraceBlob]], None]
 
 _DEFAULT_SINK: "Optional[S3JsonlTraceSink]" = None
-_DEFAULT_SINK_KEY: "Optional[Tuple[str, str, str]]" = None
+_DEFAULT_SINK_KEY: "Optional[Tuple[str, str, str, str]]" = None
 _DEFAULT_SINK_LOCK = threading.Lock()
 
 
@@ -119,6 +139,15 @@ def rows_key(prefix: str, date_str: str, callsite_id: str, run_id: str,
 def blob_key(prefix: str, sha256: str) -> str:
     """Object key for one content-addressed blob."""
     return f"{prefix}/blobs/sha256/{sha256[:2]}/{sha256}.gz"
+
+
+def status_key(prefix: str, name: str) -> str:
+    """Object key for one producer family's fixed status pointer."""
+    return f"{prefix}/status/{_safe_segment(name)}.json"
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _gzip(data: bytes) -> bytes:
@@ -171,12 +200,14 @@ class S3JsonlTraceSink:
         flush_threshold: Auto-flush once a row group holds this many rows.
         blob_flush_bytes: Auto-flush blobs once pending bytes pass this.
         register_atexit: Flush at interpreter exit. Disable in tests.
+        status_name: Producer family name for the fixed status pointer at
+            :func:`status_key`; ``None`` (the default) writes none.
 
     Counters a caller can assert on: ``rows_written``, ``blobs_written``,
     ``blobs_deduplicated`` (already present, in this process or in S3),
     ``flush_errors`` (failed row PUTs), ``blob_errors`` (failed blob PUTs),
     ``rows_dropped`` and ``blobs_dropped`` (permanent loss past the retained
-    cap or at :meth:`close`).
+    cap or at :meth:`close`), ``status_errors`` (failed status PUTs).
     """
 
     def __init__(
@@ -189,7 +220,8 @@ class S3JsonlTraceSink:
         flush_threshold: int = DEFAULT_FLUSH_THRESHOLD,
         blob_flush_bytes: int = DEFAULT_BLOB_FLUSH_BYTES,
         register_atexit: bool = True,
-    ):
+        status_name: Optional[str] = None,
+    ) -> None:
         if not bucket or not isinstance(bucket, str):
             raise ValueError("S3JsonlTraceSink requires a non-empty bucket")
         if not prefix or not isinstance(prefix, str) or not prefix.strip("/"):
@@ -207,6 +239,10 @@ class S3JsonlTraceSink:
         self.blob_errors = 0
         self.rows_dropped = 0
         self.blobs_dropped = 0
+        self.status_errors = 0
+        self.status_key = status_key(self.prefix, status_name) if status_name else None
+        self.last_rows_key: Optional[str] = None
+        self.last_error: Optional[str] = None
         self._s3 = s3_client
         self._rows: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
         self._seq: Dict[Tuple[str, str], int] = defaultdict(int)
@@ -258,6 +294,8 @@ class S3JsonlTraceSink:
         fails is re-buffered and its row is still written — a row pointing
         at a missing blob is detectable by a reader, a missing row is not.
         """
+        with self._lock:
+            blobs_pending = len(self._blobs)
         self._flush_blobs()
         with self._lock:
             groups = {k: v for k, v in self._rows.items() if v}
@@ -287,6 +325,12 @@ class S3JsonlTraceSink:
                             overflow, key, cap, self.rows_dropped,
                         )
                     self._rows[key] = merged
+        if groups or blobs_pending:
+            self._put_status(
+                row_objects_written=written,
+                row_objects_failed=len(failed),
+                blobs_attempted=blobs_pending,
+            )
         return written
 
     def close(self) -> None:
@@ -307,6 +351,9 @@ class S3JsonlTraceSink:
                 "blob_errors=%d)",
                 rows_left, blobs_left, self.flush_errors, self.blob_errors,
             )
+            # The flush above already wrote a pointer; rewrite it so the
+            # permanent loss counted here is not hidden behind it.
+            self._put_status(event="close")
 
     def _flush_blobs(self) -> int:
         with self._lock:
@@ -368,12 +415,14 @@ class S3JsonlTraceSink:
             #     rows (retried on the next flush), and the freshness monitor
             #     on the destination prefix, which catches sustained loss.
             self.flush_errors += 1
+            self._record_error(exc)
             logger.error(
                 "trace sink PUT failed for s3://%s/%s (%d row(s)): %s",
                 self.bucket, object_key, len(rows), exc,
             )
             return False
         self.rows_written += len(rows)
+        self.last_rows_key = object_key
         return True
 
     def _put_blob(self, sha: str, blob: TraceBlob) -> Optional[bool]:
@@ -397,12 +446,65 @@ class S3JsonlTraceSink:
             # Same deliberate non-raising degradation as `_put_rows`; recorded
             # on this ERROR line, `blob_errors`, and the re-buffered blob.
             self.blob_errors += 1
+            self._record_error(exc)
             logger.error(
                 "trace sink blob PUT failed for s3://%s/%s (%d bytes): %s",
                 self.bucket, object_key, len(blob.data), exc,
             )
             return None
         self.blobs_written += 1
+        return True
+
+    def _record_error(self, exc: BaseException) -> None:
+        self.last_error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
+
+    def status(self, *, event: str = "flush", **last_flush: int) -> Dict[str, object]:
+        """The body :meth:`flush` writes to the status pointer."""
+        return {
+            "schema_version": STATUS_SCHEMA_VERSION,
+            "updated_at": _utc_now(),
+            "event": event,
+            "prefix": self.prefix,
+            "run_id": self.run_id,
+            "writer_id": self.writer_id,
+            "last_rows_key": self.last_rows_key,
+            "last_flush": dict(last_flush),
+            "counters": {
+                "rows_written": self.rows_written,
+                "blobs_written": self.blobs_written,
+                "blobs_deduplicated": self.blobs_deduplicated,
+                "flush_errors": self.flush_errors,
+                "blob_errors": self.blob_errors,
+                "rows_dropped": self.rows_dropped,
+                "blobs_dropped": self.blobs_dropped,
+                "status_errors": self.status_errors,
+            },
+            "last_error": self.last_error,
+        }
+
+    def _put_status(self, *, event: str = "flush", **last_flush: int) -> bool:
+        """Overwrite the fixed status pointer. Never raises; False = not written."""
+        if self.status_key is None:
+            return False
+        body = json.dumps(self.status(event=event, **last_flush), sort_keys=True).encode("utf-8")
+        try:
+            self._client().put_object(
+                Bucket=self.bucket,
+                Key=self.status_key,
+                Body=body,
+                ContentType="application/json",
+                CacheControl="no-cache",
+            )
+        except Exception as exc:  # noqa: BLE001 — duck-typed boto errors
+            # Same deliberate non-raising degradation as `_put_rows`; the rows
+            # and blobs above are unaffected. Recorded on this ERROR line,
+            # `status_errors`, and the pointer's own age, which stops moving.
+            self.status_errors += 1
+            logger.error(
+                "trace sink status PUT failed for s3://%s/%s: %s",
+                self.bucket, self.status_key, exc,
+            )
+            return False
         return True
 
     def _client(self) -> Any:
@@ -419,7 +521,8 @@ class S3JsonlTraceSink:
 def default_trace_sink_from_env(*, s3_client: Any = None) -> "Optional[S3JsonlTraceSink]":
     """Return the process-scoped default trace sink, or ``None``.
 
-    Reads :data:`BUCKET_ENV_VAR` and :data:`PREFIX_ENV_VAR`. Neither set →
+    Reads :data:`BUCKET_ENV_VAR` and :data:`PREFIX_ENV_VAR`, and the optional
+    :data:`STATUS_ENV_VAR` naming the status pointer. Neither of the first two →
     ``None``. Both set → one :class:`S3JsonlTraceSink` per process, shared by
     every :class:`krepis.llm.LLMClient` built in it. Exactly one set raises
     :exc:`TraceSinkConfigError` at client construction, before any spend.
@@ -437,7 +540,8 @@ def default_trace_sink_from_env(*, s3_client: Any = None) -> "Optional[S3JsonlTr
             f"while looking exactly like one that was never configured. Set "
             f"{missing}, or unset {present} to disable tracing deliberately."
         )
-    key = (bucket, prefix, os.environ.get("KREPIS_RUN_ID", "").strip())
+    status_name = os.environ.get(STATUS_ENV_VAR, "").strip() or None
+    key = (bucket, prefix, os.environ.get("KREPIS_RUN_ID", "").strip(), status_name or "")
     global _DEFAULT_SINK, _DEFAULT_SINK_KEY
     with _DEFAULT_SINK_LOCK:
         if _DEFAULT_SINK is None or _DEFAULT_SINK_KEY != key:
@@ -448,6 +552,7 @@ def default_trace_sink_from_env(*, s3_client: Any = None) -> "Optional[S3JsonlTr
                 run_id=run_id,
                 s3_client=s3_client,
                 register_atexit=True,
+                status_name=status_name,
             )
             _DEFAULT_SINK_KEY = key
             logger.info(

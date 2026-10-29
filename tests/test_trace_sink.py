@@ -28,6 +28,7 @@ class FakeS3:
         self.calls = []
         self.fail_rows = 0
         self.fail_blobs = 0
+        self.fail_status = 0
 
     def put_object(self, **kw):
         self.calls.append(kw)
@@ -37,6 +38,9 @@ class FakeS3:
             raise RuntimeError("s3 down")
         if "/blobs/" in key and self.fail_blobs:
             self.fail_blobs -= 1
+            raise RuntimeError("s3 down")
+        if "/status/" in key and self.fail_status:
+            self.fail_status -= 1
             raise RuntimeError("s3 down")
         if kw.get("IfNoneMatch") == "*" and key in self.objects:
             raise _ClientError("PreconditionFailed", 412)
@@ -259,6 +263,94 @@ class TestFailuresNeverRaise:
         assert len(s3.rows()) == 1
 
 
+STATUS = "llm_traces/v1/status/thinktank.json"
+
+
+def _status(s3):
+    return json.loads(s3.objects[STATUS]["Body"])
+
+
+class TestStatusPointer:
+    def test_no_status_name_writes_no_pointer(self):
+        s3 = FakeS3()
+        sink = _sink(s3)
+        sink(_row(), {})
+        sink.flush()
+        assert sink.status_key is None
+        assert not [k for k in s3.objects if "/status/" in k]
+
+    def test_the_key_is_fixed_and_sanitised(self):
+        assert ts.status_key("p", "think tank/x") == "p/status/think_tank_x.json"
+
+    def test_a_flush_overwrites_one_fixed_key_with_the_latest_state(self):
+        s3 = FakeS3()
+        sink = _sink(s3, status_name="thinktank")
+        sha, blob = _blob("hello")
+        sink(_row(), {sha: blob})
+        sink.flush()
+        sink(_row(callsite="other"), {})
+        sink.flush()
+        status_puts = [c for c in s3.calls if "/status/" in c["Key"]]
+        assert [c["Key"] for c in status_puts] == [STATUS, STATUS]
+        body = _status(s3)
+        rows_keys = sorted(k for k in s3.objects if "/rows/" in k)
+        assert body["schema_version"] == ts.STATUS_SCHEMA_VERSION
+        assert body["last_rows_key"] in rows_keys
+        assert "callsite=other" in body["last_rows_key"]
+        assert body["counters"]["rows_written"] == 2
+        assert body["counters"]["blobs_written"] == 1
+        assert body["last_flush"] == {
+            "row_objects_written": 1, "row_objects_failed": 0, "blobs_attempted": 0,
+        }
+        assert body["last_error"] is None
+        assert (body["run_id"], body["writer_id"]) == ("run-1", sink.writer_id)
+        assert body["updated_at"].endswith("Z")
+        assert s3.objects[STATUS]["ContentType"] == "application/json"
+        assert "IfNoneMatch" not in s3.objects[STATUS]
+
+    def test_an_empty_flush_writes_no_pointer(self):
+        s3 = FakeS3()
+        sink = _sink(s3, status_name="thinktank")
+        assert sink.flush() == 0
+        assert STATUS not in s3.objects
+
+    def test_a_failed_row_put_is_on_the_pointer(self):
+        s3 = FakeS3()
+        s3.fail_rows = 1
+        sink = _sink(s3, status_name="thinktank")
+        sink(_row(), {})
+        assert sink.flush() == 0
+        body = _status(s3)
+        assert body["counters"]["flush_errors"] == 1
+        assert body["last_flush"]["row_objects_failed"] == 1
+        assert body["last_error"] == "RuntimeError: s3 down"
+        assert body["last_rows_key"] is None
+
+    def test_a_failed_status_put_never_raises_and_rows_still_land(self, caplog):
+        s3 = FakeS3()
+        s3.fail_status = 1
+        sink = _sink(s3, status_name="thinktank")
+        sink(_row(), {})
+        assert sink.flush() == 1
+        assert sink.status_errors == 1
+        assert STATUS not in s3.objects
+        assert len(s3.rows()) == 1
+        assert "status PUT failed" in caplog.text
+        sink(_row(), {})
+        sink.flush()
+        assert _status(s3)["counters"]["status_errors"] == 1
+
+    def test_permanent_loss_at_close_rewrites_the_pointer(self):
+        s3 = FakeS3()
+        s3.fail_rows = 99
+        sink = _sink(s3, status_name="thinktank")
+        sink(_row(), {})
+        sink.close()
+        body = _status(s3)
+        assert body["event"] == "close"
+        assert body["counters"]["rows_dropped"] == 1
+
+
 class TestInMemorySink:
     def test_it_keeps_rows_and_first_blob(self):
         sink = ts.InMemoryTraceSink()
@@ -272,7 +364,7 @@ class TestInMemorySink:
 class TestDefaultSink:
     @pytest.fixture(autouse=True)
     def _reset(self, monkeypatch):
-        for var in (ts.BUCKET_ENV_VAR, ts.PREFIX_ENV_VAR, "KREPIS_RUN_ID"):
+        for var in (ts.BUCKET_ENV_VAR, ts.PREFIX_ENV_VAR, ts.STATUS_ENV_VAR, "KREPIS_RUN_ID"):
             monkeypatch.delenv(var, raising=False)
         ts.reset_default_trace_sink_for_tests()
         yield
@@ -298,6 +390,14 @@ class TestDefaultSink:
         assert (first.bucket, first.prefix, first.run_id) == ("bucket", "llm_traces/v1", "run-9")
         first(_row(), {})
         assert ts.flush_default_trace_sink() == 1
+
+    def test_the_status_name_comes_from_the_environment(self, monkeypatch):
+        monkeypatch.setenv(ts.BUCKET_ENV_VAR, "bucket")
+        monkeypatch.setenv(ts.PREFIX_ENV_VAR, "llm_traces/v1")
+        assert ts.default_trace_sink_from_env(s3_client=FakeS3()).status_key is None
+        monkeypatch.setenv(ts.STATUS_ENV_VAR, "thinktank")
+        sink = ts.default_trace_sink_from_env(s3_client=FakeS3())
+        assert sink.status_key == STATUS
 
     def test_the_decorator_flushes_on_success_and_on_error(self, monkeypatch):
         monkeypatch.setenv(ts.BUCKET_ENV_VAR, "bucket")
