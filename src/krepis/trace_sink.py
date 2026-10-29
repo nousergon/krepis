@@ -221,7 +221,7 @@ class S3JsonlTraceSink:
         blob_flush_bytes: int = DEFAULT_BLOB_FLUSH_BYTES,
         register_atexit: bool = True,
         status_name: Optional[str] = None,
-    ):
+    ) -> None:
         if not bucket or not isinstance(bucket, str):
             raise ValueError("S3JsonlTraceSink requires a non-empty bucket")
         if not prefix or not isinstance(prefix, str) or not prefix.strip("/"):
@@ -458,7 +458,7 @@ class S3JsonlTraceSink:
     def _record_error(self, exc: BaseException) -> None:
         self.last_error = f"{type(exc).__name__}: {exc}"[:_MAX_ERROR_CHARS]
 
-    def status(self, *, event: str = "flush", **last_flush: int) -> Dict[str, Any]:
+    def status(self, *, event: str = "flush", **last_flush: int) -> Dict[str, object]:
         """The body :meth:`flush` writes to the status pointer."""
         return {
             "schema_version": STATUS_SCHEMA_VERSION,
