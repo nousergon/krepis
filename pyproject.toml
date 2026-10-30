@@ -158,6 +158,16 @@ where = ["src"]
 # Locking only the interpreters development actually uses ends that without
 # touching requires-python: the 3.9 dashboard box still installs krepis.
 environments = ["python_full_version >= '3.11'"]
+# Security floor for the dev lock (alpha-engine-config-I12703). filelock below
+# 4.2.1 carries the advisory krepis-PR266 cleared, and every litellm from
+# 1.104.0 on caps `filelock<4.0`, so Dependabot's minor group (krepis-PR268,
+# litellm 1.103.9 -> 1.106.2) silently re-locked filelock 4.2.4 -> 3.32.7 and the
+# filelock security update went red again (run 40821269127, 2026-10-29). The
+# constraint makes that downgrade unresolvable instead of silent: litellm stays
+# on the 1.103 line, which already clears every litellm GHSA (the newest fix
+# is 1.88.6), until a litellm release accepts filelock 4. Dev lock only; consumers
+# install with pip against the ranges above.
+constraint-dependencies = ["filelock>=4.2.1"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
