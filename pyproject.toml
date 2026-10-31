@@ -167,7 +167,12 @@ environments = ["python_full_version >= '3.11'"]
 # on the 1.103 line, which already clears every litellm GHSA (the newest fix
 # is 1.88.6), until a litellm release accepts filelock 4. Dev lock only; consumers
 # install with pip against the ranges above.
-constraint-dependencies = ["filelock>=4.2.1"]
+# litellm>=1.88.6 is the same kind of floor (alpha-engine-config-I12703): the
+# Dependabot majors group (krepis-PR271, anthropic 2 + openai 3) re-locked
+# litellm 1.103.10 -> 1.83.0: current litellm caps `openai<3.0.0`, so the
+# resolver backtracked to 1.83.0, which accepts openai 3 and re-opens all 14
+# GHSAs. 1.88.6 is the newest fix among them; openai stays on 2.x here.
+constraint-dependencies = ["filelock>=4.2.1", "litellm>=1.88.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
