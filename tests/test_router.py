@@ -1233,10 +1233,19 @@ class TestResolveLitellmMasterKey:
         assert result == "test-quoted"
 
     def test_no_key_returns_none(self):
-        """When no source has the key, returns None."""
+        """When no source has the key, returns None.
+
+        Hermetic and non-disclosing (alpha-engine-config-I5224): clearing the
+        environment is not enough, because leg 2 reads ``secrets.env`` under
+        the real home directory, so on a developer laptop this test used to
+        resolve the live key and render it in pytest's failure diff.
+        """
         with mock.patch.dict(os.environ, {}, clear=True):
-            result = _router._resolve_litellm_master_key()
-        assert result is None
+            with mock.patch("os.path.expanduser", return_value="/nonexistent"):
+                result = _router._resolve_litellm_master_key()
+        # Boolean capture: a failure must never print the value it found.
+        is_none = result is None
+        assert is_none
 
 
 class TestLitellmMasterKeyFromSSM:
