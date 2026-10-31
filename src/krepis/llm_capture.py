@@ -38,7 +38,15 @@ import os
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Union, cast
+
+from krepis.llm_trace import (
+    CAPTURE_FULL,
+    EXTENSION_NAMESPACE,
+    TRACE_SCHEMA_VERSION,
+    TraceBlob,
+    sha256_hex,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +63,14 @@ _TRUTHY = ("1", "true")
 
 class SftCaptureWriteError(RuntimeError):
     """An enabled SFT capture failed to persist — loud, never swallowed."""
+
+
+class SftProjectionError(ValueError):
+    """A trace row that cannot be projected into an SFT record.
+
+    Raised rather than returning a partial record: an SFT row with a missing
+    prompt or completion is a wrong training example, not a smaller one.
+    """
 
 
 def capture_enabled() -> bool:
@@ -246,3 +262,179 @@ def capture_llm_call(
     )
     append_sft_jsonl(sink_path, [record])
     return True
+
+
+# ── projection from an llm_trace.v1 row ────────────────────────────────────
+
+#: The ``LLMUsage`` fields an ``llm_trace.v1`` row carries, and where. The
+#: trace does not keep ``prompt_cache_miss_tokens``,
+#: ``reasoning_tokens_max_attempt``, ``web_fetch_requests`` or
+#: ``provider_cost_usd``, so a projected ``usage`` omits them rather than
+#: reporting a zero the trace never measured.
+_TRACE_USAGE_GEN_AI = (
+    ("input_tokens", "usage.input_tokens"),
+    ("output_tokens", "usage.output_tokens"),
+    ("cache_read_tokens", "usage.cache_read.input_tokens"),
+    ("cache_create_tokens", "usage.cache_creation.input_tokens"),
+)
+_TRACE_USAGE_EXTENSION = (
+    "reasoning_tokens",
+    "budget_escalations",
+    "attempts",
+    "web_search_requests",
+    "usage_unknown",
+)
+
+
+def _as_mapping(value: object) -> Mapping[str, object]:
+    """``value`` as a string-keyed mapping, or empty when it is not one."""
+    if isinstance(value, Mapping):
+        return cast("Mapping[str, object]", value)
+    return {}
+
+
+def _blob_json(
+    blobs: Mapping[str, Union[TraceBlob, bytes]], sha: object, what: str
+) -> Mapping[str, object]:
+    """Load the JSON object stored at ``sha``, checking it is that address."""
+    if not isinstance(sha, str) or not sha:
+        raise SftProjectionError(f"trace row has no {what} hash")
+    blob = blobs.get(sha)
+    if blob is None:
+        raise SftProjectionError(f"{what} blob {sha} is not in the blobs given")
+    data = blob.data if isinstance(blob, TraceBlob) else bytes(blob)
+    if sha256_hex(data) != sha:
+        raise SftProjectionError(
+            f"{what} blob does not hash to its address {sha}"
+        )
+    try:
+        loaded: object = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise SftProjectionError(f"{what} blob {sha} is not JSON: {exc}") from exc
+    if not isinstance(loaded, dict):
+        raise SftProjectionError(f"{what} blob {sha} is not a JSON object")
+    return cast("dict[str, object]", loaded)
+
+
+def sft_record_from_trace(
+    row: Mapping[str, object],
+    blobs: Mapping[str, Union[TraceBlob, bytes]],
+    *,
+    producer: str,
+    meta: Optional[Mapping[str, object]] = None,
+    cost_usd: Optional[float] = None,
+    call_seq: Optional[int] = None,
+    source: str = "live",
+    captured_at: Optional[str] = None,
+) -> Dict[str, object]:
+    """Project one ``llm_trace.v1`` row (plus its blobs) → SFT v3 record dict.
+
+    This is the trace-first path to the same envelope :func:`build_sft_record`
+    builds from a live result (alpha-engine-config-I12312, audit §6.2: "the
+    existing ``build_sft_record`` becomes a projection of the trace record"),
+    so a distillation corpus can be cut from ``llm_traces/v1/`` after the fact
+    instead of needing its own capture flag at call time.
+
+    Parameters
+    ----------
+    row
+        One trace row as :func:`krepis.llm_trace.build_trace_record` builds it
+        (or as read back from ``llm_traces/v1/rows/``).
+    blobs
+        sha256 → body, as :class:`~krepis.llm_trace.TraceBlob` or the
+        decompressed bytes read from ``llm_traces/v1/blobs/``. Each body is
+        checked against its address before it is used.
+    producer, meta, cost_usd, call_seq, source
+        As for :func:`build_sft_record`.
+    captured_at
+        ISO-8601 override; defaults to the row's ``ended_at``, so projecting
+        the same row twice yields the same record.
+
+    **Field by field.** ``input_messages`` and ``invocation_params`` come from
+    the input blob (the exact request the transport sent) by the same
+    normalization :func:`build_sft_record` applies, so their
+    ``content_hash`` matches a live capture of the same call. ``output_text``
+    and ``structured_output`` come from the output blob. ``output_message`` is
+    that output body (``text``, plus ``data`` / ``web_citations`` when
+    present): the trace keeps no raw provider response, and the envelope types
+    ``output_message`` as producer-serialized opaque JSON. ``usage`` carries
+    only the counters the trace records (see ``_TRACE_USAGE_GEN_AI``).
+    ``meta.trace`` names the trace and span, so a projected row joins back to
+    the trace it came from.
+
+    **Refused, loudly** (:exc:`SftProjectionError`): a row that is not
+    ``llm_trace.v1``; a row whose content capture is not ``full`` — a
+    ``hash_only`` row promised no body, and none is reconstructed from
+    anything else; a call that raised (it has no completion); and a body that
+    is missing, not JSON, or does not hash to its address.
+    """
+    if not str(producer).strip():
+        raise ValueError("producer must be a non-empty identifier")
+    if source not in ("live", "replay", "synthetic"):
+        raise ValueError(f"source must be live|replay|synthetic, got {source!r}")
+    if row.get("schema_version") != TRACE_SCHEMA_VERSION:
+        raise SftProjectionError(
+            f"not an {TRACE_SCHEMA_VERSION} row: {row.get('schema_version')!r}"
+        )
+    if row.get("error"):
+        raise SftProjectionError("the traced call raised; it has no completion")
+    ext = _as_mapping(row.get(EXTENSION_NAMESPACE))
+    content = _as_mapping(ext.get("content"))
+    if content.get("capture") != CAPTURE_FULL:
+        raise SftProjectionError(
+            f"content capture is {content.get('capture')!r}, not "
+            f"{CAPTURE_FULL!r}: the row carries no bodies to project"
+        )
+
+    raw_request = _blob_json(blobs, content.get("input_sha256"), "input")
+    output_body = _blob_json(blobs, content.get("output_sha256"), "output")
+
+    input_messages = cast(
+        "List[Dict[str, object]]", _normalized_input_messages(dict(raw_request))
+    )
+    invocation_params = {
+        k: _jsonable(v)
+        for k, v in raw_request.items()
+        if k not in ("messages", "system")
+    }
+
+    gen_ai = _as_mapping(row.get("gen_ai"))
+    usage_ext = _as_mapping(ext.get("usage"))
+    usage: Dict[str, object] = {
+        name: gen_ai.get(key) for name, key in _TRACE_USAGE_GEN_AI
+    }
+    usage.update({name: usage_ext.get(name) for name in _TRACE_USAGE_EXTENSION})
+
+    record_meta: Dict[str, object] = dict(meta or {})
+    record_meta.setdefault("provider", gen_ai.get("provider.name"))
+    web = output_body.get("web_citations")
+    if web:
+        record_meta["citations"] = web
+    record_meta["trace"] = {
+        "trace_id": row.get("trace_id"),
+        "span_id": row.get("span_id"),
+        "callsite_id": ext.get("callsite_id"),
+        "run_id": ext.get("run_id"),
+    }
+
+    return {
+        "schema_version": SFT_SCHEMA_VERSION,
+        "producer": producer,
+        "captured_at": captured_at or row.get("ended_at"),
+        "model": gen_ai.get("response.model"),
+        "call_seq": call_seq,
+        "input_messages": input_messages,
+        "invocation_params": invocation_params,
+        "output_message": dict(output_body),
+        "output_text": output_body.get("text"),
+        "structured_output": output_body.get("data"),
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "meta": record_meta,
+        "provenance": {
+            "source": source,
+            "content_hash": content_hash(input_messages)
+            if input_messages
+            else None,
+        },
+    }
