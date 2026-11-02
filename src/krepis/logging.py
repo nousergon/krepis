@@ -90,13 +90,18 @@ class JSONFormatter(logging.Formatter):
 # ``krepis.logging.setup_logging``.
 _SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # URL-query-string credentials: `?apikey=...&symbol=X` /
-    # `?api_key=...` / `?key=...` / `?token=...`. Conservative length
+    # `?apiKey=...` / `?api_key=...` / `?key=...` / `?token=...`. Conservative length
     # floor (16 chars) avoids redacting short ID-like tokens that look
     # alphanumeric but aren't secrets.
     (
         re.compile(
             r"([?&](?:apikey|api_key|key|token|access_token|auth_token)=)"
-            r"([A-Za-z0-9_\-\.]{16,})"
+            r"([A-Za-z0-9_\-\.]{16,})",
+            # Parameter names are case-insensitive in practice: Polygon spells
+            # it `apiKey`, and a case-sensitive pattern let the live key
+            # through into box logs and a Telegram alert on 2026-10-02
+            # (nous-ergon-ops-I2002).
+            re.IGNORECASE,
         ),
         r"\1<REDACTED>",
     ),
