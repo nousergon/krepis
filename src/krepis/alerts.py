@@ -234,6 +234,7 @@ from dataclasses import dataclass, field
 from typing import Final
 
 from krepis import _dedup, alert_tiers, fleet_events
+from krepis.logging import redact_secrets
 from krepis.telegram import (
     AUTO_FIX_NOT_NEEDED,
     RESOLUTION_NOT_NEEDED,
@@ -791,10 +792,12 @@ def _publish_sns(arn: str, message: str, subject: str | None = None) -> ChannelR
 
         region = arn.split(":")[3] if ":" in arn else DEFAULT_REGION
         client = boto3.client("sns", region_name=region)
-        kwargs: dict = {"TopicArn": arn, "Message": message}
+        # The SNS leg fans out to email, so it gets the same redaction pass as
+        # the Telegram leg (alpha-engine-config-I13042, nous-ergon-ops-I2002).
+        kwargs: dict = {"TopicArn": arn, "Message": redact_secrets(message)}
         if subject:
             # SNS subject is limited to 100 chars + ASCII + no newlines.
-            cleaned = subject.replace("\n", " ").replace("\r", " ")[:100]
+            cleaned = redact_secrets(subject).replace("\n", " ").replace("\r", " ")[:100]
             kwargs["Subject"] = cleaned
         resp = client.publish(**kwargs)
         return ChannelResult(ok=True, detail=resp.get("MessageId", "<no id>"))
