@@ -74,6 +74,7 @@ from email.mime.text import MIMEText
 from typing import Final
 
 from krepis import _dedup
+from krepis.logging import redact_secrets
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -238,6 +239,14 @@ def send_email(
     :returns: ``True`` if the email was sent (or dedup-suppressed),
         ``False`` otherwise.
     """
+    # Outbound text is redacted before anything else sees it, the dedup
+    # marker's subject preview included: an exception string carrying a
+    # credential (a URL with ?apiKey=) must not leave the process by email
+    # (alpha-engine-config-I13042, nous-ergon-ops-I2002).
+    subject = redact_secrets(subject)
+    body = redact_secrets(body)
+    if html:
+        html = redact_secrets(html)
     bucket = dedup_bucket or DEFAULT_EMAIL_DEDUP_BUCKET
     marker_key: str | None = None
     if dedup_key:
