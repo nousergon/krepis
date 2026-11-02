@@ -762,7 +762,7 @@ class TestSendMessageRedactsSecrets:
         sent = mock_post.call_args.kwargs["json"]["text"]
         assert self.FAKE not in sent
         assert "<REDACTED>" in sent
-        assert "api.polygon.io" in sent
+        assert "&apiKey=<REDACTED>" in sent
 
     def test_text_without_secrets_is_unchanged(self, configured_env, mock_post):
         assert tg.send_message("plain alert, nothing secret", parse_mode=None) is True
