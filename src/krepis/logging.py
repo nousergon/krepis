@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Generator
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -124,6 +125,23 @@ _SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
 )
 
 
+def redact_secrets(text: str) -> str:
+    """Return ``text`` with every :data:`_SECRET_REDACTION_PATTERNS` match
+    replaced. The same rule the log filter applies, for text that leaves
+    the process by another path (alert bodies; nous-ergon-ops-I2002).
+
+    Never raises: on any regex error the input is returned unchanged.
+    """
+    if not text:
+        return text
+    try:
+        for pattern, replacement in _SECRET_REDACTION_PATTERNS:
+            text = pattern.sub(replacement, text)
+    except Exception:  # noqa: BLE001 - redaction must never block a send
+        pass
+    return text
+
+
 class SecretsRedactingFilter(logging.Filter):
     """logging.Filter that redacts known secret-shaped substrings from
     every log record's formatted message.
@@ -165,13 +183,13 @@ class SecretsRedactingFilter(logging.Filter):
         return True
 
 
-def get_flow_doctor():
+def get_flow_doctor() -> Optional[object]:
     """Return the shared flow-doctor instance, or None if not initialized."""
     return _fd_instance
 
 
 @contextlib.contextmanager
-def guard_entrypoint():
+def guard_entrypoint() -> Generator[None, None, None]:
     """Wrap a pipeline entrypoint body so an uncaught crash reaches flow-doctor.
 
     flow-doctor's logging handler only sees ``logger.error()/exception()``
@@ -207,7 +225,7 @@ def monitor_handler(func: Callable) -> Callable:
             ...
     """
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: object, **kwargs: object) -> object:
         fd = _fd_instance
         if fd is None:
             return func(*args, **kwargs)

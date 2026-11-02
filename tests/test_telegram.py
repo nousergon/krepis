@@ -742,3 +742,30 @@ class TestResolutionLine:
 
     def test_default_never_invents_an_issue_number(self):
         assert "#" not in tg.DEFAULT_RESOLUTION
+
+
+# ── outbound redaction (nous-ergon-ops-I2002) ───────────────────────────────
+
+
+class TestSendMessageRedactsSecrets:
+    """An exception string naming a URL with ?apiKey= went to Telegram
+    verbatim on 2026-10-02. The alert body now gets the log filter's rule."""
+
+    FAKE = "FAKEpolygonKEY0123456789abcdefXY"
+
+    def test_query_credential_is_redacted_on_the_wire(self, configured_env, mock_post):
+        text = (
+            "Dividend window failed: 429 for url: "
+            f"https://api.polygon.io/v3/reference/dividends?cursor=1&apiKey={self.FAKE}"
+        )
+        assert tg.send_message(text, parse_mode=None) is True
+        sent = mock_post.call_args.kwargs["json"]["text"]
+        assert self.FAKE not in sent
+        assert "<REDACTED>" in sent
+        assert "api.polygon.io" in sent
+
+    def test_text_without_secrets_is_unchanged(self, configured_env, mock_post):
+        assert tg.send_message("plain alert, nothing secret", parse_mode=None) is True
+        assert mock_post.call_args.kwargs["json"]["text"].startswith(
+            "plain alert, nothing secret"
+        )
