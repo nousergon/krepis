@@ -540,6 +540,22 @@ def test_redacts_apikey_in_args_substitution():
     assert "<REDACTED>" in out
 
 
+def test_redacts_camelcase_apikey_in_url():
+    """Polygon spells the parameter ``apiKey``; a page URL that carried it
+    twice put the live key in box logs and a Telegram alert
+    (nous-ergon-ops-I2002). Both occurrences must go."""
+    fake = "FAKEpolygonKEY0123456789abcdefXY"
+    msg = (
+        "429 Client Error: Too Many Requests for url: "
+        f"https://api.polygon.io/v3/reference/dividends?cursor=abc&apiKey={fake}"
+        f"&APIKEY={fake}&limit=1000"
+    )
+    out = _run_through_filter(msg)
+    assert fake not in out
+    assert out.count("<REDACTED>") == 2
+    assert "&limit=1000" in out
+
+
 def test_redacts_aws_access_key_id():
     msg = "AWS credential AKIAIOSFODNN7EXAMPLE in env"
     out = _run_through_filter(msg)

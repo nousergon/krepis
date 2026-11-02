@@ -38,6 +38,7 @@ import logging
 import os
 import re
 import sys
+from collections.abc import Generator
 from datetime import datetime, timezone
 from typing import Callable, Optional
 
@@ -90,13 +91,18 @@ class JSONFormatter(logging.Formatter):
 # ``krepis.logging.setup_logging``.
 _SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # URL-query-string credentials: `?apikey=...&symbol=X` /
-    # `?api_key=...` / `?key=...` / `?token=...`. Conservative length
+    # `?apiKey=...` / `?api_key=...` / `?key=...` / `?token=...`. Conservative length
     # floor (16 chars) avoids redacting short ID-like tokens that look
     # alphanumeric but aren't secrets.
     (
         re.compile(
             r"([?&](?:apikey|api_key|key|token|access_token|auth_token)=)"
-            r"([A-Za-z0-9_\-\.]{16,})"
+            r"([A-Za-z0-9_\-\.]{16,})",
+            # Parameter names are case-insensitive in practice: Polygon spells
+            # it `apiKey`, and a case-sensitive pattern let the live key
+            # through into box logs and a Telegram alert on 2026-10-02
+            # (nous-ergon-ops-I2002).
+            re.IGNORECASE,
         ),
         r"\1<REDACTED>",
     ),
@@ -117,6 +123,23 @@ _SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"\b(?:ghp_|gho_|ghu_|ghs_|ghr_)[A-Za-z0-9_]{30,}"), "<GITHUB_TOKEN_REDACTED>"),
     (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), "<GITHUB_TOKEN_REDACTED>"),
 )
+
+
+def redact_secrets(text: str) -> str:
+    """Return ``text`` with every :data:`_SECRET_REDACTION_PATTERNS` match
+    replaced. The same rule the log filter applies, for text that leaves
+    the process by another path (alert bodies; nous-ergon-ops-I2002).
+
+    Never raises: on any regex error the input is returned unchanged.
+    """
+    if not text:
+        return text
+    try:
+        for pattern, replacement in _SECRET_REDACTION_PATTERNS:
+            text = pattern.sub(replacement, text)
+    except Exception:  # noqa: BLE001 - redaction must never block a send
+        pass
+    return text
 
 
 class SecretsRedactingFilter(logging.Filter):
@@ -160,13 +183,13 @@ class SecretsRedactingFilter(logging.Filter):
         return True
 
 
-def get_flow_doctor():
+def get_flow_doctor() -> Optional[object]:
     """Return the shared flow-doctor instance, or None if not initialized."""
     return _fd_instance
 
 
 @contextlib.contextmanager
-def guard_entrypoint():
+def guard_entrypoint() -> Generator[None, None, None]:
     """Wrap a pipeline entrypoint body so an uncaught crash reaches flow-doctor.
 
     flow-doctor's logging handler only sees ``logger.error()/exception()``
@@ -202,7 +225,7 @@ def monitor_handler(func: Callable) -> Callable:
             ...
     """
     @functools.wraps(func)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: object, **kwargs: object) -> object:
         fd = _fd_instance
         if fd is None:
             return func(*args, **kwargs)

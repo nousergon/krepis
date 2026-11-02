@@ -58,6 +58,7 @@ from typing import Final
 import requests
 
 from krepis import fleet_events
+from krepis.logging import redact_secrets
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -561,6 +562,10 @@ def send_message(
     # (journal excerpts, tracebacks) can never push it off the tail.
     # ── Resolution line (same section, Brian 2026-10-24) — kept with the
     # Auto-fix line in one footer that sits outside the truncation budget.
+    # Alert text leaves the process, so it gets the log filter's redaction
+    # too: an exception string naming a URL with ?apiKey= went to Telegram
+    # verbatim on 2026-10-02 (nous-ergon-ops-I2002).
+    text = redact_secrets(text)
     main_text = text
     footer: list[str] = []
     over = len(text) > TELEGRAM_MESSAGE_MAX_CHARS
