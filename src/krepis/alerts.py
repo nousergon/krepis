@@ -224,16 +224,17 @@ or on a missing/expired ``expires_at``.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import re
 import socket
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Any, Final, Protocol, cast
 
-from krepis import _dedup, alert_tiers, fleet_events
+from krepis import _dedup, alert_tiers, fleet_events, s3_surface
 from krepis.logging import redact_secrets
 from krepis.telegram import (
     AUTO_FIX_NOT_NEEDED,
@@ -566,6 +567,116 @@ CLEAR_SEVERITY: Final[str] = "info"
 CLEAR_MESSAGE_PREFIX: Final[str] = "RESOLVED"
 
 
+# ── Environment alert routing (S-20, alpha-engine-config-I12508) ──────────
+# The environment decides where an alert goes BEFORE the tier registry, the
+# log-chat fallback or the I9209 total-failure raise run, because each of
+# those fails toward the operator's phone, which is right for prod and wrong
+# for staging. `nousergon_lib.env` (the environment registry) declares
+# `alert_routing` per environment: `page` (prod, and by schema the default)
+# or `digest` (staging). Under `digest` there is one destination and no
+# fallback: a JSON record in the environment's own crucible bucket under
+# `alerts/{UTC date}/{event_id}.json`, which the daily digest's staging section
+# and the console staging pane read. No Telegram, no SNS, no dedup, no tier
+# lookup and no Overseer intake event (all prod surfaces).
+#
+# Fails UPWARD: NE_ENV unset, nousergon-lib absent, an unknown environment, a
+# registry without the field, or any other error resolves to `page`, the
+# unchanged path. Only an explicit registry `digest` changes anything.
+ALERT_ROUTING_PAGE: Final[str] = "page"
+ALERT_ROUTING_DIGEST: Final[str] = "digest"
+DIGEST_RECORD_PREFIX: Final[str] = "alerts"
+DIGEST_RECORD_SCHEMA: Final[str] = "krepis.alert_digest_record.v1"
+#: The registry bucket role a digest record is written to (staging's own store).
+DIGEST_BUCKET_ROLE: Final[str] = "crucible"
+
+#: Declared S3 surface (``krepis.s3_surface``, alpha-engine-config-I8156). The
+#: only S3 write here is the digest record, and it happens only in an
+#: environment whose registry says ``alert_routing: digest`` (staging), into
+#: THAT environment's own ``crucible`` bucket under ``alerts/``. The bucket is
+#: an environment fact, so no prod consumer's role is obliged to grant it; the
+#: staging stack's roles grant ``alerts/`` themselves.
+S3_SURFACE = (
+    s3_surface.caller_supplied(
+        "the digest record's bucket comes from the environment registry "
+        "(NE_ENV with alert_routing=digest, staging only); prod roles never write it"
+    ),
+)
+
+
+class DigestEnvironment(Protocol):
+    """The slice of ``nousergon_lib.env.Environment`` the digest writer reads."""
+
+    name: str
+    region: str
+
+    def bucket(self, role: str) -> str: ...
+
+
+def resolve_alert_routing() -> tuple[str, str, DigestEnvironment | None]:
+    """``(routing, reason, environment)`` for this process; fails upward to ``page``.
+
+    ``environment`` is the resolved ``nousergon_lib.env.Environment`` when the
+    routing is ``digest`` (the writer needs its bucket and region), else ``None``.
+    """
+    name = os.environ.get("NE_ENV", "").strip()
+    if not name:
+        return ALERT_ROUTING_PAGE, "NE_ENV unset: the default environment pages", None
+    try:
+        # Imported by name: nousergon-lib is an OPTIONAL dependency of krepis,
+        # so a static import would not resolve where it is absent.
+        ne_env = importlib.import_module("nousergon_lib.env")
+        resolve_env = cast("Callable[[str], DigestEnvironment]", getattr(ne_env, "resolve"))
+        resolved = resolve_env(name)
+        routing: object = getattr(resolved, "alert_routing", None)
+    except Exception as exc:  # absent lib, unknown env, unreadable registry
+        return (
+            ALERT_ROUTING_PAGE,
+            f"fail-upward: NE_ENV={name!r} did not resolve ({type(exc).__name__}: {exc})",
+            None,
+        )
+    if routing == ALERT_ROUTING_DIGEST:
+        return ALERT_ROUTING_DIGEST, f"NE_ENV={name!r}: registry alert_routing=digest", resolved
+    if routing == ALERT_ROUTING_PAGE:
+        return ALERT_ROUTING_PAGE, f"NE_ENV={name!r}: registry alert_routing=page", None
+    return (
+        ALERT_ROUTING_PAGE,
+        f"fail-upward: NE_ENV={name!r} registry declares no usable alert_routing ({routing!r})",
+        None,
+    )
+
+
+def _digest_s3_client(region: str) -> Any:  # pyright: ignore[reportExplicitAny]
+    import boto3  # pyright: ignore[reportMissingTypeStubs]
+
+    return boto3.client("s3", region_name=region)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+
+
+def _write_digest_record(
+    environment: DigestEnvironment, record: dict[str, object]
+) -> tuple[ChannelResult, str | None]:
+    """PUT one digest record; ``(result, s3_uri)``. Never raises."""
+    try:
+        import json
+        import uuid
+        from datetime import datetime, timezone
+
+        now = datetime.now(timezone.utc)
+        event_id = f"{now.strftime('%Y%m%dT%H%M%S%fZ')}-{uuid.uuid4().hex[:12]}"
+        bucket = environment.bucket(DIGEST_BUCKET_ROLE)
+        key = f"{DIGEST_RECORD_PREFIX}/{now.strftime('%Y-%m-%d')}/{event_id}.json"
+        body: dict[str, object] = {**record, "schema": DIGEST_RECORD_SCHEMA, "event_id": event_id, "published_at": now.isoformat()}
+        _digest_s3_client(environment.region).put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=json.dumps(body, sort_keys=True).encode(),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # boto3 missing, denied, network, unknown role
+        return ChannelResult(ok=False, detail=f"digest record write failed: {type(exc).__name__}: {exc}"), None
+    uri = f"s3://{bucket}/{key}"
+    return ChannelResult(ok=True, detail=f"digest record {uri}"), uri
+
+
 class AlertDeliveryError(RuntimeError):
     """Every requested delivery surface failed. Raised by :func:`publish`.
 
@@ -689,17 +800,30 @@ class PublishResult:
     #: consecutive detections — a self-healing blip on a job whose own next
     #: run precedes any human action.
     streak_held: bool = False
+    #: The environment's routing (S-20, I12508): ``page`` (the normal path) or
+    #: ``digest`` (one record for the environment's daily digest, never a page).
+    alert_routing: str = ALERT_ROUTING_PAGE
+    #: Why :attr:`alert_routing` resolved the way it did (incl. a fail-upward).
+    alert_routing_reason: str = ""
+    #: Under ``digest``: the outcome of the record write, the ONLY channel.
+    digest: ChannelResult | None = None
+    #: Under ``digest``: the ``s3://`` URI of the record written.
+    digest_record: str | None = None
 
     @property
     def any_ok(self) -> bool:
         if self.dedup_skipped or self.muted:
             return True
+        if self.digest is not None:
+            return self.digest.ok
         return self.sns.ok or self.telegram.ok
 
     @property
     def all_ok(self) -> bool:
         if self.dedup_skipped or self.muted:
             return True
+        if self.digest is not None:
+            return self.digest.ok
         return self.sns.ok and self.telegram.ok
 
 
@@ -1511,6 +1635,42 @@ def publish(
         detail = "suppressed in test env (PYTEST_CURRENT_TEST set)"
         result.sns = ChannelResult(ok=False, detail=detail)
         result.telegram = ChannelResult(ok=False, detail=detail)
+        return result
+
+    # ── Environment alert routing (S-20, alpha-engine-config-I12508) ─────
+    # After dry-run and the test guard (both still win), before the mute, the
+    # tier gate, dedup and every channel. See resolve_alert_routing: only an
+    # explicit registry `digest` leaves the normal path; everything else pages.
+    routing, routing_reason, routing_env = resolve_alert_routing()
+    result.alert_routing = routing
+    result.alert_routing_reason = routing_reason
+    if routing == ALERT_ROUTING_DIGEST and routing_env is not None:
+        not_attempted = f"not attempted: alert_routing=digest ({routing_reason})"
+        result.sns = ChannelResult(ok=False, detail=not_attempted)
+        result.telegram = ChannelResult(ok=False, detail=not_attempted)
+        result.destination_reason = routing_reason
+        record: dict[str, object] = {
+            "env": routing_env.name,
+            "message": formatted,
+            "severity": severity,
+            "source": source,
+            "state": state,
+            "identity_key": effective_identity,
+            "auto_fix": auto_fix,
+            "resolution": resolution,
+            "host": _publishing_host(),
+        }
+        result.digest, result.digest_record = _write_digest_record(routing_env, record)
+        if not result.digest.ok:
+            # The digest is the only channel, so its failure is total
+            # non-delivery (I9209): loud, and raised unless the caller opted out.
+            detail = (
+                f"NOUSERGON_ALERT_TOTAL_DELIVERY_FAILURE: alert_routing=digest and "
+                f"{result.digest.detail}. severity={severity!r} source={source!r}."
+            )
+            logger.error(detail)
+            if raise_on_total_failure:
+                raise AlertDeliveryError(detail)
         return result
 
     # ── Source-mute check (pre-dedup) ────────────────────────────────────
