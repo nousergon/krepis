@@ -185,3 +185,54 @@ def test_every_outbound_alert_transport_is_covered() -> None:
     )
     stale = [mod for mod in OUTBOUND_SENDERS if mod not in found]
     assert not stale, f"OUTBOUND_SENDERS lists modules with no transport any more: {stale}"
+
+
+# ── Codex review 2026-11-03 (fa0a94a): three ways a credential still left ──
+
+
+def _sent_text(**kwargs: Any) -> str:
+    with patch.object(tg.requests, "post") as post:
+        post.return_value.status_code = 200
+        post.return_value.json.return_value = {"ok": True, "result": {"message_id": 1}}
+        tg.send_message(**kwargs)
+    assert post.called
+    return post.call_args.kwargs["json"]["text"]
+
+
+@pytest.fixture
+def _tg_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "test-token-abc123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "12345")
+
+
+def test_html_escaped_query_separator_is_redacted(_tg_env: None) -> None:
+    body = f"<b>Failure</b> https://example.com/?cursor=1&amp;apiKey={_POLYGON_KEY}"
+    sent = _sent_text(text=body, parse_mode=tg.PARSE_MODE_HTML)
+    assert _POLYGON_KEY not in sent
+
+
+def test_html_redaction_marker_is_escaped_not_a_tag(_tg_env: None) -> None:
+    body = f"<b>Failure</b> https://example.com/?apiKey={_POLYGON_KEY}"
+    sent = _sent_text(text=body, parse_mode=tg.PARSE_MODE_HTML)
+    assert _POLYGON_KEY not in sent
+    assert "<REDACTED>" not in sent
+    assert "&lt;REDACTED&gt;" in sent
+    assert "<b>Failure</b>" in sent
+
+
+def test_footer_arguments_are_redacted(_tg_env: None) -> None:
+    sent = _sent_text(
+        text="failure",
+        auto_fix=f"retrying https://example.com/?apiKey={_POLYGON_KEY}",
+        resolution=f"Retry https://example.com/?token={_POLYGON_KEY}",
+        parse_mode=None,
+    )
+    assert _POLYGON_KEY not in sent
+
+
+def test_url_encoded_query_value_is_redacted_whole() -> None:
+    from krepis.logging import redact_secrets
+
+    out = redact_secrets("GET /x?access_token=abc%2Fdef0123456789abcdef0123456789&n=1")
+    assert "def0123456789" not in out
+    assert out.endswith("&n=1")

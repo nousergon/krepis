@@ -96,8 +96,13 @@ _SECRET_REDACTION_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     # alphanumeric but aren't secrets.
     (
         re.compile(
-            r"([?&](?:apikey|api_key|key|token|access_token|auth_token)=)"
-            r"([A-Za-z0-9_\-\.]{16,})",
+            # The separator may arrive HTML-escaped (`&amp;apiKey=`): an HTML
+            # alert body is escaped by its caller before it reaches
+            # telegram.send_message. The value class takes percent escapes and
+            # base64 characters, so a URL-encoded token (`abc%2Fdef...`) is
+            # matched whole instead of stopping short of the 16-char floor.
+            r"((?:[?&]|&amp;)(?:apikey|api_key|key|token|access_token|auth_token)=)"
+            r"([A-Za-z0-9_\-\.~%+/=]{16,})",
             # Parameter names are case-insensitive in practice: Polygon spells
             # it `apiKey`, and a case-sensitive pattern let the live key
             # through into box logs and a Telegram alert on 2026-10-02
