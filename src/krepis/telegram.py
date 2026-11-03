@@ -59,6 +59,9 @@ import requests
 
 from krepis import fleet_events
 from krepis.logging import redact_secrets
+
+#: Markers :func:`redact_secrets` writes (`<REDACTED>`, `<AWS_ACCESS_KEY_REDACTED>`...).
+_REDACTION_MARKER_RE = re.compile(r"<([A-Z_]*REDACTED)>")
 from krepis.secrets import get_secret
 
 logger = logging.getLogger(__name__)
@@ -565,7 +568,14 @@ def send_message(
     # Alert text leaves the process, so it gets the log filter's redaction
     # too: an exception string naming a URL with ?apiKey= went to Telegram
     # verbatim on 2026-10-02 (nous-ergon-ops-I2002).
+    # The footer arguments leave the process too, so they get the same rule.
+    # Under HTML the markers `<REDACTED>` are not a Telegram tag: escape them,
+    # or the send is refused and falls back to plain text with visible markup.
     text = redact_secrets(text)
+    if parse_mode == PARSE_MODE_HTML:
+        text = _REDACTION_MARKER_RE.sub(r"&lt;\1&gt;", text)
+    auto_fix = redact_secrets(auto_fix) if auto_fix else auto_fix
+    resolution = redact_secrets(resolution) if resolution else resolution
     main_text = text
     footer: list[str] = []
     over = len(text) > TELEGRAM_MESSAGE_MAX_CHARS
