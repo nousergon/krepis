@@ -88,7 +88,11 @@ def test_ne_env_unset_pages(monkeypatch):
     "setup",
     [
         pytest.param(
-            lambda mp: mp.setitem(sys.modules, "nousergon_lib", None), id="lib-absent"
+            lambda mp: (
+                mp.setitem(sys.modules, "nousergon_lib", None),
+                mp.setitem(sys.modules, "nousergon_lib.env", None),
+            ),
+            id="lib-absent",
         ),
         pytest.param(lambda mp: _install_registry(mp, {}), id="unknown-environment"),
         pytest.param(

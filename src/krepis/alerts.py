@@ -224,12 +224,13 @@ or on a missing/expired ``expires_at``.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 import re
 import socket
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol, cast
 
@@ -621,9 +622,11 @@ def resolve_alert_routing() -> tuple[str, str, DigestEnvironment | None]:
     if not name:
         return ALERT_ROUTING_PAGE, "NE_ENV unset: the default environment pages", None
     try:
-        from nousergon_lib import env as ne_env  # optional dependency
-
-        resolved = cast("DigestEnvironment", ne_env.resolve(name))
+        # Imported by name: nousergon-lib is an OPTIONAL dependency of krepis,
+        # so a static import would not resolve where it is absent.
+        ne_env = importlib.import_module("nousergon_lib.env")
+        resolve_env = cast("Callable[[str], DigestEnvironment]", getattr(ne_env, "resolve"))
+        resolved = resolve_env(name)
         routing: object = getattr(resolved, "alert_routing", None)
     except Exception as exc:  # absent lib, unknown env, unreadable registry
         return (
