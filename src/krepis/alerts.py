@@ -237,8 +237,11 @@ from typing import Any, Final, Protocol, cast
 from krepis import _dedup, alert_tiers, fleet_events, s3_surface
 from krepis.logging import redact_secrets
 from krepis.telegram import (
+    BRIEF_MAX_CHARS,
     INFORMATIONAL,
     _validate_parse_mode,
+    brief_alert,
+    brief_headline,
     has_auto_fix_line,
     is_informational,
     with_footer,
@@ -1360,6 +1363,7 @@ def publish(
     resolution: str | None = None,
     impact: str | None = None,
     action: str | None = None,
+    details_url: str | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1511,6 +1515,12 @@ def publish(
         when. Rendered as ``Impact:``. Every non-informational alert should
         pass it (observability-policy § Notification — auto-fix line; Brian,
         2026-11-04); one that does not is logged ``ALERT_FOOTER_UNDECLARED``.
+    :param details_url: Console page holding the persistent detail (Brian,
+        2026-11-04). When set, the Telegram leg sends only the brief form
+        (:func:`krepis.telegram.brief_alert`): the message's first paragraph cut
+        to three sentences, the Impact/Auto-fix/You lines and a link to this
+        page. SNS email keeps the full body. A long body sent without one logs
+        ``ALERT_DETAIL_UNLINKED`` so the sweep can count senders that owe a link.
     :param action: What the operator must do, with the exact link or command,
         rendered as ``You:``; ``None`` renders ``You: nothing.``.
         Info/debug/cleared messages with no ``auto_fix``/``action`` carry no
@@ -1592,6 +1602,19 @@ def publish(
             "ALERT_FOOTER_UNDECLARED source=%s impact=%s auto_fix=%s",
             source, bool((impact or "").strip()), bool((auto_fix or "").strip()),
         )
+    # Telegram's brief form is built from the caller's raw message, before
+    # the full footer is attached to the SNS/email text below.
+    telegram_text: str | None = None
+    if (details_url or "").strip():
+        telegram_text = brief_alert(
+            _format_message(brief_headline(message), severity, source, state),
+            details_url or "",
+            impact=impact, auto_fix=auto_fix, action=action, parse_mode=parse_mode,
+        )
+    elif len((message or "").strip()) > BRIEF_MAX_CHARS:
+        logger.warning(
+            "ALERT_DETAIL_UNLINKED source=%s chars=%d", source, len(message.strip()),
+        )
     formatted = with_footer(
         formatted, impact=impact, auto_fix=auto_fix, resolution=resolution,
         action=action, parse_mode=parse_mode,
@@ -1600,6 +1623,10 @@ def publish(
     provenance = _provenance_suffix()
     if provenance:
         formatted = f"{formatted}{provenance}"
+        if telegram_text is not None:
+            telegram_text = f"{telegram_text}{provenance}"
+    if telegram_text is None:
+        telegram_text = formatted
 
     # ── Environment-reachable dry-run (metron-ops-I340) ──────────────────
     # ONE-WAY, and the direction is the whole design: the variable can only
@@ -1885,7 +1912,7 @@ def publish(
             # would land twice on the Overseer intake bus.
             with fleet_events.suppress_emission():
                 result.telegram = _publish_telegram(
-                    formatted,
+                    telegram_text,
                     severity=severity,
                     # The tier decides the buzz. `silent=False` is still an
                     # explicit caller demand for a push and is honoured
@@ -2151,6 +2178,15 @@ def main(argv: list[str] | None = None) -> int:
             "the 'You:' line; omitted renders 'You: nothing.'."
         ),
     )
+    pub.add_argument(
+        "--details-url",
+        default=None,
+        help=(
+            "Console page holding the persistent detail. Telegram then gets a "
+            "brief: first paragraph (max 3 sentences), Impact/Auto-fix/You and "
+            "this link. Email keeps the full body."
+        ),
+    )
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
@@ -2365,6 +2401,7 @@ def main(argv: list[str] | None = None) -> int:
             resolution=args.resolution,
             impact=args.impact,
             action=args.action,
+            details_url=args.details_url,
         )
     except AlertDeliveryError as exc:
         # The CLI is the Bash-caller surface, so the diagnosis goes to stderr
