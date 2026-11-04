@@ -116,7 +116,7 @@ AUTO_FIX_LABEL: Final[str] = "Auto-fix:"
 #: fix (a retry, a self-heal, a filed issue with an owner) passes
 #: ``auto_fix=`` to say so; this default is the fallback, not the target.
 DEFAULT_AUTO_FIX: Final[str] = (
-    "none declared; tonight's sweep (7pm PT) root-causes it."
+    "none declared; tonight's sweep (7pm PT) root-causes it and files the fix."
 )
 #: What an informational message (a report, a recovery, a digest) passes as
 #: ``auto_fix``. It is a SENTINEL, not text: an informational message carries
