@@ -212,3 +212,74 @@ class TestPublish:
             )
             alerts.main(["publish", "--message", "boom", "--auto-fix", "retrying"])
         assert pub.call_args.kwargs["auto_fix"] == "retrying"
+
+
+class TestBriefWithDetailsUrl:
+    """Brian, 2026-11-04: Telegram gets 2-3 sentences plus a console link."""
+
+    LONG = (
+        "Budget at 112% of the month. AWS is the driver. Spend jumped on 11-03. "
+        "This fourth sentence is cut.\n\nPer-service table:\nEC2 $40\nS3 $12"
+    )
+
+    def _send(self, **kwargs):
+        with patch.object(alerts, "_publish_sns", return_value=alerts.ChannelResult(ok=True, detail="ok")) as sns, \
+             patch.object(alerts, "_publish_telegram", return_value=alerts.ChannelResult(ok=True, detail="ok")) as tgm, \
+             patch.object(alerts, "_resolve_sns_topic_arn", return_value="arn:aws:sns:us-east-1:1:t"), \
+             patch.object(alerts, "_resolve_log_chat", return_value=(None, None)):
+            alerts.publish(**kwargs)
+        return sns.call_args.args[1], tgm.call_args.args[0]
+
+    def test_telegram_gets_brief_and_link_email_keeps_body(self, publish_env):
+        sns_text, tg_text = self._send(
+            message=self.LONG, source="costs", severity="warning",
+            impact="the month ends ~$30 over", auto_fix="none; spend is a decision",
+            action="review the costs page", details_url="https://console.nousergon.ai/page/costs",
+        )
+        assert tg_text.splitlines() == [
+            "[WARNING] costs: Budget at 112% of the month. AWS is the driver. Spend jumped on 11-03.",
+            "*Impact:* the month ends ~$30 over",
+            "*Auto-fix:* none; spend is a decision",
+            "*You:* review the costs page",
+            "[Details on console](https://console.nousergon.ai/page/costs)",
+        ]
+        assert "EC2 $40" in sns_text and "EC2 $40" not in tg_text
+
+    def test_brief_omits_you_when_no_action(self, publish_env):
+        _sns, tg_text = self._send(
+            message="Router fell back twice.", source="r", severity="warning",
+            auto_fix="retries on its own", details_url="https://c/x",
+        )
+        assert "You:" not in tg_text and "Resolution:" not in tg_text
+
+    def test_informational_brief_is_headline_and_link(self, publish_env):
+        _sns, tg_text = self._send(
+            message=self.LONG, source="report", severity="info", details_url="https://c/r",
+        )
+        assert tg_text.splitlines()[1:] == ["[Details on console](https://c/r)"]
+        assert "Auto-fix" not in tg_text
+
+    def test_long_body_without_link_is_logged(self, publish_env, caplog):
+        with caplog.at_level("WARNING"):
+            self._send(message="x" * 400, source="s", severity="warning")
+        assert "ALERT_DETAIL_UNLINKED" in caplog.text
+
+    def test_cli_details_url_flag(self, publish_env):
+        with patch.object(alerts, "publish") as pub:
+            pub.return_value = alerts.PublishResult(
+                sns=alerts.ChannelResult(ok=True, detail="ok"),
+                telegram=alerts.ChannelResult(ok=True, detail="ok"),
+            )
+            alerts.main(["publish", "--message", "boom", "--details-url", "https://c/p"])
+        assert pub.call_args.kwargs["details_url"] == "https://c/p"
+
+
+def test_brief_headline_cuts_long_single_sentence():
+    out = tg.brief_headline("a" * 500)
+    assert len(out) == tg.BRIEF_MAX_CHARS and out.endswith("…")
+
+
+def test_details_line_html_escapes():
+    assert tg.details_line("https://c/p?a=1&b=2", tg.PARSE_MODE_HTML) == (
+        '<a href="https://c/p?a=1&amp;b=2">Details on console</a>'
+    )

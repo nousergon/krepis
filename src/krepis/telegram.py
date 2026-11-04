@@ -345,6 +345,59 @@ def _footer_plan(
     return plan
 
 
+#: Brian, 2026-11-04: a Telegram alert is two or three sentences plus a link to
+#: the console page that holds the details, never the details themselves.
+BRIEF_MAX_SENTENCES: Final[int] = 3
+BRIEF_MAX_CHARS: Final[int] = 320
+DETAILS_TEXT: Final[str] = "Details on console"
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def brief_headline(message: str) -> str:
+    """The first paragraph of ``message``, cut to :data:`BRIEF_MAX_SENTENCES`
+    sentences and :data:`BRIEF_MAX_CHARS` characters (an ellipsis marks a cut)."""
+    para = (message or "").strip().split("\n\n", 1)[0].strip()
+    para = " ".join(line.strip() for line in para.splitlines() if line.strip())
+    sentences = _SENTENCE_END_RE.split(para)
+    out = " ".join(sentences[:BRIEF_MAX_SENTENCES])
+    if len(out) > BRIEF_MAX_CHARS:
+        out = out[: BRIEF_MAX_CHARS - 1].rstrip() + "…"
+    return out
+
+
+def details_line(url: str, parse_mode: str | None = PARSE_MODE) -> str:
+    """A link to the console page carrying the alert's persistent detail."""
+    url = url.strip()
+    if parse_mode == PARSE_MODE_HTML:
+        return f'<a href="{escape_html(url)}">{DETAILS_TEXT}</a>'
+    if parse_mode == PARSE_MODE:
+        return f"[{DETAILS_TEXT}]({url})"
+    return f"{DETAILS_TEXT}: {url}"
+
+
+def brief_alert(
+    headline: str,
+    details_url: str,
+    *,
+    impact: str | None = None,
+    auto_fix: str | None = None,
+    action: str | None = None,
+    parse_mode: str | None = PARSE_MODE,
+) -> str:
+    """The short Telegram form: ``headline``, then ``Impact:`` and ``Auto-fix:``
+    (not for informational messages), ``You:`` only when an action is declared,
+    then the console link. ``Resolution:`` lives on the console page."""
+    lines = [headline]
+    if not is_informational(auto_fix):
+        if (impact or "").strip():
+            lines.append(impact_line(impact or "", parse_mode))
+        lines.append(auto_fix_line(auto_fix, parse_mode))
+        if (action or "").strip():
+            lines.append(action_line(action, parse_mode))
+    lines.append(details_line(details_url, parse_mode))
+    return "\n".join(lines)
+
+
 def with_footer(
     text: str,
     *,
