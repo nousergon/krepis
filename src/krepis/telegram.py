@@ -50,9 +50,12 @@ sequence.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import re
+from collections.abc import Generator
 from typing import Final
 
 import requests
@@ -113,13 +116,47 @@ AUTO_FIX_LABEL: Final[str] = "Auto-fix:"
 #: fix (a retry, a self-heal, a filed issue with an owner) passes
 #: ``auto_fix=`` to say so; this default is the fallback, not the target.
 DEFAULT_AUTO_FIX: Final[str] = (
-    "none declared by this sender. If this is a failure, tonight's nightly "
-    "sweep (7pm PT) picks it up from the alert intake, finds the root cause "
-    "and opens the fix."
+    "none declared; tonight's sweep (7pm PT) root-causes it and files the fix."
 )
-#: What an informational message (a report, a recovery, a digest) says when
-#: its sender declared nothing more specific.
+#: What an informational message (a report, a recovery, a digest) passes as
+#: ``auto_fix``. It is a SENTINEL, not text: an informational message carries
+#: NO footer at all (Brian, 2026-11-04: "Any error or alert that is not
+#: including this information is just causing noise" -- two "none needed"
+#: lines under a report are exactly that noise).
 AUTO_FIX_NOT_NEEDED: Final[str] = "none needed (informational, nothing is broken)."
+#: Alias that reads as what it is at a call site.
+INFORMATIONAL: Final[str] = AUTO_FIX_NOT_NEEDED
+
+
+_INFORMATIONAL_SCOPE: "contextvars.ContextVar[bool]" = contextvars.ContextVar(
+    "krepis_telegram_informational", default=False
+)
+
+
+@contextlib.contextmanager
+def informational_scope(active: bool = True) -> "Generator[None, None, None]":
+    """Sends inside this scope carry no footer (``krepis.alerts.publish`` uses
+    it for info/debug/cleared messages)."""
+    token = _INFORMATIONAL_SCOPE.set(bool(active))
+    try:
+        yield
+    finally:
+        _INFORMATIONAL_SCOPE.reset(token)
+
+
+def is_informational(auto_fix: str | None) -> bool:
+    """True when ``auto_fix`` marks the message as informational (no footer)."""
+    return (auto_fix or "").strip() == AUTO_FIX_NOT_NEEDED or _INFORMATIONAL_SCOPE.get()
+
+
+#: Brian, 2026-11-04: every alert says what the issue is, WHY he should care,
+#: and whether it is fixed automatically or what he must do. ``Impact:`` is
+#: the why; ``You:`` is the operator action ("nothing." when the auto-fix
+#: covers it). Rule: observability-policy.md § Notification — auto-fix line.
+IMPACT_LABEL: Final[str] = "Impact:"
+ACTION_LABEL: Final[str] = "You:"
+#: Rendered when the sender declared no operator action.
+DEFAULT_ACTION: Final[str] = "nothing."
 # A caller-written line counts in any of the three body formats:
 # `Auto-fix: x`, `*Auto-fix:* x`, `<b>Auto-fix:</b> x` (case-insensitive,
 # at the start of a line, optionally after an emoji/bullet).
@@ -172,15 +209,14 @@ def with_auto_fix(
 #: none is tracked and who files one with the options and a recommendation.
 #: :func:`send_message` guarantees it exactly as it guarantees ``Auto-fix:``.
 RESOLUTION_LABEL: Final[str] = "Resolution:"
-#: Appended when the sender declared nothing. It never invents an issue
-#: number: it says plainly that none is tracked and names the lane that files
-#: one. A sender that knows its tracked item passes ``resolution=``.
+#: Kept for callers that render it themselves. The transport no longer
+#: appends it: a default Resolution line under a default Auto-fix line said
+#: the same thing twice (Brian, 2026-11-04). It never invents an issue number.
 DEFAULT_RESOLUTION: Final[str] = (
-    "none tracked yet. Tonight's nightly sweep (7pm PT) files an issue that "
-    "lists the options and a recommended fix, and later alerts name it."
+    "none tracked yet; tonight's sweep (7pm PT) files one with options."
 )
 #: What an informational message says when its sender declared nothing.
-RESOLUTION_NOT_NEEDED: Final[str] = "none needed (informational, nothing is broken)."
+RESOLUTION_NOT_NEEDED: Final[str] = AUTO_FIX_NOT_NEEDED
 _RESOLUTION_RE = re.compile(
     r"(?im)^[ \t]*(?:[-•*_]|[^\w\s<]{1,2})?[ \t]*(?:<b>|<strong>)?[*_]?"
     r"resolution[*_]?[ \t]*:"
@@ -220,6 +256,127 @@ def with_resolution(
     if has_resolution_line(text):
         return text
     return f"{text}\n{resolution_line(resolution, parse_mode)}"
+
+
+_IMPACT_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-•*_]|[^\w\s<]{1,2})?[ \t]*(?:<b>|<strong>)?[*_]?"
+    r"impact[*_]?[ \t]*:"
+)
+_ACTION_RE = re.compile(
+    r"(?im)^[ \t]*(?:[-•*_]|[^\w\s<]{1,2})?[ \t]*(?:<b>|<strong>)?[*_]?"
+    r"you[*_]?[ \t]*:"
+)
+
+
+def _label_line(label: str, detail: str, parse_mode: str | None) -> str:
+    if parse_mode == PARSE_MODE_HTML:
+        return f"<b>{label}</b> {escape_html(detail)}"
+    if parse_mode == PARSE_MODE:
+        return f"*{label}* {detail}"
+    return f"{label} {detail}"
+
+
+def impact_line(impact: str, parse_mode: str | None = PARSE_MODE) -> str:
+    """Render the ``Impact:`` line (why the operator should care)."""
+    return _label_line(IMPACT_LABEL, impact.strip(), parse_mode)
+
+
+def action_line(action: str | None = None, parse_mode: str | None = PARSE_MODE) -> str:
+    """Render the ``You:`` line; ``None``/blank renders :data:`DEFAULT_ACTION`."""
+    return _label_line(ACTION_LABEL, (action or "").strip() or DEFAULT_ACTION, parse_mode)
+
+
+#: Canonical footer order: why it matters, what fixes it, what tracks it,
+#: what the operator does.
+_FOOTER_FIELDS: Final[tuple[str, ...]] = ("impact", "auto_fix", "resolution", "action")
+
+
+def _footer_regex(field: str) -> "re.Pattern[str]":
+    return {
+        "impact": _IMPACT_RE,
+        "auto_fix": _AUTO_FIX_RE,
+        "resolution": _RESOLUTION_RE,
+        "action": _ACTION_RE,
+    }[field]
+
+
+def _footer_plan(
+    text: str,
+    *,
+    impact: str | None,
+    auto_fix: str | None,
+    resolution: str | None,
+    action: str | None,
+    parse_mode: str | None,
+) -> dict[str, str]:
+    """Rendered lines for the footer fields ``text`` does not already carry.
+
+    Informational messages (``auto_fix`` is :data:`INFORMATIONAL`) get none.
+    A body whose sender wrote its own ``Auto-fix:`` line owns its footer: only
+    fields the sender ALSO passed explicitly are added, never a default — a
+    default ``You: nothing.`` under a hand-written "this is Brian's call" line
+    would contradict it. Otherwise ``Auto-fix:`` and ``You:`` always render
+    (with defaults), ``Impact:`` and ``Resolution:`` only when declared.
+    """
+    if is_informational(auto_fix):
+        return {}
+    owned = has_auto_fix_line(text)
+    plan: dict[str, str] = {}
+    declared = {
+        "impact": (impact or "").strip(),
+        "auto_fix": (auto_fix or "").strip(),
+        "resolution": (resolution or "").strip(),
+        "action": (action or "").strip(),
+    }
+    for field in _FOOTER_FIELDS:
+        if _footer_regex(field).search(text or ""):
+            continue
+        value = declared[field]
+        if not value and (owned or field in ("impact", "resolution")):
+            continue
+        if field == "impact":
+            plan[field] = impact_line(value, parse_mode)
+        elif field == "auto_fix":
+            plan[field] = auto_fix_line(value, parse_mode)
+        elif field == "resolution":
+            plan[field] = resolution_line(value, parse_mode)
+        else:
+            plan[field] = action_line(value, parse_mode)
+    return plan
+
+
+def with_footer(
+    text: str,
+    *,
+    impact: str | None = None,
+    auto_fix: str | None = None,
+    resolution: str | None = None,
+    action: str | None = None,
+    parse_mode: str | None = PARSE_MODE,
+) -> str:
+    """Return ``text`` carrying the alert footer (see :func:`_footer_plan`).
+
+    Lines go at the tail as one block, or — when the sender wrote its own
+    ``Auto-fix:`` line — ``Impact:`` directly above it and the rest directly
+    under it, so the block reads together.
+    """
+    plan = _footer_plan(
+        text, impact=impact, auto_fix=auto_fix, resolution=resolution,
+        action=action, parse_mode=parse_mode,
+    )
+    if not plan:
+        return text
+    if has_auto_fix_line(text):
+        out = text
+        after = [plan[f] for f in ("resolution", "action") if f in plan]
+        if after:
+            out = _insert_after_line(out, _AUTO_FIX_RE, "\n".join(after))
+        m = _AUTO_FIX_RE.search(out)
+        if "impact" in plan and m is not None:
+            out = f"{out[:m.start()]}{plan['impact']}\n{out[m.start():]}"
+        return out
+    block = "\n".join(plan[f] for f in _FOOTER_FIELDS if f in plan)
+    return f"{text}\n\n{block}"
 
 
 def _split_line(text: str, pattern: "re.Pattern[str]") -> tuple[str, str | None]:
@@ -484,6 +641,8 @@ def send_message(
     parse_mode: str | None = PARSE_MODE,
     auto_fix: str | None = None,
     resolution: str | None = None,
+    impact: str | None = None,
+    action: str | None = None,
 ) -> bool:
     """Send a single Telegram message to the channel resolved from secrets.
 
@@ -541,8 +700,15 @@ def send_message(
         that will resolve the problem, with a one-line plan — or, when none
         exists, the options and a recommendation. Rendered as the
         ``Resolution:`` line under ``Auto-fix:``; kept when ``text`` already
-        has one, else this value (or :data:`DEFAULT_RESOLUTION`) is appended.
+        has one, else this value is appended when given (no default line).
         Kept through truncation.
+    :param impact: Plain text: why the operator should care (what breaks, for
+        whom, by when). Rendered as ``Impact:`` above ``Auto-fix:``.
+    :param action: Plain text: what the operator must do, with the link or
+        exact command — or ``None`` when nothing (renders ``You: nothing.``).
+
+    Pass ``auto_fix=INFORMATIONAL`` for a report/recovery/digest: it then
+    carries no footer at all (Brian, 2026-11-04).
     """
     _validate_parse_mode(parse_mode)
     token = bot_token or get_secret("TELEGRAM_BOT_TOKEN", required=False)
@@ -576,29 +742,34 @@ def send_message(
         text = _REDACTION_MARKER_RE.sub(r"&lt;\1&gt;", text)
     auto_fix = redact_secrets(auto_fix) if auto_fix else auto_fix
     resolution = redact_secrets(resolution) if resolution else resolution
-    main_text = text
-    footer: list[str] = []
-    over = len(text) > TELEGRAM_MESSAGE_MAX_CHARS
-    if has_auto_fix_line(main_text):
-        if over:
-            main_text, line = _split_line(main_text, _AUTO_FIX_RE)
-            footer.append(line or "")
+    impact = redact_secrets(impact) if impact else impact
+    action = redact_secrets(action) if action else action
+    combined = with_footer(
+        text, impact=impact, auto_fix=auto_fix, resolution=resolution,
+        action=action, parse_mode=parse_mode,
+    )
+    if len(combined) <= TELEGRAM_MESSAGE_MAX_CHARS:
+        main_text = combined
+        fix_line = None
     else:
-        footer.append(auto_fix_line(auto_fix, parse_mode))
-    if has_resolution_line(main_text):
-        if over:
-            main_text, line = _split_line(main_text, _RESOLUTION_RE)
-            footer.append(line or "")
-    elif not over and has_auto_fix_line(main_text):
-        # The caller wrote its own Auto-fix line: the Resolution line goes
-        # directly under it, so the pair reads together.
-        main_text = _insert_after_line(
-            main_text, _AUTO_FIX_RE, resolution_line(resolution, parse_mode)
+        # Over the limit: every footer line — the caller's own or the one
+        # rendered here — leaves the body and rides OUTSIDE the truncation
+        # budget, in canonical order, so a long body can never cut it off.
+        plan = _footer_plan(
+            text, impact=impact, auto_fix=auto_fix, resolution=resolution,
+            action=action, parse_mode=parse_mode,
         )
-    else:
-        footer.append(resolution_line(resolution, parse_mode))
-    footer = [f for f in footer if f]
-    fix_line = "\n".join(footer) if footer else None
+        main_text = text
+        footer: list[str] = []
+        for field in _FOOTER_FIELDS:
+            rx = _footer_regex(field)
+            if rx.search(main_text):
+                main_text, line = _split_line(main_text, rx)
+                if line:
+                    footer.append(line)
+            elif field in plan:
+                footer.append(plan[field])
+        fix_line = "\n".join(footer) if footer else None
     budget = TELEGRAM_MESSAGE_MAX_CHARS
     if fix_line is not None:
         budget = max(TELEGRAM_MESSAGE_MAX_CHARS - len(fix_line) - 2, 200)
@@ -743,6 +914,8 @@ def send_rollup(
     disable_notification: bool = True,
     auto_fix: str | None = None,
     resolution: str | None = None,
+    impact: str | None = None,
+    action: str | None = None,
 ) -> bool:
     """Send a bulleted rollup of N findings as a single message.
 
@@ -780,4 +953,6 @@ def send_rollup(
         disable_notification=disable_notification,
         auto_fix=auto_fix,
         resolution=resolution,
+        impact=impact,
+        action=action,
     )

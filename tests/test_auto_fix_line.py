@@ -41,7 +41,8 @@ def _drop_resolution(text: str) -> str:
     these tests pin the Auto-fix half only.
     """
     return "\n".join(
-        line for line in text.split("\n") if not tg.has_resolution_line(line)
+        line for line in text.split("\n")
+        if not tg.has_resolution_line(line) and not tg._ACTION_RE.search(line)
     )
 
 
@@ -111,7 +112,7 @@ class TestSendMessage:
         tg.send_message("boom", auto_fix="retrying")
         body = tg.fleet_events.emit_alert_event.call_args.kwargs["body"]
         assert _drop_resolution(body).endswith("Auto-fix:* retrying")
-        assert tg.has_resolution_line(body)
+        assert tg._ACTION_RE.search(body)
 
     def test_rollup_passes_auto_fix_through(self, post):
         tg.send_rollup(["a"], auto_fix="none needed")
@@ -162,16 +163,46 @@ class TestPublish:
         _sns, tg_text = _publish(message="boom", source="x", severity="error")
         assert tg_text.endswith(tg.DEFAULT_AUTO_FIX)
 
-    def test_info_default_is_none_needed(self, publish_env):
-        _sns, tg_text = _publish(message="report", source="x", severity="info")
-        assert tg_text.endswith(tg.AUTO_FIX_NOT_NEEDED)
+    def test_info_has_no_footer(self, publish_env):
+        """Brian 2026-11-04: boilerplate under a report is noise."""
+        sns_text, tg_text = _publish(message="report", source="x", severity="info")
+        assert tg_text == "[INFO] x: report"
+        assert sns_text == "[INFO] x: report"
 
-    def test_recovery_default_is_none_needed(self, publish_env):
+    def test_recovery_has_no_footer(self, publish_env):
         _sns, tg_text = _publish(
             message="ok again", source="x", state=alerts.ALERT_STATE_CLEARED,
             severity="info", identity_key="k",
         )
-        assert tg_text.endswith(tg.AUTO_FIX_NOT_NEEDED)
+        assert "Auto-fix:" not in tg_text
+
+    def test_info_with_a_declared_action_keeps_its_footer(self, publish_env):
+        _sns, tg_text = _publish(
+            message="report", source="x", severity="info", action="read section 2",
+        )
+        assert "Auto-fix:" in tg_text
+
+    def test_impact_and_action_reach_both_channels(self, publish_env):
+        with patch.object(alerts, "_publish_sns", return_value=alerts.ChannelResult(ok=True, detail="ok")) as sns, \
+             patch.object(alerts, "_publish_telegram", return_value=alerts.ChannelResult(ok=True, detail="ok")) as tgm, \
+             patch.object(alerts, "_resolve_sns_topic_arn", return_value="arn:aws:sns:us-east-1:1:t"), \
+             patch.object(alerts, "_resolve_log_chat", return_value=(None, None)):
+            alerts.publish(message="boom", source="x", impact="no trades today",
+                           auto_fix="retry 06:10", action="nothing")
+        for text in (sns.call_args.args[1], tgm.call_args.args[0]):
+            assert text.endswith(
+                "*Impact:* no trades today\n*Auto-fix:* retry 06:10\n*You:* nothing"
+            )
+
+    def test_cli_impact_and_action_flags(self, publish_env):
+        with patch.object(alerts, "publish") as pub:
+            pub.return_value = alerts.PublishResult(
+                sns=alerts.ChannelResult(ok=True, detail="ok"),
+                telegram=alerts.ChannelResult(ok=True, detail="ok"),
+            )
+            alerts.main(["publish", "--message", "boom", "--impact", "i", "--action", "a"])
+        assert pub.call_args.kwargs["impact"] == "i"
+        assert pub.call_args.kwargs["action"] == "a"
 
     def test_cli_flag(self, publish_env):
         with patch.object(alerts, "publish") as pub:

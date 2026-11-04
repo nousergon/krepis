@@ -237,13 +237,11 @@ from typing import Any, Final, Protocol, cast
 from krepis import _dedup, alert_tiers, fleet_events, s3_surface
 from krepis.logging import redact_secrets
 from krepis.telegram import (
-    AUTO_FIX_NOT_NEEDED,
-    RESOLUTION_NOT_NEEDED,
+    INFORMATIONAL,
     _validate_parse_mode,
     has_auto_fix_line,
-    has_resolution_line,
-    with_auto_fix,
-    with_resolution,
+    is_informational,
+    with_footer,
 )
 from krepis.telegram import PARSE_MODE as TELEGRAM_PARSE_MODE
 
@@ -1111,6 +1109,7 @@ def _publish_telegram(
     chat_id: str | None = None,
     message_thread_id: int | None = None,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
+    informational: bool = False,
 ) -> ChannelResult:
     """Send one message to the resolved Telegram ``destination``.
 
@@ -1170,13 +1169,20 @@ def _publish_telegram(
         transport_kwargs: dict[str, str | None] = {}
         if parse_mode != TELEGRAM_PARSE_MODE:
             transport_kwargs["parse_mode"] = parse_mode
-        ok = send_message(
-            message,
-            disable_notification=disable_push,
-            chat_id=chat_id,
-            message_thread_id=message_thread_id,
-            **transport_kwargs,
-        )
+        # Informational: without the scope the transport would append its
+        # default footer to a report `publish` deliberately left without one.
+        # A context scope, not a kwarg, so test doubles of `send_message` with
+        # an explicit kwarg list keep working (see the note above).
+        from krepis.telegram import informational_scope
+
+        with informational_scope(informational):
+            ok = send_message(
+                message,
+                disable_notification=disable_push,
+                chat_id=chat_id,
+                message_thread_id=message_thread_id,
+                **transport_kwargs,
+            )
         # The destination is named in `detail` as well as on
         # `PublishResult.telegram_destination` so a human reading a CLI
         # stderr line (which prints only the detail) can tell the operator
@@ -1352,6 +1358,8 @@ def publish(
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
     auto_fix: str | None = None,
     resolution: str | None = None,
+    impact: str | None = None,
+    action: str | None = None,
 ) -> PublishResult:
     """Fan out a failure alert to the operator-surveillance channels.
 
@@ -1499,6 +1507,14 @@ def publish(
         :data:`krepis.telegram.RESOLUTION_NOT_NEEDED` for a recovery or an
         info/debug message, and to :data:`krepis.telegram.DEFAULT_RESOLUTION`
         otherwise. A body that already carries a ``Resolution:`` line keeps it.
+    :param impact: Why the operator should care — what breaks, for whom, by
+        when. Rendered as ``Impact:``. Every non-informational alert should
+        pass it (observability-policy § Notification — auto-fix line; Brian,
+        2026-11-04); one that does not is logged ``ALERT_FOOTER_UNDECLARED``.
+    :param action: What the operator must do, with the exact link or command,
+        rendered as ``You:``; ``None`` renders ``You: nothing.``.
+        Info/debug/cleared messages with no ``auto_fix``/``action`` carry no
+        footer at all.
     :param destination: Explicit override of the severity-derived Telegram
         destination — one of :data:`ALERT_DESTINATIONS`. ``None`` (default)
         derives it from ``severity``. An override is honoured where it can
@@ -1555,23 +1571,31 @@ def publish(
     # delivered text on every channel (SNS email included), never to the bus
     # event's raw `body` or the dedup identity. Before the provenance suffix,
     # which stays the last line.
-    if not has_auto_fix_line(formatted):
-        fix_detail = auto_fix
-        if not fix_detail and (
+    # Informational (a report, a recovery, a digest) carries NO footer
+    # (Brian, 2026-11-04: boilerplate under a report is noise). Everything
+    # else carries Impact (when declared) / Auto-fix / Resolution (when
+    # declared) / You — see `krepis.telegram.with_footer`.
+    informational = is_informational(auto_fix) or (
+        not (auto_fix or "").strip()
+        and not (action or "").strip()
+        and (
             state == ALERT_STATE_CLEARED
             or severity.lower() in _AUTO_FIX_INFORMATIONAL_SEVERITIES
-        ):
-            fix_detail = AUTO_FIX_NOT_NEEDED
-        formatted = with_auto_fix(formatted, fix_detail, parse_mode)
-    # ── Resolution line (Brian, 2026-10-24) — directly under Auto-fix.
-    if not has_resolution_line(formatted):
-        res_detail = resolution
-        if not res_detail and (
-            state == ALERT_STATE_CLEARED
-            or severity.lower() in _AUTO_FIX_INFORMATIONAL_SEVERITIES
-        ):
-            res_detail = RESOLUTION_NOT_NEEDED
-        formatted = with_resolution(formatted, res_detail, parse_mode)
+        )
+    )
+    if informational:
+        auto_fix = INFORMATIONAL
+    elif not (impact or "").strip() and not has_auto_fix_line(formatted):
+        # Measurable, not silent: the sweep counts senders that still owe
+        # their alerts a "why it matters" line.
+        logger.warning(
+            "ALERT_FOOTER_UNDECLARED source=%s impact=%s auto_fix=%s",
+            source, bool((impact or "").strip()), bool((auto_fix or "").strip()),
+        )
+    formatted = with_footer(
+        formatted, impact=impact, auto_fix=auto_fix, resolution=resolution,
+        action=action, parse_mode=parse_mode,
+    )
 
     provenance = _provenance_suffix()
     if provenance:
@@ -1872,6 +1896,7 @@ def publish(
                         else (tier != alert_tiers.TIER_PAGE or None)
                     ),
                     parse_mode=parse_mode,
+                    informational=informational,
                     destination=resolved,
                     chat_id=log_chat_id if resolved == DESTINATION_LOG_CHAT else None,
                     message_thread_id=(
@@ -2113,6 +2138,19 @@ def main(argv: list[str] | None = None) -> int:
             "files one) is used."
         ),
     )
+    pub.add_argument(
+        "--impact",
+        default=None,
+        help="Why the operator should care. Rendered as the 'Impact:' line.",
+    )
+    pub.add_argument(
+        "--action",
+        default=None,
+        help=(
+            "What the operator must do (link or exact command). Rendered as "
+            "the 'You:' line; omitted renders 'You: nothing.'."
+        ),
+    )
     pub.add_argument("--no-sns", action="store_true", help="Skip SNS publish.")
     pub.add_argument("--no-telegram", action="store_true", help="Skip Telegram fan-out.")
     pub.add_argument(
@@ -2325,6 +2363,8 @@ def main(argv: list[str] | None = None) -> int:
             console_artifact=args.console_artifact,
             auto_fix=args.auto_fix,
             resolution=args.resolution,
+            impact=args.impact,
+            action=args.action,
         )
     except AlertDeliveryError as exc:
         # The CLI is the Bash-caller surface, so the diagnosis goes to stderr

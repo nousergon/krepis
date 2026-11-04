@@ -20,12 +20,13 @@ from krepis.secrets import clear_cache
 
 _FIX_TAIL = re.compile(
     r"\n\n(?:\*Auto-fix:\*|<b>Auto-fix:</b>|Auto-fix:) [^\n]*"
-    r"\n(?:\*Resolution:\*|<b>Resolution:</b>|Resolution:) [^\n]*\Z"
+    r"(?:\n(?:\*Resolution:\*|<b>Resolution:</b>|Resolution:) [^\n]*)?"
+    r"\n(?:\*You:\*|<b>You:</b>|You:) [^\n]*\Z"
 )
 
 
 def _body(text: str) -> str:
-    """The body without the transport-appended ``Auto-fix:``/``Resolution:`` footer."""
+    """The body without the transport-appended ``Auto-fix:``/``You:`` footer."""
     assert _FIX_TAIL.search(text), f"no Auto-fix line appended: {text!r}"
     return _FIX_TAIL.sub("", text)
 
@@ -682,30 +683,30 @@ class TestDestinationOverrides:
 
 
 class TestResolutionLine:
-    """Every message names what will END the problem (Brian, 2026-10-24).
+    """``Resolution:`` renders only when declared (Brian, 2026-11-04: a default
+    Resolution line under a default Auto-fix line said the same thing twice).
 
-    observability-policy § Notification — auto-fix line (§7.4b, resolution half).
+    observability-policy § Notification — auto-fix line.
     """
 
     def _sent(self, mock_post) -> str:
         return mock_post.call_args.kwargs["json"]["text"]
 
-    def test_default_resolution_appended_under_auto_fix(self, configured_env, mock_post):
+    def test_no_default_resolution_line(self, configured_env, mock_post):
         tg.send_message("boom", parse_mode=None)
         text = self._sent(mock_post)
-        fix_at = text.index("Auto-fix:")
-        res_at = text.index("Resolution:")
-        assert res_at > fix_at
-        assert text.endswith(f"Resolution: {tg.DEFAULT_RESOLUTION}")
+        assert "Resolution:" not in text
+        assert text.endswith(f"Auto-fix: {tg.DEFAULT_AUTO_FIX}\nYou: {tg.DEFAULT_ACTION}")
 
-    def test_declared_resolution_is_rendered(self, configured_env, mock_post):
+    def test_declared_resolution_is_rendered_between_fix_and_action(self, configured_env, mock_post):
         tg.send_message(
             "boom", parse_mode=None,
             resolution="alpha-engine-config#123 — widen the retry window",
         )
-        assert self._sent(mock_post).endswith(
-            "Resolution: alpha-engine-config#123 — widen the retry window"
-        )
+        lines = self._sent(mock_post).splitlines()
+        assert lines[-2] == "Resolution: alpha-engine-config#123 — widen the retry window"
+        assert lines[-3].startswith("Auto-fix:")
+        assert lines[-1] == "You: nothing."
 
     def test_callers_line_wins_and_is_not_duplicated(self, configured_env, mock_post):
         tg.send_message("boom\nResolution: aec#9 — fix it", parse_mode=None, resolution="other")
@@ -713,22 +714,34 @@ class TestResolutionLine:
         assert text.count("Resolution:") == 1
         assert "aec#9" in text
 
-    def test_inserted_directly_under_callers_auto_fix_line(self, configured_env, mock_post):
-        tg.send_message("boom\n\nAuto-fix: retry at 06:10\n\nmore detail", parse_mode=None)
+    def test_declared_lines_go_directly_under_callers_auto_fix_line(self, configured_env, mock_post):
+        tg.send_message(
+            "boom\n\nAuto-fix: retry at 06:10\n\nmore detail", parse_mode=None,
+            resolution="aec#1", action="approve the PR",
+        )
         lines = self._sent(mock_post).splitlines()
         i = next(n for n, line in enumerate(lines) if line.startswith("Auto-fix:"))
-        assert lines[i + 1].startswith("Resolution:")
+        assert lines[i + 1] == "Resolution: aec#1"
+        assert lines[i + 2] == "You: approve the PR"
+
+    def test_callers_own_footer_gets_no_defaults(self, configured_env, mock_post):
+        """A hand-written Auto-fix line owns the footer: no default You line
+        that could contradict it ("changing a budget is Brian's call")."""
+        tg.send_message("boom\nAuto-fix: none; Brian's call", parse_mode=None)
+        text = self._sent(mock_post)
+        assert "You:" not in text
+        assert "Resolution:" not in text
 
     def test_html_escapes_resolution(self, configured_env, mock_post):
         tg.send_message("x", parse_mode="HTML", resolution="a<b")
-        assert self._sent(mock_post).endswith("<b>Resolution:</b> a&lt;b")
+        assert "<b>Resolution:</b> a&lt;b" in self._sent(mock_post)
 
     def test_survives_truncation(self, configured_env, mock_post):
         long_body = "y" * (tg.TELEGRAM_MESSAGE_MAX_CHARS + 500)
         tg.send_message(long_body, parse_mode=None, resolution="aec#1 — plan")
         text = self._sent(mock_post)
         assert len(text) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
-        assert text.endswith("Resolution: aec#1 — plan")
+        assert text.endswith("Resolution: aec#1 — plan\nYou: nothing.")
 
     def test_callers_lines_survive_truncation(self, configured_env, mock_post):
         body = (
@@ -742,6 +755,58 @@ class TestResolutionLine:
 
     def test_default_never_invents_an_issue_number(self):
         assert "#" not in tg.DEFAULT_RESOLUTION
+
+
+class TestImpactAndActionLines:
+    """Brian, 2026-11-04: every alert says why he should care and whether he
+    must do anything."""
+
+    def _sent(self, mock_post) -> str:
+        return mock_post.call_args.kwargs["json"]["text"]
+
+    def test_full_footer_in_canonical_order(self, configured_env, mock_post):
+        tg.send_message(
+            "router: 3 entries unfunded", parse_mode=None,
+            impact="calls to them fail over to one provider",
+            auto_fix="none", resolution="aec#9", action="top up GLM: <link>",
+        )
+        assert self._sent(mock_post) == (
+            "router: 3 entries unfunded\n\n"
+            "Impact: calls to them fail over to one provider\n"
+            "Auto-fix: none\n"
+            "Resolution: aec#9\n"
+            "You: top up GLM: <link>"
+        )
+
+    def test_impact_goes_above_callers_auto_fix_line(self, configured_env, mock_post):
+        tg.send_message("boom\nAuto-fix: retry", parse_mode=None, impact="no orders today")
+        lines = self._sent(mock_post).splitlines()
+        assert lines[-2:] == ["Impact: no orders today", "Auto-fix: retry"]
+
+    def test_informational_has_no_footer(self, configured_env, mock_post):
+        tg.send_message("daily report", parse_mode=None, auto_fix=tg.INFORMATIONAL)
+        assert self._sent(mock_post) == "daily report"
+
+    def test_informational_scope_has_no_footer(self, configured_env, mock_post):
+        with tg.informational_scope():
+            tg.send_message("daily report", parse_mode=None)
+        assert self._sent(mock_post) == "daily report"
+        tg.send_message("boom", parse_mode=None)
+        assert "Auto-fix:" in self._sent(mock_post)
+
+    def test_html_escapes_impact_and_action(self, configured_env, mock_post):
+        tg.send_message("x", parse_mode="HTML", impact="a<b", action="c>d")
+        text = self._sent(mock_post)
+        assert "<b>Impact:</b> a&lt;b" in text
+        assert "<b>You:</b> c&gt;d" in text
+
+    def test_footer_survives_truncation(self, configured_env, mock_post):
+        tg.send_message(
+            "z" * 9000, parse_mode=None, impact="why", action="do this",
+        )
+        text = self._sent(mock_post)
+        assert len(text) <= tg.TELEGRAM_MESSAGE_MAX_CHARS
+        assert text.endswith(f"Impact: why\nAuto-fix: {tg.DEFAULT_AUTO_FIX}\nYou: do this")
 
 
 # ── outbound redaction (nous-ergon-ops-I2002) ───────────────────────────────
