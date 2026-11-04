@@ -209,7 +209,7 @@ class TestEnvDryRunReachesPublish:
 _EXPECTED_TODAY = (
     "[ERROR] metron: boom\n\n"
     f"*Auto-fix:* {__import__('krepis.telegram').telegram.DEFAULT_AUTO_FIX}\n"
-    f"*Resolution:* {__import__('krepis.telegram').telegram.DEFAULT_RESOLUTION}"
+    f"*You:* {__import__('krepis.telegram').telegram.DEFAULT_ACTION}"
 )
 
 

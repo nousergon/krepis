@@ -197,19 +197,14 @@ class TestPublish:
                 # No-push, not no-send: disable_notification=True, message sent.
                 assert send.call_args.kwargs.get("disable_notification") is True
                 sent_text = send.call_args.args[0] if send.call_args.args else send.call_args.kwargs.get("message")
+                # Informational sends carry no footer (Brian 2026-11-04).
                 assert sent_text == (
-                    f"[{sev.upper()}] test: x\n\n*Auto-fix:* "
-                    + (
-                        alerts_mod_tg.AUTO_FIX_NOT_NEEDED
-                        if sev.lower() in {"info", "debug", "notice"}
-                        else alerts_mod_tg.DEFAULT_AUTO_FIX
-                    )
-                    + "\n*Resolution:* "
-                    + (
-                        alerts_mod_tg.RESOLUTION_NOT_NEEDED
-                        if sev.lower() in {"info", "debug", "notice"}
-                        else alerts_mod_tg.DEFAULT_RESOLUTION
-                    )
+                    f"[{sev.upper()}] test: x"
+                    if sev.lower() in {"info", "debug", "notice"}
+                    else f"[{sev.upper()}] test: x\n\n*Auto-fix:* "
+                    + alerts_mod_tg.DEFAULT_AUTO_FIX
+                    + "\n*You:* "
+                    + alerts_mod_tg.DEFAULT_ACTION
                 )
 
     def test_declared_resolution_reaches_every_channel(self, fake_boto3):
@@ -227,7 +222,8 @@ class TestPublish:
         sent = send.call_args.args[0]
         assert sent.endswith(
             "*Auto-fix:* retry at 06:10\n"
-            "*Resolution:* alpha-engine-config#123 — widen the window"
+            "*Resolution:* alpha-engine-config#123 — widen the window\n"
+            "*You:* nothing."
         )
         assert "Resolution: alpha-engine-config#123" in sns.publish.call_args.kwargs["Message"].replace("*", "")
 
