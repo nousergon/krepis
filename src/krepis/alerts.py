@@ -1700,15 +1700,21 @@ def publish(
         result.sns = ChannelResult(ok=False, detail=not_attempted)
         result.telegram = ChannelResult(ok=False, detail=not_attempted)
         result.destination_reason = routing_reason
+        # The record leaves the process like an SNS body does, so it gets the
+        # same redaction pass (the SNS leg below; nous-ergon-ops-I2002). Codex
+        # finding d311c4c6bdebaa0f: these strings were written to S3 raw.
+        def _clean(value: object) -> object:
+            return redact_secrets(value) if isinstance(value, str) else value
+
         record: dict[str, object] = {
             "env": routing_env.name,
-            "message": formatted,
+            "message": _clean(formatted),
             "severity": severity,
-            "source": source,
+            "source": _clean(source),
             "state": state,
-            "identity_key": effective_identity,
-            "auto_fix": auto_fix,
-            "resolution": resolution,
+            "identity_key": _clean(effective_identity),
+            "auto_fix": _clean(auto_fix),
+            "resolution": _clean(resolution),
             "host": _publishing_host(),
         }
         result.digest, result.digest_record = _write_digest_record(routing_env, record)
