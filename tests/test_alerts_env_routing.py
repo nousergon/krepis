@@ -172,3 +172,22 @@ def test_dry_run_still_wins_over_digest(monkeypatch, s3):
     r = alerts.publish("x", source="s", dry_run=True)
     s3.put_object.assert_not_called()
     assert r.alert_routing == "page" and r.digest is None
+
+
+def test_digest_record_is_redacted_like_the_sns_body(monkeypatch, s3, no_page_path):
+    """Codex finding d311c4c6bdebaa0f: the digest branch wrote message, source,
+    auto_fix and resolution to S3 without the SNS leg's redaction pass."""
+    monkeypatch.setenv("NE_ENV", "staging")
+    _install_registry(monkeypatch, {"staging": _Env("staging", "digest")})
+    secret = "AKIA" + "ABCDEFGHIJKLMNOP"
+    assert alerts.redact_secrets(secret) != secret  # the pattern this test relies on
+
+    alerts.publish(f"login failed with key {secret}", severity="warning",
+                   source="staging-probe", auto_fix=f"rotate {secret}",
+                   resolution=f"see {secret}")
+
+    raw = s3.put_object.call_args.kwargs["Body"]
+    raw = raw.decode() if isinstance(raw, bytes) else raw
+    assert secret not in raw
+    body = json.loads(raw)
+    assert "login failed with key" in body["message"] and body["source"] == "staging-probe"
