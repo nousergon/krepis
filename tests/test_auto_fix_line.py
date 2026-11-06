@@ -241,7 +241,7 @@ class TestBriefWithDetailsUrl:
             "*Impact:* the month ends ~$30 over",
             "*Auto-fix:* none; spend is a decision",
             "*You:* review the costs page",
-            "[Details on console](https://console.nousergon.ai/page/costs)",
+            "Details on console: https://console.nousergon.ai/page/costs",
         ]
         assert "EC2 $40" in sns_text and "EC2 $40" not in tg_text
 
@@ -256,7 +256,7 @@ class TestBriefWithDetailsUrl:
         _sns, tg_text = self._send(
             message=self.LONG, source="report", severity="info", details_url="https://c/r",
         )
-        assert tg_text.splitlines()[1:] == ["[Details on console](https://c/r)"]
+        assert tg_text.splitlines()[1:] == ["Details on console: https://c/r"]
         assert "Auto-fix" not in tg_text
 
     def test_long_body_without_link_is_logged(self, publish_env, caplog):
@@ -283,3 +283,32 @@ def test_details_line_html_escapes():
     assert tg.details_line("https://c/p?a=1&b=2", tg.PARSE_MODE_HTML) == (
         '<a href="https://c/p?a=1&amp;b=2">Details on console</a>'
     )
+
+
+def test_markdown_details_link_survives_default_transport_escaping(post):
+    """codex 0b3bffbfa99290ce: ``[text](url)`` came out of send_message as
+    ``\\[Details on console\\](url)`` — literal text, no link."""
+    brief = tg.brief_alert("Router fell back.", "https://c/page/x", auto_fix="retries")
+    tg.send_message(brief, auto_fix="retries")
+    sent = post.call_args.kwargs["json"]["text"]
+    assert "\\[" not in sent and "\\]" not in sent
+    assert "Details on console: https://c/page/x" in sent
+
+
+@pytest.mark.parametrize("message", [
+    "<b>One. Two. Three. Four.</b>",                       # sentence cut drops </b>
+    "<b>" + "a" * 400 + "</b>",                           # char cut drops </b>
+    "x" * 300 + ' <a href="https://c/' + "p" * 40 + '">link</a>',  # char cut inside a tag
+])
+def test_html_brief_headline_closes_what_it_cuts(message):
+    """codex a788de1c87608cdd: tag-blind brief truncation left unclosed or
+    partial tags, which Telegram rejects for the whole message."""
+    out = tg.brief_headline(message, tg.PARSE_MODE_HTML)
+    assert len(out) <= tg.BRIEF_MAX_CHARS
+    assert tg._open_tags(out) == []
+    lt = out.rfind("<")
+    assert lt == -1 or out.find(">", lt) != -1
+
+
+def test_html_brief_headline_untouched_when_nothing_cut():
+    assert tg.brief_headline("<b>Short.</b> Fine.", tg.PARSE_MODE_HTML) == "<b>Short.</b> Fine."

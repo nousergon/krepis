@@ -1607,7 +1607,7 @@ def publish(
     telegram_text: str | None = None
     if (details_url or "").strip():
         telegram_text = brief_alert(
-            _format_message(brief_headline(message), severity, source, state),
+            _format_message(brief_headline(message, parse_mode), severity, source, state),
             details_url or "",
             impact=impact, auto_fix=auto_fix, action=action, parse_mode=parse_mode,
         )
