@@ -353,15 +353,34 @@ DETAILS_TEXT: Final[str] = "Details on console"
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
 
 
-def brief_headline(message: str) -> str:
+def brief_headline(message: str, parse_mode: str | None = PARSE_MODE) -> str:
     """The first paragraph of ``message``, cut to :data:`BRIEF_MAX_SENTENCES`
-    sentences and :data:`BRIEF_MAX_CHARS` characters (an ellipsis marks a cut)."""
+    sentences and :data:`BRIEF_MAX_CHARS` characters (an ellipsis marks a cut).
+
+    Under ``parse_mode="HTML"`` either cut can drop a closing tag the caller
+    wrote (``<b>A. B. C. D.</b>``) or land inside one (``<a href="…``), and
+    Telegram rejects the whole message for an unclosed or partial tag. So in
+    that mode a trailing partial tag is dropped and every tag still open is
+    re-closed, with room for the closers reserved inside the char budget —
+    the same repair :func:`_truncate_html` makes for long bodies.
+    """
     para = (message or "").strip().split("\n\n", 1)[0].strip()
     para = " ".join(line.strip() for line in para.splitlines() if line.strip())
     sentences = _SENTENCE_END_RE.split(para)
     out = " ".join(sentences[:BRIEF_MAX_SENTENCES])
-    if len(out) > BRIEF_MAX_CHARS:
-        out = out[: BRIEF_MAX_CHARS - 1].rstrip() + "…"
+    html = parse_mode == PARSE_MODE_HTML
+    reserve = _max_open_tag_closer_length(out) if html else 0
+    cut = len(out) > BRIEF_MAX_CHARS
+    if cut:
+        out = out[: max(BRIEF_MAX_CHARS - 1 - reserve, 0)]
+    if html:
+        lt = out.rfind("<")
+        if lt != -1 and out.find(">", lt) == -1:
+            out = out[:lt]
+    if cut:
+        out = out.rstrip() + "…"
+    if html:
+        out += "".join(f"</{tag}>" for tag in reversed(_open_tags(out)))
     return out
 
 
@@ -370,8 +389,9 @@ def details_line(url: str, parse_mode: str | None = PARSE_MODE) -> str:
     url = url.strip()
     if parse_mode == PARSE_MODE_HTML:
         return f'<a href="{escape_html(url)}">{DETAILS_TEXT}</a>'
-    if parse_mode == PARSE_MODE:
-        return f"[{DETAILS_TEXT}]({url})"
+    # Markdown gets the bare URL, not ``[text](url)``: :func:`send_message`
+    # escapes ``[`` and ``]`` for that mode, which turned the link into
+    # literal ``[Details on console](…)`` text. Telegram links a bare URL.
     return f"{DETAILS_TEXT}: {url}"
 
 
