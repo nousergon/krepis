@@ -153,7 +153,10 @@ STREAK_MARKER_PREFIX: Final[str] = "_alerts/_streak"
 _DYNAMIC_LADDER: Final[dict[str, str]] = {
     "critical": TIER_PAGE,
     "alarm": TIER_PAGE,
-    "error": TIER_NOTIFY_SILENT,
+    # observability-policy.md §7.2b (Brian, 2026-11-06): a dynamic row reaches
+    # the chat only at critical/alarm. An `error` is recorded and drained by the
+    # nightly sweep, never sent.
+    "error": TIER_TRACKED_ONLY,
     "warning": TIER_TRACKED_ONLY,
     "warn": TIER_TRACKED_ONLY,
     "info": TIER_TRACKED_ONLY,

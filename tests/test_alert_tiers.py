@@ -93,7 +93,7 @@ def test_dynamic_row_resolves_from_severity(tmp_path, monkeypatch):
          "severities": ["dynamic"]},
     ])
     assert alert_tiers.resolve_tier("sweep", "critical").tier == alert_tiers.TIER_PAGE
-    assert alert_tiers.resolve_tier("sweep", "error").tier == alert_tiers.TIER_NOTIFY_SILENT
+    assert alert_tiers.resolve_tier("sweep", "error").tier == alert_tiers.TIER_TRACKED_ONLY
     assert alert_tiers.resolve_tier("sweep", "warning").tier == alert_tiers.TIER_TRACKED_ONLY
     # An unrecognised severity on a dynamic row is not a licence to go quiet.
     assert alert_tiers.resolve_tier("sweep", "banana").tier == alert_tiers.TIER_PAGE
