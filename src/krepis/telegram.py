@@ -582,9 +582,9 @@ def _truncate_html(text: str, limit: int = TELEGRAM_MESSAGE_MAX_CHARS) -> str:
     return head + closers + suffix
 
 
-def _open_tags(fragment: str) -> list:
+def _open_tags(fragment: str) -> list[str]:
     """The stack of Telegram-HTML tags still open at the end of ``fragment``."""
-    stack: list = []
+    stack: list[str] = []
     i = 0
     while True:
         i = fragment.find("<", i)
