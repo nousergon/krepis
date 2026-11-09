@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gzip
 import json
+import threading
 
 import pytest
 
@@ -451,3 +452,68 @@ def test_the_sink_declares_its_s3_surface_as_the_variable():
 def test_an_untyped_client_error_is_not_mistaken_for_a_precondition():
     assert not ts._is_precondition_failed(RuntimeError("x"))
     assert ts._is_precondition_failed(_ClientError("412"))
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("closing", [False, True])
+def test_overlapping_flushes(fail_first, closing):
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingS3(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def put_object(self, **kw):
+            self.attempts.append(kw["Key"])
+            if len(self.attempts) == 1:
+                entered.set()
+                assert release.wait(5)
+                if fail_first:
+                    raise RuntimeError("first PUT failed")
+            super().put_object(**kw)
+
+    s3 = BlockingS3()
+    sink = _sink(s3, flush_threshold=1)
+    first = threading.Thread(target=sink, args=(_row(marker=1), {}))
+    first.start()
+    try:
+        assert entered.wait(5)
+        sink(_row(marker=2), {})
+        assert sink.rows_written == 1
+        if closing:
+            sink.close()
+    finally:
+        release.set()
+        first.join(5)
+    assert not first.is_alive()
+    sink.flush()
+    expected = 1 if fail_first and closing else 2
+    rows = s3.rows()
+    assert sorted(r["krepis"]["marker"] for r in rows) == ([2] if expected == 1 else [1, 2])
+    assert sink.rows_written == expected
+    assert sink.rows_dropped == 2 - expected
+    assert sink.flush_errors == int(fail_first)
+    assert len(set(s3.attempts)) == len(s3.attempts)
+
+
+def test_retry_reserves_new_sequence():
+    s3 = FakeS3()
+    sink = _sink(s3)
+    s3.fail_rows = 1
+    sink(_row(), {})
+    assert sink.flush() == 0
+    assert sink.flush() == 1
+    assert [call["Key"].rsplit(".", 3)[-3] for call in s3.calls] == ["0", "1"]
+    assert sink.rows_written == 1
+    assert sink.rows_dropped == 0
+
+
+def test_independent_trace_writers_do_not_collide():
+    s3 = FakeS3()
+    for _ in range(2):
+        sink = _sink(s3)
+        sink(_row(), {})
+        sink.flush()
+    assert len(s3.rows()) == 2
+    assert len(s3.objects) == 2

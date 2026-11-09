@@ -57,7 +57,8 @@ import os
 import threading
 import uuid
 from collections import defaultdict
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, cast
+from krepis._sink_identity import new_writer_id
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
@@ -137,7 +138,7 @@ def resolve_run_id(env_var: str = "KREPIS_RUN_ID") -> str:
 class S3JsonlCostSink:
     """Buffer cost records and flush them as partitioned JSONL to S3.
 
-    Key layout: ``{prefix}/{date}/{run_id}/{callsite_id}.{seq}.jsonl``
+    Key layout: ``{prefix}/{date}/{run_id}/{callsite_id}.{writer_id}.{seq}.jsonl``
 
     ``date`` comes from each record's own ``ts`` (UTC, set by
     :func:`krepis.cost.record_llm_call`), not from flush time — so a record
@@ -186,7 +187,7 @@ class S3JsonlCostSink:
         s3_client: Any = None,
         flush_threshold: int = DEFAULT_FLUSH_THRESHOLD,
         register_atexit: bool = True,
-    ):
+    ) -> None:
         if not bucket or not isinstance(bucket, str):
             raise ValueError("S3JsonlCostSink requires a non-empty bucket")
         if not prefix or not isinstance(prefix, str):
@@ -194,6 +195,7 @@ class S3JsonlCostSink:
         self.bucket = bucket
         self.prefix = prefix.rstrip("/")
         self.run_id = run_id or resolve_run_id()
+        self.writer_id = new_writer_id()
         self.flush_threshold = max(1, int(flush_threshold))
         self.flush_errors = 0
         self.records_written = 0
@@ -203,9 +205,10 @@ class S3JsonlCostSink:
         #: may still be recovered by a later successful flush).
         self.records_dropped = 0
         self._s3 = s3_client
-        self._buffers: dict[tuple[str, str], list[dict]] = defaultdict(list)
+        self._buffers: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
         self._seq: dict[tuple[str, str], int] = defaultdict(int)
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._closed = False
         if register_atexit:
             atexit.register(self.flush)
@@ -225,7 +228,7 @@ class S3JsonlCostSink:
         record.setdefault("run_id", self.run_id)
         group = (self._record_date(record), str(record.get("callsite_id") or "unknown"))
         with self._lock:
-            self._buffers[group].append(record)
+            self._buffers[group].append(cast("dict[str, object]", record))
             over = len(self._buffers[group]) >= self.flush_threshold
         if over:
             self.flush()
@@ -242,29 +245,30 @@ class S3JsonlCostSink:
         """Write every buffered group. Returns the number of objects PUT.
 
         A group whose PUT fails is re-buffered (oldest-first) rather than
-        dropped — see the class docstring (I10000). ``seq`` advances only
-        for a group that actually wrote, so a retry can never leave a gap
-        or overwrite a prior object with the same ``seq``.
+        dropped — see the class docstring (I10000). Sequences are reserved
+        before PUT and never reused, including on retry. Gaps are harmless:
+        readers list objects by prefix rather than requiring contiguous seqs.
         """
-        with self._lock:
+        # Reserve identities before I/O; overlapping flushes own distinct batches.
+        with self._flush_lock, self._lock:
             groups = {k: v for k, v in self._buffers.items() if v}
             self._buffers.clear()
             seqs = {key: self._seq[key] for key in groups}
+            for key in groups:
+                self._seq[key] += 1
         written = 0
-        failed: dict[tuple[str, str], list[dict]] = {}
+        failed: dict[tuple[str, str], list[dict[str, object]]] = {}
         for key, records in groups.items():
             date_str, callsite_id = key
             if self._put_group(date_str, callsite_id, seqs[key], records):
                 written += 1
-                with self._lock:
-                    self._seq[key] = seqs[key] + 1
             else:
                 failed[key] = records
         if failed:
             self._requeue_failed(failed)
         return written
 
-    def _requeue_failed(self, failed: dict[tuple[str, str], list[dict]]) -> None:
+    def _requeue_failed(self, failed: dict[tuple[str, str], list[dict[str, object]]]) -> None:
         """Put failed groups back at the front of their buffer, capped.
 
         Records already in the buffer (accepted via ``__call__`` while the
@@ -275,6 +279,9 @@ class S3JsonlCostSink:
         cap = self.flush_threshold * MAX_RETAINED_MULTIPLE
         with self._lock:
             for key, records in failed.items():
+                if self._closed:
+                    self.records_dropped += len(records)
+                    continue
                 merged = records + self._buffers[key]
                 if len(merged) > cap:
                     overflow = len(merged) - cap
@@ -300,6 +307,7 @@ class S3JsonlCostSink:
         """
         self.flush()
         with self._lock:
+            self._closed = True
             remaining = sum(len(v) for v in self._buffers.values())
             if remaining:
                 self.records_dropped += remaining
@@ -311,12 +319,11 @@ class S3JsonlCostSink:
                 "(flush_errors=%d, records_dropped=%d)",
                 remaining, self.flush_errors, self.records_dropped,
             )
-        self._closed = True
 
     def _put_group(
-        self, date_str: str, callsite_id: str, seq: int, records: list[dict]
+        self, date_str: str, callsite_id: str, seq: int, records: list[dict[str, object]]
     ) -> bool:
-        key = f"{self.prefix}/{date_str}/{self.run_id}/{callsite_id}.{seq}.jsonl"
+        key = f"{self.prefix}/{date_str}/{self.run_id}/{callsite_id}.{self.writer_id}.{seq}.jsonl"
         body = "\n".join(json.dumps(r, default=str) for r in records).encode("utf-8")
         try:
             self._client().put_object(
@@ -340,13 +347,15 @@ class S3JsonlCostSink:
             #     absence of the object itself. That last layer is what
             #     catches SUSTAINED loss when logs go unread, and its
             #     absence is what let alpha-engine-config-I5206 run 17 days.
-            self.flush_errors += 1
+            with self._lock:
+                self.flush_errors += 1
             logger.error(
                 "cost sink PUT failed for s3://%s/%s (%d record(s)): %s",
                 self.bucket, key, len(records), exc,
             )
             return False
-        self.records_written += len(records)
+        with self._lock:
+            self.records_written += len(records)
         logger.debug(
             "cost sink wrote %d record(s) to s3://%s/%s",
             len(records), self.bucket, key,
