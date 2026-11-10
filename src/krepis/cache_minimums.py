@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from importlib import resources
+from typing import cast
 
 import yaml
 
@@ -54,7 +55,8 @@ def _load() -> dict[str, int]:
     with resources.files("krepis").joinpath(_MINIMUMS_RESOURCE).open(
         "r", encoding="utf-8"
     ) as fh:
-        raw = yaml.safe_load(fh)
+        # The packaged YAML has a string-keyed top-level mapping.
+        raw = cast("dict[str, object]", yaml.safe_load(fh))
     minimums = (raw or {}).get("minimums") or {}
     if not isinstance(minimums, dict) or not minimums:
         raise ValueError(
@@ -62,7 +64,8 @@ def _load() -> dict[str, int]:
             "return an empty table, which would silently read as 'no model "
             "has a minimum' and disable every below-threshold guard"
         )
-    return {str(k): int(v) for k, v in minimums.items()}
+    # The published minimums are integers; retain the existing int coercion.
+    return {str(k): int(v) for k, v in cast("dict[object, int]", minimums).items()}
 
 
 def known_models() -> tuple[str, ...]:

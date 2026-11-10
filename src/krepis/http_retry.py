@@ -42,7 +42,7 @@ import logging as _logging
 import random as _random
 import re
 import time as _time
-from typing import Callable, Iterable, TypeVar
+from typing import Callable, Iterable, Mapping, TypeVar, cast
 
 import requests
 
@@ -117,7 +117,8 @@ def backoff_delay(
         except (TypeError, ValueError):
             wait = None
     if wait is None:
-        wait = base * (2 ** attempt)
+        # Exponentiation's inferred type is imprecise; this product is numeric.
+        wait = cast(float, base * (2 ** attempt))
     jitter = (rng or _random).uniform(0, base)
     return min(wait + jitter, cap)
 
@@ -126,7 +127,9 @@ def request_with_retry(
     url: str,
     *,
     method: str = "GET",
-    params: "dict | None" = None,
+    params: Mapping[
+        str, str | bytes | int | float | Iterable[str | bytes | int | float] | None
+    ] | None = None,
     session: "requests.Session | None" = None,
     timeout: float = 15.0,
     max_attempts: int = 3,
@@ -252,7 +255,8 @@ def is_transient_boto_error(
     """True for ``botocore.exceptions.ClientError`` in the transient code class."""
     if type(exc).__name__ != "ClientError" or not type(exc).__module__.startswith("botocore"):
         return False
-    response = getattr(exc, "response", None) or {}
+    # ClientError's untyped response carries the provider's nested error mapping.
+    response = cast("dict[str, dict[str, str]]", getattr(exc, "response", None) or {})
     code = (response.get("Error") or {}).get("Code", "")
     return code in frozenset(codes)
 
