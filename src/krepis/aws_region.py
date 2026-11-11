@@ -46,7 +46,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Final
+from typing import Final, Protocol, cast
 
 logger = logging.getLogger(__name__)
 
@@ -61,13 +61,31 @@ DEFAULT_REGION: Final[str] = "us-east-1"
 _IMDS_TIMEOUT_SECONDS: Final[float] = 1.0
 
 
+class _RegionSession(Protocol):
+    def get_config_variable(self, logical_name: str) -> str | None: ...
+
+
+class _SessionModule(Protocol):
+    def get_session(self) -> _RegionSession: ...
+
+
+class _RegionFetcher(Protocol):
+    def retrieve_region(self) -> str | None: ...
+
+
+class _RegionFetcherFactory(Protocol):
+    def __call__(self, *, timeout: float, num_attempts: int) -> _RegionFetcher: ...
+
+
 def _from_botocore_session() -> str | None:
     try:
         import botocore.session
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
-        return botocore.session.get_session().get_config_variable("region")
+        # Botocore is untyped; describe only the region lookup surface we use.
+        session_module = cast(_SessionModule, botocore.session)
+        return session_module.get_session().get_config_variable("region")
     except Exception:  # noqa: BLE001 - config resolution is best-effort
         logger.debug("aws_region: botocore session region lookup failed", exc_info=True)
         return None
@@ -79,7 +97,9 @@ def _from_imds() -> str | None:
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
-        region = InstanceMetadataRegionFetcher(
+        # The untyped constructor accepts a fractional timeout at runtime.
+        fetcher_factory = cast(_RegionFetcherFactory, InstanceMetadataRegionFetcher)
+        region = fetcher_factory(
             timeout=_IMDS_TIMEOUT_SECONDS, num_attempts=1
         ).retrieve_region()
         return region or None
