@@ -59,7 +59,7 @@ import argparse
 import json
 import re
 import sys
-from typing import Final, Optional
+from typing import Final, Optional, Sequence
 
 #: The two classifications this module returns. Deliberately a closed set: the
 #: policy names exactly these two words, and the operator-facing message is
@@ -70,17 +70,17 @@ TIMEOUT: Final[str] = "TIMEOUT"
 
 #: Return codes that mean "killed for memory". 137 = 128+SIGKILL (POSIX shell
 #: exit-code convention); -9 = SIGKILL as a Python negative ``returncode``.
-OOM_RETURNCODES: Final[frozenset] = frozenset({137, -9})
+OOM_RETURNCODES: Final[frozenset[int]] = frozenset({137, -9})
 
 #: 124 = the ``timeout`` coreutil's own "I killed the child at the budget"
 #: convention; 143 = 128+SIGTERM; -14/-15 = SIGALRM/SIGTERM as Python negative
 #: return codes. A watchdog SIGTERM and a ``timeout --signal=TERM`` both land
 #: here.
-TIMEOUT_RETURNCODES: Final[frozenset] = frozenset({124, 143, -14, -15})
+TIMEOUT_RETURNCODES: Final[frozenset[int]] = frozenset({124, 143, -14, -15})
 
 #: SSM's own terminal status meaning "I killed this at ``executionTimeout``".
 #: The only case where no exit code was ever produced by the workload.
-TIMEOUT_STATUSES: Final[frozenset] = frozenset({"TimedOut"})
+TIMEOUT_STATUSES: Final[frozenset[str]] = frozenset({"TimedOut"})
 
 #: Lines that name a MEMORY kill. Anchored loosely on purpose: these come from
 #: bash's job-control message, the kernel's oom-killer, glibc, CPython and Go,
@@ -320,7 +320,7 @@ def format_cause(
     return "{} — no kill line survived in the captured output".format(head)
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """CLI so a bash launcher gets the same verdict without re-deriving it.
 
     ``python -m krepis.resource_kill classify --stage X --rc 137``
