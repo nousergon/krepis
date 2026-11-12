@@ -1485,7 +1485,7 @@ requires-dist = [
     { name = "exchange-calendars", marker = "python_full_version >= '3.10' and extra == 'dev'", specifier = ">=4.0" },
     { name = "flow-doctor", marker = "extra == 'flow-doctor'", specifier = ">=0.16.0" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0" },
-    { name = "litellm", marker = "python_full_version >= '3.11' and extra == 'dev'", specifier = ">=1.0" },
+    { name = "litellm", marker = "python_full_version >= '3.11' and extra == 'dev'", specifier = ">=1.0,<1.109" },
     { name = "litellm", marker = "python_full_version < '3.11' and extra == 'dev'", specifier = ">=1.0,<1.97" },
     { name = "moto", marker = "extra == 'dev'", specifier = ">=5.0" },
     { name = "openai", marker = "extra == 'openai'", specifier = ">=1.40" },
