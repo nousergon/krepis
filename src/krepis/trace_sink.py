@@ -59,12 +59,12 @@ import logging
 import os
 import re
 import threading
-import uuid
 from collections import OrderedDict, defaultdict
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from krepis import s3_surface
+from krepis._sink_identity import new_writer_id
 from krepis.cost_sink import resolve_run_id
 from krepis.llm_trace import EXTENSION_NAMESPACE, TraceBlob
 
@@ -229,7 +229,7 @@ class S3JsonlTraceSink:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.run_id = run_id or resolve_run_id()
-        self.writer_id = uuid.uuid4().hex[:8]
+        self.writer_id = new_writer_id()
         self.flush_threshold = max(1, int(flush_threshold))
         self.blob_flush_bytes = max(1, int(blob_flush_bytes))
         self.rows_written = 0
@@ -250,6 +250,9 @@ class S3JsonlTraceSink:
         self._blob_bytes = 0
         self._stored: set = set()
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._status_lock = threading.Lock()
+        self._closed = False
         if register_atexit:
             atexit.register(self.close)
 
@@ -289,6 +292,8 @@ class S3JsonlTraceSink:
     def flush(self) -> int:
         """Write pending blobs, then every buffered row group.
 
+        Sequences are reserved before PUT and never reused on retry. Gaps
+        are harmless because readers list by prefix.
         Returns the number of ROW objects written. Blobs go first so that a
         row is never readable before the content it points at; a blob that
         fails is re-buffered and its row is still written — a row pointing
@@ -297,23 +302,27 @@ class S3JsonlTraceSink:
         with self._lock:
             blobs_pending = len(self._blobs)
         self._flush_blobs()
-        with self._lock:
+        # Reserve identities before I/O; overlapping flushes own distinct batches.
+        with self._flush_lock, self._lock:
             groups = {k: v for k, v in self._rows.items() if v}
             self._rows.clear()
             seqs = {key: self._seq[key] for key in groups}
+            for key in groups:
+                self._seq[key] += 1
         written = 0
         failed: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         for key, rows in groups.items():
             if self._put_rows(key, seqs[key], rows):
                 written += 1
-                with self._lock:
-                    self._seq[key] = seqs[key] + 1
             else:
                 failed[key] = rows
         if failed:
             cap = self.flush_threshold * MAX_RETAINED_MULTIPLE
             with self._lock:
                 for key, rows in failed.items():
+                    if self._closed:
+                        self.rows_dropped += len(rows)
+                        continue
                     merged = rows + self._rows[key]
                     if len(merged) > cap:
                         overflow = len(merged) - cap
@@ -337,6 +346,7 @@ class S3JsonlTraceSink:
         """Flush, then count anything still buffered as permanently lost."""
         self.flush()
         with self._lock:
+            self._closed = True
             rows_left = sum(len(v) for v in self._rows.values())
             blobs_left = len(self._blobs)
             self.rows_dropped += rows_left
@@ -414,15 +424,17 @@ class S3JsonlTraceSink:
             # (c) recorded on: this ERROR line, `flush_errors`, the re-buffered
             #     rows (retried on the next flush), and the freshness monitor
             #     on the destination prefix, which catches sustained loss.
-            self.flush_errors += 1
+            with self._lock:
+                self.flush_errors += 1
             self._record_error(exc)
             logger.error(
                 "trace sink PUT failed for s3://%s/%s (%d row(s)): %s",
                 self.bucket, object_key, len(rows), exc,
             )
             return False
-        self.rows_written += len(rows)
-        self.last_rows_key = object_key
+        with self._lock:
+            self.rows_written += len(rows)
+            self.last_rows_key = object_key
         return True
 
     def _put_blob(self, sha: str, blob: TraceBlob) -> Optional[bool]:
@@ -486,26 +498,28 @@ class S3JsonlTraceSink:
         """Overwrite the fixed status pointer. Never raises; False = not written."""
         if self.status_key is None:
             return False
-        body = json.dumps(self.status(event=event, **last_flush), sort_keys=True).encode("utf-8")
-        try:
-            self._client().put_object(
-                Bucket=self.bucket,
-                Key=self.status_key,
-                Body=body,
-                ContentType="application/json",
-                CacheControl="no-cache",
-            )
-        except Exception as exc:  # noqa: BLE001 — duck-typed boto errors
-            # Same deliberate non-raising degradation as `_put_rows`; the rows
-            # and blobs above are unaffected. Recorded on this ERROR line,
-            # `status_errors`, and the pointer's own age, which stops moving.
-            self.status_errors += 1
-            logger.error(
-                "trace sink status PUT failed for s3://%s/%s: %s",
-                self.bucket, self.status_key, exc,
-            )
-            return False
-        return True
+        # Serialize pointer snapshots and writes without blocking producers.
+        with self._status_lock:
+            body = json.dumps(self.status(event=event, **last_flush), sort_keys=True).encode("utf-8")
+            try:
+                self._client().put_object(
+                    Bucket=self.bucket,
+                    Key=self.status_key,
+                    Body=body,
+                    ContentType="application/json",
+                    CacheControl="no-cache",
+                )
+            except Exception as exc:  # noqa: BLE001 — duck-typed boto errors
+                # Same deliberate non-raising degradation as `_put_rows`; the rows
+                # and blobs above are unaffected. Recorded on this ERROR line,
+                # `status_errors`, and the pointer's own age, which stops moving.
+                self.status_errors += 1
+                logger.error(
+                    "trace sink status PUT failed for s3://%s/%s: %s",
+                    self.bucket, self.status_key, exc,
+                )
+                return False
+            return True
 
     def _client(self) -> Any:
         if self._s3 is None:

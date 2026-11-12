@@ -9,6 +9,7 @@ the work it was measuring.
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -123,7 +124,7 @@ class TestKeyLayout:
         sink(_record(callsite_id="evaljudge-sync"))
         sink.flush()
         assert s3.puts[0]["Key"] == (
-            "cost_raw/2026-07-28/run-xyz/evaljudge-sync.0.jsonl"
+            f"cost_raw/2026-07-28/run-xyz/evaljudge-sync.{sink.writer_id}.0.jsonl"
         )
         assert s3.puts[0]["ContentType"] == "application/x-ndjson"
 
@@ -155,7 +156,7 @@ class TestKeyLayout:
         sink = _sink(s3)
         sink({"ts": "2026-07-28T00:00:00+00:00", "cost_usd": 0.1})
         sink.flush()
-        assert s3.puts[0]["Key"].endswith("unknown.0.jsonl")
+        assert s3.puts[0]["Key"].endswith(f"unknown.{sink.writer_id}.0.jsonl")
 
 
 class TestFailureHandling:
@@ -204,17 +205,15 @@ class TestFailedFlushRecovery:
         assert sink.records_written == 1
         assert len(s3.puts) == 1
 
-    def test_seq_does_not_advance_on_failure(self):
-        """A retry must reuse the same seq — advancing it on a failed PUT
-        would let the eventual successful write collide with (or skip) a
-        seq number, either overwriting or leaving a gap."""
+    def test_seq_is_reserved_even_on_failure(self):
+        """Retries use a new identity; a gap does not imply lost records."""
         s3 = FakeS3(fail=True)
         sink = _sink(s3)
         sink(_record())
         sink.flush()
         s3.fail = False
         sink.flush()
-        assert s3.puts[0]["Key"].endswith(".0.jsonl")
+        assert s3.puts[0]["Key"].endswith(".1.jsonl")
 
     def test_newly_buffered_records_are_ordered_after_the_retry(self):
         s3 = FakeS3(fail=True)
@@ -340,7 +339,7 @@ class TestDefaultSinkFromEnv:
         assert s3.puts[0]["Bucket"] == "alpha-engine-research"
         assert s3.puts[0]["Key"] == (
             "decision_artifacts/_cost_raw/2026-07-28/sf-exec-1/"
-            "replay-concordance.0.jsonl"
+            f"replay-concordance.{sink.writer_id}.0.jsonl"
         )
 
     def test_one_sink_per_process(self, monkeypatch):
@@ -615,3 +614,56 @@ class TestFlushCostOnExit:
             for r in caplog.records
         )
         assert not any("flushed" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("fail_first", [False, True])
+@pytest.mark.parametrize("closing", [False, True])
+def test_overlapping_flushes(fail_first, closing):
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingS3(FakeS3):
+        def __init__(self):
+            super().__init__()
+            self.attempts = []
+
+        def put_object(self, **kw):
+            self.attempts.append(kw["Key"])
+            if len(self.attempts) == 1:
+                entered.set()
+                assert release.wait(5)
+                if fail_first:
+                    raise RuntimeError("first PUT failed")
+            super().put_object(**kw)
+
+    s3 = BlockingS3()
+    sink = _sink(s3, flush_threshold=1)
+    first = threading.Thread(target=sink, args=(_record(cost=1),))
+    first.start()
+    try:
+        assert entered.wait(5)
+        sink(_record(cost=2))
+        assert sink.records_written == 1
+        if closing:
+            sink.close()
+    finally:
+        release.set()
+        first.join(5)
+    assert not first.is_alive()
+    sink.flush()
+    expected = 1 if fail_first and closing else 2
+    objects = {p["Key"]: p for p in s3.puts}
+    rows = [json.loads(line) for p in objects.values() for line in p["Body"].splitlines()]
+    assert sorted(r["cost_usd"] for r in rows) == ([2] if expected == 1 else [1, 2])
+    assert sink.records_written == expected
+    assert sink.records_dropped == 2 - expected
+    assert sink.flush_errors == int(fail_first)
+    assert len(set(s3.attempts)) == len(s3.attempts)
+
+
+def test_independent_cost_writers_do_not_collide():
+    s3 = FakeS3()
+    for _ in range(2):
+        sink = _sink(s3)
+        sink(_record())
+        sink.flush()
+    assert len({p["Key"] for p in s3.puts}) == 2
