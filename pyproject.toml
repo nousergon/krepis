@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "krepis"
-version = "0.59.97"
+version = "0.59.98"
 description = "krepis (Greek κρηπίς — the foundation a structure stands on): general-purpose Python primitives for production data and LLM pipelines on AWS — logging, SSM secrets, Telegram/SNS/Web Push alerts, bounded-backoff HTTP retry, S3 writer locks, the Anthropic payload chokepoint, LLM cost telemetry, the LLM-as-judge transport core, trading-calendar/date helpers, and EC2-spot/SSM resilience."
 readme = "README.md"
 # EC2 still runs Python 3.9 on the always-on micro instance, so PEP 604
@@ -115,7 +115,19 @@ dev = [
     # (alpha-engine-config-I7464). Remove when a litellm release supporting
     # 3.10 fixes the forward ref.
     "litellm>=1.0,<1.97; python_version < '3.11'",
-    "litellm>=1.0; python_version >= '3.11'",
+    # litellm 1.109.0 and later are excluded on 3.11+: the router moved its
+    # fallback walk into `router_python_core`, so the `litellm.router.run_async_fallback`
+    # seam tests/test_router_contract_errors.py patches is no longer the one
+    # that runs, and the real walk raises `KeyError: 'metadata'` from
+    # `_core_log_retry` (logged as "Error occurred while trying to do
+    # fallbacks - 'metadata'"), failing the 503/429 positive controls. Measured
+    # 2026-11-12 on 3.12: 1.108.4 and 1.108.6 pass (25/25); 1.109.0 and 1.109.1
+    # fail 2; 1.110.0rc2 fails 4 (the 400 fail-fast control as well). The
+    # request path through `acompletion` still falls back correctly on 1.109.1,
+    # so this guards the contract seam, not a production outage
+    # (alpha-engine-config-I13364). Remove when the seam is re-pointed at the
+    # new module and the suite passes on the newest release.
+    "litellm>=1.0,<1.109; python_version >= '3.11'",
     # Validates the router resolve contract against resolve_schema.json.
     # Declared (not merely assumed present) so the contract test RUNS in CI
     # instead of importorskip'ing itself into silence -- an unrun guard is
