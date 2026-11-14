@@ -404,6 +404,38 @@ class TestLoadDefaultPricing:
         assert card.input_per_1m == pytest.approx(3.0)
 
 
+class TestDeepSeekDirectCardHistory:
+    """Direct DeepSeek cards: a rate change appends a dated card (never edits)."""
+
+    def test_pro_rate_change_appended_with_history_kept(self):
+        table = load_default_pricing()
+        before = table.get("deepseek-v4-pro", date(2026, 8, 15))
+        after = table.get("deepseek-v4-pro", date(2026, 8, 16))
+        assert before.effective_from < after.effective_from == date(2026, 8, 16)
+        assert after.cache_read_per_1m > before.cache_read_per_1m
+        assert after.input_per_1m > before.input_per_1m
+
+    def test_flash_rate_change_appended_with_history_kept(self):
+        table = load_default_pricing()
+        before = table.get("deepseek-v4-flash", date(2026, 9, 9))
+        after = table.get("deepseek-v4-flash", date(2026, 9, 10))
+        assert before.effective_from < after.effective_from == date(2026, 9, 10)
+        assert after.input_per_1m > before.input_per_1m
+
+    def test_flash_legacy_and_current_names_price_identically(self):
+        table = load_default_pricing()
+        at = date(2026, 11, 14)
+        legacy = table.get("deepseek-v4-flash", at)
+        current = table.get("deepseek-flash", at)
+        assert legacy.model_dump(exclude={"model_name"}) == current.model_dump(exclude={"model_name"})
+
+    @pytest.mark.parametrize("model", ["deepseek-v4-pro", "deepseek-v4-flash", "deepseek-flash"])
+    def test_cache_read_below_input_and_create_equals_input(self, model: str):
+        card = load_default_pricing().get(model, date(2026, 11, 14))
+        assert 0 < card.cache_read_per_1m < card.input_per_1m
+        assert card.cache_create_per_1m == card.input_per_1m
+
+
 # ── metadata_from_anthropic_message (SDK adapter) ─────────────────────────
 
 
