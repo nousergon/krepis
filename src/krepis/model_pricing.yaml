@@ -170,6 +170,37 @@ cards:
     output_per_1m: 0.87
     cache_read_per_1m: 0.003625  # 99% cache discount (0.435 → 0.003625)
     cache_create_per_1m: 0.435   # no write-upcharge for auto prefix caching
+  # Direct-API rate changes, appended (not edited) so earlier artifacts keep the
+  # rate active when they were captured.  Source, read 2026-11-14:
+  #   https://api-docs.deepseek.com/quick_start/pricing
+  #   https://api-docs.deepseek.com/updates  (change dates)
+  # DeepSeek now publishes peak / off-peak rates (off-peak = half; peak is
+  # 01:00-04:00 and 06:00-10:00 UTC Mon-Fri).  A card carries one flat rate, so
+  # these use the PEAK rate: the conservative choice, never understating spend.
+  # Automatic prefix caching still has no write upcharge (create = input).
+  # deepseek-v4-pro: peak/off-peak pricing took effect 2026-08-16 16:00 UTC.
+  - model_name: deepseek-v4-pro
+    effective_from: 2026-08-16
+    input_per_1m: 1.32
+    output_per_1m: 3.96
+    cache_read_per_1m: 0.044
+    cache_create_per_1m: 1.32
+  # deepseek-flash (V4.1 Flash, announced 2026-09-10 with reduced prices; the
+  # page gives no finer effective time).  The legacy name `deepseek-v4-flash`
+  # is still accepted and billed at this same Flash price, so both names carry
+  # the card.
+  - model_name: deepseek-v4-flash
+    effective_from: 2026-09-10
+    input_per_1m: 0.30
+    output_per_1m: 1.20
+    cache_read_per_1m: 0.006
+    cache_create_per_1m: 0.30
+  - model_name: deepseek-flash
+    effective_from: 2026-09-10
+    input_per_1m: 0.30
+    output_per_1m: 1.20
+    cache_read_per_1m: 0.006
+    cache_create_per_1m: 0.30
   # ── xAI / Grok direct API (via the egress proxy) ─────────────────────────
   - model_name: grok-4.5
     effective_from: 2026-07-27
