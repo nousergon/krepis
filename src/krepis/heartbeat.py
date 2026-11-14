@@ -117,7 +117,7 @@ def emit_heartbeat_if_elapsed(
     interval_s: int = HEARTBEAT_INTERVAL_S,
     last_heartbeat_at: float | None = None,
     now: float | None = None,
-) -> bool:
+) -> float:
     """Call :func:`emit_heartbeat` if ``interval_s`` has elapsed since the last one.
 
     Convenience wrapper for time-based callers that want a single
