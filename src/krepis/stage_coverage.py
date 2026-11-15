@@ -143,7 +143,7 @@ import sys
 from dataclasses import asdict, dataclass, field
 from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, TypedDict, Union, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, Optional, Protocol, TypedDict, Union, cast
 
 from krepis import rehearsal as rehearsal_ns
 from krepis import s3_surface
@@ -542,7 +542,10 @@ class StageVerdict:
 
 
 def load_registry(
-    s3_client: _S3RegistryReader,
+    # Any, not _S3RegistryReader: callers pass None with ``local_path`` and
+    # strict-mode consumers pass untyped boto3 clients (nousergon-lib
+    # pipeline_status/coverage.py); a Protocol here is a new error in each.
+    s3_client: Any,  # pyright: ignore[reportExplicitAny]
     *,
     bucket: str = DEFAULT_BUCKET,
     key: str = REGISTRY_KEY,
@@ -560,7 +563,8 @@ def load_registry(
         with open(local_path, encoding="utf-8") as handle:
             return yaml.safe_load(handle) or {}
 
-    body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
+    reader = cast(_S3RegistryReader, s3_client)
+    body = reader.get_object(Bucket=bucket, Key=key)["Body"].read()
     return yaml.safe_load(body) or {}
 
 
