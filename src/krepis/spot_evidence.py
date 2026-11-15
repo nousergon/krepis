@@ -61,7 +61,7 @@ import json
 import logging
 import sys
 from datetime import datetime, timezone
-from typing import Final, Optional
+from typing import Any, Final, Mapping, Optional, Protocol, cast
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
@@ -102,11 +102,25 @@ EVIDENCE_RETENTION_DAYS: Final[int] = 90
 STAGING_RETENTION_DAYS: Final[int] = 14
 
 
+class _S3Client(Protocol):
+    """The three S3 calls this module makes; a boto3 S3 client satisfies it."""
+
+    def list_objects_v2(self, **kwargs: str) -> Mapping[str, object]: ...
+
+    def copy_object(
+        self, *, Bucket: str, Key: str, CopySource: Mapping[str, str]
+    ) -> object: ...
+
+    def delete_objects(
+        self, *, Bucket: str, Delete: Mapping[str, object]
+    ) -> object: ...
+
+
 class StagingUriError(ValueError):
     """A ``--staging`` value that is not an ``s3://bucket/key`` URI."""
 
 
-def parse_s3_uri(uri: str):
+def parse_s3_uri(uri: str) -> tuple[str, str]:
     """Split ``s3://bucket/key/prefix`` into ``(bucket, prefix)``.
 
     Raises :class:`StagingUriError` on anything else. This is the one place
@@ -147,25 +161,28 @@ def durable_prefix_for(
     )
 
 
-def _list_keys(s3, bucket: str, prefix: str):
+def _list_keys(s3: _S3Client, bucket: str, prefix: str) -> list[str]:
     """All object keys under ``prefix``. Raises on a genuine S3 error."""
-    keys = []
-    token = None
+    keys: list[str] = []
+    token: Optional[str] = None
     while True:
         kwargs = {"Bucket": bucket, "Prefix": prefix.rstrip("/") + "/"}
         if token:
             kwargs["ContinuationToken"] = token
         resp = s3.list_objects_v2(**kwargs)
-        for item in resp.get("Contents", []) or []:
+        contents = cast("list[Mapping[str, str]]", resp.get("Contents", []) or [])
+        for item in contents:
             keys.append(item["Key"])
         if not resp.get("IsTruncated"):
             return keys
-        token = resp.get("NextContinuationToken")
+        token = cast(Optional[str], resp.get("NextContinuationToken"))
         if not token:
             return keys
 
 
-def _preserve(s3, bucket: str, prefix: str, dest_prefix: str):
+def _preserve(
+    s3: _S3Client, bucket: str, prefix: str, dest_prefix: str
+) -> tuple[bool, str]:
     """Copy every staging object to ``dest_prefix``. Returns ``(ok, detail)``.
 
     ``ok`` is True only when EVERY object copied (or there were none to copy —
@@ -197,7 +214,7 @@ def _preserve(s3, bucket: str, prefix: str, dest_prefix: str):
     return True, "preserved {} object(s)".format(copied)
 
 
-def _delete_staging(s3, bucket: str, prefix: str):
+def _delete_staging(s3: _S3Client, bucket: str, prefix: str) -> tuple[bool, str]:
     """Delete THIS RUN's staging prefix. Returns ``(ok, detail)``.
 
     Reachable from exactly two places, both inside :func:`teardown`: the
@@ -211,7 +228,7 @@ def _delete_staging(s3, bucket: str, prefix: str):
     return _delete_prefix(s3, bucket, prefix)
 
 
-def _delete_prefix(s3, bucket: str, prefix: str):
+def _delete_prefix(s3: _S3Client, bucket: str, prefix: str) -> tuple[bool, str]:
     """Delete every object under ``prefix``. Returns ``(ok, detail)``."""
     try:
         keys = _list_keys(s3, bucket, prefix)
@@ -235,20 +252,23 @@ def _delete_prefix(s3, bucket: str, prefix: str):
     return True, "deleted {} object(s)".format(deleted)
 
 
-def _child_prefixes(s3, bucket: str, root: str):
+def _child_prefixes(s3: _S3Client, bucket: str, root: str) -> list[str]:
     """Immediate child ``CommonPrefixes`` under ``root`` (one S3 LIST, no HEADs)."""
-    out = []
-    token = None
+    out: list[str] = []
+    token: Optional[str] = None
     while True:
         kwargs = {"Bucket": bucket, "Prefix": root, "Delimiter": "/"}
         if token:
             kwargs["ContinuationToken"] = token
         resp = s3.list_objects_v2(**kwargs)
-        for item in resp.get("CommonPrefixes", []) or []:
+        prefixes = cast(
+            "list[Mapping[str, str]]", resp.get("CommonPrefixes", []) or []
+        )
+        for item in prefixes:
             out.append(item["Prefix"])
         if not resp.get("IsTruncated"):
             return out
-        token = resp.get("NextContinuationToken")
+        token = cast(Optional[str], resp.get("NextContinuationToken"))
         if not token:
             return out
 
@@ -271,7 +291,9 @@ def _leaf_date(child_prefix: str) -> Optional[datetime]:
     return None
 
 
-def _prune(s3, bucket: str, root: str, *, older_than_days: int, now: datetime):
+def _prune(
+    s3: _S3Client, bucket: str, root: str, *, older_than_days: int, now: datetime
+) -> tuple[int, str]:
     """Delete child prefixes of ``root`` whose encoded date is past retention.
 
     Returns ``(pruned_count, detail)``. Never raises: retention is hygiene, and
@@ -303,13 +325,15 @@ def teardown(
     *,
     slug: str,
     exit_code: int,
-    s3_client=None,
+    # Any, not _S3Client: callers hand in an untyped boto3 client (or a stub-typed
+    # one whose explicit keyword signatures a **kwargs Protocol cannot match).
+    s3_client: Any = None,  # pyright: ignore[reportExplicitAny]
     now: Optional[datetime] = None,
     dry_run: bool = False,
     prune: bool = True,
     staging_retention_days: int = STAGING_RETENTION_DAYS,
     evidence_retention_days: int = EVIDENCE_RETENTION_DAYS,
-):
+) -> dict[str, object]:
     """Preserve evidence when the run failed, then clean the staging prefix.
 
     Args:
@@ -330,7 +354,7 @@ def teardown(
         teardown that raises on the failure path replaces the diagnosis it
         exists to protect.
     """
-    result = {
+    result: dict[str, object] = {
         "staging_uri": staging_uri,
         "slug": slug,
         "exit_code": exit_code,
@@ -357,10 +381,11 @@ def teardown(
                 type(exc).__name__, exc
             )
             return result
+    s3 = cast(_S3Client, s3_client)
 
     resolved_now = now or datetime.now(timezone.utc)
 
-    def _sweep():
+    def _sweep() -> str:
         """Bound both retained trees. Retires `crucible-backtester#675`'s
         per-repo bash prune, which only ever reached its own stage's prefix and
         needed a BSD/GNU `date` fallback to compute the cutoff."""
@@ -368,14 +393,14 @@ def teardown(
             return ""
         staging_root = prefix.rstrip("/").rsplit("/", 1)[0] + "/"
         n1, d1 = _prune(
-            s3_client,
+            s3,
             bucket,
             staging_root,
             older_than_days=staging_retention_days,
             now=resolved_now,
         )
         n2, d2 = _prune(
-            s3_client,
+            s3,
             bucket,
             "{}/{}/".format(DURABLE_PREFIX, slug or "unknown-stage"),
             older_than_days=evidence_retention_days,
@@ -388,7 +413,7 @@ def teardown(
         if dry_run:
             result["detail"] = "would delete staging (run succeeded; nothing to preserve)"
             return result
-        ok, detail = _delete_staging(s3_client, bucket, prefix)
+        ok, detail = _delete_staging(s3, bucket, prefix)
         result["deleted"] = ok
         result["detail"] = "run succeeded; no evidence retained; {}{}".format(
             detail, _sweep()
@@ -403,7 +428,7 @@ def teardown(
         )
         return result
 
-    ok, detail = _preserve(s3_client, bucket, prefix, dest)
+    ok, detail = _preserve(s3, bucket, prefix, dest)
     result["preserved"] = ok
     if not ok:
         # The whole point. Staging is the only remaining copy of this failure's
@@ -416,13 +441,13 @@ def teardown(
         )
         return result
 
-    del_ok, del_detail = _delete_staging(s3_client, bucket, prefix)
+    del_ok, del_detail = _delete_staging(s3, bucket, prefix)
     result["deleted"] = del_ok
     result["detail"] = "{}; {}{}".format(detail, del_detail, _sweep())
     return result
 
 
-def _render(result) -> str:
+def _render(result: Mapping[str, object]) -> str:
     """One human line for the launcher's stdout — this reaches the SF cause."""
     if result.get("preserved"):
         return "  spot_evidence: failure evidence preserved -> {} ({})".format(
@@ -433,7 +458,7 @@ def _render(result) -> str:
     return "  spot_evidence: {}".format(result.get("detail"))
 
 
-def main(argv: Optional[list] = None) -> int:
+def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m krepis.spot_evidence",
         description=(

@@ -26,7 +26,7 @@ has no value (``feedback_no_silent_fails``).
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional, cast
 
 try:  # TypedDict with total=False on 3.9 lives in typing
     from typing import TypedDict
@@ -54,7 +54,9 @@ class Citation(TypedDict, total=False):
 # ── Anthropic (server-side web_search tool) ──────────────────────────────
 
 
-def extract_anthropic_search_events(msg: Any) -> List[SearchEvent]:
+# The public entry points take ``Any``: callers pass SDK response objects (or
+# duck-typed stand-ins and dicts) that this module reads by attribute only.
+def extract_anthropic_search_events(msg: Any) -> List[SearchEvent]:  # pyright: ignore[reportExplicitAny]
     """Pair ``server_tool_use`` blocks with their ``web_search_tool_result``
     blocks and return one :class:`SearchEvent` per search, in issue order.
 
@@ -64,19 +66,24 @@ def extract_anthropic_search_events(msg: Any) -> List[SearchEvent]:
     result block (or an error result) yields ``urls=[]`` with ``error``
     populated.
     """
-    tool_uses: dict = {}
-    results_by_id: dict = {}
-    errors_by_id: dict = {}
+    tool_uses: dict[str, dict[str, str]] = {}
+    results_by_id: dict[str, List[object]] = {}
+    errors_by_id: dict[str, str] = {}
     order: List[str] = []
 
-    for block in getattr(msg, "content", None) or []:
+    blocks: List[object] = getattr(msg, "content", None) or []
+    for block in blocks:
         btype = getattr(block, "type", None)
         if btype == "server_tool_use" and getattr(block, "name", None) == "web_search":
             block_id = getattr(block, "id", None)
             if block_id is None:
                 continue
-            inp = getattr(block, "input", None) or {}
-            query = inp.get("query", "") if isinstance(inp, dict) else ""
+            inp: object = getattr(block, "input", None) or {}
+            query = (
+                cast("dict[str, str]", inp).get("query", "")
+                if isinstance(inp, dict)
+                else ""
+            )
             tool_uses[block_id] = {"query": query}
             order.append(block_id)
         elif btype == "web_search_tool_result":
@@ -85,7 +92,7 @@ def extract_anthropic_search_events(msg: Any) -> List[SearchEvent]:
                 continue
             content = getattr(block, "content", None)
             if isinstance(content, list):
-                results_by_id[tool_use_id] = content
+                results_by_id[tool_use_id] = cast("List[object]", content)
             else:
                 err_code = getattr(content, "error_code", None)
                 errors_by_id[tool_use_id] = err_code or str(content)
@@ -110,7 +117,7 @@ def extract_anthropic_search_events(msg: Any) -> List[SearchEvent]:
     return out
 
 
-def extract_anthropic_citations(msg: Any) -> List[Citation]:
+def extract_anthropic_citations(msg: Any) -> List[Citation]:  # pyright: ignore[reportExplicitAny]
     """Flatten every returned search result into a :class:`Citation` list.
 
     The Anthropic ``web_search_tool_result`` content items carry ``url`` +
@@ -118,13 +125,14 @@ def extract_anthropic_citations(msg: Any) -> List[Citation]:
     :func:`extract_anthropic_search_events` reports per-search.
     """
     citations: List[Citation] = []
-    for block in getattr(msg, "content", None) or []:
+    blocks: List[object] = getattr(msg, "content", None) or []
+    for block in blocks:
         if getattr(block, "type", None) != "web_search_tool_result":
             continue
         content = getattr(block, "content", None)
         if not isinstance(content, list):
             continue
-        for r in content:
+        for r in cast("List[object]", content):
             url = getattr(r, "url", None)
             if not isinstance(url, str):
                 continue
@@ -134,7 +142,7 @@ def extract_anthropic_citations(msg: Any) -> List[Citation]:
     return citations
 
 
-def final_text_after_last_tool(content: Any) -> str:
+def final_text_after_last_tool(content: Any) -> str:  # pyright: ignore[reportExplicitAny]
     """Return only the text the model wrote AFTER its last tool use.
 
     With a server-side search tool the response interleaves ``text`` /
@@ -171,7 +179,7 @@ def final_text_after_last_tool(content: Any) -> str:
 # ── OpenRouter (openrouter:web_search server tool) ────────────────────────
 
 
-def extract_openrouter_citations(completion: Any) -> List[Citation]:
+def extract_openrouter_citations(completion: Any) -> List[Citation]:  # pyright: ignore[reportExplicitAny]
     """Extract ``url_citation`` annotations from an OpenRouter chat
     completion into a :class:`Citation` list.
 
@@ -184,31 +192,42 @@ def extract_openrouter_citations(completion: Any) -> List[Citation]:
     the queries the model issued are not in the response, so there is no
     OpenRouter counterpart to :func:`extract_anthropic_search_events`.
     """
-    choices = getattr(completion, "choices", None) or []
+    choices: List[object] = getattr(completion, "choices", None) or []
     if not choices:
         return []
     message = getattr(choices[0], "message", None)
-    annotations = getattr(message, "annotations", None) or []
+    annotations: List[object] = getattr(message, "annotations", None) or []
 
     citations: List[Citation] = []
     for ann in annotations:
+        get: Callable[[str], object]
         if isinstance(ann, dict):
-            ann_type = ann.get("type")
-            payload = ann.get("url_citation") or {}
-            get = payload.get
+            ann_dict = cast("dict[str, object]", ann)
+            ann_type = ann_dict.get("type")
+            payload_dict = cast(
+                "dict[str, object]", ann_dict.get("url_citation") or {}
+            )
+            get = payload_dict.get
         else:
             ann_type = getattr(ann, "type", None)
             payload = getattr(ann, "url_citation", None)
             if payload is None:
                 continue
-            def get(key, _payload=payload):  # noqa: ANN001 — tiny local shim
+
+            def _attr_get(key: str, _payload: object = payload) -> object:
                 return getattr(_payload, key, None)
+
+            get = _attr_get
         if ann_type != "url_citation":
             continue
         url = get("url")
         if not isinstance(url, str):
             continue
         citations.append(
-            Citation(url=url, title=get("title"), snippet=get("content"))
+            Citation(
+                url=url,
+                title=cast(Optional[str], get("title")),
+                snippet=cast(Optional[str], get("content")),
+            )
         )
     return citations
