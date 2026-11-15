@@ -705,10 +705,7 @@ def publish(
     stdout: str,
     correlation_id: Optional[str] = None,
     prefix: str = CHECKS_PREFIX,
-    # Unannotated on purpose (still baselined): ssm_dispatcher.run passes its
-    # own untyped client, and any annotation here turns that call site into a
-    # new unknown-argument error. Typed once ssm_dispatcher is.
-    s3_client=None,  # noqa: ANN001
+    s3_client: "object | None" = None,
     now: Optional[datetime] = None,
 ) -> "Optional[dict[str, object]]":
     """Read-modify-write this stage's console row. **Never raises.**

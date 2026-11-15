@@ -9756,22 +9756,6 @@
         ],
         "./src/krepis/rss_budget.py": [
             {
-                "code": "reportUnknownParameterType",
-                "range": {
-                    "startColumn": 4,
-                    "endColumn": 13,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingParameterType",
-                "range": {
-                    "startColumn": 4,
-                    "endColumn": 13,
-                    "lineCount": 1
-                }
-            },
-            {
                 "code": "reportUnknownVariableType",
                 "range": {
                     "startColumn": 12,
@@ -11924,14 +11908,6 @@
                 "range": {
                     "startColumn": 18,
                     "endColumn": 30,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportUnknownMemberType",
-                "range": {
-                    "startColumn": 23,
-                    "endColumn": 41,
                     "lineCount": 1
                 }
             }
