@@ -70,7 +70,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Final
+from typing import Final, Mapping, TypedDict, cast
 
 from krepis import s3_surface
 
@@ -184,10 +184,49 @@ class TierDecision:
     page_after_consecutive: int = 1
 
 
-_cache: dict[str, object] = {"doc": None, "fetched_at": 0.0}
+class _Override(TypedDict, total=False):
+    """One ``episode_overrides`` item on a registry row."""
+
+    when: dict[str, object]
+    tier: str
 
 
-def _load_registry() -> dict | None:
+# Functional form: ``class`` is a keyword, so it cannot be a class-body field.
+_RowOptional = TypedDict(
+    "_RowOptional",
+    {
+        "class": str,
+        "tier": str,
+        "episode_overrides": "list[_Override]",
+        "page_after_consecutive": int,
+    },
+    total=False,
+)
+
+
+class _Row(_RowOptional):
+    """One ``entries`` row of the published delivery-tier registry."""
+
+    source: str
+
+
+class _RegistryDoc(TypedDict, total=False):
+    """The published delivery-tier registry document."""
+
+    schema_version: int
+    entries: list[_Row]
+    muted_topics: object
+
+
+class _Cache(TypedDict):
+    doc: _RegistryDoc | None
+    fetched_at: float
+
+
+_cache: _Cache = {"doc": None, "fetched_at": 0.0}
+
+
+def _load_registry() -> _RegistryDoc | None:
     """Return the published routing document, or ``None`` if unavailable.
 
     ``None`` is never a silent outcome — every caller of this function routes
@@ -201,7 +240,7 @@ def _load_registry() -> dict | None:
     """
     now = time.monotonic()
     if _cache["doc"] is not None and now - float(_cache["fetched_at"]) < CACHE_TTL_SEC:
-        return _cache["doc"]  # type: ignore[return-value]
+        return _cache["doc"]
 
     raw: str | None = None
     local = os.environ.get(REGISTRY_PATH_ENV)
@@ -223,7 +262,7 @@ def _load_registry() -> dict | None:
             body = boto3.client("s3").get_object(
                 Bucket=REGISTRY_BUCKET, Key=REGISTRY_OBJECT,
             )["Body"].read()
-            raw = body.decode("utf-8")
+            raw = cast("bytes", body).decode("utf-8")
         except Exception as exc:
             logger.error(
                 "alert_tiers: could not read the delivery-tier registry at "
@@ -253,7 +292,8 @@ def _load_registry() -> dict | None:
             "every alert routes to PAGE.",
         )
         return None
-    version = doc.get("schema_version")
+    registry = cast("_RegistryDoc", doc)
+    version = registry.get("schema_version")
     if version != SUPPORTED_SCHEMA_VERSION:
         logger.error(
             "alert_tiers: registry schema_version=%r, this krepis understands "
@@ -263,9 +303,9 @@ def _load_registry() -> dict | None:
         )
         return None
 
-    _cache["doc"] = doc
+    _cache["doc"] = registry
     _cache["fetched_at"] = now
-    return doc
+    return registry
 
 
 def reset_cache() -> None:
@@ -305,13 +345,13 @@ def muted_sibling_topic_name(topic_name: str | None) -> str | None:
     muted = doc.get("muted_topics")
     if not isinstance(muted, dict):
         return None
-    sibling = muted.get(topic_name)
+    sibling = cast("dict[str, object]", muted).get(topic_name)
     if not isinstance(sibling, str) or not sibling:
         return None
     return sibling
 
 
-def _match(source: str, entries: list[dict]) -> list[dict]:
+def _match(source: str, entries: list[_Row]) -> list[_Row]:
     """Rows claiming ``source``: exact matches, else the longest wildcard.
 
     A registry ``source`` ending in ``*`` (e.g. ``research-runner:*``) is a
@@ -335,7 +375,7 @@ def _match(source: str, entries: list[dict]) -> list[dict]:
 def resolve_tier(
     source: str | None,
     severity: str,
-    attributes: dict | None = None,
+    attributes: Mapping[str, object] | None = None,
 ) -> TierDecision:
     """Resolve the delivery tier for one emission. Never raises.
 
@@ -392,14 +432,15 @@ def resolve_tier(
             registry_drift=True,
         )
 
-    resolved: list[tuple[str, dict]] = []
+    resolved: list[tuple[str, _Row]] = []
     override_note = ""
+    attrs: Mapping[str, object] = attributes or {}
     for row in rows:
         tier = row.get("tier")
         for override in row.get("episode_overrides") or []:
             when = override.get("when") or {}
             if when and all(
-                (attributes or {}).get(k) == v for k, v in when.items()
+                attrs.get(k) == v for k, v in when.items()
             ):
                 tier = override.get("tier")
                 override_note = f"; episode override matched {when!r}"
@@ -410,7 +451,7 @@ def resolve_tier(
                 # An unrecognised severity on a dynamic row is not a reason to
                 # go quiet: the row said "it depends", and we cannot tell.
                 tier = TIER_PAGE
-        if tier not in TIERS:
+        if tier is None or tier not in TIERS:
             logger.error(
                 "alert_tiers: registry row %r declares tier=%r, which is not "
                 "one of %s — paging.", row.get("class"), row.get("tier"), TIERS,
@@ -472,7 +513,7 @@ def consecutive_count(bucket: str, identity: str) -> int | None:
         body = boto3.client("s3").get_object(
             Bucket=bucket, Key=_streak_marker(identity),
         )["Body"].read()
-        return int(json.loads(body).get("consecutive", 0))
+        return int(json.loads(cast("bytes", body)).get("consecutive", 0))
     except Exception as exc:  # missing marker included: this is the first one
         logger.debug("alert_tiers: streak read for %r: %s", identity, exc)
         return 0 if _is_missing(exc) else None
@@ -481,7 +522,8 @@ def consecutive_count(bucket: str, identity: str) -> int | None:
 def _is_missing(exc: Exception) -> bool:
     resp = getattr(exc, "response", None)
     if isinstance(resp, dict):
-        return resp.get("Error", {}).get("Code") in ("NoSuchKey", "404")
+        errors = cast("dict[str, dict[str, object]]", resp)
+        return errors.get("Error", {}).get("Code") in ("NoSuchKey", "404")
     return False
 
 

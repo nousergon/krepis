@@ -230,7 +230,7 @@ import os
 import re
 import socket
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final, Protocol, cast
 
@@ -1356,7 +1356,7 @@ def publish(
     silent: bool | None = None,
     destination: str | None = None,
     console_artifact: str | None = None,
-    episode_attributes: dict | None = None,
+    episode_attributes: Mapping[str, object] | None = None,
     raise_on_total_failure: bool = True,
     parse_mode: str | None = TELEGRAM_PARSE_MODE,
     auto_fix: str | None = None,

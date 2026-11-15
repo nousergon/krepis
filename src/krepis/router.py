@@ -62,6 +62,7 @@ from typing import TYPE_CHECKING, Any, Optional
 
 if TYPE_CHECKING:
     from krepis.llm_config import ModelSpec
+    from krepis.model_registry import RegistryMapping
 
 logger = logging.getLogger(__name__)
 
@@ -332,7 +333,7 @@ def _resolve_exec_context(exec_context: str | None = None) -> str:
     return ctx
 
 
-def _entry_reachable_from(entry: dict, exec_context: str) -> bool:
+def _entry_reachable_from(entry: RegistryMapping, exec_context: str) -> bool:
     """Thin alias for :func:`krepis.model_registry.entry_reachable_from`.
 
     The predicate itself — including the R28 rule that an entry declaring no
@@ -1709,7 +1710,7 @@ def _resolve_group_json(
     from . import model_registry as _mr
 
     registry = _mr.load_registry(reg_path)
-    models_by_id: dict[str, dict] = registry.models
+    models_by_id: dict[str, RegistryMapping] = registry.models
 
     if group not in registry.groups:
         raise ValueError(
