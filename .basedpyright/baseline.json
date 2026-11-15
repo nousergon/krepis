@@ -2402,24 +2402,6 @@
                 }
             }
         ],
-        "./src/krepis/aws_region.py": [
-            {
-                "code": "reportMissingTypeStubs",
-                "range": {
-                    "startColumn": 15,
-                    "endColumn": 31,
-                    "lineCount": 1
-                }
-            },
-            {
-                "code": "reportMissingTypeStubs",
-                "range": {
-                    "startColumn": 13,
-                    "endColumn": 27,
-                    "lineCount": 1
-                }
-            }
-        ],
         "./src/krepis/cache_minimums.py": [
             {
                 "code": "reportUnknownVariableType",
