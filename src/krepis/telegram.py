@@ -85,7 +85,7 @@ TELEGRAM_MESSAGE_MAX_CHARS: Final[int] = 4096
 #: which is distinct from the default: the payload omits the key rather than
 #: sending ``null``, because Telegram rejects an explicit null.
 PARSE_MODE_HTML: Final[str] = "HTML"
-PARSE_MODES: Final[tuple] = (PARSE_MODE, PARSE_MODE_HTML)
+PARSE_MODES: Final[tuple[str, ...]] = (PARSE_MODE, PARSE_MODE_HTML)
 # Telegram's 400 `description` when the entity parser reaches the end of the
 # body with an entity still open, or meets a tag it does not know. The same
 # marker opens BOTH the Markdown-v1 and the HTML variants (measured against the
@@ -98,7 +98,7 @@ PARSE_MODES: Final[tuple] = (PARSE_MODE, PARSE_MODE_HTML)
 _ENTITY_PARSE_ERROR_MARKER: Final[str] = "can't parse entities"
 #: Tags Telegram's HTML mode accepts. Anything else is an "Unsupported start
 #: tag" 400 and, on our side, a truncation boundary that must not be crossed.
-_HTML_TAGS: Final[frozenset] = frozenset({
+_HTML_TAGS: Final[frozenset[str]] = frozenset({
     "b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "span",
     "tg-spoiler", "tg-emoji", "a", "code", "pre", "blockquote",
 })
@@ -617,7 +617,7 @@ def _open_tags(fragment: str) -> list[str]:
 def _max_open_tag_closer_length(text: str) -> int:
     """Characters the closers would need at the deepest nesting in ``text``."""
     deepest = 0
-    stack: list = []
+    stack: list[str] = []
     i = 0
     while True:
         i = text.find("<", i)
@@ -874,7 +874,7 @@ def send_message(
     if message_thread_id is not None:
         payload["message_thread_id"] = message_thread_id
 
-    def _post(body: dict) -> "tuple[bool, str | None]":
+    def _post(body: dict[str, str | int | bool]) -> "tuple[bool, str | None]":
         """POST ``body``; return ``(delivered, description_on_failure)``.
 
         ``description`` is ``None`` when the request never produced a parseable
@@ -1015,7 +1015,7 @@ def send_rollup(
     if not findings:
         return True
 
-    lines = []
+    lines: list[str] = []
     if header:
         lines.append(f"*{header}*")
     lines.extend(f"- {item}" for item in findings)

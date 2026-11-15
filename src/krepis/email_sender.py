@@ -150,25 +150,28 @@ def _send_via_ses(
         "If sender is @gmail.com, email may be silently dropped."
     )
     try:
-        import boto3
-        from botocore.exceptions import ClientError
+        import boto3  # pyright: ignore[reportMissingTypeStubs]  # no boto3 stubs in the base install
+        from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # ditto
 
         ses = boto3.client("ses", region_name=region)
-        message: dict = {
-            "Subject": {"Data": subject, "Charset": "UTF-8"},
-            "Body": {"Text": {"Data": plain_body, "Charset": "UTF-8"}},
+        body_part: dict[str, dict[str, str]] = {
+            "Text": {"Data": plain_body, "Charset": "UTF-8"},
         }
         if html:
-            message["Body"]["Html"] = {"Data": html, "Charset": "UTF-8"}
-        ses.send_email(
+            body_part["Html"] = {"Data": html, "Charset": "UTF-8"}
+        message: dict[str, object] = {
+            "Subject": {"Data": subject, "Charset": "UTF-8"},
+            "Body": body_part,
+        }
+        ses.send_email(  # pyright: ignore[reportUnknownMemberType]
             Source=sender,
             Destination={"ToAddresses": recipients},
             Message=message,
         )
         logger.info("Email sent via SES: %r -> %d recipient(s)", subject, len(recipients))
         return True
-    except ClientError as e:
-        logger.error("SES send failed: %s", e.response["Error"]["Message"])
+    except ClientError as e:  # pyright: ignore[reportPossiblyUnboundVariable, reportUnknownVariableType]  # unbound only if the import above raised; pre-existing behaviour kept
+        logger.error("SES send failed: %s", e.response["Error"]["Message"])  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
         return False
     except Exception as e:
         logger.error("SES email error: %s", e)
@@ -290,7 +293,7 @@ def send_email(
             plain_body=body, html=html, region=region,
         )
 
-    if sent and marker_key:
+    if sent and marker_key and dedup_key:  # marker_key is set only when dedup_key is truthy
         _dedup.write_marker(
             bucket, marker_key, dedup_key=dedup_key, message_preview=subject,
         )

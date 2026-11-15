@@ -60,14 +60,18 @@ logger = logging.getLogger(__name__)
 VAPID_SUBJECT_DEFAULT: Final[str] = "mailto:ops@nousergon.com"
 
 try:
-    from pywebpush import WebPushException, webpush as _webpush
+    # pywebpush is an optional extra and ships no stubs; its names are untyped.
+    from pywebpush import (  # pyright: ignore[reportMissingImports]
+        WebPushException,  # pyright: ignore[reportUnknownVariableType]
+        webpush as _webpush,  # pyright: ignore[reportUnknownVariableType]
+    )
 except ImportError:  # pragma: no cover - exercised via the "not installed" test
     _webpush = None
-    WebPushException = None  # type: ignore[assignment,misc]
+    WebPushException = None
 
 
 def send_push(
-    subscription: Mapping[str, Any],
+    subscription: Mapping[str, Any],  # pyright: ignore[reportExplicitAny]
     *,
     title: str,
     body: str,
@@ -148,9 +152,9 @@ def send_push(
             vapid_claims={"sub": subject},
         )
         ok = True
-    except WebPushException as exc:
-        status = getattr(getattr(exc, "response", None), "status_code", "?")
-        logger.warning("Web Push send failed (%s): %s", status, exc)
+    except WebPushException as exc:  # pyright: ignore[reportGeneralTypeIssues, reportUnknownVariableType]
+        status = getattr(getattr(exc, "response", None), "status_code", "?")  # pyright: ignore[reportUnknownArgumentType]
+        logger.warning("Web Push send failed (%s): %s", status, exc)  # pyright: ignore[reportUnknownArgumentType]
 
     if not fleet_events.emission_suppressed():
         fleet_events.emit_alert_event(
