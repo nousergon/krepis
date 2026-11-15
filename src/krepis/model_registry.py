@@ -61,6 +61,11 @@ logger = logging.getLogger(__name__)
 #: A mapping parsed from the registry YAML (the document or one of its rows).
 #: Its values are whatever the YAML holds; nothing narrower is known statically.
 RegistryMapping = Dict[str, Any]
+# Public ``entry`` parameters take ``Any``: strict consumers (alpha-engine-config
+# scripts/generate_litellm_proxy_config.py and others) pass bare ``dict`` rows parsed
+# from YAML, and a ``Dict[str, Any]`` parameter turns each call into a new
+# reportUnknownArgumentType error in their CI (krepis#309 lesson).
+RegistryEntryArg = Any  # pyright: ignore[reportExplicitAny]
 
 #: Statuses excluded from every generated surface.
 #:
@@ -235,7 +240,7 @@ def find_registry(explicit: Optional[Path] = None) -> Path:
     )
 
 
-def entry_declares_capability(entry: RegistryMapping, capability: str) -> bool:
+def entry_declares_capability(entry: RegistryEntryArg, capability: str) -> bool:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """True only when *entry* declares *capability* as literal ``True``.
 
     Absence is NOT capability. An undeclared flag means nobody measured it, and
@@ -249,7 +254,7 @@ def entry_declares_capability(entry: RegistryMapping, capability: str) -> bool:
     return capabilities.get(capability) is True
 
 
-def entry_reachable_from(entry: RegistryMapping, exec_context: str) -> bool:
+def entry_reachable_from(entry: RegistryEntryArg, exec_context: str) -> bool:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Whether *entry* declares itself reachable from *exec_context* (R28).
 
     An entry with no ``reachable_from`` key is **not** reachable from anywhere.
@@ -441,7 +446,7 @@ def load_registry(path: Optional[Path] = None) -> Registry:
 # in the generator, and never carried across to krepis — divergence 2 in this
 # module's header.
 
-def litellm_model(entry: RegistryMapping) -> str:
+def litellm_model(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Build the litellm model string: ``openai/deepseek-v4-flash`` etc."""
     route = entry.get("route", "")
     provider = entry.get("provider", "")
@@ -458,7 +463,7 @@ def litellm_model(entry: RegistryMapping) -> str:
     return "openai/%s" % model
 
 
-def api_key_env(entry: RegistryMapping) -> str:
+def api_key_env(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Name of the environment variable holding this entry's credential."""
     route = entry.get("route", "")
     provider = entry.get("provider", "")
@@ -476,7 +481,7 @@ def api_key_env(entry: RegistryMapping) -> str:
     return EGRESS_PLACEHOLDER_ENV
 
 
-def api_key_for(entry: RegistryMapping, style: str = "value", overrides: Optional[Dict[str, str]] = None) -> str:
+def api_key_for(entry: RegistryEntryArg, style: str = "value", overrides: Optional[Dict[str, str]] = None) -> str:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Render this entry's credential in the shape *style* asks for.
 
     ``overrides`` lets a caller supply a key it already holds (the in-process
@@ -496,7 +501,7 @@ def api_key_for(entry: RegistryMapping, style: str = "value", overrides: Optiona
     return os.environ.get(name) or default
 
 
-def extra_body(entry: RegistryMapping) -> Optional[RegistryMapping]:
+def extra_body(entry: RegistryEntryArg) -> Optional[RegistryMapping]:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Extract ``params.reasoning`` and OpenRouter provider pinning into
     litellm's ``extra_body``, or None.
 
@@ -603,7 +608,7 @@ def deployment_params(
     return params
 
 
-def declared_tpm(entry: RegistryMapping, floor: int) -> Optional[int]:
+def declared_tpm(entry: RegistryEntryArg, floor: int) -> Optional[int]:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """The entry's ``tpm``, raised to *floor*, or None when undeclared.
 
     ``tpm`` reads as a per-minute budget. Under ``routing_strategy:
