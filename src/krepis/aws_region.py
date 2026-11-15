@@ -44,6 +44,7 @@ observe-mode around at the call site.
 
 from __future__ import annotations
 
+import importlib
 import logging
 import os
 from typing import Final, Protocol, cast
@@ -77,14 +78,21 @@ class _RegionFetcherFactory(Protocol):
     def __call__(self, *, timeout: float, num_attempts: int) -> _RegionFetcher: ...
 
 
+class _UtilsModule(Protocol):
+    InstanceMetadataRegionFetcher: _RegionFetcherFactory
+
+
 def _from_botocore_session() -> str | None:
     try:
-        import botocore.session
+        # Botocore ships no type stubs, so a static ``import botocore.session``
+        # is a basedpyright strict error; the Protocol above describes only
+        # the region lookup surface we use.
+        session_module = cast(
+            _SessionModule, importlib.import_module("botocore.session")
+        )
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
-        # Botocore is untyped; describe only the region lookup surface we use.
-        session_module = cast(_SessionModule, botocore.session)
         return session_module.get_session().get_config_variable("region")
     except Exception:  # noqa: BLE001 - config resolution is best-effort
         logger.debug("aws_region: botocore session region lookup failed", exc_info=True)
@@ -93,13 +101,13 @@ def _from_botocore_session() -> str | None:
 
 def _from_imds() -> str | None:
     try:
-        from botocore.utils import InstanceMetadataRegionFetcher
+        # Same missing-stubs boundary as :func:`_from_botocore_session`.
+        utils_module = cast(_UtilsModule, importlib.import_module("botocore.utils"))
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
         # The untyped constructor accepts a fractional timeout at runtime.
-        fetcher_factory = cast(_RegionFetcherFactory, InstanceMetadataRegionFetcher)
-        region = fetcher_factory(
+        region = utils_module.InstanceMetadataRegionFetcher(
             timeout=_IMDS_TIMEOUT_SECONDS, num_attempts=1
         ).retrieve_region()
         return region or None
