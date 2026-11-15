@@ -97,12 +97,57 @@ import json
 import logging
 import re
 import statistics
+from collections.abc import Iterable
 from datetime import datetime, timezone
-from typing import Any, Final, Optional
+from typing import Final, Optional, Protocol, SupportsIndex, SupportsInt, TypedDict, cast
 from krepis import rehearsal as rehearsal_ns
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _GetObjectResponse(TypedDict):
+    Body: _StreamingBody
+
+
+class _S3RowClient(Protocol):
+    """The boto3 S3 client methods :func:`publish` calls (boto3 ships no stubs)."""
+
+    def get_object(self, *, Bucket: str, Key: str) -> _GetObjectResponse: ...
+
+    def put_object(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str
+    ) -> object: ...
+
+
+def _json_object(value: object) -> "Optional[dict[str, object]]":
+    """``value`` when it is a dict (a JSON object), else ``None``."""
+    if isinstance(value, dict):
+        # The JSON boundary: rows and readings are only ever read by str key.
+        return cast("dict[str, object]", value)
+    return None
+
+
+def _json_iter(value: object) -> "Iterable[object]":
+    """``value`` for iteration; a non-iterable raises ``TypeError`` as ``for`` would."""
+    if isinstance(value, Iterable):
+        return cast("Iterable[object]", value)
+    raise TypeError(f"{type(value).__name__!r} object is not iterable")
+
+
+def _json_int(value: object) -> int:
+    """``int(value)``; a value ``int()`` cannot take raises ``TypeError`` as it would."""
+    if isinstance(value, (str, bytes, bytearray, SupportsInt, SupportsIndex)):
+        return int(value)
+    raise TypeError(
+        "int() argument must be a string, a bytes-like object or a real number, "
+        f"not {type(value).__name__!r}"
+    )
+
 
 # ── Console surface ──────────────────────────────────────────────────────────
 #
@@ -358,7 +403,7 @@ exit $__krepis_rss_rc
 """
 
 
-def parse_reading(stdout: str) -> "Optional[dict[str, Any]]":
+def parse_reading(stdout: str) -> "Optional[dict[str, object]]":
     """Recover the last harness record from streamed stdout, or ``None``.
 
     ``None`` means the sentinel never arrived — a distinct condition from
@@ -375,8 +420,9 @@ def parse_reading(stdout: str) -> "Optional[dict[str, Any]]":
             parsed = json.loads(blob)
         except (ValueError, TypeError):
             continue
-        if isinstance(parsed, dict):
-            return parsed
+        reading = _json_object(parsed)
+        if reading is not None:
+            return reading
     return None
 
 
@@ -395,7 +441,7 @@ def headroom(peak_rss_kb: int, mem_total_kb: int) -> float:
     return max(0.0, min(1.0, 1.0 - (float(peak_rss_kb) / float(mem_total_kb))))
 
 
-def trend_median(history: "list[dict[str, Any]]") -> "Optional[tuple[float, int]]":
+def trend_median(history: "Iterable[object]") -> "Optional[tuple[float, int]]":
     """Median headroom across the retained readings, or ``None``.
 
     Returns ``None`` below :data:`MIN_TREND_SAMPLES` rather than a median of
@@ -403,19 +449,22 @@ def trend_median(history: "list[dict[str, Any]]") -> "Optional[tuple[float, int]
     too few observations is worse than no trend, because it renders with the
     same authority.
     """
-    values = [
-        float(r["headroom"])
-        for r in history
-        if isinstance(r, dict) and isinstance(r.get("headroom"), (int, float))
-    ]
+    values: "list[float]" = []
+    for r in history:
+        row = _json_object(r)
+        if row is None:
+            continue
+        value = row.get("headroom")
+        if isinstance(value, (int, float)):
+            values.append(float(value))
     if len(values) < MIN_TREND_SAMPLES:
         return None
     return statistics.median(values), len(values)
 
 
 def classify(
-    reading: "Optional[dict[str, Any]]",
-    history: "list[dict[str, Any]]",
+    reading: "Optional[dict[str, object]]",
+    history: "Iterable[object]",
 ) -> "tuple[str, str]":
     """Map a reading plus its history onto ``(envelope_status, summary)``.
 
@@ -454,8 +503,8 @@ def classify(
             "work is unaffected; its memory budget is unknown for this run.",
         )
 
-    peak = int(reading["peak_rss_kb"])
-    total = int(reading["mem_total_kb"])
+    peak = _json_int(reading["peak_rss_kb"])
+    total = _json_int(reading["mem_total_kb"])
     free = headroom(peak, total)
     label = (
         f"peak RSS {peak / _KIB / _KIB:.2f} GiB of {total / _KIB / _KIB:.2f} GiB "
@@ -495,12 +544,12 @@ def build_envelope(
     *,
     stage: str,
     step: str,
-    reading: "Optional[dict[str, Any]]",
-    previous: "Optional[dict[str, Any]]",
+    reading: "Optional[dict[str, object]]",
+    previous: object,
     instance_id: str,
     correlation_id: Optional[str] = None,
     now: Optional[datetime] = None,
-) -> "dict[str, Any]":
+) -> "dict[str, object]":
     """Build this stage's console row, folding the new reading into the old one.
 
     Two merge rules, both there to keep the row honest across the several
@@ -530,13 +579,18 @@ def build_envelope(
       where an optimistic headroom would read as measured.
     """
     ran_at = _now_iso(now)
-    previous = previous if isinstance(previous, dict) else {}
+    previous_row = _json_object(previous)
+    previous = previous_row if previous_row is not None else {}
     prev_instance = previous.get("instance_id")
-    history = [h for h in previous.get("history", []) if isinstance(h, dict)]
+    history: "list[dict[str, object]]" = []
+    for h in _json_iter(previous.get("history", [])):
+        entry = _json_object(h)
+        if entry is not None:
+            history.append(entry)
 
     same_box = prev_instance == instance_id
     unobserved_steps: "list[str]" = (
-        [s for s in previous.get("unobserved_steps") or [] if isinstance(s, str)]
+        [s for s in _json_iter(previous.get("unobserved_steps") or []) if isinstance(s, str)]
         if same_box
         else []
     )
@@ -545,13 +599,13 @@ def build_envelope(
 
     merged = reading
     if same_box and previous.get("reading"):
-        prev_reading = previous["reading"]
+        prev_reading = _json_object(previous["reading"])
         # Same box, later step: keep whichever peak is higher, and keep a real
         # measurement over an unmeasured one.
-        if isinstance(prev_reading, dict) and prev_reading.get("measured"):
+        if prev_reading is not None and prev_reading.get("measured"):
             if not (reading and reading.get("measured")):
                 merged = prev_reading
-            elif int(prev_reading.get("peak_rss_kb", 0)) >= int(
+            elif _json_int(prev_reading.get("peak_rss_kb", 0)) >= _json_int(
                 reading.get("peak_rss_kb", 0)
             ):
                 merged = prev_reading
@@ -588,7 +642,7 @@ def build_envelope(
             "steps on this instance reached: a LOWER BOUND on the stage's "
             f"peak, not the stage's peak. {summary}"
         )
-    body: "dict[str, Any]" = {
+    body: "dict[str, object]" = {
         "schema_version": 1,
         "check_id": check_id(stage),
         "component_id": check_id(stage),
@@ -629,7 +683,8 @@ def build_envelope(
     }
     if merged and merged.get("measured"):
         body["headroom"] = round(
-            headroom(int(merged["peak_rss_kb"]), int(merged["mem_total_kb"])), 4
+            headroom(_json_int(merged["peak_rss_kb"]), _json_int(merged["mem_total_kb"])),
+            4,
         )
     trend = trend_median(history)
     if trend is not None:
@@ -650,9 +705,12 @@ def publish(
     stdout: str,
     correlation_id: Optional[str] = None,
     prefix: str = CHECKS_PREFIX,
-    s3_client=None,
+    # Unannotated on purpose (still baselined): ssm_dispatcher.run passes its
+    # own untyped client, and any annotation here turns that call site into a
+    # new unknown-argument error. Typed once ssm_dispatcher is.
+    s3_client=None,  # noqa: ANN001
     now: Optional[datetime] = None,
-) -> "Optional[dict[str, Any]]":
+) -> "Optional[dict[str, object]]":
     """Read-modify-write this stage's console row. **Never raises.**
 
     Returns the published body, or ``None`` when nothing was published (an
@@ -681,13 +739,16 @@ def publish(
         )
 
         if s3_client is None:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             s3_client = boto3.client("s3")
+        # The SDK boundary: boto3 ships no stubs, so the client built above (or
+        # the caller's) is used only through the methods _S3RowClient names.
+        s3 = cast("_S3RowClient", s3_client)
 
-        previous: "Optional[dict[str, Any]]" = None
+        previous: object = None
         try:
-            obj = s3_client.get_object(Bucket=bucket, Key=key)
+            obj = s3.get_object(Bucket=bucket, Key=key)
             previous = json.loads(obj["Body"].read().decode("utf-8"))
         except Exception:
             # No prior row (first run for this stage) or an unreadable one.
@@ -704,7 +765,7 @@ def publish(
             correlation_id=correlation_id,
             now=now,
         )
-        s3_client.put_object(
+        s3.put_object(
             Bucket=bucket,
             Key=key,
             Body=json.dumps(body, indent=2).encode("utf-8"),
@@ -767,7 +828,10 @@ def _selftest() -> int:
         )
         return 0 if proc.returncode == 0 else 1
     status, summary = classify(reading, [])
-    print(f"headroom       : {headroom(reading['peak_rss_kb'], reading['mem_total_kb']):.4f}")
+    # The harness writes both fields as ints; passed through unconverted, as before.
+    peak_kb = cast(int, reading["peak_rss_kb"])
+    total_kb = cast(int, reading["mem_total_kb"])
+    print(f"headroom       : {headroom(peak_kb, total_kb):.4f}")
     print(f"verdict        : {status} — {summary}")
     return 0 if proc.returncode == 0 else 1
 
@@ -782,7 +846,7 @@ def _rehearse(peak_rss_kb: int, mem_total_kb: int, history_headroom: "list[float
     the hard floor and shows the band firing first.
     """
     history = [{"headroom": h} for h in history_headroom]
-    reading = {
+    reading: "dict[str, object]" = {
         "measured": True,
         "peak_rss_kb": peak_rss_kb,
         "mem_total_kb": mem_total_kb,

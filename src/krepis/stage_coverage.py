@@ -141,14 +141,153 @@ import os
 import re
 import sys
 from dataclasses import asdict, dataclass, field
+from collections.abc import Iterable
 from datetime import date, datetime, timezone
-from typing import Any, Final
+from typing import TYPE_CHECKING, Final, Literal, Optional, Protocol, TypedDict, Union, cast
 
 from krepis import rehearsal as rehearsal_ns
 from krepis import s3_surface
 from krepis.trading_calendar import last_closed_trading_day
 
+if TYPE_CHECKING:
+    from typing_extensions import Unpack
+
 logger = logging.getLogger(__name__)
+
+
+# ── Typed shapes (registry rows and the boto3 calls this module makes) ───────
+
+
+class _StageRow(TypedDict, total=False):
+    """One ``pipeline_stages:`` row of ``ARTIFACT_REGISTRY.yaml``."""
+
+    stage: str
+    stage_class: str
+    output: str
+    reason: str
+    artifacts: list[str]
+
+
+class _ArtifactRowBase(TypedDict):
+    artifact_id: str
+
+
+class _ArtifactRow(_ArtifactRowBase, total=False):
+    """One ``artifacts:`` row of ``ARTIFACT_REGISTRY.yaml``."""
+
+    s3_bucket: str
+    s3_key_template: str
+    refresh: str
+    refresh_reason: str
+
+
+class _Registry(TypedDict, total=False):
+    """The two ``ARTIFACT_REGISTRY.yaml`` sections this module reads."""
+
+    pipeline_stages: list[_StageRow]
+    artifacts: list[_ArtifactRow]
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _GetObjectResponse(TypedDict):
+    Body: _StreamingBody
+
+
+class _HeadObjectResponse(TypedDict, total=False):
+    LastModified: datetime
+
+
+class _ListedObject(TypedDict, total=False):
+    Key: str
+    LastModified: datetime
+
+
+class _ListObjectsPage(TypedDict, total=False):
+    Contents: list[_ListedObject]
+
+
+class _ListObjectsPaginator(Protocol):
+    def paginate(self, *, Bucket: str, Prefix: str) -> Iterable[_ListObjectsPage]: ...
+
+
+class _ClientErrorDetail(TypedDict, total=False):
+    Code: str
+
+
+class _ResponseMetadata(TypedDict, total=False):
+    HTTPStatusCode: int
+
+
+class _ClientErrorResponse(TypedDict, total=False):
+    """``botocore.exceptions.ClientError.response``, the fields read here."""
+
+    Error: _ClientErrorDetail
+    ResponseMetadata: _ResponseMetadata
+
+
+class _S3RegistryReader(Protocol):
+    """The boto3 S3 client method :func:`load_registry` calls (boto3 ships no stubs)."""
+
+    def get_object(self, *, Bucket: str, Key: str) -> _GetObjectResponse: ...
+
+
+class _S3Prober(Protocol):
+    """The boto3 S3 client methods the artifact probes call."""
+
+    def head_object(self, *, Bucket: str, Key: str) -> _HeadObjectResponse: ...
+
+    def get_paginator(
+        self, operation_name: Literal["list_objects_v2"]
+    ) -> _ListObjectsPaginator: ...
+
+
+class _S3VerdictWriter(Protocol):
+    """The boto3 S3 client method :func:`record_verdict` calls."""
+
+    def put_object(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str
+    ) -> object: ...
+
+
+class _S3CoverageClient(_S3RegistryReader, _S3Prober, _S3VerdictWriter, Protocol):
+    """Every S3 method :func:`assert_stage_coverage` reaches."""
+
+
+class _MetricDimension(TypedDict):
+    Name: str
+    Value: str
+
+
+class _MetricDatum(TypedDict):
+    MetricName: str
+    Dimensions: list[_MetricDimension]
+    Value: float
+    Unit: str
+
+
+class _CloudWatchMetrics(Protocol):
+    """The boto3 CloudWatch client method :func:`record_verdict` calls."""
+
+    def put_metric_data(
+        self, *, Namespace: str, MetricData: list[_MetricDatum]
+    ) -> object: ...
+
+
+#: ``(outcome, payload)`` from one artifact probe — see :func:`_head`.
+_ProbeResult = Union[
+    tuple[Literal["present"], Optional[datetime]],
+    tuple[Literal["absent"], str],
+    tuple[Literal["probe_failed"], str],
+]
+
+
+class _UnmeasuredExtra(TypedDict, total=False):
+    stage_class: str
+    declared_output: str
+    expected: list[str]
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -238,7 +377,7 @@ class StageCoverageContractError(ValueError):
     """
 
 
-def _require_run_date(run_date: Any) -> str:
+def _require_run_date(run_date: object) -> str:
     """Return ``run_date`` as a non-empty string, or raise loudly.
 
     **The grouping key is the SF execution's ``run_date``, always.** It is the
@@ -391,7 +530,7 @@ class StageVerdict:
             return not set(self.stale).issubset(set(self.stale_conditional))
         return False
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, object]:
         """JSON-serialisable form (tuples flattened to lists)."""
         raw = asdict(self)
         raw["unmeasured"] = [list(pair) for pair in self.unmeasured]
@@ -403,12 +542,12 @@ class StageVerdict:
 
 
 def load_registry(
-    s3_client: Any,
+    s3_client: _S3RegistryReader,
     *,
     bucket: str = DEFAULT_BUCKET,
     key: str = REGISTRY_KEY,
     local_path: str | None = None,
-) -> dict[str, Any]:
+) -> _Registry:
     """Return the parsed registry.
 
     ``local_path`` reads from disk instead of S3 — used by tests and by any
@@ -425,7 +564,7 @@ def load_registry(
     return yaml.safe_load(body) or {}
 
 
-def resolve_stage_row(registry: dict[str, Any], stage: str) -> dict[str, Any] | None:
+def resolve_stage_row(registry: _Registry, stage: str) -> _StageRow | None:
     """Return the ``pipeline_stages:`` row for ``stage``, or ``None``.
 
     ``None`` is an UNMEASURED condition, never a pass: a stage absent from the
@@ -438,7 +577,7 @@ def resolve_stage_row(registry: dict[str, Any], stage: str) -> dict[str, Any] | 
     return None
 
 
-def index_artifacts(registry: dict[str, Any]) -> dict[str, dict[str, Any]]:
+def index_artifacts(registry: _Registry) -> dict[str, _ArtifactRow]:
     """Return ``{artifact_id: row}`` for the registry's ``artifacts:`` list."""
     return {
         row["artifact_id"]: row
@@ -462,6 +601,15 @@ def resolve_cycle_date(now: datetime) -> date | None:
     except Exception:  # noqa: BLE001 — any calendar failure is UNMEASURED
         logger.warning("stage_coverage: trading calendar unavailable", exc_info=True)
         return None
+    return _as_calendar_date(resolved)
+
+
+def _as_calendar_date(resolved: object) -> date | None:
+    """Normalise a calendar's answer to a ``date``; anything else is ``None``.
+
+    Takes ``object`` so the checks also hold for a calendar (or a test double)
+    that hands back something other than the declared ``date``.
+    """
     if isinstance(resolved, datetime):
         return resolved.date()
     if isinstance(resolved, date):
@@ -491,7 +639,7 @@ def format_key(template: str, cycle_date: date) -> str:
 # ── The pure core ────────────────────────────────────────────────────────────
 
 
-def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
+def _head(s3_client: _S3Prober, bucket: str, key: str) -> _ProbeResult:
     """Probe one key. Returns ``(outcome, payload)``.
 
     ``outcome`` is ``"present"`` (payload = ``LastModified`` datetime),
@@ -503,11 +651,14 @@ def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
     except Exception as exc:  # noqa: BLE001 — classified below, never re-raised
         code = ""
         status = 0
-        response = getattr(exc, "response", None)
+        response: object = getattr(exc, "response", None)
         if isinstance(response, dict):
-            code = str((response.get("Error") or {}).get("Code", ""))
+            # botocore ClientError.response; malformed shapes still fail as before.
+            error_response = cast("_ClientErrorResponse", response)
+            code = str((error_response.get("Error") or {}).get("Code", ""))
             status = int(
-                (response.get("ResponseMetadata") or {}).get("HTTPStatusCode", 0) or 0
+                (error_response.get("ResponseMetadata") or {}).get("HTTPStatusCode", 0)
+                or 0
             )
         if code in {"404", "NoSuchKey", "NotFound"} or status == 404:
             return "absent", ""
@@ -558,12 +709,12 @@ def _wildcard_pattern(key: str) -> tuple[str, re.Pattern[str]]:
 
 
 def _newest_match(
-    s3_client: Any,
+    s3_client: _S3Prober,
     bucket: str,
     key: str,
     *,
     cap_pages: int = WILDCARD_LIST_CAP_PAGES,
-) -> tuple[str, Any]:
+) -> _ProbeResult:
     """Resolve a ``*``-bearing key to its newest instance by LIST.
 
     Same ``(outcome, payload)`` contract as :func:`_head`: ``"present"`` with
@@ -578,7 +729,7 @@ def _newest_match(
     except ValueError as exc:
         return "probe_failed", f"unresolvable wildcard key: {exc}"
 
-    newest = None
+    newest: Optional[datetime] = None
     try:
         paginator = s3_client.get_paginator("list_objects_v2")
         for page_index, page in enumerate(
@@ -601,9 +752,11 @@ def _newest_match(
                     newest = last_modified
     except Exception as exc:  # noqa: BLE001 — classified below, never re-raised
         code = ""
-        response = getattr(exc, "response", None)
+        response: object = getattr(exc, "response", None)
         if isinstance(response, dict):
-            code = str((response.get("Error") or {}).get("Code", ""))
+            # botocore ClientError.response; malformed shapes still fail as before.
+            error_response = cast("_ClientErrorResponse", response)
+            code = str((error_response.get("Error") or {}).get("Code", ""))
         return "probe_failed", f"{type(exc).__name__}: {code or exc}"
 
     if newest is None:
@@ -611,7 +764,7 @@ def _newest_match(
     return "present", newest
 
 
-def _probe(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
+def _probe(s3_client: _S3Prober, bucket: str, key: str) -> _ProbeResult:
     """HEAD a fixed key; LIST-and-match a key carrying the ``*`` segment."""
     if WILDCARD_SEGMENT in key:
         return _newest_match(s3_client, bucket, key)
@@ -619,10 +772,10 @@ def _probe(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
 
 
 def evaluate_stage(
-    registry: dict[str, Any],
+    registry: _Registry,
     stage: str,
     *,
-    s3_client: Any,
+    s3_client: _S3Prober,
     now: datetime,
     run_date: str,
     cycle_date: date | None = None,
@@ -652,7 +805,7 @@ def evaluate_stage(
         window_start.astimezone(timezone.utc).isoformat() if window_start else None
     )
 
-    def unmeasured(reason: str, **extra: Any) -> StageVerdict:
+    def unmeasured(reason: str, **extra: Unpack[_UnmeasuredExtra]) -> StageVerdict:
         return StageVerdict(
             stage=stage,
             status=STATUS_UNMEASURED,
@@ -737,12 +890,12 @@ def evaluate_stage(
             continue
         bucket = str(spec.get("s3_bucket") or DEFAULT_BUCKET)
         key = format_key(template, cycle_date)
-        outcome, payload = _probe(s3_client, bucket, key)
-        if outcome == "absent":
+        probe = _probe(s3_client, bucket, key)
+        if probe[0] == "absent":
             missing.append(artifact_id)
-        elif outcome == "probe_failed":
-            unmeasured_pairs.append((artifact_id, str(payload)))
-        elif window_start is None or payload is None:
+        elif probe[0] == "probe_failed":
+            unmeasured_pairs.append((artifact_id, str(probe[1])))
+        elif window_start is None or probe[1] is None:
             # Present, but no window to judge recency against. NOT counted as
             # covered: a present key with no window is `unmeasured`, never a
             # pass — degrading it to healthy is how a stage that stopped
@@ -751,7 +904,7 @@ def evaluate_stage(
                 (artifact_id, "present but no execution window to judge recency")
             )
         else:
-            last_modified = payload
+            last_modified = probe[1]
             if last_modified.tzinfo is None:
                 last_modified = last_modified.replace(tzinfo=timezone.utc)
             if last_modified < window_start:
@@ -876,8 +1029,8 @@ def verdict_key(
 def record_verdict(
     verdict: StageVerdict,
     *,
-    s3_client: Any = None,
-    cloudwatch_client: Any = None,
+    s3_client: Optional[_S3VerdictWriter] = None,
+    cloudwatch_client: Optional[_CloudWatchMetrics] = None,
     bucket: str = DEFAULT_BUCKET,
     prefix: str = VERDICT_PREFIX,
     execution_name: str | None = None,
@@ -962,13 +1115,13 @@ def assert_stage_coverage(
     window_start: datetime | None = None,
     enforce: bool = False,
     now: datetime | None = None,
-    s3_client: Any = None,
-    cloudwatch_client: Any = None,
+    s3_client: object = None,
+    cloudwatch_client: object = None,
     bucket: str = DEFAULT_BUCKET,
     registry_local_path: str | None = None,
     not_applicable_reason: str | None = None,
     execution_name: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, object]:
     """Assert ``stage`` wrote what it declared. Returns the verdict dict.
 
     ``not_applicable_reason``: the stage's own per-run declaration that its
@@ -1005,21 +1158,25 @@ def assert_stage_coverage(
     now = now or datetime.now(timezone.utc)
     try:
         if s3_client is None:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             from krepis.aws_region import resolve_region
 
             s3_client = boto3.client("s3", region_name=resolve_region())
         if cloudwatch_client is None:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             from krepis.aws_region import resolve_region
 
             cloudwatch_client = boto3.client("cloudwatch", region_name=resolve_region())
+        # The SDK boundary: boto3 ships no stubs, so the client built above (or
+        # the caller's) is used only through the methods these Protocols name.
+        s3 = cast("_S3CoverageClient", s3_client)
+        cloudwatch = cast("_CloudWatchMetrics", cloudwatch_client)
 
         try:
             registry = load_registry(
-                s3_client, bucket=bucket, local_path=registry_local_path
+                s3, bucket=bucket, local_path=registry_local_path
             )
         except Exception as exc:  # noqa: BLE001
             verdict = StageVerdict(
@@ -1034,7 +1191,7 @@ def assert_stage_coverage(
             verdict = evaluate_stage(
                 registry,
                 stage,
-                s3_client=s3_client,
+                s3_client=s3,
                 now=now,
                 run_date=run_date,
                 cycle_date=resolve_cycle_date(now),
@@ -1045,8 +1202,8 @@ def assert_stage_coverage(
 
         record_verdict(
             verdict,
-            s3_client=s3_client,
-            cloudwatch_client=cloudwatch_client,
+            s3_client=s3,
+            cloudwatch_client=cloudwatch,
             bucket=bucket,
             execution_name=execution_name,
         )
