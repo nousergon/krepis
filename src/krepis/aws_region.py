@@ -79,7 +79,7 @@ class _RegionFetcherFactory(Protocol):
 
 def _from_botocore_session() -> str | None:
     try:
-        import botocore.session
+        import botocore.session  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
@@ -93,7 +93,7 @@ def _from_botocore_session() -> str | None:
 
 def _from_imds() -> str | None:
     try:
-        from botocore.utils import InstanceMetadataRegionFetcher
+        from botocore.utils import InstanceMetadataRegionFetcher  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs
     except ImportError:  # pragma: no cover - botocore ships with boto3
         return None
     try:
