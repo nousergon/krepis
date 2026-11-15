@@ -115,11 +115,79 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Final, Optional
+from typing import Callable, Final, List, Mapping, Optional, Protocol, TypedDict, cast
 
 from . import resource_kill, rss_budget, s3_surface
 
 logger = logging.getLogger(__name__)
+
+
+# The SDK boundary. boto3 ships no stubs, so every client this module uses --
+# built here or injected by a caller -- is reached only through the methods the
+# protocols below name, and its responses only through the keys the TypedDicts
+# below name. Both are static descriptions; nothing is validated at runtime, so
+# a malformed response fails exactly where it did before.
+
+
+class _TextSink(Protocol):
+    """The stream methods this module calls on ``stdout_stream``/``stderr_stream``."""
+
+    def write(self, s: str, /) -> object: ...
+
+    def flush(self) -> object: ...
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _GetObjectResponse(TypedDict):
+    Body: _StreamingBody
+
+
+class _S3ObjectSummary(TypedDict):
+    Key: str
+
+
+class _ListObjectsV2Response(TypedDict, total=False):
+    Contents: Optional[List[_S3ObjectSummary]]
+
+
+class _S3Client(Protocol):
+    """The boto3 S3 client methods this module calls."""
+
+    def list_objects_v2(self, *, Bucket: str, Prefix: str) -> _ListObjectsV2Response: ...
+
+    def get_object(self, *, Bucket: str, Key: str, Range: str) -> _GetObjectResponse: ...
+
+    def put_object(
+        self, *, Bucket: str, Key: str, Body: bytes, ContentType: str
+    ) -> object: ...
+
+
+class _SentCommand(TypedDict, total=False):
+    CommandId: str
+
+
+class _SendCommandResponse(TypedDict, total=False):
+    Command: _SentCommand
+
+
+class _CommandInvocation(TypedDict, total=False):
+    Status: str
+    StandardOutputContent: Optional[str]
+    StandardErrorContent: Optional[str]
+    ResponseCode: Optional[int]
+
+
+class _SsmClient(Protocol):
+    """The boto3 SSM client methods this module calls."""
+
+    def send_command(self, **kwargs: object) -> _SendCommandResponse: ...
+
+    def get_command_invocation(
+        self, *, CommandId: str, InstanceId: str
+    ) -> _CommandInvocation: ...
 
 # Status taxonomy from SSM's get-command-invocation. Terminal non-Success
 # statuses all map to exit 1.
@@ -226,8 +294,8 @@ def _fetch_remote_output_tail(
     bucket: Optional[str],
     key_prefix: Optional[str],
     command_id: str,
-    s3_client=None,
-    sleep=time.sleep,
+    s3_client: "object | None" = None,
+    sleep: Callable[[float], object] = time.sleep,
     attempts: int = REMOTE_TAIL_ATTEMPTS,
     tail_bytes: int = REMOTE_TAIL_BYTES,
 ) -> str:
@@ -248,7 +316,7 @@ def _fetch_remote_output_tail(
         return ""
     if s3_client is None:
         try:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             s3_client = boto3.client("s3")
         except Exception as exc:
@@ -259,11 +327,12 @@ def _fetch_remote_output_tail(
                 exc,
             )
             return ""
+    s3 = cast("_S3Client", s3_client)
     prefix = "{}/{}/".format(key_prefix.rstrip("/"), command_id)
-    keys: list = []
+    keys: List[str] = []
     for attempt in range(attempts):
         try:
-            resp = s3_client.list_objects_v2(Bucket=bucket, Prefix=prefix)
+            resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
             keys = [
                 item["Key"]
                 for item in (resp.get("Contents", []) or [])
@@ -280,14 +349,14 @@ def _fetch_remote_output_tail(
         if keys or attempt == attempts - 1:
             break
         sleep(REMOTE_TAIL_RETRY_SECONDS)
-    chunks = []
+    chunks: List[str] = []
     # stdout last: bash's own "<script>: line N: <pid> Killed" job-control
     # message goes to the shell's stderr, but a launcher that redirects 2>&1
     # puts it on stdout, and resource_kill scans tail-first — so ordering the
     # blob stderr-then-stdout keeps the most recently written text last.
     for key in sorted(keys, key=lambda k: (not k.endswith("/stderr"), k)):
         try:
-            obj = s3_client.get_object(
+            obj = s3.get_object(
                 Bucket=bucket, Key=key, Range="bytes=-{}".format(int(tail_bytes))
             )
             body = obj["Body"].read()
@@ -327,9 +396,9 @@ def _recover_rss_stdout(
     output_bucket: Optional[str],
     output_key_prefix: Optional[str],
     command_id: str,
-    s3_client,
-    sleep,
-    err,
+    s3_client: "object | None",
+    sleep: Callable[[float], object],
+    err: _TextSink,
     description: str,
 ) -> str:
     """Return the stdout the peak-RSS sentinel should be parsed from.
@@ -412,8 +481,8 @@ def _ship_diagnostics(
     stdout_tail: str,
     stderr_tail: str,
     instance_id: str,
-    boto3_client=None,
-    stderr_stream=None,
+    boto3_client: "object | None" = None,
+    stderr_stream: Optional[_TextSink] = None,
     response_code: Optional[int] = None,
     classification: Optional[str] = None,
     kill_line: Optional[str] = None,
@@ -458,14 +527,15 @@ def _ship_diagnostics(
         "kill_line": kill_line,
         "remote_tail": remote_tail,
     }
+    s3: object
     try:
         if boto3_client is None:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             s3 = boto3.client("s3")
         else:
             s3 = boto3_client
-        s3.put_object(
+        cast("_S3Client", s3).put_object(
             Bucket=bucket,
             Key=key,
             Body=json.dumps(payload, indent=2).encode("utf-8"),
@@ -509,12 +579,12 @@ def run(
     diagnostics_bucket: Optional[str] = None,
     diagnostics_prefix: Optional[str] = None,
     resource_limit: Optional[str] = None,
-    stdout_stream=None,
-    stderr_stream=None,
-    sleep=time.sleep,
-    monotonic=time.monotonic,
-    boto3_client=None,
-    s3_client=None,
+    stdout_stream: Optional[_TextSink] = None,
+    stderr_stream: Optional[_TextSink] = None,
+    sleep: Callable[[float], object] = time.sleep,
+    monotonic: Callable[[], float] = time.monotonic,
+    boto3_client: "object | None" = None,
+    s3_client: "object | None" = None,
 ) -> int:
     """Send ``script`` to ``instance_id`` via SSM, poll until terminal, stream stdout.
 
@@ -570,9 +640,10 @@ def run(
     out = stdout_stream if stdout_stream is not None else sys.stdout
     err = stderr_stream if stderr_stream is not None else sys.stderr
 
+    ssm: object
     try:
         if boto3_client is None:
-            import boto3
+            import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
             ssm = boto3.client("ssm", region_name=region)
         else:
@@ -584,6 +655,7 @@ def run(
             file=err,
         )
         return 1
+    ssm_client = cast("_SsmClient", ssm)
 
     # Peak-RSS budget (alpha-engine-config-I7260). Gated on the caller having
     # already opted this dispatcher into writing run records to a bucket, and
@@ -613,7 +685,7 @@ def run(
             measure_rss = False
 
     payload = _encode_command_payload(script)
-    send_kwargs: dict = {
+    send_kwargs: "dict[str, object]" = {
         "InstanceIds": [instance_id],
         "DocumentName": "AWS-RunShellScript",
         "Comment": description[:100],  # SSM Comment cap is 100 chars
@@ -636,7 +708,7 @@ def run(
         send_kwargs["OutputS3KeyPrefix"] = output_key_prefix
 
     try:
-        resp = ssm.send_command(**send_kwargs)
+        resp = ssm_client.send_command(**send_kwargs)
     except Exception as exc:
         print(
             f"ssm_dispatcher: send_command failed for {description!r}: "
@@ -666,7 +738,7 @@ def run(
         sleep(poll_interval_seconds)
 
         try:
-            inv = ssm.get_command_invocation(
+            inv = ssm_client.get_command_invocation(
                 CommandId=command_id,
                 InstanceId=instance_id,
             )
@@ -749,7 +821,8 @@ def run(
                     description=description,
                 )
                 body = rss_budget.publish(
-                    bucket=diagnostics_bucket,
+                    # measure_rss is only ever True when diagnostics_bucket is truthy.
+                    bucket=cast(str, diagnostics_bucket),
                     description=description,
                     instance_id=instance_id,
                     stdout=rss_stdout,
@@ -909,9 +982,11 @@ def _classify_boto_exception(exc: BaseException) -> str:
     available (e.g., on non-botocore exceptions). Tests patch this for
     deterministic InvocationDoesNotExist surfacing.
     """
-    response = getattr(exc, "response", None)
+    response: object = getattr(exc, "response", None)
     if isinstance(response, dict):
-        code = response.get("Error", {}).get("Code")
+        # botocore's parsed error body; a malformed "Error" member raises here
+        # exactly as before (cast is a no-op at runtime).
+        code = cast("Mapping[str, Mapping[str, object]]", response).get("Error", {}).get("Code")
         if code:
             return str(code)
     return type(exc).__name__
