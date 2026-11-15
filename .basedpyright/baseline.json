@@ -3630,6 +3630,24 @@
                 }
             }
         ],
+        "./src/krepis/email_sender.py": [
+            {
+                "code": "reportUnknownVariableType",
+                "range": {
+                    "startColumn": 8,
+                    "endColumn": 11,
+                    "lineCount": 1
+                }
+            },
+            {
+                "code": "reportUnknownMemberType",
+                "range": {
+                    "startColumn": 14,
+                    "endColumn": 26,
+                    "lineCount": 1
+                }
+            }
+        ],
         "./src/krepis/fleet_events.py": [
             {
                 "code": "reportMissingTypeArgument",

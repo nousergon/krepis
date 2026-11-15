@@ -153,7 +153,7 @@ def _send_via_ses(
         import boto3  # pyright: ignore[reportMissingTypeStubs]  # no boto3 stubs in the base install
         from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # ditto
 
-        ses = boto3.client("ses", region_name=region)  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
+        ses = boto3.client("ses", region_name=region)
         body_part: dict[str, dict[str, str]] = {
             "Text": {"Data": plain_body, "Charset": "UTF-8"},
         }
