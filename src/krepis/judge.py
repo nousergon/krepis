@@ -67,7 +67,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any, Iterable, Mapping, Optional, cast
 
 __all__ = [
     "JudgeModelSpec",
@@ -184,8 +184,10 @@ def request_model_for(
 # ── Rubric rendering ──────────────────────────────────────────────────────
 
 
+# The public entry points below keep ``Any`` where callers hand in arbitrary
+# JSON-able values, Pydantic classes or SDK response objects; internals cast.
 def render_rubric(
-    template: str, *, agent_input: Any, agent_output: Any,
+    template: str, *, agent_input: Any, agent_output: Any,  # pyright: ignore[reportExplicitAny]
 ) -> str:
     """Render a rubric template against an (input, output) pair.
 
@@ -222,8 +224,8 @@ def render_rubric(
 
 
 def build_structured_tool_spec(
-    schema: Any, *, tool_name: str, description: str,
-) -> dict[str, Any]:
+    schema: Any, *, tool_name: str, description: str,  # pyright: ignore[reportExplicitAny]
+) -> dict[str, Any]:  # pyright: ignore[reportExplicitAny]
     """Synthesize an Anthropic tool-use spec forcing structured output.
 
     ``schema`` is either a Pydantic ``BaseModel`` subclass (its
@@ -264,8 +266,8 @@ class ToolResultNotFoundError(ValueError):
 
 
 def parse_batch_tool_result(
-    message_payload: Any, *, tool_name: str, schema: Optional[Any] = None,
-) -> Any:
+    message_payload: Any, *, tool_name: str, schema: Optional[Any] = None,  # pyright: ignore[reportExplicitAny]
+) -> Any:  # pyright: ignore[reportExplicitAny]
     """Parse one Batches-API result's ``message`` block for a named tool call.
 
     Accepts either an SDK ``Message`` object or its dict equivalent (a
@@ -288,22 +290,28 @@ def parse_batch_tool_result(
     match the schema) propagate unwrapped so callers can distinguish
     the two.
     """
-    content = (
+    content = cast(
+        "Iterable[object]",
         message_payload["content"]
         if isinstance(message_payload, dict)
-        else message_payload.content
+        else message_payload.content,
     )
     for block in content:
         block_type = (
-            block.get("type") if isinstance(block, dict) else block.type
+            cast("dict[str, object]", block).get("type")
+            if isinstance(block, dict)
+            else getattr(block, "type")
         )
         block_name = (
-            block.get("name") if isinstance(block, dict)
+            cast("dict[str, object]", block).get("name")
+            if isinstance(block, dict)
             else getattr(block, "name", None)
         )
         if block_type == "tool_use" and block_name == tool_name:
             tool_input = (
-                block["input"] if isinstance(block, dict) else block.input
+                cast("dict[str, object]", block)["input"]
+                if isinstance(block, dict)
+                else getattr(block, "input")
             )
             if schema is not None and hasattr(schema, "model_validate"):
                 return schema.model_validate(tool_input)
@@ -383,7 +391,9 @@ class JudgeToolCallLeakError(ValueError):
     comment above for the two confirmed failure shapes.
     """
 
-    def __init__(self, message: str, *, reason: str, finish_reason: Optional[str]):
+    def __init__(
+        self, message: str, *, reason: str, finish_reason: Optional[str]
+    ) -> None:
         super().__init__(message)
         self.reason = reason
         """Machine-stable failure-mode tag: ``"truncated_before_tool_call"``
@@ -405,8 +415,15 @@ modules — both mirror the Anthropic Batches API's
 class of token, not one vendor's exact spelling")."""
 
 
+def _field(obj: object, name: str) -> object:
+    """``obj.get(name)`` for a dict, else ``getattr(obj, name, None)``."""
+    if isinstance(obj, dict):
+        return cast("dict[str, object]", obj).get(name)
+    return getattr(obj, name, None)
+
+
 def check_openai_tool_response_for_leak(
-    choice: Any, *, tool_name: str,
+    choice: Any, *, tool_name: str,  # pyright: ignore[reportExplicitAny]
 ) -> None:
     """Raise :exc:`JudgeToolCallLeakError` if ``choice`` shows either
     known leak/truncation signature; return ``None`` (no raise) otherwise.
@@ -445,19 +462,10 @@ def check_openai_tool_response_for_leak(
     (mirrors :func:`parse_batch_tool_result`'s tool-name matching for the
     Anthropic transport).
     """
-    message = choice.get("message") if isinstance(choice, dict) else getattr(choice, "message", None)
-    finish_reason = (
-        choice.get("finish_reason") if isinstance(choice, dict)
-        else getattr(choice, "finish_reason", None)
-    )
-    tool_calls = (
-        (message or {}).get("tool_calls") if isinstance(message, dict)
-        else getattr(message, "tool_calls", None)
-    )
-    content = (
-        (message or {}).get("content") if isinstance(message, dict)
-        else getattr(message, "content", None)
-    ) or ""
+    message = _field(choice, "message")
+    finish_reason = cast(Optional[str], _field(choice, "finish_reason"))
+    tool_calls = _field(message, "tool_calls")
+    content = cast(str, _field(message, "content") or "")
 
     if finish_reason == "length" and not tool_calls:
         raise JudgeToolCallLeakError(
