@@ -54,9 +54,13 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, cast
 
 logger = logging.getLogger(__name__)
+
+#: A mapping parsed from the registry YAML (the document or one of its rows).
+#: Its values are whatever the YAML holds; nothing narrower is known statically.
+RegistryMapping = Dict[str, Any]
 
 #: Statuses excluded from every generated surface.
 #:
@@ -231,7 +235,7 @@ def find_registry(explicit: Optional[Path] = None) -> Path:
     )
 
 
-def entry_declares_capability(entry: dict, capability: str) -> bool:
+def entry_declares_capability(entry: RegistryMapping, capability: str) -> bool:
     """True only when *entry* declares *capability* as literal ``True``.
 
     Absence is NOT capability. An undeclared flag means nobody measured it, and
@@ -241,10 +245,11 @@ def entry_declares_capability(entry: dict, capability: str) -> bool:
     catches, and until it does, this returns False and the member is skipped
     with a stated reason rather than gambled on.
     """
-    return (entry.get("capabilities") or {}).get(capability) is True
+    capabilities: RegistryMapping = entry.get("capabilities") or {}
+    return capabilities.get(capability) is True
 
 
-def entry_reachable_from(entry: dict, exec_context: str) -> bool:
+def entry_reachable_from(entry: RegistryMapping, exec_context: str) -> bool:
     """Whether *entry* declares itself reachable from *exec_context* (R28).
 
     An entry with no ``reachable_from`` key is **not** reachable from anywhere.
@@ -300,16 +305,17 @@ class Registry:
     render from this; none of them re-reads the file.
     """
 
-    def __init__(self, path: Path, doc: Dict[str, Any]) -> None:
+    def __init__(self, path: Path, doc: RegistryMapping) -> None:
         self.path = path
         self.doc = doc
-        self.models: Dict[str, dict] = {
-            m["id"]: m for m in (doc.get("models") or []) if "id" in m
+        rows: List[RegistryMapping] = doc.get("models") or []
+        self.models: Dict[str, RegistryMapping] = {
+            m["id"]: m for m in rows if "id" in m
         }
         self.groups: Dict[str, List[str]] = dict(doc.get("model_groups") or {})
 
     @property
-    def live_models(self) -> Dict[str, dict]:
+    def live_models(self) -> Dict[str, RegistryMapping]:
         """Every model whose ``status`` is not in :data:`EXCLUDED_STATUSES`.
 
         A row with no ``status`` counts as live: the field is optional in the
@@ -417,7 +423,7 @@ def load_registry(path: Optional[Path] = None) -> Registry:
         raise ValueError(
             "registry at %s did not parse to a mapping (got %s)" % (resolved, type(doc).__name__)
         )
-    return Registry(resolved, doc)
+    return Registry(resolved, cast("RegistryMapping", doc))
 
 
 # ── Per-entry derived facts ──────────────────────────────────────────────
@@ -435,7 +441,7 @@ def load_registry(path: Optional[Path] = None) -> Registry:
 # in the generator, and never carried across to krepis — divergence 2 in this
 # module's header.
 
-def litellm_model(entry: dict) -> str:
+def litellm_model(entry: RegistryMapping) -> str:
     """Build the litellm model string: ``openai/deepseek-v4-flash`` etc."""
     route = entry.get("route", "")
     provider = entry.get("provider", "")
@@ -452,7 +458,7 @@ def litellm_model(entry: dict) -> str:
     return "openai/%s" % model
 
 
-def api_key_env(entry: dict) -> str:
+def api_key_env(entry: RegistryMapping) -> str:
     """Name of the environment variable holding this entry's credential."""
     route = entry.get("route", "")
     provider = entry.get("provider", "")
@@ -470,7 +476,7 @@ def api_key_env(entry: dict) -> str:
     return EGRESS_PLACEHOLDER_ENV
 
 
-def api_key_for(entry: dict, style: str = "value", overrides: Optional[Dict[str, str]] = None) -> str:
+def api_key_for(entry: RegistryMapping, style: str = "value", overrides: Optional[Dict[str, str]] = None) -> str:
     """Render this entry's credential in the shape *style* asks for.
 
     ``overrides`` lets a caller supply a key it already holds (the in-process
@@ -490,7 +496,7 @@ def api_key_for(entry: dict, style: str = "value", overrides: Optional[Dict[str,
     return os.environ.get(name) or default
 
 
-def extra_body(entry: dict) -> Optional[dict]:
+def extra_body(entry: RegistryMapping) -> Optional[RegistryMapping]:
     """Extract ``params.reasoning`` and OpenRouter provider pinning into
     litellm's ``extra_body``, or None.
 
@@ -512,8 +518,8 @@ def extra_body(entry: dict) -> Optional[dict]:
     ``provider``, which names the underlying model vendor (e.g.
     ``anthropic``) and is a different field from the routing path.
     """
-    result: dict = {}
-    params = entry.get("params") or {}
+    result: RegistryMapping = {}
+    params: RegistryMapping = entry.get("params") or {}
     reasoning = params.get("reasoning")
     if reasoning and reasoning != "null":
         result["reasoning"] = reasoning
@@ -548,11 +554,11 @@ def extra_body(entry: dict) -> Optional[dict]:
 
 
 def deployment_params(
-    entry: dict,
+    entry: RegistryMapping,
     *,
     api_key_style: str = "value",
     api_key_overrides: Optional[Dict[str, str]] = None,
-) -> dict:
+) -> RegistryMapping:
     """The litellm params every consumer derives identically from one entry.
 
     Covers model string, credential, ``api_base`` and the multi-tenant egress
@@ -564,7 +570,7 @@ def deployment_params(
     consumer that needs the registry's own declared values reads them off
     *entry* (see :func:`declared_tpm`).
     """
-    params: dict = {
+    params: RegistryMapping = {
         "model": litellm_model(entry),
         "api_key": api_key_for(entry, style=api_key_style, overrides=api_key_overrides),
     }
@@ -586,7 +592,7 @@ def deployment_params(
     if upstream_host:
         params.setdefault("extra_headers", {})["X-Upstream-Host"] = upstream_host
 
-    entry_params = entry.get("params") or {}
+    entry_params: RegistryMapping = entry.get("params") or {}
     if "max_tokens" in entry_params:
         params["max_tokens"] = entry_params["max_tokens"]
 
@@ -597,7 +603,7 @@ def deployment_params(
     return params
 
 
-def declared_tpm(entry: dict, floor: int) -> Optional[int]:
+def declared_tpm(entry: RegistryMapping, floor: int) -> Optional[int]:
     """The entry's ``tpm``, raised to *floor*, or None when undeclared.
 
     ``tpm`` reads as a per-minute budget. Under ``routing_strategy:
