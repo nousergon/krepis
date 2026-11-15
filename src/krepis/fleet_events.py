@@ -49,10 +49,11 @@ import logging
 import os
 import socket
 import uuid
+from collections.abc import Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
-from typing import Any, Dict, Final, Iterator, Optional
+from typing import Dict, Final, List, Optional, Protocol, TypedDict, cast
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
@@ -79,7 +80,7 @@ S3_SURFACE = (s3_surface.literal("overseer", s3_surface.MODE_READWRITE),)
 DEFAULT_REGION: Final[str] = "us-east-1"
 MAX_BODY_CHARS: Final[int] = 4000
 
-_VALID_SEVERITIES: Final[frozenset] = frozenset({"info", "warning", "error", "critical"})
+_VALID_SEVERITIES: Final[frozenset[str]] = frozenset({"info", "warning", "error", "critical"})
 
 # Set by alerts.publish around its Telegram fan-out so send_message's
 # auto-emit hook stays quiet — publish emits one rich event itself.
@@ -87,7 +88,7 @@ _emission_suppressed: ContextVar[bool] = ContextVar("_emission_suppressed", defa
 
 
 @contextmanager
-def suppress_emission() -> Iterator[None]:
+def suppress_emission() -> Generator[None, None, None]:
     """Suppress auto-emission from nested chokepoints within this context."""
     token = _emission_suppressed.set(True)
     try:
@@ -149,7 +150,7 @@ def _build_detail(
     delivery_tier: Optional[str] = None,
     alert_class: Optional[str] = None,
     registry_drift: Optional[bool] = None,
-) -> Dict[str, Any]:
+) -> Dict[str, object]:
     hostname: Optional[str]
     try:
         hostname = socket.gethostname()
@@ -194,11 +195,28 @@ def _build_detail(
     }
 
 
-def _put_event(detail: Dict[str, Any]) -> None:
-    import boto3
+class _PutEventsResultEntry(TypedDict, total=False):
+    EventId: str
+    ErrorCode: str
+    ErrorMessage: str
+
+
+class _PutEventsResponse(TypedDict):
+    FailedEntryCount: int
+    Entries: List[_PutEventsResultEntry]
+
+
+class _EventsClient(Protocol):
+    """The one boto3 EventBridge client method this module calls (boto3 ships no stubs)."""
+
+    def put_events(self, *, Entries: List[Dict[str, str]]) -> _PutEventsResponse: ...
+
+
+def _put_event(detail: Dict[str, object]) -> None:
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
     client = boto3.client("events", region_name=_region())
-    resp = client.put_events(
+    resp = cast("_EventsClient", client).put_events(
         Entries=[
             {
                 "Source": EVENT_SOURCE,
@@ -215,8 +233,8 @@ def _put_event(detail: Dict[str, Any]) -> None:
         )
 
 
-def _write_fallback(detail: Dict[str, Any]) -> None:
-    import boto3
+def _write_fallback(detail: Dict[str, object]) -> None:
+    import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
     bucket = os.environ.get(FALLBACK_BUCKET_ENV, DEFAULT_FALLBACK_BUCKET)
     now = datetime.now(timezone.utc)

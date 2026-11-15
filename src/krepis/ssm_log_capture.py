@@ -143,12 +143,18 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Final, Optional
+from typing import IO, Final, Optional, Protocol, cast
 
 from . import resource_kill
 from krepis import rss_budget, s3_surface
 
 logger = logging.getLogger(__name__)
+
+
+class _S3Uploader(Protocol):
+    """The one boto3 S3 client method this module calls (boto3 ships no stubs)."""
+
+    def upload_file(self, filename: str, bucket: str, key: str, /) -> None: ...
 
 DEFAULT_BUCKET: Final[str] = "alpha-engine-research"
 S3_PREFIX: Final[str] = "_ssm_logs"
@@ -335,10 +341,10 @@ def _ship_log_to_s3(
     if not log_path.exists():
         return False, f"log file not found: {log_path}"
     try:
-        import boto3
+        import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
 
         s3 = boto3.client("s3")
-        s3.upload_file(str(log_path), bucket, key)
+        cast("_S3Uploader", s3).upload_file(str(log_path), bucket, key)
         return True, f"s3://{bucket}/{key}"
     except Exception as exc:
         return False, f"{type(exc).__name__}: {exc}"
@@ -572,7 +578,7 @@ def _auto_generate_correlation_id() -> str:
     return str(uuid.uuid4())
 
 
-def _write_correlation_header(logf, correlation_id: str | None) -> None:
+def _write_correlation_header(logf: IO[bytes], correlation_id: str | None) -> None:
     """Write the ``# correlation-id: ...`` header line into the log file.
 
     Best-effort (never raises). Written before the inner command's output
@@ -662,7 +668,7 @@ def run(
     # I11101). Corroborates (or vetoes) a text-only OOM classification —
     # see resource_kill.classify's corroboration gate. Most captures never
     # carry one; that is the ordinary case, not a gap.
-    last_rss_reading: Optional[dict] = None
+    last_rss_reading: Optional[dict[str, object]] = None
     exit_code = 1
     orphan_note: Optional[str] = None
     try:
@@ -773,8 +779,9 @@ def run(
                 last_output_line=last_output_line,
                 cause_line=last_cause_line,
                 kill_line=last_kill_line,
-                peak_rss_kb=(last_rss_reading or {}).get("peak_rss_kb"),
-                mem_total_kb=(last_rss_reading or {}).get("mem_total_kb"),
+                # The reading is parsed JSON; the harness writes these as ints.
+                peak_rss_kb=cast("int | None", (last_rss_reading or {}).get("peak_rss_kb")),
+                mem_total_kb=cast("int | None", (last_rss_reading or {}).get("mem_total_kb")),
             )
             print(failure_msg, file=sys.stderr)
             _append_log(log_path, failure_msg + "\n")
@@ -874,7 +881,7 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.WARNING)
 
-    inner = args.inner_cmd or []
+    inner: list[str] = args.inner_cmd or []
     if inner and inner[0] == "--":
         inner = inner[1:]
     if not inner:

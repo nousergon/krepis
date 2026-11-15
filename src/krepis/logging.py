@@ -40,7 +40,7 @@ import re
 import sys
 from collections.abc import Generator
 from datetime import datetime, timezone
-from typing import Callable, Optional
+from typing import Callable, Optional, Protocol, TypedDict, TypeVar, cast
 
 # ``${VAR}`` interpolation tokens in a flow-doctor.yaml. flow-doctor
 # resolves these from ``os.environ`` eagerly at ``FlowDoctor.from_config()``
@@ -51,6 +51,23 @@ _FD_VAR_RE = re.compile(r"\$\{([A-Z][A-Z0-9_]*)\}")
 # Singleton populated by setup_logging() when FLOW_DOCTOR_ENABLED=1.
 # ``Optional[object]`` typing avoids forcing a flow_doctor import here.
 _fd_instance: Optional[object] = None
+
+_R = TypeVar("_R")
+
+
+class _FlowDoctorLike(Protocol):
+    """The two ``flow_doctor.FlowDoctor`` methods this module calls."""
+
+    def guard(self) -> contextlib.AbstractContextManager[object]: ...
+
+    def report(self, error: BaseException, /) -> object: ...
+
+
+class _HandlerKwargs(TypedDict, total=False):
+    """Keyword arguments setup_logging forwards to ``FlowDoctorHandler``."""
+
+    level: int
+    exclude_patterns: list[str]
 
 
 class JSONFormatter(logging.Formatter):
@@ -67,7 +84,7 @@ class JSONFormatter(logging.Formatter):
         if record.exc_info and record.exc_info[0] is not None:
             entry["exc"] = self.formatException(record.exc_info)
         if hasattr(record, "ctx"):
-            entry["ctx"] = record.ctx
+            entry["ctx"] = getattr(record, "ctx")
         return json.dumps(entry, default=str)
 
 
@@ -210,7 +227,9 @@ def guard_entrypoint() -> Generator[None, None, None]:
             with guard_entrypoint():
                 run_pipeline()
     """
-    fd = _fd_instance
+    # flow_doctor is an optional dependency, so the singleton is held as
+    # ``object``; it is only ever a FlowDoctor when set.
+    fd = cast("Optional[_FlowDoctorLike]", _fd_instance)
     if fd is None:
         yield
         return
@@ -218,7 +237,7 @@ def guard_entrypoint() -> Generator[None, None, None]:
         yield
 
 
-def monitor_handler(func: Callable) -> Callable:
+def monitor_handler(func: Callable[..., _R]) -> Callable[..., _R]:
     """Decorator form of :func:`guard_entrypoint` for Lambda handlers.
 
     ``fd`` is resolved at call time (not decoration time) so it works when the
@@ -230,8 +249,8 @@ def monitor_handler(func: Callable) -> Callable:
             ...
     """
     @functools.wraps(func)
-    def wrapper(*args: object, **kwargs: object) -> object:
-        fd = _fd_instance
+    def wrapper(*args: object, **kwargs: object) -> _R:
+        fd = cast("Optional[_FlowDoctorLike]", _fd_instance)  # see guard_entrypoint
         if fd is None:
             return func(*args, **kwargs)
         try:
@@ -457,7 +476,7 @@ def _attach_flow_doctor(
         _log.warning("flow-doctor inactive (dev): construction failed: %s", exc)
         return
 
-    handler_kwargs: dict = {"level": logging.ERROR}
+    handler_kwargs: _HandlerKwargs = {"level": logging.ERROR}
     if exclude_patterns:
         handler_kwargs["exclude_patterns"] = exclude_patterns
     handler = flow_doctor.FlowDoctorHandler(_fd_instance, **handler_kwargs)

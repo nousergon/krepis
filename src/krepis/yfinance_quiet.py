@@ -36,13 +36,14 @@ from __future__ import annotations
 import contextlib
 import functools
 import logging
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Generator, Mapping
+from typing import TypeVar
 
 __all__ = ["quiet_yfinance", "yf_quiet", "log_yf_coverage"]
 
 
 @contextlib.contextmanager
-def quiet_yfinance():
+def quiet_yfinance() -> Generator[None, None, None]:
     """Demote yfinance's internal logger to CRITICAL for the duration of a fetch.
 
     yfinance emits an ERROR record per failing symbol (and several distinctly
@@ -62,11 +63,14 @@ def quiet_yfinance():
         yf_logger.setLevel(prior_level)
 
 
-def yf_quiet(fn: Callable) -> Callable:
+_R = TypeVar("_R")
+
+
+def yf_quiet(fn: Callable[..., _R]) -> Callable[..., _R]:
     """Run a yfinance fetcher under :func:`quiet_yfinance` (see rationale there)."""
 
     @functools.wraps(fn)
-    def wrapper(*args, **kwargs):
+    def wrapper(*args: object, **kwargs: object) -> _R:
         with quiet_yfinance():
             return fn(*args, **kwargs)
 
@@ -76,8 +80,8 @@ def yf_quiet(fn: Callable) -> Callable:
 def log_yf_coverage(
     logger: logging.Logger,
     kind: str,
-    requested: Iterable[str],
-    covered: Collection[str] | dict,
+    requested: Collection[str],
+    covered: Collection[str] | Mapping[str, object],
     *,
     error_on_empty: bool = False,
     note: str = "",
