@@ -32,10 +32,27 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Final
+from collections.abc import Mapping
+from typing import Final, Protocol, TypedDict, cast
 from krepis import s3_surface
 
 logger = logging.getLogger(__name__)
+
+
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
+class _GetObjectResponse(TypedDict):
+    Body: _StreamingBody
+
+
+class _S3MarkerClient(Protocol):
+    """The boto3 S3 client methods this module calls (boto3 ships no stubs)."""
+
+    def get_object(self, *, Bucket: str, Key: str) -> _GetObjectResponse: ...
+
+    def put_object(self, *, Bucket: str, Key: str, Body: bytes, ContentType: str) -> object: ...
 
 DEFAULT_DEDUP_BUCKET: Final[str] = "alpha-engine-research"
 
@@ -83,16 +100,18 @@ def check_marker(
     suppresses subsequent effects indefinitely.
     """
     try:
-        import boto3
-        from botocore.exceptions import ClientError
+        import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
+        from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs
     except ImportError as exc:
         return False, f"boto3 unavailable: {exc!r}"
     client = boto3.client("s3")
     try:
-        resp = client.get_object(Bucket=bucket, Key=key)
+        resp = cast("_S3MarkerClient", client).get_object(Bucket=bucket, Key=key)
         payload = json.loads(resp["Body"].read())
     except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
+        # botocore leaves ClientError.response unannotated; it is the parsed
+        # error body, whose "Error" member maps string keys to strings.
+        code = cast("Mapping[str, Mapping[str, str]]", exc.response).get("Error", {}).get("Code", "")
         if code == "NoSuchKey":
             return False, "no marker"
         logger.warning(
@@ -144,8 +163,8 @@ def write_marker(
     time within the window).
     """
     try:
-        import boto3
-        from botocore.exceptions import ClientError
+        import boto3  # pyright: ignore[reportMissingTypeStubs]  # boto3 ships no stubs
+        from botocore.exceptions import ClientError  # pyright: ignore[reportMissingTypeStubs]  # botocore ships no stubs
     except ImportError as exc:
         logger.warning(
             "dedup: marker write skipped — boto3 unavailable: %s", exc,
@@ -156,12 +175,14 @@ def write_marker(
     first_published_at = now_iso
     publish_count = 1
     try:
-        resp = client.get_object(Bucket=bucket, Key=key)
+        resp = cast("_S3MarkerClient", client).get_object(Bucket=bucket, Key=key)
         prior = json.loads(resp["Body"].read())
         first_published_at = prior.get("first_published_at", now_iso)
         publish_count = int(prior.get("publish_count", 0)) + 1
     except ClientError as exc:
-        code = exc.response.get("Error", {}).get("Code", "")
+        # botocore leaves ClientError.response unannotated; it is the parsed
+        # error body, whose "Error" member maps string keys to strings.
+        code = cast("Mapping[str, Mapping[str, str]]", exc.response).get("Error", {}).get("Code", "")
         if code != "NoSuchKey":
             logger.warning(
                 "dedup: marker RMW read failed (writing fresh): %s", exc,
@@ -177,7 +198,7 @@ def write_marker(
         "message_preview": message_preview[:200],
     }
     try:
-        client.put_object(
+        cast("_S3MarkerClient", client).put_object(
             Bucket=bucket,
             Key=key,
             Body=json.dumps(payload).encode("utf-8"),

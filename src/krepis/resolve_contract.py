@@ -41,9 +41,10 @@ boundary, not an object that happens to serialise to one.
 from __future__ import annotations
 
 import json
-from typing import Any, Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Tuple, get_args
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import JsonSchemaValue
 
 from .router import EXEC_CONTEXTS, RESOLVE_SCHEMA_VERSION, WIRE_FORMATS
 
@@ -67,19 +68,22 @@ SCHEMA_ID = (
 #: there is no single one: the router carries no route-keyed table (endpoints
 #: are registry-owned, alpha-engine-config-I6186), and the registry's own
 #: ``route`` field is the authority.
-RESOLVE_ROUTES = ("litellm_proxy", "egress_proxy", "openrouter", "direct")
+ResolveRoute = Literal["litellm_proxy", "egress_proxy", "openrouter", "direct"]
+RESOLVE_ROUTES: Tuple[ResolveRoute, ...] = get_args(ResolveRoute)
 
 #: What KIND of name ``model``/``deployment_id`` carries.
-WIRE_ADDRESSING = ("group", "capability_group", "deployment")
+WireAddressing = Literal["group", "capability_group", "deployment"]
+WIRE_ADDRESSING: Tuple[WireAddressing, ...] = get_args(WireAddressing)
 
 #: Which credential the caller must present. Mirrors the
 #: ``auth_token_type`` -> secret-name table in :mod:`krepis.router`.
-AUTH_TOKEN_TYPES = (
+AuthTokenType = Literal[
     "placeholder",
     "openrouter_key",
     "litellm_master_key",
     "direct_api_key",
-)
+]
+AUTH_TOKEN_TYPES: Tuple[AuthTokenType, ...] = get_args(AuthTokenType)
 
 
 class ResolveCapabilities(BaseModel):
@@ -173,7 +177,7 @@ class ResolveContract(BaseModel):
             "Upstream provider, or 'litellm' when the central router is serving."
         ),
     )
-    route: Literal[RESOLVE_ROUTES] = Field(  # type: ignore[valid-type]
+    route: ResolveRoute = Field(
         description="Which transport serves this group.",
     )
     api_base_url: str = Field(
@@ -202,7 +206,7 @@ class ResolveContract(BaseModel):
             "`model` for consumers that read this key."
         ),
     )
-    wire_addressing: Optional[Literal[WIRE_ADDRESSING]] = Field(  # type: ignore[valid-type]
+    wire_addressing: Optional[WireAddressing] = Field(
         default=None,
         description=(
             "What KIND of name `model`/`deployment_id` is. 'group' and "
@@ -213,7 +217,7 @@ class ResolveContract(BaseModel):
             "older than that fix."
         ),
     )
-    auth_token_type: Literal[AUTH_TOKEN_TYPES] = Field(  # type: ignore[valid-type]
+    auth_token_type: AuthTokenType = Field(
         description=(
             "Which credential the caller must present. 'placeholder' means the "
             "egress proxy injects the real key."
@@ -256,7 +260,7 @@ class ResolveContract(BaseModel):
     capabilities: ResolveCapabilities = Field(
         description="Per-model feature flags as declared in the registry.",
     )
-    params: Dict[str, Any] = Field(
+    params: Dict[str, object] = Field(
         description=(
             "Model params from the registry (max_tokens, reasoning, "
             "structured_outputs)."
@@ -323,7 +327,7 @@ class ResolveContract(BaseModel):
     )
 
 
-def resolve_json_schema() -> dict:
+def resolve_json_schema() -> JsonSchemaValue:
     """The JSON Schema for :class:`ResolveContract`, as a dict."""
     return ResolveContract.model_json_schema()
 
