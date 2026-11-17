@@ -127,7 +127,7 @@ dev = [
     # so this guards the contract seam, not a production outage
     # (alpha-engine-config-I13364). Remove when the seam is re-pointed at the
     # new module and the suite passes on the newest release.
-    "litellm>=1.0,<1.109; python_version >= '3.11'",
+    "litellm>=1.0,<1.110; python_version >= '3.11'",
     # Validates the router resolve contract against resolve_schema.json.
     # Declared (not merely assumed present) so the contract test RUNS in CI
     # instead of importorskip'ing itself into silence -- an unrun guard is
