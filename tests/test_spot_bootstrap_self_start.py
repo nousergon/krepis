@@ -104,7 +104,12 @@ def test_unit_file_passes_systemd_analyze_verify(tmp_path):
         ["systemd-analyze", "verify", str(path)], capture_output=True, text=True
     )
     assert proc.returncode == 0, proc.stderr
-    assert proc.stderr.strip() == "", proc.stderr
+    # `verify` also scans the host's own /usr/lib/systemd units and reports
+    # their deprecations (runner image ubuntu: xfs_scrub_all.service,
+    # walinuxagent.service ... "CPUAccounting= has been removed"). Those are
+    # not ours; any diagnostic that names OUR unit still fails.
+    ours = [ln for ln in proc.stderr.splitlines() if ln.strip() and path.name in ln]
+    assert ours == [], proc.stderr
 
 
 def test_percent_in_description_is_escaped_for_systemd():
