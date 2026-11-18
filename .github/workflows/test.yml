@@ -16,7 +16,10 @@ on:
 jobs:
   test:
     name: pytest (py${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    # ubuntu-latest moved to 26.04, which has no Python 3.9 build for
+    # actions/setup-python ("version '3.9' ... was not found for Ubuntu 26.04").
+    # Keep the declared-floor leg on 24.04 so the floor stays tested.
+    runs-on: ${{ matrix.python-version == '3.9' && 'ubuntu-24.04' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
