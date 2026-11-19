@@ -16,7 +16,7 @@ class AdmissionRefused(ValueError):
     """A candidate or request does not satisfy the authenticated workload policy."""
 
 
-def _text(value: str, field: str) -> None:
+def _text(value: object, field: str) -> None:
     if not isinstance(value, str) or not value.strip() or len(value) > 512:
         raise ValueError("invalid " + field)
 
