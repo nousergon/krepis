@@ -50,6 +50,103 @@
 #
 # version: 1
 cards:
+  # Claude 5 generation: official direct API prices, verified 2026-11-19.
+  # https://platform.claude.com/docs/en/about-claude/pricing
+  # Launch dates: https://www.anthropic.com/news/claude-fable-5-mythos-5
+  # https://www.anthropic.com/news/claude-sonnet-5
+  # https://www.anthropic.com/news/claude-opus-5
+  # https://www.anthropic.com/claude-fable-and-mythos-5-1
+  # https://www.anthropic.com/claude-fable-and-mythos-5-2
+  # https://www.anthropic.com/claude-opus-5-5
+  # https://www.anthropic.com/claude-sonnet-5-5
+  # https://www.anthropic.com/claude-haiku-5-5
+  # The Haiku launch also halved Sonnet 5.5 cache reads on October 7.
+  - model_name: claude-opus-5
+    effective_from: 2026-07-24
+    input_per_1m: 5
+    output_per_1m: 25
+    cache_read_per_1m: 0.5
+    cache_create_per_1m: 6.25
+    cache_create_1h_per_1m: 10
+  - model_name: claude-opus-5-5
+    effective_from: 2026-09-22
+    input_per_1m: 4
+    output_per_1m: 20
+    cache_read_per_1m: 0.2
+    cache_create_per_1m: 5.0
+    cache_create_1h_per_1m: 8
+  - model_name: claude-sonnet-5
+    effective_from: 2026-06-30
+    input_per_1m: 2
+    output_per_1m: 10
+    cache_read_per_1m: 0.2
+    cache_create_per_1m: 2.5
+    cache_create_1h_per_1m: 4
+  - model_name: claude-sonnet-5-5
+    effective_from: 2026-09-28
+    input_per_1m: 2
+    output_per_1m: 10
+    cache_read_per_1m: 0.2
+    cache_create_per_1m: 2.5
+    cache_create_1h_per_1m: 4
+  - model_name: claude-sonnet-5-5
+    effective_from: 2026-10-07
+    input_per_1m: 2
+    output_per_1m: 10
+    cache_read_per_1m: 0.1
+    cache_create_per_1m: 2.5
+    cache_create_1h_per_1m: 4
+  - model_name: claude-fable-5
+    effective_from: 2026-06-09
+    input_per_1m: 10
+    output_per_1m: 50
+    cache_read_per_1m: 1
+    cache_create_per_1m: 12.5
+    cache_create_1h_per_1m: 20
+  - model_name: claude-mythos-5
+    effective_from: 2026-06-09
+    input_per_1m: 10
+    output_per_1m: 50
+    cache_read_per_1m: 1
+    cache_create_per_1m: 12.5
+    cache_create_1h_per_1m: 20
+  - model_name: claude-fable-5-1
+    effective_from: 2026-09-01
+    input_per_1m: 10
+    output_per_1m: 50
+    cache_read_per_1m: 0.25
+    cache_create_per_1m: 12.5
+    cache_create_1h_per_1m: 20
+  - model_name: claude-mythos-5-1
+    effective_from: 2026-09-01
+    input_per_1m: 10
+    output_per_1m: 50
+    cache_read_per_1m: 0.25
+    cache_create_per_1m: 12.5
+    cache_create_1h_per_1m: 20
+  - model_name: claude-fable-5-2
+    effective_from: 2026-11-09
+    input_per_1m: 8
+    output_per_1m: 40
+    cache_read_per_1m: 0.2
+    cache_create_per_1m: 10.0
+    cache_create_1h_per_1m: 16
+  - model_name: claude-mythos-5-2
+    effective_from: 2026-11-09
+    input_per_1m: 8
+    output_per_1m: 40
+    cache_read_per_1m: 0.2
+    cache_create_per_1m: 10.0
+    cache_create_1h_per_1m: 16
+  - model_name: claude-haiku-5-5
+    effective_from: 2026-10-07
+    input_per_1m: 0.1
+    output_per_1m: 0.5
+    cache_read_per_1m: 0.01
+    cache_create_per_1m: 0.125
+    cache_create_1h_per_1m: 0.2
+    prompt_tier_threshold: 100000
+    prompt_tier_multiplier: 5
   - model_name: claude-haiku-4-5
     effective_from: 2026-01-01
     input_per_1m: 1.00

@@ -141,6 +141,22 @@ class PriceCard(BaseModel):
     # rate), preserving behavior for cards authored before this field
     # existed. See ``compute_cost``'s ``cache_create_1h_tokens`` handling.
     cache_create_1h_per_1m: float | None = Field(default=None, ge=0.0)
+    # Optional all-token rate tier selected by total prompt size PER REQUEST,
+    # including both cache writes and reads. Never apply to an aggregate bucket.
+    prompt_tier_threshold: int | None = Field(default=None, gt=0)
+    prompt_tier_multiplier: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_prompt_tier(self) -> "PriceCard":
+        if self.prompt_tier_threshold is None and self.prompt_tier_multiplier != 1:
+            raise ValueError("prompt_tier_multiplier requires a prompt_tier_threshold")
+        return self
+
+    def prompt_multiplier(self, prompt_tokens: int) -> float:
+        """Select a request's token rate tier; flat tool fees never scale."""
+        if self.prompt_tier_threshold is not None and prompt_tokens > self.prompt_tier_threshold:
+            return self.prompt_tier_multiplier
+        return 1.0
 
 
 # ── Errors ────────────────────────────────────────────────────────────────
@@ -534,6 +550,9 @@ def compute_cost(
         + cache_create_1h_tokens * cache_create_1h_rate
     ) / _TOKENS_PER_PRICE_UNIT
 
+    cost *= card.prompt_multiplier(
+        input_tokens + cache_read_tokens + cache_create_tokens + cache_create_1h_tokens
+    )
     if tool_requests:
         for tool_name, count in tool_requests.items():
             if count <= 0:
@@ -623,6 +642,16 @@ def recompute_cost(
     """
     when = at if at is not None else datetime.now(timezone.utc)
     card = table.get(metadata.model_name, when)
+    if card.prompt_tier_threshold is not None and (
+        metadata.attempts > 1 or metadata.provider != "anthropic"
+    ):
+        # Aggregate attempts lose per-request prompt sizes, and the OpenAI
+        # adapter carries inclusive prompt counts rather than disjoint cache
+        # buckets. Neither is a valid input to a prompt-size tier. The record
+        # builders preserve tokens and emit cost_source=unpriced on this error.
+        raise PriceCardLookupError(
+            "Prompt-tier pricing needs disjoint native counters and single request boundaries"
+        )
 
     tool_requests = _tool_request_counts(metadata)
     tool_fees: dict[str, ToolFee] | None = None
