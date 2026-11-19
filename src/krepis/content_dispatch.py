@@ -16,10 +16,11 @@ Started/uncertain records retain capacity and are never automatically expired,
 cleared or retried. Recovery needs external effect evidence; this primitive
 intentionally exposes no unverified reset operation.
 """
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import hashlib
 import json
 import sqlite3
+import uuid
 from typing import Callable, Optional, cast
 
 from .workload_admission import (
@@ -93,9 +94,21 @@ class DispatchJournal:
                 result_json TEXT,
                 PRIMARY KEY(consumer,request_id));
         """)
-        db.execute("INSERT OR IGNORE INTO content_dispatch_config VALUES(1,1,?)", (max_inflight,))
-        if db.execute("SELECT version,capacity FROM content_dispatch_config WHERE singleton=1").fetchone() != (1, max_inflight):
-            raise ValueError("journal version/capacity mismatch")
+        db.execute("INSERT OR IGNORE INTO content_dispatch_config VALUES(1,2,?)", (max_inflight,))
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            version, capacity = db.execute("SELECT version,capacity FROM content_dispatch_config WHERE singleton=1").fetchone()
+            if version not in {1, 2} or capacity != max_inflight:
+                raise ValueError("journal version/capacity mismatch")
+            columns = {row[1] for row in db.execute("PRAGMA table_info(content_dispatch_attempts)")}
+            if "execution_id" not in columns:
+                db.execute("ALTER TABLE content_dispatch_attempts ADD COLUMN execution_id TEXT")
+            db.execute("CREATE UNIQUE INDEX IF NOT EXISTS content_dispatch_execution_id ON content_dispatch_attempts(execution_id)")
+            db.execute("UPDATE content_dispatch_config SET version=2 WHERE singleton=1")
+            db.execute("COMMIT")
+        except BaseException:
+            db.execute("ROLLBACK")
+            raise
         self.max_inflight = max_inflight
 
     def _durable(self) -> None:
@@ -108,7 +121,7 @@ class DispatchJournal:
             raise ValueError("durable synchronous disk-backed journal required")
 
     def _claim(self, consumer: str, request_id: str, binding: str,
-               candidate: ContentCandidate) -> None:
+               candidate: ContentCandidate) -> str:
         self._durable()
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -123,9 +136,13 @@ class DispatchJournal:
                 "SELECT COUNT(*) FROM content_dispatch_attempts WHERE status!='completed'").fetchone()[0]
             if count >= self.max_inflight:
                 raise CapacityUnavailable("unresolved attempt capacity exhausted")
-            self.db.execute("INSERT INTO content_dispatch_attempts VALUES(?,?,?,?,?,'started',NULL)",
-                            (consumer, request_id, binding, candidate.adapter_id, candidate.qualification_ref))
+            execution_id = uuid.uuid4().hex
+            self.db.execute("INSERT INTO content_dispatch_attempts "
+                            "(consumer,request_id,binding,adapter_id,qualification_ref,status,result_json,execution_id) "
+                            "VALUES(?,?,?,?,?,'started',NULL,?)",
+                            (consumer, request_id, binding, candidate.adapter_id, candidate.qualification_ref, execution_id))
             self.db.execute("COMMIT")
+            return execution_id
         except BaseException:
             self.db.execute("ROLLBACK")
             raise
@@ -180,10 +197,12 @@ class DispatchJournal:
         admit_content(profile, request, candidate, authenticated_consumer=authenticated_consumer)
         if len(content.encode("utf-8")) != request.input_bytes:
             raise ValueError("input size does not match complete rendered content")
-        self._claim(authenticated_consumer, request.request_id,
+        if request.execution_id:
+            raise ValueError("caller must not supply execution identity")
+        execution_id = self._claim(authenticated_consumer, request.request_id,
                        _binding(profile, request, candidate, content), candidate)
         try:
-            result = adapter(request, candidate, content)
+            result = adapter(replace(request, execution_id=execution_id), candidate, content)
             if not isinstance(result, ContentResult):
                 raise ValueError("adapter must return a normalized ContentResult")
             if len(result.text.encode("utf-8")) > request.output_bytes:

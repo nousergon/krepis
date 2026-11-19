@@ -42,7 +42,7 @@ def test_intent_is_durable_before_adapter_and_response_survives_restart(tmp_path
     def adapter(request, candidate, content):
         observer = m.DispatchJournal(connection(tmp_path / "journal.sqlite"), max_inflight=1)
         assert observer.status("consumer", "request") == "started"
-        assert (request, candidate, content) == (r, c, "hello")
+        assert (replace(request, execution_id=""), candidate, content) == (r, c, "hello")
         return m.ContentResult("answer", "served-model", "trace-1")
     result = dispatch(m, j, p, r, c, adapter)
     db.close()
@@ -177,3 +177,41 @@ def test_simultaneous_workers_cannot_both_claim_one_slot(tmp_path):
             release.set()
         for future in futures:
             future.result(timeout=5)
+
+
+def test_execution_identity_is_durable_and_unique_across_consumers(tmp_path):
+    m, db, j, p, r, c = fixture(tmp_path)
+    observed = []
+    def adapter(request, *args):
+        identity = request.execution_id
+        row = db.execute("SELECT execution_id FROM content_dispatch_attempts WHERE execution_id=?", (identity,)).fetchone()
+        assert row == (identity,)
+        observed.append(identity)
+        return m.ContentResult("ok", "served", identity)
+    dispatch(m, j, p, r, c, adapter)
+    dispatch(m, j, replace(p, consumer_id="other"), r, c, adapter, consumer="other")
+    assert len(set(observed)) == 2
+    assert all(len(identity) == 32 for identity in observed)
+
+
+def test_v1_journal_migrates_without_replaying_or_losing_result(tmp_path):
+    import json
+    m = api()
+    db = connection(tmp_path / "legacy.sqlite")
+    db.executescript("""
+      CREATE TABLE content_dispatch_config(singleton INTEGER PRIMARY KEY, version INTEGER, capacity INTEGER);
+      INSERT INTO content_dispatch_config VALUES(1,1,1);
+      CREATE TABLE content_dispatch_attempts(consumer TEXT,request_id TEXT,binding TEXT,adapter_id TEXT,qualification_ref TEXT,status TEXT,result_json TEXT,PRIMARY KEY(consumer,request_id));
+    """)
+    result = {"text":"old answer","served_model":"observed","trace_id":"old-receipt"}
+    db.execute("INSERT INTO content_dispatch_attempts VALUES(?,?,?,?,?,?,?)", ("consumer","old","binding","native","q","completed",json.dumps(result)))
+    journal = m.DispatchJournal(db, max_inflight=1)
+    assert journal.result("consumer", "old") == m.ContentResult(**result)
+    assert db.execute("SELECT version FROM content_dispatch_config").fetchone() == (2,)
+    assert db.execute("SELECT execution_id FROM content_dispatch_attempts").fetchone() == (None,)
+
+
+def test_intake_cannot_choose_durable_execution_identity(tmp_path):
+    m, _, j, p, r, c = fixture(tmp_path)
+    with pytest.raises(ValueError, match="caller"):
+        dispatch(m, j, p, replace(r, execution_id="e" * 32), c, lambda *a: pytest.fail("executed"))
