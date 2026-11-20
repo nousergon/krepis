@@ -69,8 +69,13 @@ class ContentRequest:
     input_bytes: int
     output_bytes: int
     timeout_seconds: int
+    execution_id: str = ""  # Minted durably by dispatch, never by caller intake.
 
     def __post_init__(self) -> None:
+        if self.execution_id != "":
+            _text(self.execution_id, "execution_id")
+        if self.execution_id and (len(self.execution_id) != 32 or any(c not in "0123456789abcdef" for c in self.execution_id)):
+            raise ValueError("invalid execution_id")
         for field in ("request_id", "profile_revision", "group", "data_class", "trigger"):
             _text(getattr(self, field), field)
         _number(self.input_bytes, "input_bytes", minimum=0)
