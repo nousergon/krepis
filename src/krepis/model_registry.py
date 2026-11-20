@@ -302,6 +302,20 @@ def entry_reachable_from(entry: RegistryEntryArg, exec_context: str) -> bool:  #
     return exec_context in declared
 
 
+def entry_transport(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExplicitAny]
+    """Return the declared transport; legacy entries remain API."""
+    transport = entry.get("execution_transport", "api")
+    if not isinstance(transport, str) or transport not in ("api", "native"):
+        raise ValueError(f"invalid execution transport: {transport!r}")
+    return transport
+
+
+def require_api_entry(entry: RegistryEntryArg) -> None:  # pyright: ignore[reportExplicitAny]
+    """Refuse native metadata before API credentials or deployments are derived."""
+    if entry_transport(entry) != "api":
+        raise ValueError("native execution transport cannot be used as an API deployment")
+
+
 class Registry:
     """A parsed registry: the derivation's shared intermediate representation.
 
@@ -314,6 +328,8 @@ class Registry:
         self.path = path
         self.doc = doc
         rows: List[RegistryMapping] = doc.get("models") or []
+        for row in rows:
+            entry_transport(row)
         self.models: Dict[str, RegistryMapping] = {
             m["id"]: m for m in rows if "id" in m
         }
@@ -321,20 +337,26 @@ class Registry:
 
     @property
     def live_models(self) -> Dict[str, RegistryMapping]:
-        """Every model whose ``status`` is not in :data:`EXCLUDED_STATUSES`.
+        """API models whose ``status`` is not in :data:`EXCLUDED_STATUSES`.
 
         A row with no ``status`` counts as live: the field is optional in the
         registry schema, and treating its absence as excluded would silently
         empty the config the first time somebody omitted it.
         """
+        return self.live_models_for("api")
+
+    def live_models_for(self, transport: str) -> Dict[str, RegistryMapping]:
+        """Live models for an explicitly selected execution transport."""
+        entry_transport({"execution_transport": transport})
         return {
             mid: entry
             for mid, entry in self.models.items()
             if entry.get("status") not in EXCLUDED_STATUSES
+            and entry_transport(entry) == transport
         }
 
     def live_group_ids(
-        self, group: str, *, requires: Tuple[str, ...] = ()
+        self, group: str, *, requires: Tuple[str, ...] = (), transport: str = "api"
     ) -> List[str]:
         """Live members of *group*, in declared order, with each drop logged.
 
@@ -345,6 +367,8 @@ class Registry:
         found" — a worse outcome than the dead member the filter exists to
         remove.
 
+        *transport* defaults to API; native selection must be explicit.
+
         *requires* narrows further to members declaring EVERY named capability
         (:data:`ROUTABLE_CAPABILITIES`). Status and capability are two different
         rejections and are logged as two different reasons: a member excluded
@@ -352,7 +376,7 @@ class Registry:
         for this call shape.
         """
         live: List[str] = []
-        for mid, _reason in self._group_members(group, requires=requires):
+        for mid, _reason in self._group_members(group, requires=requires, transport=transport):
             if _reason is None:
                 live.append(mid)
         if not live:
@@ -364,9 +388,10 @@ class Registry:
         return live
 
     def _group_members(
-        self, group: str, *, requires: Tuple[str, ...] = ()
+        self, group: str, *, requires: Tuple[str, ...] = (), transport: str = "api"
     ) -> Iterator[Tuple[str, Optional[str]]]:
         """Yield ``(member_id, rejection_reason_or_None)`` in declared order."""
+        entry_transport({"execution_transport": transport})
         for mid in self.groups.get(group, []):
             entry = self.models.get(mid)
             if entry is None:
@@ -374,6 +399,9 @@ class Registry:
                     "model %r referenced in group %r is not in the models list", mid, group
                 )
                 yield mid, "not present in the models list"
+                continue
+            if entry_transport(entry) != transport:
+                yield mid, f"execution transport is {entry_transport(entry)!r}, requested {transport!r}"
                 continue
             status = entry.get("status")
             if status in EXCLUDED_STATUSES:
@@ -398,21 +426,22 @@ class Registry:
             yield mid, None
 
     def capability_rejections(
-        self, group: str, *, requires: Tuple[str, ...] = ()
+        self, group: str, *, requires: Tuple[str, ...] = (), transport: str = "api"
     ) -> List[Tuple[str, str]]:
         """Every member of *group* that was rejected, with the reason."""
         return [
             (mid, reason)
-            for mid, reason in self._group_members(group, requires=requires)
+            for mid, reason in self._group_members(group, requires=requires, transport=transport)
             if reason is not None
         ]
 
     def iter_live_groups(
-        self, *, requires: Tuple[str, ...] = ()
+        self, *, requires: Tuple[str, ...] = (), transport: str = "api"
     ) -> Iterator[Tuple[str, List[str]]]:
         """Yield ``(group, live_member_ids)`` for every group with a live member."""
+        entry_transport({"execution_transport": transport})
         for group in self.groups:
-            live = self.live_group_ids(group, requires=requires)
+            live = self.live_group_ids(group, requires=requires, transport=transport)
             if live:
                 yield group, live
 
@@ -448,6 +477,7 @@ def load_registry(path: Optional[Path] = None) -> Registry:
 
 def litellm_model(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Build the litellm model string: ``openai/deepseek-v4-flash`` etc."""
+    require_api_entry(entry)
     route = entry.get("route", "")
     provider = entry.get("provider", "")
     model = entry.get("model", "")
@@ -465,6 +495,7 @@ def litellm_model(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExpl
 
 def api_key_env(entry: RegistryEntryArg) -> str:  # pyright: ignore[reportExplicitAny]  # see RegistryEntryArg
     """Name of the environment variable holding this entry's credential."""
+    require_api_entry(entry)
     route = entry.get("route", "")
     provider = entry.get("provider", "")
 
