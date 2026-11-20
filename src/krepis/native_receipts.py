@@ -131,6 +131,24 @@ class ReceiptStore:
         if result.rowcount != 1:
             raise ReceiptRefused("receipt is not a pending physical send")
 
+    def deadline(self, execution_id: str) -> float:
+        """Trusted authorization's absolute Unix deadline for transport fencing."""
+        _execution(execution_id)
+        row = self.db.execute(
+            "SELECT expires_at FROM main.native_receipts WHERE execution_id=?", (execution_id,)).fetchone()
+        if row is None:
+            raise ReceiptRefused("execution is not authorized")
+        return float(row[0])
+
+    def counts(self) -> dict[str, int]:
+        """Durable state counts; claimed includes every unresolved physical send."""
+        result = {"authorized": 0, "claimed": 0, "completed": 0}
+        for state, count in self.db.execute("SELECT state,COUNT(*) FROM main.native_receipts GROUP BY state"):
+            if state not in result:
+                raise ValueError("unknown receipt state")
+            result[state] = int(count)
+        return result
+
     def status(self, execution_id: str) -> Optional[str]:
         _execution(execution_id)
         row = self.db.execute("SELECT state FROM main.native_receipts WHERE execution_id=?", (execution_id,)).fetchone()

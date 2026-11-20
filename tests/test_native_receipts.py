@@ -144,3 +144,18 @@ def test_dedicated_reader_opens_without_write_access(tmp_path):
     readonly = sqlite3.connect(path.as_uri()+'?mode=ro', uri=True, isolation_level=None, timeout=0)
     reader = m.ReceiptStore(readonly, initialize=False)
     assert reader.read(EXECUTION, 'thread', 0.1).served_model == 'actual'
+
+def test_transport_deadline_comes_from_durable_authorization(tmp_path):
+    m, _, db, store = fixture(tmp_path)
+    deadline = db.execute('SELECT expires_at FROM native_receipts WHERE execution_id=?',(EXECUTION,)).fetchone()[0]
+    assert store.deadline(EXECUTION) == deadline
+    with pytest.raises(m.ReceiptRefused):
+        store.deadline('b'*32)
+
+def test_durable_counts_include_unresolved_sends(tmp_path):
+    _, _, _, store = fixture(tmp_path)
+    assert store.counts() == {'authorized':1,'claimed':0,'completed':0}
+    receipt = store.claim(EXECUTION,'thread','upstream.test')
+    assert store.counts() == {'authorized':0,'claimed':1,'completed':0}
+    store.complete(receipt,served_model='actual',response_id='r')
+    assert store.counts() == {'authorized':0,'claimed':0,'completed':1}
