@@ -169,5 +169,8 @@ def test_boto3_client_built_with_resolve_region_never_raises_noregionerror(
     monkeypatch.setattr(aws_region, "_from_botocore_session", lambda: None)
     monkeypatch.setattr(aws_region, "_from_imds", lambda: None)
 
-    client = boto3.client("cloudwatch", region_name=aws_region.resolve_region())
+    client = boto3.client(
+        "cloudwatch", region_name=aws_region.resolve_region(),
+        aws_access_key_id="testing", aws_secret_access_key="testing",
+    )
     assert client.meta.region_name == aws_region.DEFAULT_REGION

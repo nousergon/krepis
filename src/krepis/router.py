@@ -1422,7 +1422,8 @@ def served_model_for_deployment(deployment_name: str) -> Optional[str]:
 
     registry = _mr.load_registry(reg_path)
     groups = registry.groups
-    models = registry.models
+    models = {mid: entry for mid, entry in registry.models.items()
+              if _mr.entry_transport(entry) == "api"}
     for group_name, group_ids in groups.items():
         prefix = f"{group_name}-"
         if not deployment_name.startswith(prefix):
@@ -1915,12 +1916,20 @@ def _resolve_group_json(
         _msg = "; ".join(_litellm_skip_reasons)
         logger.warning("LiteLLM proxy skipped for group %r: %s", group, _msg)
 
-    skips: list[dict] = []
+    skips: list[RegistryMapping] = []
 
     # Iterate the fallback chain — first CLI-compatible entry wins
     for mid in group_ids:
         entry = models_by_id.get(mid)
         if entry is None:
+            continue
+
+        if _mr.entry_transport(entry) != "api":
+            skips.append({
+                "registry_id": mid,
+                "provider": entry.get("provider", ""),
+                "reason": "Native execution transport is excluded from API resolution",
+            })
             continue
 
         # R4 — a deprecated or unavailable entry MUST NOT be reachable at
@@ -2833,8 +2842,7 @@ def _resolve_model_json(
         # and a hand-written model id has already silently killed a live
         # consumer once (morning-signal, 2026-07-15).
         addressable = sorted(
-            mid for mid, e in registry.models.items()
-            if e.get("status") not in _mr.EXCLUDED_STATUSES
+            mid for mid in registry.live_models
         )
         raise ValueError(
             f"Model id {model_id!r} is not in the registry. This function "
@@ -2844,6 +2852,7 @@ def _resolve_model_json(
             f"{addressable}"
         )
 
+    _mr.require_api_entry(entry)
     status = entry.get("status")
     if status in _mr.EXCLUDED_STATUSES:
         # R4: the derivation layer filters these out of the proxy config, so
