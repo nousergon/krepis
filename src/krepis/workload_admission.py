@@ -98,8 +98,15 @@ class ContentCandidate:
     execution_class: str
     billing: str
     qualification_ref: str
+    registry_id: str = ""
+    registry_revision: str = ""
 
     def __post_init__(self) -> None:
+        if self.registry_id or self.registry_revision:
+            _text(self.registry_id, "registry_id")
+            _text(self.registry_revision, "registry_revision")
+            if len(self.registry_revision) != 64 or any(c not in "0123456789abcdef" for c in self.registry_revision):
+                raise ValueError("invalid registry revision digest")
         for field in ("adapter_id", "group", "execution_class", "billing", "qualification_ref"):
             _text(getattr(self, field), field)
         _members(self.processors, "processors")

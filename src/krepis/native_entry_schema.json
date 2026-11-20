@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:krepis:native-entry:v1",
+  "title": "Native execution metadata v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "adapter_id",
+    "processors",
+    "execution_class",
+    "billing",
+    "qualification_ref",
+    "deployment_ref",
+    "served_models"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1,
+      "type": "integer"
+    },
+    "adapter_id": {
+      "$ref": "#/$defs/identity"
+    },
+    "processors": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identity"
+      }
+    },
+    "execution_class": {
+      "$ref": "#/$defs/identity"
+    },
+    "billing": {
+      "$ref": "#/$defs/identity"
+    },
+    "qualification_ref": {
+      "$ref": "#/$defs/identity"
+    },
+    "deployment_ref": {
+      "$ref": "#/$defs/identity"
+    },
+    "served_models": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identity"
+      }
+    }
+  },
+  "$defs": {
+    "identity": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "\\S"
+    }
+  }
+}

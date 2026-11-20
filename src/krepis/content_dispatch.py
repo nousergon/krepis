@@ -69,7 +69,12 @@ def _sets(value: object) -> list[str]:
 
 def _binding(profile: ContentProfile, request: ContentRequest,
              candidate: ContentCandidate, content: str) -> str:
-    raw = json.dumps([asdict(profile), asdict(request), asdict(candidate), content],
+    candidate_fields = asdict(candidate)
+    if not candidate.registry_id and not candidate.registry_revision:
+        # Preserve the durable binding of callers predating registry integration.
+        del candidate_fields["registry_id"]
+        del candidate_fields["registry_revision"]
+    raw = json.dumps([asdict(profile), asdict(request), candidate_fields, content],
                      default=_sets, sort_keys=True, separators=(",", ":"), allow_nan=False)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -111,6 +116,10 @@ class DispatchJournal:
             raise
         self.max_inflight = max_inflight
 
+    def verify_durability(self) -> None:
+        """Refuse unavailable durability before a service-owned journal write."""
+        self._durable()
+
     def _durable(self) -> None:
         if self.db.isolation_level is not None or self.db.in_transaction:
             raise ValueError("independent autocommit connection required")
@@ -121,7 +130,7 @@ class DispatchJournal:
             raise ValueError("durable synchronous disk-backed journal required")
 
     def _claim(self, consumer: str, request_id: str, binding: str,
-               candidate: ContentCandidate) -> str:
+               candidate: ContentCandidate, preflight: Optional[Callable[[], None]] = None) -> str:
         self._durable()
         self.db.execute("BEGIN IMMEDIATE")
         try:
@@ -136,6 +145,10 @@ class DispatchJournal:
                 "SELECT COUNT(*) FROM content_dispatch_attempts WHERE status!='completed'").fetchone()[0]
             if count >= self.max_inflight:
                 raise CapacityUnavailable("unresolved attempt capacity exhausted")
+            if preflight is not None:
+                # Trusted, bounded, effect-free check under the capacity lock.
+                # Refusal rolls back without claiming an execution or quota slot.
+                preflight()
             execution_id = uuid.uuid4().hex
             self.db.execute("INSERT INTO content_dispatch_attempts "
                             "(consumer,request_id,binding,adapter_id,qualification_ref,status,result_json,execution_id) "
@@ -185,9 +198,13 @@ class DispatchJournal:
         authenticated_consumer: str,
         content: str,
         adapter: Callable[[ContentRequest, ContentCandidate, str], object],
+        preflight: Optional[Callable[[], None]] = None,
     ) -> ContentResult:
         """Commit an attempt before its external effect; never retry on any failure.
 
+        The optional preflight runs under the claim lock and must perform only
+        bounded local policy/evidence reads, never sends or external effects.
+        Refusal does not claim capacity; the service records that refusal.
         No write lock is held while the adapter runs. Even cancellation is uncertain:
         the upstream may already have consumed quota. A persistence failure after a
         result leaves the started record blocking replay, rather than returning an
@@ -200,7 +217,7 @@ class DispatchJournal:
         if request.execution_id:
             raise ValueError("caller must not supply execution identity")
         execution_id = self._claim(authenticated_consumer, request.request_id,
-                       _binding(profile, request, candidate, content), candidate)
+                       _binding(profile, request, candidate, content), candidate, preflight)
         try:
             result = adapter(replace(request, execution_id=execution_id), candidate, content)
             if not isinstance(result, ContentResult):
