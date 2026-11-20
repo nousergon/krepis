@@ -403,3 +403,66 @@ def test_registry_snapshot_v1_wire_digest_is_stable():
         'sequence': [True, 1, 1.0, None, '\U0001f600'], '\U0001f600': 'text',
     }})
     assert registry.snapshot_revision() == '79dbaa1b53b9ea346474bccdabd3ca0d6d7608c3c1d2b06083f6ee9367d5af7b'
+
+
+def test_readiness_checks_current_binding_without_execution_or_journal_growth(harness):
+    service, state, calls, qualifications, journal = harness
+    proof = service.readiness('valid')
+    assert proof.schema_version == 1 and proof.ready is True
+    assert proof.quota == 'not_evaluated'
+    assert proof.registry_revision == qualifications[0].candidate.registry_revision
+    assert not calls
+    assert journal.db.execute('SELECT COUNT(*) FROM content_dispatch_attempts').fetchone()[0] == 0
+    assert journal.db.execute('SELECT COUNT(*) FROM content_service_events').fetchone()[0] == 0
+    state['qualified'] = False
+    assert service.readiness('valid').ready is False
+
+
+def test_readiness_rejects_revoked_identity(harness):
+    service, state, calls, _, _ = harness
+    state['authorized'] = False
+    with pytest.raises(ServiceRefused):
+        service.readiness('valid')
+    assert not calls
+
+
+def test_readiness_reports_uncertain_capacity_and_never_replays(harness):
+    service, _, calls, _, journal = harness
+    def fail(*args):
+        raise RuntimeError('ambiguous')
+    service.execute = fail
+    with pytest.raises(RuntimeError):
+        service.submit('valid', request_id='r', content='hi')
+    proof = service.readiness('valid')
+    assert proof.ready is False and proof.reason == 'capacity_unavailable'
+    assert journal.status('consumer', 'r') == 'uncertain'
+
+
+def test_readiness_rechecks_binding_after_qualification(harness):
+    service, state, _, _, _ = harness
+    def revoke(route):
+        state['authorized'] = False
+        return True
+    service.qualified = revoke
+    with pytest.raises(ServiceRefused):
+        service.readiness('valid')
+
+
+def test_readiness_refuses_unwritable_journal(harness):
+    service, _, _, _, journal = harness
+    journal.db.execute('PRAGMA query_only=ON')
+    with pytest.raises(sqlite3.OperationalError):
+        service.readiness('valid')
+
+
+def test_readiness_rechecks_final_qualification(harness):
+    service, state, _, _, _ = harness
+    original = service.load_binding
+    calls = []
+    def revoke(principal):
+        calls.append(1)
+        if len(calls) == 2:
+            state['qualified'] = False
+        return original(principal)
+    service.load_binding = revoke
+    assert service.readiness('valid').ready is False

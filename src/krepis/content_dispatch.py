@@ -129,6 +129,21 @@ class DispatchJournal:
         if not main or mode not in {"wal", "delete", "truncate", "persist"} or sync < 2:
             raise ValueError("durable synchronous disk-backed journal required")
 
+    def capacity_available(self) -> bool:
+        """Point-in-time capacity, never a reservation or provider quota claim."""
+        self.verify_durability()
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            # A read-only/query-only connection can pass durability and SELECT.
+            # Check local write admission without adding or modifying any record.
+            self.db.execute("UPDATE content_dispatch_attempts SET status=status WHERE 0")
+            count = self.db.execute(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM content_dispatch_attempts "
+                "WHERE status!='completed' LIMIT ?)", (self.max_inflight,)).fetchone()[0]
+            return count < self.max_inflight
+        finally:
+            self.db.execute("ROLLBACK")
+
     def _claim(self, consumer: str, request_id: str, binding: str,
                candidate: ContentCandidate, preflight: Optional[Callable[[], None]] = None) -> str:
         self._durable()

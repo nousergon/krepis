@@ -88,6 +88,18 @@ def _route(registry: Registry, group: str, mid: str, revision: str) -> NativeRou
     ), _text(entry.get("model")), _text(native["deployment_ref"]), frozenset(served_members))
 
 
+@dataclass(frozen=True)
+class ContentReadiness:
+    """Authenticated local admission snapshot; not a reservation or quota probe."""
+
+    ready: bool
+    reason: str
+    registry_revision: str
+    checked_at: float
+    schema_version: int = 1
+    quota: str = "not_evaluated"
+
+
 class ContentService:
     """Per-worker binding core sharing the durable dispatch journal's capacity.
 
@@ -205,6 +217,46 @@ class ContentService:
             return self.journal.dispatch(profile, request, route.candidate,
                                          authenticated_consumer=principal, content=content, adapter=invoke, preflight=preflight)
         raise ServiceRefused("no permitted qualified native content route")
+
+    def readiness(self, credentials: object) -> ContentReadiness:
+        """Check the current local admission path without executing or spending.
+
+        Trusted callbacks retain submit's bounded/effect-free contract. Quota is
+        not contacted or inferred. Submit repeats every check atomically with
+        its execution claim; this snapshot reserves nothing and may go stale.
+        Errors remain errors, never a fabricated healthy observation.
+        """
+        self.journal.verify_durability()
+        principal, binding = self._identity(credentials)
+        profile = binding.profile
+        registry = self.load_registry()
+        revision = _registry_revision(registry)
+        request = ContentRequest("readiness", profile.revision, profile.group,
+                                 binding.data_class, binding.trigger, 0,
+                                 profile.max_output_bytes, profile.timeout_seconds)
+        eligible = False
+        selected: Optional[NativeRoute] = None
+        for mid in registry.live_group_ids(profile.group, transport="native"):
+            route = _route(registry, profile.group, mid, revision)
+            try:
+                admit_content(profile, request, route.candidate, authenticated_consumer=principal)
+            except AdmissionRefused:
+                # Explicit negative observation below; no dispatch or fallback send.
+                continue
+            if self.qualified(route) is True:
+                eligible = True
+                selected = route
+                break
+        current_principal, current_binding = self._identity(credentials)
+        if (current_principal != principal or current_binding != binding
+                or _registry_revision(self.load_registry()) != revision):
+            raise ServiceRefused("service binding changed during readiness observation")
+        if selected is not None and self.qualified(selected) is not True:
+            eligible = False
+        capacity = self.journal.capacity_available()
+        reason = ("no_qualified_route" if not eligible else
+                  "capacity_unavailable" if not capacity else "locally_admissible")
+        return ContentReadiness(eligible and capacity, reason, revision, time.time())
 
     def status(self, credentials: object, request_id: str) -> Optional[str]:
         principal, _binding = self._identity(credentials)
