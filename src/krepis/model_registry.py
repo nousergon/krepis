@@ -51,6 +51,9 @@ so it is a parameter rather than a branch: an in-process router needs the key's
 
 from __future__ import annotations
 
+from datetime import date, datetime
+import hashlib
+import json
 import logging
 import os
 from pathlib import Path
@@ -316,6 +319,27 @@ def require_api_entry(entry: RegistryEntryArg) -> None:  # pyright: ignore[repor
         raise ValueError("native execution transport cannot be used as an API deployment")
 
 
+def _snapshot_value(value: object) -> object:
+    """Type-tag YAML values so dates cannot collide with strings or mappings."""
+    if value is None:
+        return ["null"]
+    if type(value) in (bool, int, float, str):
+        return [type(value).__name__, value]
+    if type(value) is datetime:
+        return ["datetime", value.isoformat()]
+    if type(value) is date:
+        return ["date", value.isoformat()]
+    if isinstance(value, list):
+        return ["list", [_snapshot_value(item) for item in cast(List[object], value)]]
+    if isinstance(value, dict):
+        mapping = cast(Dict[object, object], value)
+        if any(not isinstance(key, str) for key in mapping):
+            raise ValueError("registry snapshot keys must be strings")
+        entries = cast(Dict[str, object], mapping)
+        return ["mapping", [[key, _snapshot_value(entries[key])] for key in sorted(entries)]]
+    raise ValueError("unsupported registry snapshot value")
+
+
 class Registry:
     """A parsed registry: the derivation's shared intermediate representation.
 
@@ -334,6 +358,18 @@ class Registry:
             m["id"]: m for m in rows if "id" in m
         }
         self.groups: Dict[str, List[str]] = dict(doc.get("model_groups") or {})
+
+    def snapshot_revision(self) -> str:
+        """Versioned digest of the loaded snapshot, including YAML timestamps.
+
+        Mapping order is immaterial; sequence order and scalar types matter.
+        Unsupported values and nonfinite numbers fail closed. This is a content
+        identity, not proof of qualification or authorization. Changing from an
+        older digest algorithm invalidates its qualification references.
+        """
+        raw = json.dumps(["krepis.registry.snapshot.v1", _snapshot_value(self.doc)],
+                         separators=(",", ":"), allow_nan=False, ensure_ascii=False)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
     @property
     def live_models(self) -> Dict[str, RegistryMapping]:

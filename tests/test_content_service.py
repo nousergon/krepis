@@ -351,3 +351,55 @@ def test_duplicate_uncertain_request_does_not_claim_new_uncertainty(harness):
         "SELECT outcome FROM content_service_events ORDER BY event_id"
     ).fetchall()
     assert rows == [("uncertain",), ("refused",)]
+
+
+def test_registry_yaml_dates_do_not_prevent_qualified_dispatch(harness):
+    import yaml
+    service, state, calls, _, _ = harness
+    state['doc']['review'] = yaml.safe_load('expires: 2027-01-02\nchecked: 2027-01-01T12:00:00Z\n')
+    assert service.submit('valid', request_id='dated-registry', content='hi').text == 'reply'
+    assert len(calls) == 1
+
+
+def test_registry_revision_is_canonical_and_type_preserving():
+    from datetime import date, datetime, timezone
+    from krepis.content_service import _registry_revision
+
+    def revision(value):
+        return _registry_revision(Registry(Path('fixture'), {'models': [], 'metadata': value}))
+
+    assert revision({'a': 1, 'b': 2}) == revision({'b': 2, 'a': 1})
+    values = [date(2027, 1, 2), '2027-01-02', {'date': '2027-01-02'},
+              datetime(2027, 1, 2, tzinfo=timezone.utc), True, 1, 1.0, None, [], {}]
+    assert len({revision(value) for value in values}) == len(values)
+    assert revision([1, 2]) != revision([2, 1])
+
+
+@pytest.mark.parametrize('value', [float('nan'), float('inf'), {1: 'non-string key'}, {'unsupported'}])
+def test_registry_revision_rejects_unsupported_values(value):
+    from krepis.content_service import _registry_revision
+    with pytest.raises(ValueError):
+        _registry_revision(Registry(Path('fixture'), {'models': [], 'metadata': value}))
+
+
+@pytest.mark.parametrize('as_key', [False, True])
+def test_registry_revision_rejects_unicode_surrogates(as_key):
+    from krepis.content_service import _registry_revision
+    scalar = '\U0001f600'
+    surrogate_pair = '\ud83d\ude00'
+    assert scalar != surrogate_pair
+    good = {scalar: 'value'} if as_key else {'key': scalar}
+    bad = {surrogate_pair: 'value'} if as_key else {'key': surrogate_pair}
+    assert len(_registry_revision(Registry(Path('fixture'), {'models': [], 'metadata': good}))) == 64
+    with pytest.raises(ValueError):
+        _registry_revision(Registry(Path('fixture'), {'models': [], 'metadata': bad}))
+
+
+def test_registry_snapshot_v1_wire_digest_is_stable():
+    from datetime import date, datetime, timezone
+    registry = Registry(Path('fixture'), {'models': [], 'metadata': {
+        'expires': date(2027, 1, 2),
+        'checked': datetime(2027, 1, 1, 12, tzinfo=timezone.utc),
+        'sequence': [True, 1, 1.0, None, '\U0001f600'], '\U0001f600': 'text',
+    }})
+    assert registry.snapshot_revision() == '79dbaa1b53b9ea346474bccdabd3ca0d6d7608c3c1d2b06083f6ee9367d5af7b'

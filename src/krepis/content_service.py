@@ -13,7 +13,6 @@ cancellation and tool isolation. This core never makes a fallback attempt once
 an execution is claimed. It neither grants account access nor qualifies a host.
 """
 from dataclasses import dataclass
-import hashlib
 import json
 import time
 from typing import Callable, Optional, cast
@@ -57,8 +56,7 @@ class NativeRoute:
 def _registry_revision(registry: Registry) -> str:
     # Canonical data, not a file timestamp or caller-supplied revision. Any model
     # or group change invalidates the previous qualification and replay binding.
-    raw = json.dumps(registry.doc, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    return registry.snapshot_revision()
 
 
 def _route(registry: Registry, group: str, mid: str, revision: str) -> NativeRoute:
