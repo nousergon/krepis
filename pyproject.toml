@@ -157,7 +157,7 @@ where = ["src"]
 # execution context can be missing the control (see that module's docstring).
 # Dropping it from this list restores the outage it exists to close, silently —
 # `tests/test_session_dlp_packaged_config.py` fails if it is unreadable.
-"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "py.typed", "dlp_config/*.toml"]
+"krepis" = ["model_pricing.yaml", "cache_minimums.yaml", "fleet_event_schema_v1.json", "resolve_schema.json", "native_entry_schema.json", "py.typed", "dlp_config/*.toml"]
 
 [tool.uv]
 # uv.lock is the DEV lockfile only: CI (test.yml's 3.9-3.13 matrix) and every
