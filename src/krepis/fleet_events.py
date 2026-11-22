@@ -150,6 +150,7 @@ def _build_detail(
     delivery_tier: Optional[str] = None,
     alert_class: Optional[str] = None,
     registry_drift: Optional[bool] = None,
+    registry_unreadable: Optional[bool] = None,
 ) -> Dict[str, object]:
     hostname: Optional[str]
     try:
@@ -187,6 +188,9 @@ def _build_detail(
         "delivery_tier": delivery_tier,
         "alert_class": alert_class,
         "registry_drift": registry_drift,
+        # Distinguishes "registry could not be read" from "readable registry,
+        # no row for this source"; both set registry_drift and both page.
+        "registry_unreadable": registry_unreadable,
         "disable_notification": disable_notification,
         "runtime": {
             "lambda_function_name": os.environ.get("AWS_LAMBDA_FUNCTION_NAME"),
@@ -266,6 +270,7 @@ def emit_alert_event(
     delivery_tier: Optional[str] = None,
     alert_class: Optional[str] = None,
     registry_drift: Optional[bool] = None,
+    registry_unreadable: Optional[bool] = None,
 ) -> bool:
     """Emit one structured alert event to the Overseer intake. Never raises.
 
@@ -314,6 +319,7 @@ def emit_alert_event(
         delivery_tier=delivery_tier,
         alert_class=alert_class,
         registry_drift=registry_drift,
+        registry_unreadable=registry_unreadable,
     )
 
     try:

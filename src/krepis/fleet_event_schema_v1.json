@@ -157,6 +157,13 @@
     "null"
    ],
    "description": "alpha-engine-config-I6751. True when the source had no alert_classes row or the published tier registry was unreadable. Such an emission PAGES as the fail-upward default; this field is what makes the gap countable."
+  },
+  "registry_unreadable": {
+   "type": [
+    "boolean",
+    "null"
+   ],
+   "description": "alpha-engine-config-I13894. True only when the published tier registry could not be read (distinct from a readable registry with no row for the source, which sets registry_drift alone). Implies registry_drift; the emission pages either way. Absent or null on events from older producers."
   }
  },
  "additionalProperties": false

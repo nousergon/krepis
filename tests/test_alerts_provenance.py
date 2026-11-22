@@ -454,10 +454,10 @@ class TestProvenanceChangesNothingElse:
         _publish(fake, message="boom", source="metron")
         assert emit.call_args.kwargs["body"] == "boom"
 
-    def test_the_event_schema_gains_no_field(
+    def test_the_emitted_kwargs_are_exactly_the_documented_set(
         self, monkeypatch, ad_hoc_env, fake_boto3
     ):
-        """Additive-only would still be a schema change; this adds nothing."""
+        """Pins the emit contract; registry_unreadable (I13894) is the latest addition."""
         ad_hoc_env()
         fake, _sts, _sns = fake_boto3
         monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *_a, **_k: [])
@@ -467,7 +467,7 @@ class TestProvenanceChangesNothingElse:
         assert set(emit.call_args.kwargs) == {
             "origin", "body", "severity_raw", "source", "dedup_key", "channels",
             "state", "identity_key", "delivery_tier", "alert_class",
-            "registry_drift",
+            "registry_drift", "registry_unreadable",
         }
 
     def test_format_message_itself_is_unchanged(self):
@@ -475,3 +475,70 @@ class TestProvenanceChangesNothingElse:
         applied by ``publish``, so every consumer that calls ``_format_message``
         (or asserts on it) sees exactly what it saw before."""
         assert alerts._format_message("boom", "error", "metron") == "[ERROR] metron: boom"
+
+
+class TestRegistryUnreadablePropagation:
+    """alpha-engine-config-I13894: an unreadable registry is told apart from a
+    missing row on the result and on the bus event. Both still PAGE."""
+
+    def _run(self, monkeypatch, ad_hoc_env, fake_boto3):
+        ad_hoc_env()
+        fake, _sts, _sns = fake_boto3
+        monkeypatch.setattr(alerts, "_fetch_source_mutes", lambda *_a, **_k: [])
+        emit = MagicMock(return_value=True)
+        monkeypatch.setattr(alerts.fleet_events, "emit_alert_event", emit)
+        result, _tg = _publish(fake, message="boom", source="metron")
+        return result, emit
+
+    def test_unreadable_registry_flags_result_and_event_and_still_pages(
+        self, monkeypatch, ad_hoc_env, fake_boto3, tmp_path
+    ):
+        from krepis import alert_tiers
+
+        monkeypatch.setenv(alert_tiers.REGISTRY_PATH_ENV, str(tmp_path / "nope.json"))
+        alert_tiers.reset_cache()
+        result, emit = self._run(monkeypatch, ad_hoc_env, fake_boto3)
+        assert result.tier == alert_tiers.TIER_PAGE
+        assert result.registry_drift is True
+        assert result.registry_unreadable is True
+        assert emit.call_args.kwargs["registry_drift"] is True
+        assert emit.call_args.kwargs["registry_unreadable"] is True
+
+    def test_missing_row_is_drift_but_not_unreadable_and_still_pages(
+        self, monkeypatch, ad_hoc_env, fake_boto3, tmp_path
+    ):
+        import json
+
+        from krepis import alert_tiers
+
+        path = tmp_path / "reg.json"
+        path.write_text(json.dumps({
+            "schema_version": 1, "entries": [], "muted_topics": {},
+        }))
+        monkeypatch.setenv(alert_tiers.REGISTRY_PATH_ENV, str(path))
+        alert_tiers.reset_cache()
+        result, emit = self._run(monkeypatch, ad_hoc_env, fake_boto3)
+        assert result.tier == alert_tiers.TIER_PAGE
+        assert result.registry_drift is True
+        assert result.registry_unreadable is False
+        assert emit.call_args.kwargs["registry_unreadable"] is False
+
+    def test_successful_lookup_sets_neither_flag(
+        self, monkeypatch, ad_hoc_env, fake_boto3, tmp_path
+    ):
+        import json
+
+        from krepis import alert_tiers
+
+        path = tmp_path / "reg.json"
+        path.write_text(json.dumps({
+            "schema_version": 1, "muted_topics": {},
+            "entries": [{"class": "c", "source": "metron", "tier": "tracked-only",
+                         "severities": ["error"]}],
+        }))
+        monkeypatch.setenv(alert_tiers.REGISTRY_PATH_ENV, str(path))
+        alert_tiers.reset_cache()
+        result, emit = self._run(monkeypatch, ad_hoc_env, fake_boto3)
+        assert result.registry_drift is False
+        assert result.registry_unreadable is False
+        assert emit.call_args.kwargs["registry_unreadable"] is False
