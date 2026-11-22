@@ -42,7 +42,7 @@ import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Iterator, List, Optional
 
 from krepis.anthropic_payload import (
     build_messages_payload,
@@ -648,7 +648,7 @@ class LLMError(RuntimeError):
     tokens were consumed even though no valid output was produced.
     """
 
-    def __init__(self, message: str, *, usage: "Optional[LLMUsage]" = None):
+    def __init__(self, message: str, *, usage: "Optional[LLMUsage]" = None) -> None:
         super().__init__(message)
         self.usage = usage
 
@@ -857,7 +857,7 @@ class StreamIdleTimeoutError(LLMError):
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
         reasoning_chars: int = 0,
-    ):
+    ) -> None:
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
         #: Characters of REASONING delta (``reasoning_content`` /
@@ -903,7 +903,7 @@ class StreamTotalTimeoutError(LLMError):
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
         reasoning_chars: int = 0,
-    ):
+    ) -> None:
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
         #: Characters of REASONING delta (``reasoning_content`` /
@@ -955,7 +955,7 @@ def _close_stream(stream: Any) -> None:
 
 def _iter_with_idle_timeout(
     stream: Any, *, idle_timeout: float, total_timeout: Optional[float] = None
-):
+) -> Iterator[object]:
     """Yield items from *stream*, bounding the SILENCE BETWEEN them and,
     when *total_timeout* is given, the TOTAL wall-clock time spent iterating.
 
@@ -1687,7 +1687,7 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
-def _finalize_result(method):
+def _finalize_result(method: Callable[..., Any]) -> Callable[..., Any]:  # pyright: ignore[reportExplicitAny]
     """Stamp the call's degradation record onto the result, then emit a priced
     cost record for it.
 
@@ -1717,7 +1717,7 @@ def _finalize_result(method):
     """
 
     @functools.wraps(method)
-    def _wrapped(self, *args, **kwargs):
+    def _wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportExplicitAny]
         self.dropped_params = []
         self._dlp_facts = {}
         # Trace context first: the router-edge request carries its ids, so
@@ -1910,7 +1910,7 @@ class LLMClient:
         budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
         trace_sink: Optional[Callable[..., None]] = None,
         trace_capture: Optional[str] = None,
-    ):
+    ) -> None:
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
                 "LLMClient requires a non-empty callsite_id — it is the join "
@@ -2487,7 +2487,7 @@ class LLMClient:
             )
         return self._client
 
-    def _call_transport(self, fn, /, **kwargs):
+    def _call_transport(self, fn: Callable[..., Any], /, **kwargs: Any) -> Any:  # pyright: ignore[reportExplicitAny]
         """Issue one provider call, classifying its failure before anyone retries.
 
         A 4xx that refuses the REQUEST is permanent: no attempt count and no
@@ -3295,7 +3295,7 @@ class LLMClient:
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
         limit = self._effective_max_tokens(max_tokens)
 
-        def _parse_and_validate(raw_data: Any):
+        def _parse_and_validate(raw_data: Any) -> object:
             if is_pydantic:
                 parsed = schema.model_validate(raw_data)
             else:
