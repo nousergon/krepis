@@ -179,6 +179,13 @@ class TierDecision:
     #: rather than merely survivable (observability-policy.md §2.2 —
     #: coverage is derived, never hand-listed).
     registry_drift: bool = False
+    #: True only when the registry itself could not be read (missing or
+    #: unreadable file/object, bad JSON, unsupported schema_version). A
+    #: readable registry with no row for the source is ``registry_drift`` but
+    #: NOT unreadable: the first is an outage of the table, the second is a
+    #: gap in it, and they are fixed by different people. Both still page and
+    #: both still set ``registry_drift`` — this flag only tells them apart.
+    registry_unreadable: bool = False
     #: From the matched row. Consecutive detections of the same condition
     #: required before a `page` row actually pages.
     page_after_consecutive: int = 1
@@ -418,6 +425,7 @@ def resolve_tier(
             reason="delivery-tier registry unavailable — failing UPWARD to "
                    "page (see the ERROR log line for the cause)",
             registry_drift=True,
+            registry_unreadable=True,
         )
 
     rows = _match(source, list(doc.get("entries") or []))

@@ -796,6 +796,10 @@ class PublishResult:
     #: unreadable. The emission PAGED either way; this is what makes the gap
     #: countable rather than merely survivable (observability-policy.md §2.2).
     registry_drift: bool = False
+    #: True only when the registry could not be read at all (as opposed to a
+    #: readable registry lacking a row for the source). Implies
+    #: ``registry_drift``; the emission paged either way.
+    registry_unreadable: bool = False
     #: True when a ``page``-tier emission was delivered at ``notify-silent``
     #: because the condition has not yet survived ``page_after_consecutive``
     #: consecutive detections — a self-healing blip on a job whose own next
@@ -1767,6 +1771,7 @@ def publish(
     result.tier_reason = decision.reason
     result.alert_class = decision.alert_class
     result.registry_drift = decision.registry_drift
+    result.registry_unreadable = decision.registry_unreadable
     if decision.registry_drift:
         # ERROR, not WARNING: an unroutable source is a REGISTRY gap, and the
         # emission paged to cover for it. A WARNING is what this class of gap
@@ -1963,6 +1968,7 @@ def publish(
         delivery_tier=result.tier,
         alert_class=result.alert_class,
         registry_drift=result.registry_drift,
+        registry_unreadable=result.registry_unreadable,
     )
 
     # ── Total non-delivery is LOUD (alpha-engine-config-I9209) ───────────

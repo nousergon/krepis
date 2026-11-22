@@ -119,6 +119,49 @@ class TestEmitAlertEvent:
             )
         jsonschema.validate(_emitted_detail(events_client), schema)
 
+    def test_registry_unreadable_reaches_the_event_and_validates(
+        self, fake_events_boto3
+    ):
+        jsonschema = pytest.importorskip("jsonschema")
+        from pathlib import Path
+
+        schema = json.loads(
+            (
+                Path(fleet_events.__file__).parent / "fleet_event_schema_v1.json"
+            ).read_text()
+        )
+        fake, events_client, _ = fake_events_boto3
+        with patch.dict("sys.modules", {"boto3": fake}):
+            fleet_events.emit_alert_event(
+                origin="alerts.publish",
+                body="x",
+                registry_drift=True,
+                registry_unreadable=True,
+            )
+        detail = _emitted_detail(events_client)
+        assert detail["registry_unreadable"] is True
+        jsonschema.validate(detail, schema)
+
+    def test_event_without_registry_unreadable_still_validates(self):
+        """Backward compatibility: the field is optional, so an event from an
+        older producer (key absent) validates against the new schema."""
+        jsonschema = pytest.importorskip("jsonschema")
+        from pathlib import Path
+
+        schema = json.loads(
+            (
+                Path(fleet_events.__file__).parent / "fleet_event_schema_v1.json"
+            ).read_text()
+        )
+        assert "registry_unreadable" not in schema["required"]
+        detail = fleet_events._build_detail(
+            origin="alerts.publish", body="x", severity_raw="error",
+            source="s", dedup_key=None, channels=None,
+            disable_notification=None,
+        )
+        del detail["registry_unreadable"]
+        jsonschema.validate(detail, schema)
+
     def test_bus_env_override(self, fake_events_boto3, monkeypatch):
         fake, events_client, _ = fake_events_boto3
         monkeypatch.setenv(fleet_events.BUS_ENV, "custom-bus")

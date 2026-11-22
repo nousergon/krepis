@@ -49,6 +49,7 @@ def test_exact_source_resolves_its_declared_tier(tmp_path, monkeypatch):
     assert d.tier == alert_tiers.TIER_TRACKED_ONLY
     assert d.alert_class == "hygiene_thing"
     assert d.registry_drift is False
+    assert d.registry_unreadable is False
 
 
 def test_unknown_source_pages_and_is_marked_as_drift(tmp_path, monkeypatch):
@@ -59,6 +60,8 @@ def test_unknown_source_pages_and_is_marked_as_drift(tmp_path, monkeypatch):
     d = alert_tiers.resolve_tier("a-source-nobody-declared", "info")
     assert d.tier == alert_tiers.TIER_PAGE
     assert d.registry_drift is True
+    # A readable registry with a missing row is drift, NOT an unreadable one.
+    assert d.registry_unreadable is False
 
 
 def test_missing_source_pages(tmp_path, monkeypatch):
@@ -67,6 +70,7 @@ def test_missing_source_pages(tmp_path, monkeypatch):
         d = alert_tiers.resolve_tier(empty, "info")
         assert d.tier == alert_tiers.TIER_PAGE
         assert d.registry_drift is True
+        assert d.registry_unreadable is False
 
 
 def test_unreadable_registry_fails_upward_to_page(tmp_path, monkeypatch):
@@ -75,6 +79,7 @@ def test_unreadable_registry_fails_upward_to_page(tmp_path, monkeypatch):
     d = alert_tiers.resolve_tier("anything", "info")
     assert d.tier == alert_tiers.TIER_PAGE
     assert d.registry_drift is True
+    assert d.registry_unreadable is True
 
 
 def test_unknown_schema_version_is_refused_rather_than_guessed(tmp_path, monkeypatch):
@@ -85,6 +90,7 @@ def test_unknown_schema_version_is_refused_rather_than_guessed(tmp_path, monkeyp
     d = alert_tiers.resolve_tier("s", "info")
     assert d.tier == alert_tiers.TIER_PAGE
     assert d.registry_drift is True
+    assert d.registry_unreadable is True
 
 
 def test_dynamic_row_resolves_from_severity(tmp_path, monkeypatch):
