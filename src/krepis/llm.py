@@ -42,7 +42,7 @@ import time as _time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from typing import Any, Callable, List, Optional
+from typing import Any, Callable, Iterator, List, Optional
 
 from krepis.anthropic_payload import (
     build_messages_payload,
@@ -124,14 +124,84 @@ def _warn_dlp_disabled_once() -> None:
     )
 
 
-def _check_fallback_transition(group: str, fallback_used: bool, served_model: str, primary: str) -> None:
-    """Log a warning/info when a group enters or exits fallback.
+#: Alert-tier registry key for a fallback-engaged alert. The delivery tier is
+#: resolved from the registry by this source (``krepis.alert_tiers``), never
+#: from severity; a source with no row pages and is recorded as registry drift,
+#: so the row belongs in the registry's ``playbooks.yaml`` (a notify-silent or
+#: tracked-only class — serving from a fallback is degraded, not down).
+FALLBACK_ALERT_SOURCE = "krepis.llm.fallback"
+
+#: Cross-process dedup window for the engaged alert. The in-process
+#: ``_fallback_state`` already makes one alert per episode per process; this
+#: bounds a fleet of short-lived processes (each starts with empty state)
+#: that all meet the same outage.
+FALLBACK_ALERT_DEDUP_WINDOW_MIN = 60
+
+#: Unavailable failure cause, stated explicitly rather than left blank.
+FALLBACK_CAUSE_UNKNOWN = "unknown"
+
+
+def _fallback_cause(resp: object) -> str:
+    """The failure cause the response exposes, else :data:`FALLBACK_CAUSE_UNKNOWN`.
+
+    The proxy walks the chain server-side and the completion response carries
+    only the serving deployment, so the cause is usually not available here.
+    A response object that does carry one (``fallback_cause``) is honoured.
+    """
+    cause = getattr(resp, "fallback_cause", None)
+    if isinstance(cause, str) and cause.strip():
+        return cause.strip()
+    return FALLBACK_CAUSE_UNKNOWN
+
+
+def _publish_fallback_alert(group: str, primary: str, served_model: str, cause: str) -> str | None:
+    """Publish the engaged alert through the alert-tier registry. Never raises.
+
+    Returns ``None`` on delivery, else a short description of the failure. The
+    completed LLM call must still return, so every error is contained and made
+    observable through an ERROR log and the return value.
+    """
+    try:
+        from krepis import alerts
+
+        outcome = alerts.publish(
+            f"LLM group {group!r} is serving from a fallback: configured primary "
+            f"{primary}, serving substitute {served_model}, failure cause {cause}.",
+            severity="warning",
+            source=FALLBACK_ALERT_SOURCE,
+            dedup_key=f"llm-fallback:{group}:{primary}:{served_model}",
+            dedup_window_min=FALLBACK_ALERT_DEDUP_WINDOW_MIN,
+            raise_on_total_failure=False,
+        )
+        if not outcome.any_ok:
+            raise RuntimeError("no delivery surface accepted the alert")
+        return None
+    except Exception as exc:  # noqa: BLE001 - the LLM call has already succeeded
+        detail = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "fallback alert for group %r (primary %s, served by %s) was NOT "
+            "delivered: %s",
+            group, primary, served_model, detail,
+        )
+        return detail
+
+
+def _check_fallback_transition(
+    group: str,
+    fallback_used: bool,
+    served_model: str,
+    primary: str,
+    cause: str = FALLBACK_CAUSE_UNKNOWN,
+) -> str | None:
+    """Log and alert when a group enters or exits fallback.
 
     Called by :meth:`LLMClient._stamp_fallback_facts` on every completed
     router-edge call, so the operator sees exactly when a backup model signs
     on and when the primary recovers.  ``model-router-policy`` R12 makes
-    serving from a fallback an ALERT, and the WARNING below is the line an
-    alert rule can key on.
+    serving from a fallback an ALERT: the entry transition publishes one alert
+    (:func:`_publish_fallback_alert`) and logs the WARNING an alert rule can
+    key on. Calls within the same episode alert nothing; recovery clears the
+    episode, so a later fallback alerts again.
 
     It had ZERO call sites until alpha-engine-config-I9995 — the only writer
     of ``_fallback_state`` was never reached, so the transition it exists to
@@ -140,19 +210,25 @@ def _check_fallback_transition(group: str, fallback_used: bool, served_model: st
     *primary* is the DEPLOYMENT this process addressed (``{group}-{mid}``),
     not an upstream model id, because that is the name the comparison was made
     against and an operator reading the line needs the two to be comparable.
+
+    Returns the alert delivery failure description, or ``None`` (no alert
+    attempted, or delivered).
     """
     was_in_fallback = _fallback_state.get(group, False)
+    alert_error: str | None = None
     if fallback_used and not was_in_fallback:
         logger.warning(
-            "🔄 group %r FALLBACK ENGAGED — primary %s failed, now served by %s",
-            group, primary, served_model,
+            "🔄 group %r FALLBACK ENGAGED — primary %s failed, now served by %s (cause: %s)",
+            group, primary, served_model, cause,
         )
+        alert_error = _publish_fallback_alert(group, primary, served_model, cause)
     elif not fallback_used and was_in_fallback:
         logger.info(
             "✅ group %r PRIMARY RESTORED — %s is healthy again",
             group, primary,
         )
     _fallback_state[group] = fallback_used
+    return alert_error
 
 
 def _resolve_group_served_model(resp: Any, *, spec: Any) -> str:
@@ -572,7 +648,7 @@ class LLMError(RuntimeError):
     tokens were consumed even though no valid output was produced.
     """
 
-    def __init__(self, message: str, *, usage: "Optional[LLMUsage]" = None):
+    def __init__(self, message: str, *, usage: "Optional[LLMUsage]" = None) -> None:
         super().__init__(message)
         self.usage = usage
 
@@ -781,7 +857,7 @@ class StreamIdleTimeoutError(LLMError):
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
         reasoning_chars: int = 0,
-    ):
+    ) -> None:
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
         #: Characters of REASONING delta (``reasoning_content`` /
@@ -827,7 +903,7 @@ class StreamTotalTimeoutError(LLMError):
         elapsed: float = 0.0,
         finish_reason: Optional[str] = None,
         reasoning_chars: int = 0,
-    ):
+    ) -> None:
         super().__init__(message, usage=usage)
         self.partial_text = partial_text
         #: Characters of REASONING delta (``reasoning_content`` /
@@ -879,7 +955,7 @@ def _close_stream(stream: Any) -> None:
 
 def _iter_with_idle_timeout(
     stream: Any, *, idle_timeout: float, total_timeout: Optional[float] = None
-):
+) -> Iterator[object]:
     """Yield items from *stream*, bounding the SILENCE BETWEEN them and,
     when *total_timeout* is given, the TOTAL wall-clock time spent iterating.
 
@@ -1479,6 +1555,10 @@ class LLMResult:
     # failure mode (I7232) a second time: every consumer reading it, including
     # crucible's run manifest, concluded the primary had served.
     fallback_used: bool = False
+    # Set when this call ENTERED a fallback episode and the alert for it could
+    # not be delivered: a description of the failure. ``None`` otherwise. The
+    # call itself is unaffected; this and an ERROR log make the loss observable.
+    fallback_alert_error: Optional[str] = None
     # The deployment name the router actually reported for this call —
     # `{group}-{mid}` on the router edge, the upstream model id elsewhere,
     # ``None`` when the route reported none. Distinct from ``model``, which is
@@ -1607,7 +1687,7 @@ class GroundedResult(LLMResult):
 # ── Client ────────────────────────────────────────────────────────────────
 
 
-def _finalize_result(method):
+def _finalize_result(method: Callable[..., Any]) -> Callable[..., Any]:  # pyright: ignore[reportExplicitAny]
     """Stamp the call's degradation record onto the result, then emit a priced
     cost record for it.
 
@@ -1637,7 +1717,7 @@ def _finalize_result(method):
     """
 
     @functools.wraps(method)
-    def _wrapped(self, *args, **kwargs):
+    def _wrapped(self: Any, *args: Any, **kwargs: Any) -> Any:  # pyright: ignore[reportExplicitAny]
         self.dropped_params = []
         self._dlp_facts = {}
         # Trace context first: the router-edge request carries its ids, so
@@ -1830,7 +1910,7 @@ class LLMClient:
         budget_escalation_factor: float = _BUDGET_ESCALATION_FACTOR,
         trace_sink: Optional[Callable[..., None]] = None,
         trace_capture: Optional[str] = None,
-    ):
+    ) -> None:
         if not isinstance(callsite_id, str) or not callsite_id.strip():
             raise ValueError(
                 "LLMClient requires a non-empty callsite_id — it is the join "
@@ -2075,11 +2155,12 @@ class LLMClient:
         result.served_deployment = served_deployment
         fallback_used = served_deployment != self.spec.model
         result.fallback_used = fallback_used
-        _check_fallback_transition(
+        result.fallback_alert_error = _check_fallback_transition(
             self.spec.model.split("-", 1)[0],
             fallback_used,
             served_deployment,
             self.spec.model,
+            _fallback_cause(resp),
         )
 
     def _emit_cost_record(self, result: Any) -> None:
@@ -2406,7 +2487,7 @@ class LLMClient:
             )
         return self._client
 
-    def _call_transport(self, fn, /, **kwargs):
+    def _call_transport(self, fn: Callable[..., Any], /, **kwargs: Any) -> Any:  # pyright: ignore[reportExplicitAny]
         """Issue one provider call, classifying its failure before anyone retries.
 
         A 4xx that refuses the REQUEST is permanent: no attempt count and no
@@ -3214,7 +3295,7 @@ class LLMClient:
         schema_dict = schema.model_json_schema() if is_pydantic else dict(schema)
         limit = self._effective_max_tokens(max_tokens)
 
-        def _parse_and_validate(raw_data: Any):
+        def _parse_and_validate(raw_data: Any) -> object:
             if is_pydantic:
                 parsed = schema.model_validate(raw_data)
             else:
