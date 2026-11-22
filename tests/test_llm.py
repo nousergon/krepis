@@ -2577,6 +2577,93 @@ models:
         assert _llm._fallback_state["med"] is True
 
 
+class TestFallbackEntryAlert:
+    """Entering a fallback episode publishes ONE alert (alpha-engine-config-I13940)."""
+
+    SPEC = TestServerSideFallbackIsVisibleAndPriceable.SPEC
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path, monkeypatch):
+        reg = tmp_path / "LLM_MODEL_REGISTRY.yaml"
+        reg.write_text(TestServerSideFallbackIsVisibleAndPriceable._REGISTRY)
+        monkeypatch.setenv("LLM_MODEL_REGISTRY_PATH", str(reg))
+        monkeypatch.setattr(_llm, "_fallback_state", {}, raising=True)
+        self.calls = []
+
+        def fake_publish(message, **kwargs):
+            self.calls.append((message, kwargs))
+            return SimpleNamespace(any_ok=True)
+
+        monkeypatch.setattr("krepis.alerts.publish", fake_publish)
+
+    def _client(self, fake):
+        return LLMClient(
+            self.SPEC,
+            callsite_id="krepis-test",
+            client_factory=lambda _spec, _key: fake,
+            api_key="sk-router-test",
+        )
+
+    def test_entry_alerts_with_group_primary_substitute_and_unknown_cause(self):
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert len(self.calls) == 1
+        message, kwargs = self.calls[0]
+        assert "'med'" in message
+        assert "med-deepseek-v4-flash-max" in message and "med-qwen3-max" in message
+        assert "failure cause unknown" in message
+        assert kwargs["source"] == _llm.FALLBACK_ALERT_SOURCE
+        assert kwargs["dedup_key"]
+        assert result.fallback_alert_error is None
+
+    def test_available_cause_is_named(self):
+        resp = _openai_resp("hello", model="med-qwen3-max")
+        resp.fallback_cause = "rate_limited"
+        self._client(FakeOpenAI([resp])).complete(system="s", user_content="u")
+        assert "failure cause rate_limited" in self.calls[0][0]
+
+    def test_repeat_calls_do_not_re_alert_and_recovery_rearms(self):
+        fake = FakeOpenAI([
+            _openai_resp("a", model="med-qwen3-max"),
+            _openai_resp("b", model="med-qwen3-max"),
+            _openai_resp("c", model="med-deepseek-v4-flash-max"),
+            _openai_resp("d", model="med-qwen3-max"),
+        ])
+        client = self._client(fake)
+        for _ in range(4):
+            client.complete(system="s", user_content="u")
+        assert len(self.calls) == 2, "episode 1 once, recovery, episode 2 once"
+
+    def test_healthy_call_publishes_nothing(self):
+        fake = FakeOpenAI([_openai_resp("a", model="med-deepseek-v4-flash-max")])
+        self._client(fake).complete(system="s", user_content="u")
+        assert self.calls == []
+
+    def test_publish_raising_does_not_break_the_call_and_is_observable(
+        self, monkeypatch, caplog
+    ):
+        def boom(message, **kwargs):
+            raise RuntimeError("transport down")
+
+        monkeypatch.setattr("krepis.alerts.publish", boom)
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        with caplog.at_level(logging.ERROR, logger="krepis.llm"):
+            result = self._client(fake).complete(system="s", user_content="u")
+        assert result.text == "hello"
+        assert result.fallback_used is True
+        assert "transport down" in (result.fallback_alert_error or "")
+        assert any("NOT delivered" in r.getMessage() for r in caplog.records)
+
+    def test_total_delivery_failure_is_observable(self, monkeypatch):
+        monkeypatch.setattr(
+            "krepis.alerts.publish", lambda m, **k: SimpleNamespace(any_ok=False)
+        )
+        fake = FakeOpenAI([_openai_resp("hello", model="med-qwen3-max")])
+        result = self._client(fake).complete(system="s", user_content="u")
+        assert result.text == "hello"
+        assert result.fallback_alert_error
+
+
 class TestDLPVerdictReachesTheArtifact:
     """The DLP scan's OUTCOME must be observable (alpha-engine-config-I10001).
 
