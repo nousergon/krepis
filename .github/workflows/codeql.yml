@@ -41,13 +41,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea  # v4.39.4
         with:
           languages: ${{ matrix.language }}
           config-file: ./.github/codeql/codeql-config.yml
 
       - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066  # v4.39.3
+        uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea  # v4.39.4
 
   # Alert (Telegram) on genuine post-merge failure of this workflow on the
   # default branch. Reusable workflow + transport in nousergon-lib. See
@@ -56,5 +56,5 @@ jobs:
     needs: [analyze]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
     permissions: {}
-    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@d8c10dbf0518d95832265e40bfde9f8191ee9b95
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@f8696fd10f3eb7818e0f96184756a3d15ac69c8d
     secrets: inherit
