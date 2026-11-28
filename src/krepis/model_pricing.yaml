@@ -236,6 +236,28 @@ cards:
     output_per_1m: 4.40
     cache_read_per_1m: 0.26      # ~81% cache discount (1.40 → 0.26)
     cache_create_per_1m: 1.40    # automatic prefix caching — no write upcharge
+  # ── Google Gemini direct API (via the egress proxy) ──────────────────────
+  # Source: https://ai.google.dev/gemini-api/docs/pricing (paid tier,
+  # Standard, text, read 2026-11-28). Implicit caching bills cached prompt
+  # tokens at the cache-read rate with no write upcharge, so
+  # cache_create_per_1m is the input rate. Explicit context-cache STORAGE
+  # (USD per 1M tokens per hour) is not modelled.
+  - model_name: gemini-3.5-flash
+    effective_from: 2026-11-28   # first read; the page states no release date
+    input_per_1m: 1.50
+    output_per_1m: 9.00          # thinking tokens bill as output
+    cache_read_per_1m: 0.15
+    cache_create_per_1m: 1.50    # implicit caching — no write upcharge
+  # gemini-2.5-pro prices prompts above 200k tokens at a higher rate (input
+  # 2.50, output 15.00, cache read 0.25). A card carries one flat rate, so it
+  # holds the <=200k rate the page leads with; a caller sending >200k-token
+  # prompts must price those itself.
+  - model_name: gemini-2.5-pro
+    effective_from: 2026-11-28   # first read; the page states no release date
+    input_per_1m: 1.25
+    output_per_1m: 10.00         # thinking tokens bill as output
+    cache_read_per_1m: 0.125
+    cache_create_per_1m: 1.25    # implicit caching — no write upcharge
 
 # Server-side tool fees (Anthropic ``Message.usage.server_tool_use``).
 # Billed as flat per-request fees, independent of which model invoked
